@@ -13,13 +13,14 @@
 - [x] pytest 冒烟（夹具隔离 DATA_ROOT/CONFIG）
 - [x] scripts/dev.ps1 + GitHub 建仓
 
-## M1 项目域
-- [ ] Project CRUD API + 项目目录自举（data/projects/<uid>/）
-- [ ] 步骤执行器：单步启动/取消/心跳；重跑语义（清产物+下游 stale）
-- [ ] 输入指纹（配置键 + 上游产物哈希 → sha256）
-- [ ] 崩溃恢复：启动扫描 running→interrupted；dead 判定（心跳超时）
-- [ ] 日志：每步日志文件 + API 尾读
-- [ ] pytest：执行器状态机全路径 + 恢复测试（kill 模拟）
+## M1 项目域 ✅ 2026-09-17
+- [x] Project CRUD API + 项目目录自举（data/projects/<uid>/，manifest.json 双写）
+- [x] 步骤执行器：单步启动/取消/心跳；重跑语义（清产物+下游 stale）；future 异常观测
+- [x] 输入指纹（cfg_keys 配置快照 + 上游产物哈希 → sha256）；fresh 标记 + 指纹跳过
+- [x] 崩溃恢复：启动扫描 running→failed(STEP_INTERRUPTED) / job→dead
+- [x] 日志：每步 logs/<step>.log + API 尾读
+- [x] 项目状态聚合（processing/failed/done）随步骤联动
+- [x] pytest 14 项：状态机全路径 + 取消/失败/恢复/API E2E（夹具隔离 DATA_ROOT）
 
 ## M2 管线前半（步骤 1–6）
 - [ ] download：yt-dlp 库 + archive 去重 + cookies/代理 + 本地导入

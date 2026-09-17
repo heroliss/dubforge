@@ -17,8 +17,16 @@ from typing import Any
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-CONFIG_PATH = Path(os.environ.get("DUBFORGE_CONFIG", REPO_ROOT / "config.yaml"))
-DATA_ROOT = Path(os.environ.get("DUBFORGE_DATA_ROOT", REPO_ROOT / "data"))
+
+
+def config_path() -> Path:
+    """配置文件路径 (惰性取环境变量: 测试夹具在导入后才注入, 必须每次读)"""
+    return Path(os.environ.get("DUBFORGE_CONFIG", REPO_ROOT / "config.yaml"))
+
+
+def data_root() -> Path:
+    """数据根目录 (惰性取环境变量, 同上; 测试隔离依赖此语义)"""
+    return Path(os.environ.get("DUBFORGE_DATA_ROOT", REPO_ROOT / "data"))
 
 PROJECTS_DIR_NAME = "projects"
 DB_FILE_NAME = "dubforge.db"
@@ -107,8 +115,9 @@ def _deep_merge(base: dict, override: dict) -> dict:
 
 def load_config() -> dict:
     """读取配置 (默认值 ∪ config.yaml); 每次调用重读, 改配置即时生效"""
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    cp = config_path()
+    if cp.exists():
+        with open(cp, "r", encoding="utf-8") as f:
             user = yaml.safe_load(f) or {}
         return _deep_merge(DEFAULTS, user)
     return copy.deepcopy(DEFAULTS)
@@ -127,27 +136,28 @@ def get(key: str, default: Any = None) -> Any:
 def set_key(key: str, value: Any) -> None:
     """点分路径写配置值并落盘 (保留其他键; 原子写)"""
     user: dict = {}
-    if CONFIG_PATH.exists():
-        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+    cp = config_path()
+    if cp.exists():
+        with open(cp, "r", encoding="utf-8") as f:
             user = yaml.safe_load(f) or {}
     node = user
     parts = key.split(".")
     for p in parts[:-1]:
         node = node.setdefault(p, {})
     node[parts[-1]] = value
-    CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    tmp = CONFIG_PATH.with_suffix(".yaml.tmp")
+    cp.parent.mkdir(parents=True, exist_ok=True)
+    tmp = cp.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(user, f, allow_unicode=True, sort_keys=False)
-    os.replace(tmp, CONFIG_PATH)          # 原子替换, 避免写一半损坏
+    os.replace(tmp, cp)          # 原子替换, 避免写一半损坏
 
 
 def projects_dir() -> Path:
     """全部视频项目的数据根: data/projects/"""
-    p = DATA_ROOT / PROJECTS_DIR_NAME
+    p = data_root() / PROJECTS_DIR_NAME
     p.mkdir(parents=True, exist_ok=True)
     return p
 
 
 def db_path() -> Path:
-    return DATA_ROOT / DB_FILE_NAME
+    return data_root() / DB_FILE_NAME

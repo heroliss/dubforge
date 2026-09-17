@@ -20,7 +20,9 @@ FRONTEND_DIST = config.REPO_ROOT / "frontend" / "dist"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    # M1: runner.recover_interrupted() —— 启动时把 running 状态的步骤判为 interrupted
+    # 崩溃恢复: 上次运行残留的 running 状态判中断 (原子写保证无半成品)
+    from dubforge.runner import runner
+    runner.recover()
     yield
 
 
@@ -38,10 +40,14 @@ def health():
     return {"ok": True, "app": "DubForge", "version": "0.1.0"}
 
 
-# ---- API 路由 (M1 起逐个模块挂载) ----
-from app.api import settings as api_settings  # noqa: E402
+# ---- API 路由 ----
+from app.api import projects as api_projects
+from app.api import settings as api_settings
+from app.api import steps as api_steps
 
 app.include_router(api_settings.router)
+app.include_router(api_projects.router)
+app.include_router(api_steps.router)
 
 
 # ---- 前端静态托管 (frontend/dist 存在时; 开发期走 vite dev server) ----

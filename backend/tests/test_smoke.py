@@ -1,24 +1,6 @@
 # -*- coding: utf-8 -*-
-"""M0 冒烟测试: 配置读写 / DB 建表 / FastAPI health (夹具隔离 DATA_ROOT)"""
-import os
-import tempfile
-from pathlib import Path
-
+"""M0 冒烟测试: 配置读写 / DB 建表 / FastAPI health (夹具隔离 DATA_ROOT, 见 conftest)"""
 import pytest
-
-
-@pytest.fixture()
-def isolated_env(tmp_path, monkeypatch):
-    """把 DATA_ROOT/CONFIG 指到临时目录, 隔离真实数据"""
-    monkeypatch.setenv("DUBFORGE_DATA_ROOT", str(tmp_path / "data"))
-    monkeypatch.setenv("DUBFORGE_CONFIG", str(tmp_path / "config.yaml"))
-    # 重置已缓存的单例 (config 没有 engine 缓存, db 有)
-    import dubforge.config as cfg
-    import dubforge.db as db
-    from dubforge.domain import models  # noqa: F401
-    db.reset_engine()
-    yield tmp_path
-    db.reset_engine()
 
 
 def test_config_defaults_and_roundtrip(isolated_env):
@@ -36,17 +18,18 @@ def test_config_defaults_and_roundtrip(isolated_env):
 def test_db_creates_tables(isolated_env):
     import sqlmodel
     from dubforge import config
-    from dubforge.db import get_engine, init_db
+    from dubforge.db import init_db
+    from dubforge.domain import crud
     from dubforge.domain.models import Project
     init_db()
     assert config.db_path().exists()
-    with sqlmodel.Session(get_engine()) as s:
+    with crud.session() as s:
         p = Project(uid="t1", title="测试项目")
         s.add(p)
         s.commit()
         s.refresh(p)
         assert p.id is not None
-        rows = s.exec(sqlmodel.select(Project)).all()
+        rows = list(s.exec(sqlmodel.select(Project)).all())
         assert len(rows) == 1
 
 

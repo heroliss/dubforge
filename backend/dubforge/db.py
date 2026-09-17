@@ -12,7 +12,7 @@ def get_engine():
     """惰性单例 engine; DATA_ROOT 可被环境变量重定向 (测试夹具)"""
     global _engine
     if _engine is None:
-        config.DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        config.data_root().mkdir(parents=True, exist_ok=True)
         _engine = sqlmodel.create_engine(
             f"sqlite:///{config.db_path()}",
             connect_args={"check_same_thread": False},
