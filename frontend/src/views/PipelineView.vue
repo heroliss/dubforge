@@ -89,7 +89,7 @@ function rerunDialog(step: any) {
 }
 
 function openWorkbench() {
-  router.push('/workbench')
+  router.push(`/projects/${uid}/workbench`)
 }
 </script>
 
