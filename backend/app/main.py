@@ -60,8 +60,9 @@ if FRONTEND_DIST.is_dir():
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        # API 之外的路径全部回退到 index.html (vue-router history 模式)
+        # API 之外的路径全部回退到 index.html; index 禁缓存 (防旧资源清单)
+        headers = {"Cache-Control": "no-store"}
         candidate = FRONTEND_DIST / full_path
         if full_path and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(FRONTEND_DIST / "index.html")
+            return FileResponse(candidate, headers=headers)
+        return FileResponse(FRONTEND_DIST / "index.html", headers=headers)

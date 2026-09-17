@@ -8,6 +8,7 @@ const cfg = ref<any>(null)
 const saving = ref(false)
 const testing = ref(false)
 const testResult = ref<null | { ok: boolean; text: string }>(null)
+const loadError = ref('')
 
 const profiles = ref<any[]>([])
 const form = ref({
@@ -33,15 +34,21 @@ function move(i: number, d: number) {
 }
 
 onMounted(async () => {
-  cfg.value = await (await fetch('/api/settings')).json()
-  const llm = cfg.value.llm
-  profiles.value = (llm.profiles?.length ? llm.profiles :
-    [{ name: '默认', base_url: llm.base_url, api_key: llm.api_key,
-       model: llm.model, enabled: true }]).map((p: any) => ({ ...p }))
-  form.value.temperature = Number(llm.temperature)
-  form.value.max_workers = Number(llm.max_workers)
-  form.value.timeout = Number(llm.timeout ?? 300)
-  form.value.thinking = llm.thinking ?? 'auto'
+  try {
+    const _r = await fetch('/api/settings')
+    if (!_r.ok) throw new Error('HTTP ' + _r.status)
+    cfg.value = await _r.json()
+    const llm = cfg.value.llm
+    profiles.value = (llm.profiles?.length ? llm.profiles :
+      [{ name: '默认', base_url: llm.base_url, api_key: llm.api_key,
+         model: llm.model, enabled: true }]).map((p: any) => ({ ...p }))
+    form.value.temperature = Number(llm.temperature)
+    form.value.max_workers = Number(llm.max_workers)
+    form.value.timeout = Number(llm.timeout ?? 300)
+    form.value.thinking = llm.thinking ?? 'auto'
+  } catch (e: any) {
+    loadError.value = `加载失败 (${e.message}) —— 请确认后端窗口正在运行 (8600)`
+  }
 })
 
 async function save(showTip = true) {
@@ -87,7 +94,8 @@ async function testConnection() {
       可保存多组配置并按顺序启用：前面的失败时自动切换到下一个。
     </n-alert>
 
-    <n-spin :show="!cfg">
+    <n-alert v-if="loadError" type="error">{{ loadError }}</n-alert>
+    <n-spin :show="!cfg && !loadError">
       <n-space vertical size="large" v-if="cfg">
         <!-- ============ LLM 配置池 (可编辑) ============ -->
         <n-card title="🌐 大模型 (LLM) — 翻译与分句" size="small">
