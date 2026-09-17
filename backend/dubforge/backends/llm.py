@@ -1,0 +1,173 @@
+# -*- coding: utf-8 -*-
+"""
+LLM 后端 (OpenAI 兼容 chat.completions)
+========================================
+- 用 httpx 直连, 不引 openai SDK (保持依赖轻)
+- chat(): 文本补全; chat_json(): JSON 模式 + 容错提取 + 校验重试
+- 配置: config llm 段 (base_url/api_key/model/temperature/max_workers)
+"""
+import json
+import re
+import threading
+
+import httpx
+
+from dubforge import config
+from dubforge.errors import ServiceOfflineError, StepFailedError
+
+_offline_cache: dict = {}
+_offline_lock = threading.Lock()
+
+
+def _client() -> httpx.Client:
+    base = str(config.get("llm.base_url", "")).rstrip("/")
+    if not base:
+        raise ServiceOfflineError("LLM base_url 未配置",
+                                  suggestion="请在 config.yaml 的 llm 段填写 base_url 与 api_key")
+    read_to = float(config.get("llm.timeout", 300))
+    return httpx.Client(base_url=base,
+                        timeout=httpx.Timeout(connect=10, read=read_to,
+                                              write=60, pool=10),
+                        trust_env=False)  # 本地代理由 Clash 规则管, 不读环境代理
+
+
+def _payload(messages: list[dict], temperature: float | None, json_mode: bool) -> dict:
+    body = {
+        "model": config.get("llm.model", "glm-4.7"),
+        "messages": messages,
+        "temperature": temperature if temperature is not None
+        else float(config.get("llm.temperature", 0.1)),
+    }
+    if json_mode:
+        body["response_format"] = {"type": "json_object"}
+    # 思考模式: GLM-4.5+ 支持请求级开关; 字幕翻译不需要长思考, 关闭可大幅提速
+    thinking = str(config.get("llm.thinking", "auto"))
+    if thinking == "disabled":
+        body["thinking"] = {"type": "disabled"}
+    elif thinking == "enabled":
+        body["thinking"] = {"type": "enabled"}
+    return body
+
+
+def _post(body: dict) -> str:
+    key = config.get("llm.api_key", "")
+    if not key:
+        raise ServiceOfflineError("LLM api_key 未配置",
+                                  suggestion="请复制 config.example.yaml 为 config.yaml 并填入 API key")
+
+    # 429/5xx/读超时 → 指数退避重试 (思考型模型慢 + 限流都是常态)
+    import time as _time
+    last_exc: Exception | None = None
+    r = None
+    for attempt in range(1, 4):
+        try:
+            with _client() as c:
+                r = c.post("/chat/completions", json=body,
+                           headers={"Authorization": f"Bearer {key}"})
+            last_exc = None
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
+            last_exc = e
+            if isinstance(e, httpx.ConnectError):
+                raise ServiceOfflineError(
+                    f"LLM 服务不可达: {config.get('llm.base_url')}",
+                    detail=str(e)) from e
+            _time.sleep(3 * attempt)
+            continue
+        if r.status_code == 200 or (r.status_code != 429 and r.status_code < 500):
+            break
+        retry_after = r.headers.get("Retry-After")
+        wait = float(retry_after) if (retry_after or "").replace(".", "").isdigit()             else 5 * attempt
+        _time.sleep(wait)
+    if last_exc is not None:
+        raise StepFailedError(
+            f"LLM 请求超时/中断 (已重试): {type(last_exc).__name__}",
+            detail=str(last_exc)[:500],
+            suggestion="思考型模型响应慢时可调大 config llm.timeout, 或换更快模型。")
+    if r.status_code == 401:
+        raise ServiceOfflineError("LLM 认证失败 (401)", code="LLM_AUTH",
+                                  suggestion="请检查 config.yaml 的 llm.api_key")
+
+    if r.status_code != 200:
+        raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
+                              detail=r.text[:800],
+                              suggestion="429=配额限流 (稍后重试); 其他码见 detail。")
+    data = r.json()
+    return data["choices"][0]["message"]["content"]
+
+
+def check_online() -> bool:
+    """轻量连通性探测 (结果缓存 60s, 避免每句都探)"""
+    key = str(config.get("llm.base_url", ""))
+    now = __import__("time").time()
+    with _offline_lock:
+        hit = _offline_cache.get(key)
+        if hit and now - hit[0] < 60:
+            return hit[1]
+    ok = False
+    try:
+        with _client() as c:
+            r = c.get("/models", headers={"Authorization": f"Bearer {config.get('llm.api_key','')}"})
+            ok = r.status_code in (200, 401)   # 401 说明服务在, 只是 key 校验层
+    except Exception:
+        ok = False
+    with _offline_lock:
+        _offline_cache[key] = (now, ok)
+    return ok
+
+
+def chat(prompt: str, system: str | None = None,
+         temperature: float | None = None) -> str:
+    """单轮文本补全"""
+    messages = ([{"role": "system", "content": system}] if system else []) + [
+        {"role": "user", "content": prompt}]
+    return _post(_payload(messages, temperature, json_mode=False))
+
+
+def _extract_json(text: str):
+    """容错提取 JSON: 剥 markdown 围栏 → 找首个 [...] 或 {...} 平衡块"""
+    text = re.sub(r"```(?:json)?\s*(.*?)\s*```", r"\1", text, flags=re.S)
+    for opener, closer in (("[", "]"), ("{", "}")):
+        start = text.find(opener)
+        if start < 0:
+            continue
+        depth = 0
+        for i in range(start, len(text)):
+            if text[i] == opener:
+                depth += 1
+            elif text[i] == closer:
+                depth -= 1
+                if depth == 0:
+                    return json.loads(text[start:i + 1])
+    raise json.JSONDecodeError("未找到平衡的 JSON 块", text, 0)
+
+
+def chat_json(prompt: str, validator=None, system: str | None = None,
+              max_retries: int = 3, temperature: float | None = None,
+              log=lambda m: None):
+    """JSON 补全 + 校验 + 重试 (失败重试时附加纠错提示)
+
+    validator: callable(obj) -> 归一化结果 (通过, 返回值作为 chat_json 的返回)
+               或 raise ValueError(原因); 返回 None 则原样返回解析对象
+    """
+    last_err: Exception | None = None
+    last_raw = ""
+    for attempt in range(1, max_retries + 1):
+        retry_hint = ""
+        if last_err is not None:
+            retry_hint = (f"\n\n【重试提示】上一次输出解析或校验失败: {last_err}\n"
+                          f"请严格按要求的 JSON 结构重新输出, 不要输出任何解释文字。")
+        raw = chat(prompt + retry_hint, system=system, temperature=temperature)
+        last_raw = raw
+        try:
+            obj = _extract_json(raw)
+            if validator:
+                normalized = validator(obj)
+                return obj if normalized is None else normalized
+            return obj
+        except Exception as e:  # noqa: BLE001 (解析/校验失败都要重试)
+            last_err = e
+            log(f"LLM JSON 第 {attempt}/{max_retries} 次解析失败: {e}")
+    raise StepFailedError(
+        f"LLM 输出连续 {max_retries} 次无法通过 JSON 校验: {last_err}",
+        detail=last_raw[:1200],
+        suggestion="可重试本步骤; 若反复失败, 换更强的模型 (config llm.model)。")

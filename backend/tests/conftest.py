@@ -19,6 +19,11 @@ def isolated_env(tmp_path, monkeypatch):
     db.reset_engine()
 
 
+def _engine_for_test():
+    from dubforge.db import get_engine
+    return get_engine()
+
+
 def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15.0) -> str:
     """轮询等待步骤到达终态 (执行器在后台线程)"""
     from dubforge.domain import crud
@@ -29,8 +34,16 @@ def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15
         if step.status in statuses:
             return step.status
         time.sleep(0.05)
+    err = f" | {step.error_code}: {step.error_message}" if step.error_code else ""
+    import sqlmodel as _sm
+    from dubforge.domain.models import Job as _Job
+    with _sm.Session(_engine_for_test()) as _s:
+        _j = _s.exec(_sm.select(_Job).where(
+            _Job.project_id == project.id, _Job.step_key == step_key)).first()
+        if _j and _j.error_detail:
+            err += "\n  detail: " + _j.error_detail[-400:]
     raise TimeoutError(f"步骤 {step_key} 未在 {timeout}s 内到达 {statuses}, 当前 "
-                       f"{step.status}")
+                       f"{step.status}{err}")
 
 
 @pytest.fixture()

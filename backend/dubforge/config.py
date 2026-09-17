@@ -40,6 +40,8 @@ DEFAULTS: dict[str, Any] = {
         "model": "glm-4.7",
         "max_workers": 1,          # LLM 并发请求数 (本地/弱限流设 1)
         "temperature": 0.1,
+        "timeout": 300,            # 读超时秒数 (思考型模型单次可能 >120s)
+        "thinking": "auto",      # auto=不传(官方默认) / disabled=关闭思考(翻译任务推荐, 大幅提速) / enabled
     },
     "download": {
         "resolution": 1080,         # 最高分辨率

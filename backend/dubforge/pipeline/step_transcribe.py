@@ -88,6 +88,9 @@ def run(ctx) -> None:
     srt_lines = [SubLine(i + 1, s, max(e, s + _MIN_LINE), t)
                  for i, (s, e, t) in enumerate(segs)]
 
+    # 词级时间戳落盘 (下游 split 拆分超长行时保时间轴)
+    ctx.write_json("words.json", words)
+
     srt_dir = ctx.pdir / "srt"
     srt_dir.mkdir(exist_ok=True)
     out = srt_dir / "src.srt"

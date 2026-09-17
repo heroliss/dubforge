@@ -30,10 +30,13 @@
 - [x] transcribe：faster-whisper 词级时间戳 + 标点/停顿/时长三重断句 → src.srt；HF 缓存自动复用 vl_cache
 - [x] 测试：SRT 读写、断句纯函数、本地导入幂等、真实 demucs+whisper 端到端（2.5s 样片）
 
-### M2b 文本链（待做）
-- [ ] split：NLP 粗切 + LLM 语义切句
-- [ ] translate：三档策略 + 术语表 + 风格提示词 + 续传缓存
-- [ ] subtitles：源/译/双语 SRT + 行宽控制
+### M2b 文本链 ✅ 2026-09-17
+- [x] llm 后端：OpenAI 兼容 (httpx 直连任意服务商)，JSON 容错提取+校验重试，429/5xx/读超时指数退避，thinking 请求级开关，超时可配 (思考型模型友好)
+- [x] split：超长行规则切分 (token 保真) + LLM 语义切 (校验失败自动回退)；词级时间戳保时间轴
+- [x] translate：三档策略 (整篇直译/分块两步+全局审校/滚动摘要) + 术语表 + 风格提示词 + 按行号 id 对齐 (根治 JSON 错位) + 块级续传缓存
+- [x] subtitles：源/译/双语 SRT + 行宽硬换行
+- [x] 测试 6 项 (全 mock 零 token) + 真实 GLM-5.3-flash 全链冒烟 (6 句 17s)
+- [x] 设置面板提前交付 (原 M4)：LLM 全参数可配 + 测试连接按钮，适配任意 OpenAI 兼容服务商
 - [ ] split：NLP 粗切 + LLM 语义切句
 - [ ] translate：三档策略 + 术语表 + 风格提示词 + gpt_log 式续传缓存
 - [ ] subtitles：源/译/双语 SRT + 行宽控制
