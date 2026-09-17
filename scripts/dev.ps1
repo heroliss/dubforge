@@ -1,9 +1,14 @@
 ﻿# DubForge 开发环境一键启动 (前后端 + 浏览器)
 # 用法: 双击根目录 StartDev.bat, 或 .\scripts\dev.ps1
 #       需已跑过: backend/uv sync 与 frontend/npm install
+param([int]$BackendPort = 0)   # 0 = 读 config.yaml 的 server.port
 $ErrorActionPreference = "Stop"
 $Host.UI.RawUI.WindowTitle = "DubForge Dev Launcher"
 $Root = (Resolve-Path "$PSScriptRoot\..").Path
+if ($BackendPort -le 0) {
+    $m = Select-String -Path "$Root\config.yaml" -Pattern '^\s*port:\s*(\d+)' -ErrorAction SilentlyContinue
+    $BackendPort = if ($m) { [int]$m.Matches[0].Groups[1].Value } else { 8600 }
+}
 
 Write-Host ""
 Write-Host "  == DubForge dev ==" -ForegroundColor Cyan
@@ -28,9 +33,18 @@ function Get-PortPids($p) {
     return $pids | Select-Object -Unique
 }
 
-$existing = Get-PortPids 8600
+$existing = Get-PortPids $BackendPort
 if ($existing) {
-    Write-Host "  [提示] 检测到 8600 端口已被占用 (PID: $($existing -join ', ')) —— 已有 DubForge 实例在运行。" -ForegroundColor Yellow
+    # 识别占用进程名: python/uv = 自己的旧实例; 其他程序 = 建议换端口
+    $procNames = ($existing | ForEach-Object {
+        (Get-Process -Id $_ -ErrorAction SilentlyContinue).ProcessName
+    }) -join ", "
+    Write-Host "  [提示] 端口 $BackendPort 已被占用 (PID: $($existing -join ', ') | 进程: $procNames)" -ForegroundColor Yellow
+    if ($procNames -notmatch 'python|uv') {
+        Write-Host "  [错误] 占用者不是 DubForge (是其他程序), 不能自动处理。" -ForegroundColor Red
+        Write-Host "  解决: 使用其他端口启动 — .\scripts\dev.ps1 -BackendPort 8610" -ForegroundColor Yellow
+        Read-Host "  回车退出"; exit 1
+    }
     Write-Host "    [1] 直接连接现有实例 (推荐 —— 不重启, 保留运行中的任务)"
     Write-Host "    [2] 结束现有实例并重新启动"
     Write-Host "    [3] 退出"
@@ -39,8 +53,8 @@ if ($existing) {
     if ($ans -eq "2") {
         foreach ($epid in $existing) { taskkill /PID $epid /T /F 2>$null | Out-Null }
         Start-Sleep -Seconds 1
-        if (Get-PortPids 8600) {
-            Write-Host "  [错误] 旧实例无法结束 (文件占用?), 请手动关闭后重试。" -ForegroundColor Red
+        if (Get-PortPids $BackendPort) {
+            Write-Host "  [错误] 旧实例无法结束, 请手动关闭后重试。" -ForegroundColor Red
             Read-Host "  回车退出"; exit 1
         }
         Write-Host "  旧实例已结束, 开始重新启动..." -ForegroundColor Green
@@ -74,7 +88,7 @@ if ($existing) {
 # ---- 后端 (8600, reload) ----
 $backend = Start-Process -PassThru powershell -ArgumentList @(
     "-NoProfile", "-Command",
-    "`$Host.UI.RawUI.WindowTitle='DubForge Backend'; cd '$Root\backend'; uv run uvicorn app.main:app --port 8600 --reload"
+    "`$Host.UI.RawUI.WindowTitle='DubForge Backend'; cd '$Root\backend'; uv run uvicorn app.main:app --port $BackendPort --reload"
 )
 
 # ---- 前端 (5273, 热更新) ----
@@ -90,11 +104,11 @@ function Test-Port($p) {
 $okB = $false; $okF = $false
 for ($i = 0; $i -lt 50; $i++) {
     Start-Sleep -Milliseconds 800
-    if (-not $okB) { $okB = Test-Port 8600 }
+    if (-not $okB) { $okB = Test-Port $BackendPort }
     if (-not $okF) { $okF = Test-Port 5273 }
     if ($okB -and $okF) { break }
 }
-if ($okB) { Write-Host "  [OK] 后端 http://127.0.0.1:8600" -ForegroundColor Green } else { Write-Host "  [失败] 后端 8600 未就绪 (看 Backend 窗口报错)" -ForegroundColor Red }
+if ($okB) { Write-Host "  [OK] 后端 http://127.0.0.1:$BackendPort" -ForegroundColor Green } else { Write-Host "  [失败] 后端 $BackendPort 未就绪 (看 Backend 窗口报错)" -ForegroundColor Red }
 if ($okF) { Write-Host "  [OK] 前端 http://127.0.0.1:5273" -ForegroundColor Green } else { Write-Host "  [失败] 前端 5273 未就绪 (看 Frontend 窗口报错)" -ForegroundColor Red }
 if ($okB -and $okF) { Start-Process "http://127.0.0.1:5273" }
 

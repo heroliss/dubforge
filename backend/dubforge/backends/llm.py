@@ -56,7 +56,7 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
-def _post(provider: dict, body: dict) -> str:
+def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
     key = provider.get("api_key", "")
     name = provider.get("name", "default")
@@ -93,6 +93,14 @@ def _post(provider: dict, body: dict) -> str:
     if r.status_code == 401:
         raise ServiceOfflineError("LLM 认证失败 (401)", code="LLM_AUTH",
                                   suggestion=f"请检查配置「{name}」的 api_key")
+    if r.status_code == 400 and provider.get("params"):
+        # 该服务商不认某个专属参数 → 自适应降级: 剥离专属参数重发一次
+        log(f"⚠ 「{name}」拒绝了专属参数, 已自动剥离重试 ({r.text[:120]})")
+        core = {k: v for k, v in body.items()
+                if k not in (provider.get("params") or {})}
+        with _client(provider.get("base_url", "")) as c:
+            r = c.post("/chat/completions", json=core,
+                       headers={"Authorization": f"Bearer {key}"})
     if r.status_code != 200:
         raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
                               detail=r.text[:800],
@@ -135,7 +143,7 @@ def chat(prompt: str, system: str | None = None,
     for provider in _profiles():
         try:
             return _post(provider, _payload(provider, messages, temperature,
-                                            json_mode=False))
+                                            json_mode=False), log=log)
         except (ServiceOfflineError, StepFailedError) as e:
             errors.append(f"「{provider.get('name')}」: {e.message}")
     raise StepFailedError(

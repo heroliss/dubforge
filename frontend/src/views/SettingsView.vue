@@ -41,7 +41,9 @@ onMounted(async () => {
     const llm = cfg.value.llm
     profiles.value = (llm.profiles?.length ? llm.profiles :
       [{ name: '默认', base_url: llm.base_url, api_key: llm.api_key,
-         model: llm.model, enabled: true }]).map((p: any) => ({ ...p }))
+         model: llm.model, enabled: true }]).map((p: any) => ({
+      ...p, paramsJson: JSON.stringify(p.params ?? {}, null, 1),
+    }))
     form.value.temperature = Number(llm.temperature)
     form.value.max_workers = Number(llm.max_workers)
     form.value.timeout = Number(llm.timeout ?? 300)
@@ -51,13 +53,29 @@ onMounted(async () => {
   }
 })
 
+// 官方依据的参数模板 (选定后自动填入, 可再手动改; 其余服务商请查其官方文档)
+const PARAM_TPLS: Record<string, { label: string, params: any }> = {
+  glm53: { label: 'GLM-5.3-flash 官方推荐 (思考型)',
+           params: { temperature: 1, top_p: 0.95, reasoning_effort: 'max' } },
+  low_random: { label: '翻译通用 (低随机, 更稳定)', params: { temperature: 0.2 } },
+  clear: { label: '清空', params: {} },
+}
+function applyTpl(p: any, key: string) {
+  if (key && PARAM_TPLS[key]) p.paramsJson = JSON.stringify(PARAM_TPLS[key].params, null, 1)
+}
+
 async function save(showTip = true) {
   saving.value = true
   try {
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {
-        'llm.profiles': profiles.value,
+        'llm.profiles': profiles.value.map((p: any) => {
+          let params: any = {}
+          try { params = JSON.parse(p.paramsJson || '{}') } catch { /* 留空 */ }
+          const { paramsJson, ...rest } = p
+          return { ...rest, params }
+        }),
         'llm.temperature': form.value.temperature,
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
@@ -132,6 +150,16 @@ async function testConnection() {
                 <n-input v-model:value="p.api_key" type="password"
                          show-password-on="click" size="small"
                          placeholder="密钥直接保存在本地 config.yaml" />
+              </n-form-item>
+              <n-form-item label-placement="left" label="专属参数">
+                <n-space vertical size="tiny" style="width:100%">
+                  <n-select size="small" :value="''"
+                            :options="Object.entries(PARAM_TPLS).map(([k, v]) => ({ label: v.label, value: k }))"
+                            placeholder="选择参数模板 (官方推荐值)…"
+                            @update:value="(v: string) => applyTpl(p, v)" />
+                  <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
+                           placeholder='JSON, 原样合并进请求体, 如 {"temperature":1,"reasoning_effort":"max"}' />
+                </n-space>
               </n-form-item>
             </n-card>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
