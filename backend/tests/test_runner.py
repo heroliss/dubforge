@@ -15,7 +15,8 @@ from conftest import wait_status
 from dubforge.domain import crud
 
 
-def test_run_done_and_artifact(make_project, isolated_env):
+def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps):
+    stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
     r = runner.start_step(uid, "assemble")
@@ -37,7 +38,8 @@ def test_run_done_and_artifact(make_project, isolated_env):
     assert m["steps"][8]["status"] == "done"   # assemble 是第 9 步
 
 
-def test_skip_when_fresh(make_project, isolated_env):
+def test_skip_when_fresh(make_project, isolated_env, stub_heavy_steps):
+    stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
     runner.start_step(uid, "assemble")
@@ -53,7 +55,8 @@ def test_skip_when_fresh(make_project, isolated_env):
     assert art_path.stat().st_mtime == mtime1
 
 
-def test_config_change_invalidates(make_project, isolated_env, monkeypatch):
+def test_config_change_invalidates(make_project, isolated_env, monkeypatch, stub_heavy_steps):
+    stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
     runner.start_step(uid, "assemble")
@@ -68,26 +71,11 @@ def test_config_change_invalidates(make_project, isolated_env, monkeypatch):
     wait_status(uid, "assemble", {"done"})
 
 
-def test_force_rerun_marks_downstream_stale(make_project, isolated_env, monkeypatch):
-    """tts(mock 后端) → assemble; force 重跑 tts → 下游置 stale"""
+def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_heavy_steps):
+    """tts → assemble (双双桩化); force 重跑 tts → 下游置 stale"""
+    stub_heavy_steps("tts", "assemble")
     uid = make_project()
     project = crud.get_project(uid)
-    pdir = crud.project_dir(uid)
-
-    # 伪造上游 dubtask 产物 (tts 真实现需要)
-    pdir.joinpath("artifacts", "dubtask").mkdir(parents=True, exist_ok=True)
-    task = pdir / "artifacts" / "dubtask" / "dubtask.json"
-    task.write_text(json.dumps({"lines": [{"id": 1, "text": "测试", "start": 0.0,
-                                           "end": 2.0}]}), encoding="utf-8")
-    crud.add_artifact(project.id, "dubtask", "json", "dubtask.json",
-                      task, "artifacts/dubtask/dubtask.json")
-
-    from dubforge.backends import tts_indextts25
-    def fake_synth(url, text, out_path, lang, **kw):
-        out_path.write_bytes(b"RIFF")
-        return out_path
-    monkeypatch.setattr(tts_indextts25, "synth", fake_synth)
-
     runner = _runner()
     for key in ("tts", "assemble"):
         runner.start_step(uid, key)
@@ -106,7 +94,8 @@ def test_force_rerun_marks_downstream_stale(make_project, isolated_env, monkeypa
     assert crud.get_step(project.id, "assemble").status == "done"
 
 
-def test_cancel_mid_run(make_project, isolated_env):
+def test_cancel_mid_run(make_project, isolated_env, stub_heavy_steps):
+    stub_heavy_steps("assemble")
     uid = make_project(params={"delay_step": {"assemble": 0.4}})
     runner = _runner()
     runner.start_step(uid, "assemble")
@@ -122,7 +111,8 @@ def test_cancel_mid_run(make_project, isolated_env):
         assert not any(a.name.endswith("_result.json") for a in arts.values())
 
 
-def test_fail_step_records_error(make_project, isolated_env):
+def test_fail_step_records_error(make_project, isolated_env, stub_heavy_steps):
+    stub_heavy_steps("assemble")
     uid = make_project(params={"fail_step": "assemble"})
     runner = _runner()
     runner.start_step(uid, "assemble")
@@ -151,8 +141,9 @@ def test_crash_recovery(make_project, isolated_env):
     assert "重跑" in step2.error_suggestion
 
 
-def test_api_e2e(isolated_env):
+def test_api_e2e(isolated_env, stub_heavy_steps):
     """API 全环: 建项目 → 跑桩步骤 → 轮询 → fresh 标记 → 日志读取"""
+    stub_heavy_steps("assemble")
     from fastapi.testclient import TestClient
     from app.main import app
     with TestClient(app) as client:

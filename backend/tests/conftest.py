@@ -47,6 +47,37 @@ def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15
 
 
 @pytest.fixture()
+def stub_heavy_steps(monkeypatch):
+    """把指定步骤的运行函数临时替换为桩行为 (状态机测试与真实现解耦)。
+
+    用法: stub_heavy_steps("assemble") 或 stub_heavy_steps("tts", "assemble")。
+    桩支持项目参数: fail_step / delay_step (与原桩实现语义一致)。
+    """
+    import time as _time
+    from dubforge.errors import StepFailedError
+    from dubforge.pipeline import steps as steps_mod
+
+    def make_stub(key):
+        def run(ctx):
+            delays = ctx.project_params.get("delay_step", {})
+            delay = float(delays.get(key, 0)) if isinstance(delays, dict) else 0.0
+            for i in range(3):
+                if delay:
+                    _time.sleep(delay)
+                ctx.check_cancel()
+                ctx.log(f"[stub] 分片 {i + 1}/3")
+            if ctx.project_params.get("fail_step") == key:
+                raise StepFailedError(f"模拟失败: 步骤 {key} (项目参数 fail_step 触发)")
+            ctx.write_json(f"{key}_result.json", {"step": key})
+        return run
+
+    def _patch(*keys):
+        for k in keys:
+            monkeypatch.setitem(steps_mod._RUNNERS, k, make_stub(k))
+    return _patch
+
+
+@pytest.fixture()
 def make_project(isolated_env):
     """项目工厂: 默认无延迟; 可传 params (如 fail_step / delay_step)"""
     from dubforge.domain import crud

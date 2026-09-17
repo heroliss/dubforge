@@ -51,10 +51,12 @@
 - [x] 真机验证：IndexTTS 真实合成 3.6s 中文配音 ✓
 - [x] pytest 27 项全绿
 
-### M3b 成片（待做）
-- [ ] merge_audio：逐句铺轨 + 响度归一
-- [ ] assemble：背景混音 + ducking + 可选烧录 + 时间戳归档
-- [ ] pytest：合成音频样片端到端
+### M3b 成片 ✅ 2026-09-17
+- [x] assemble 两阶段：A) numpy 铺轨 (32k 单声道统一, 句间淡入淡出, 峰值归一) + EBU R128 响度归一 → dub_full.wav；B) ffmpeg 封装 (背景音量 + 人声 ducking sidechaincompress + 可选字幕烧录重编码, 视频流默认直拷)
+- [x] 产物：output/final_时间戳.mp4 (多版本并存) + 伴生 .srt
+- [x] 测试：铺轨纯函数 + 合成样片端到端 (混音/烧录两分支)
+- [x] 真机验证：真实 IndexTTS 两句 → 出片 6.0s/1.4MB ✓
+- [x] 测试基建：stub_heavy_steps 夹具 —— 状态机测试与真实现永久解耦 (九步全真后不再有"桩步骤"可用)
 
 ## M4 前端应用
 - [ ] 新建项目（粘贴链接/本地导入）+ 项目列表（状态卡）
