@@ -129,13 +129,19 @@ def add_artifact(project_id: int, step_key: str, kind: str, name: str,
 
 
 def delete_step_artifacts(project_id: int, step_key: str) -> None:
-    """重跑前置: 删该步骤全部产物 (DB 行 + 磁盘文件)"""
+    """重跑前置: 删该步骤产物 (DB 行 + 磁盘文件)。
+
+    例外: media/ 下的源视频不删 —— 获取步骤没有"过期"概念, 本地文件在/链接已
+    归档就应复用 (step_download 的幂等分支依赖它); 真要删请整项目删除。
+    """
     with session() as s:
         rows = list(s.exec(sqlmodel.select(Artifact).where(
             Artifact.project_id == project_id, Artifact.step_key == step_key)))
+        pdir = project_dir_by_id(s, project_id)
         for a in rows:
-            p = project_dir_by_id(s, project_id) / a.rel_path
-            p.unlink(missing_ok=True)
+            p = pdir / a.rel_path
+            if not a.rel_path.replace("\\", "/").startswith("media/"):
+                p.unlink(missing_ok=True)
             s.delete(a)
         s.commit()
 

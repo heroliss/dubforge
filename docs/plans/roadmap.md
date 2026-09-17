@@ -23,9 +23,17 @@
 - [x] pytest 14 项：状态机全路径 + 取消/失败/恢复/API E2E（夹具隔离 DATA_ROOT）
 
 ## M2 管线前半（步骤 1–6）
-- [ ] download：yt-dlp 库 + archive 去重 + cookies/代理 + 本地导入
-- [ ] preprocess：音轨 16k 提取 + demucs 人声/背景 + 可选 pyannote 说话人
-- [ ] transcribe：faster-whisper 词级时间戳 → 源 SRT
+
+### M2a 媒体链 ✅ 2026-09-17（download/preprocess/transcribe）
+- [x] download：yt-dlp 库 + archive 去重 + cookies/代理 + 本地导入；media/ 源视频不受 force 删除影响（获取无过期概念）
+- [x] preprocess：ffmpeg 16k 提取（显式 -f wav）+ demucs htdemucs 分离人声/背景（单声道自动转立体声；soundfile 读取避开 torchcodec）
+- [x] transcribe：faster-whisper 词级时间戳 + 标点/停顿/时长三重断句 → src.srt；HF 缓存自动复用 vl_cache
+- [x] 测试：SRT 读写、断句纯函数、本地导入幂等、真实 demucs+whisper 端到端（2.5s 样片）
+
+### M2b 文本链（待做）
+- [ ] split：NLP 粗切 + LLM 语义切句
+- [ ] translate：三档策略 + 术语表 + 风格提示词 + 续传缓存
+- [ ] subtitles：源/译/双语 SRT + 行宽控制
 - [ ] split：NLP 粗切 + LLM 语义切句
 - [ ] translate：三档策略 + 术语表 + 风格提示词 + gpt_log 式续传缓存
 - [ ] subtitles：源/译/双语 SRT + 行宽控制

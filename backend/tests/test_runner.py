@@ -18,37 +18,37 @@ from dubforge.domain import crud
 def test_run_done_and_artifact(make_project, isolated_env):
     uid = make_project()
     runner = _runner()
-    r = runner.start_step(uid, "download")
+    r = runner.start_step(uid, "translate")
     assert r["status"] == "started"
-    wait_status(uid, "download", {"done"})
+    wait_status(uid, "translate", {"done"})
 
     project = crud.get_project(uid)
-    arts = crud.latest_artifacts(project.id, ["download"])
-    assert "download/download_result.json" in {f"{a.step_key}/{a.name}"
+    arts = crud.latest_artifacts(project.id, ["translate"])
+    assert "translate/translate_result.json" in {f"{a.step_key}/{a.name}"
                                                for a in arts.values()}
     # 产物文件在盘上, 日志非空
     art = next(iter(arts.values()))
     assert (isolated_env / "data" / "projects" / uid / art.rel_path).exists()
-    log = (isolated_env / "data" / "projects" / uid / "logs" / "download.log")
+    log = (isolated_env / "data" / "projects" / uid / "logs" / "translate.log")
     assert "开始步骤" in log.read_text(encoding="utf-8")
     # manifest 已刷新为 done
     m = json.loads((isolated_env / "data" / "projects" / uid / "manifest.json")
                    .read_text(encoding="utf-8"))
-    assert m["steps"][0]["status"] == "done"
+    assert m["steps"][4]["status"] == "done"  # translate 是第 5 步
 
 
 def test_skip_when_fresh(make_project, isolated_env):
     uid = make_project()
     runner = _runner()
-    runner.start_step(uid, "download")
-    wait_status(uid, "download", {"done"})
+    runner.start_step(uid, "translate")
+    wait_status(uid, "translate", {"done"})
 
-    art_path = (isolated_env / "data" / "projects" / uid / "artifacts" / "download"
-                / "download_result.json")
+    art_path = (isolated_env / "data" / "projects" / uid / "artifacts" / "translate"
+                / "translate_result.json")
     mtime1 = art_path.stat().st_mtime
 
     # 再跑 (不 force) → 跳过, 产物未动
-    r = runner.start_step(uid, "download", force=False)
+    r = runner.start_step(uid, "translate", force=False)
     assert r["status"] == "skipped"
     assert art_path.stat().st_mtime == mtime1
 
@@ -56,35 +56,34 @@ def test_skip_when_fresh(make_project, isolated_env):
 def test_config_change_invalidates(make_project, isolated_env, monkeypatch):
     uid = make_project()
     runner = _runner()
-    runner.start_step(uid, "download")
-    wait_status(uid, "download", {"done"})
+    runner.start_step(uid, "translate")
+    wait_status(uid, "translate", {"done"})
 
-    # download 的 cfg_keys=("download",) —— 改其中一项 → 指纹变 → 不再跳过
+    # translate 的 cfg_keys 含 ("translate",) —— 改其中一项 → 指纹变 → 不再跳过
     monkeypatch.setenv("DUBFORGE_CONFIG", str(isolated_env / "config.yaml"))
-    cfgmod.set_key("download.resolution", 720)
-    r = runner.start_step(uid, "download", force=False)
+    cfgmod.set_key("translate.whole_doc_max_lines", 30)
+    r = runner.start_step(uid, "translate", force=False)
     assert r["status"] == "started"
-    wait_status(uid, "download", {"done"})
+    wait_status(uid, "translate", {"done"})
 
 
 def test_force_rerun_marks_downstream_stale(make_project, isolated_env):
     uid = make_project()
     runner = _runner()
-    for key in ("download", "transcribe"):
+    # 用桩步骤 split/translate (transcribe 已是需本地源的真实现, 状态机测试不碰)
+    for key in ("split", "translate"):
         runner.start_step(uid, key)
         wait_status(uid, key, {"done"})
-
-    # force 重跑 download → 下游 transcribe 置 stale
-    runner.start_step(uid, "download", force=True)
-    wait_status(uid, "download", {"done"})
-    step_t = crud.get_step(crud.get_project(uid).id, "transcribe")
+    runner.start_step(uid, "split", force=True)
+    wait_status(uid, "split", {"done"})
+    step_t = crud.get_step(crud.get_project(uid).id, "translate")
     assert step_t.status == "stale"
-    assert "download" in step_t.error_message
+    assert "split" in step_t.error_message
 
     # stale 后正常重跑 (不 force) 也能执行 (status != done)
-    runner.start_step(uid, "transcribe", force=False)
-    wait_status(uid, "transcribe", {"done"})
-    assert crud.get_step(crud.get_project(uid).id, "transcribe").status == "done"
+    runner.start_step(uid, "translate", force=False)
+    wait_status(uid, "translate", {"done"})
+    assert crud.get_step(crud.get_project(uid).id, "translate").status == "done"
 
 
 def test_cancel_mid_run(make_project, isolated_env):
@@ -142,18 +141,18 @@ def test_api_e2e(isolated_env):
         assert r.status_code == 200
         uid = r.json()["uid"]
 
-        r = client.post(f"/api/projects/{uid}/steps/download/run",
+        r = client.post(f"/api/projects/{uid}/steps/split/run",
                         json={"force": False})
         assert r.json()["status"] == "started"
         for _ in range(200):
             steps = client.get(f"/api/projects/{uid}/steps").json()
-            if steps[0]["status"] == "done":
+            if steps[3]["status"] == "done":
                 break
             time.sleep(0.05)
-        assert steps[0]["status"] == "done"
-        assert steps[0]["fresh"] is True          # 指纹一致 → 前端显示"已是最新"
+        assert steps[3]["status"] == "done"
+        assert steps[3]["fresh"] is True          # 指纹一致 → 前端显示"已是最新"
 
-        r = client.get(f"/api/projects/{uid}/steps/download/log")
+        r = client.get(f"/api/projects/{uid}/steps/split/log")
         assert r.status_code == 200
         assert any("开始步骤" in l for l in r.json()["lines"])
 

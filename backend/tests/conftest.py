@@ -7,7 +7,10 @@ import pytest
 
 @pytest.fixture()
 def isolated_env(tmp_path, monkeypatch):
-    monkeypatch.setenv("DUBFORGE_DATA_ROOT", str(tmp_path / "data"))
+    # DUBFORGE_DEBUG_DATADIR 设置时把数据放到 pytest tmp 之外 (排查文件消失类问题用)
+    import os as _os
+    root = _os.environ.get("DUBFORGE_DEBUG_DATADIR") or str(tmp_path / "data")
+    monkeypatch.setenv("DUBFORGE_DATA_ROOT", root)
     monkeypatch.setenv("DUBFORGE_CONFIG", str(tmp_path / "config.yaml"))
     import dubforge.db as db
     db.reset_engine()

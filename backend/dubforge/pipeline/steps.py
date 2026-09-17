@@ -34,7 +34,18 @@ def _stub(step_key: str):
     return run
 
 
-_RUNNERS = {key: _stub(key) for key in STEP_KEYS}
+# 真实实现 (M2a 媒体链): 已交付的逐步覆盖桩实现
+from dubforge.pipeline.step_download import run as _download_run
+from dubforge.pipeline.step_preprocess import run as _preprocess_run
+from dubforge.pipeline.step_transcribe import run as _transcribe_run
+
+_RUNNERS = {
+    "download": _download_run,
+    "preprocess": _preprocess_run,
+    "transcribe": _transcribe_run,
+    **{key: _stub(key) for key in STEP_KEYS
+       if key not in ("download", "preprocess", "transcribe")},
+}
 
 
 def get_runner(step_key: str) -> Callable:

@@ -1,0 +1,104 @@
+import time
+# -*- coding: utf-8 -*-
+import time
+"""M2a 媒体链测试: SRT 读写 / 断句纯函数 / download 幂等与去重档案"""
+import json
+
+from conftest import wait_status
+from dubforge.utils.srt import SubLine, parse_srt, write_srt
+
+
+def test_srt_roundtrip(isolated_env):
+    lines = [SubLine(1, 0.5, 2.1, "你好世界"), SubLine(2, 2.5, 5.0, "Hello world")]
+    p = isolated_env / "t.srt"
+    write_srt(lines, p)
+    parsed = parse_srt(p)
+    assert len(parsed) == 2
+    assert parsed[0].text == "你好世界"
+    assert abs(parsed[1].start - 2.5) < 1e-6
+    assert parsed[1].text == "Hello world"
+
+
+def test_segment_from_words(isolated_env):
+    from dubforge.pipeline.step_transcribe import _segment_from_words
+    # 词序列: 停顿 1.2s 切句 + 句末标点切句
+    words = [
+        {"start": 0.0, "end": 0.4, "word": "今天"},
+        {"start": 0.4, "end": 0.9, "word": "天气"},
+        {"start": 2.1, "end": 2.6, "word": "很好"},        # gap 1.2s > 0.8 → 切
+        {"start": 2.6, "end": 3.0, "word": "啊。"},        # 标点 → 切
+    ]
+    segs = _segment_from_words(words)
+    assert len(segs) == 2
+    assert segs[0][2] == "今天天气"
+    assert segs[1][2] == "很好啊。"
+
+
+def test_download_local_import_and_idempotent(make_project, isolated_env):
+    """本地导入: 造一个假视频文件 (ffmpeg 合成 1s 彩条) → 跑两遍 → 第二遍跳过"""
+    import subprocess
+    src = isolated_env / "sample.mp4"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=1",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=1",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                    str(src)], check=True)
+
+    from dubforge.domain import crud
+    p = crud.create_project(title="本地导入测试", source_kind="local",
+                            source_url=str(src))
+    uid = p.uid
+    runner = _runner()
+    runner.start_step(uid, "download")
+    wait_status(uid, "download", {"done"})
+
+    video = isolated_env / "data" / "projects" / uid / "media" / "video.mp4"
+    assert video.exists()
+    # 幂等: 文件 mtime 不变
+    mtime = video.stat().st_mtime
+    runner.start_step(uid, "download", force=True)   # force 复用已有视频 (media 不删)
+    wait_status(uid, "download", {"done"})
+    assert video.stat().st_mtime == mtime
+    # meta 产物
+    meta = json.loads((video.parent / "meta.json").read_text(encoding="utf-8"))
+    assert meta["file"] == "video.mp4"
+
+
+def test_preprocess_and_transcribe_local(make_project, isolated_env):
+    """本地样片全链: download → preprocess → transcribe (demucs+whisper 真跑, 1s 样片)"""
+    import subprocess
+    # 2.5s 语音样片: 440Hz 正弦 (whisper 会输出空/噪声句, 断言的是链路与产物形态)
+    src = isolated_env / "sample.mp4"
+    subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+                    "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=2.5",
+                    "-f", "lavfi", "-i", "sine=frequency=440:duration=2.5",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "aac",
+                    str(src)], check=True)
+
+    from dubforge.domain import crud
+    p = crud.create_project(title="媒体链测试", source_kind="local",
+                            source_url=str(src))
+    uid = p.uid
+    runner = _runner()
+    for key in ("download", "preprocess"):
+        runner.start_step(uid, key)
+        wait_status(uid, key, {"done"}, timeout=300)
+
+    audio = isolated_env / "data" / "projects" / uid / "audio"
+    assert (audio / "raw.wav").exists()
+    assert (audio / "vocal.wav").exists()
+    assert (audio / "background.wav").exists()
+
+    runner.start_step(uid, "transcribe")
+    wait_status(uid, "transcribe", {"done"}, timeout=600)
+    src_srt = isolated_env / "data" / "projects" / uid / "srt" / "src.srt"
+    assert src_srt.exists()
+    tr = json.loads((isolated_env / "data" / "projects" / uid / "artifacts"
+                     / "transcribe" / "transcribe.json").read_text(encoding="utf-8"))
+    assert tr["model"]
+    assert tr["duration"] >= 2.0
+
+
+def _runner():
+    from dubforge.runner import runner
+    return runner

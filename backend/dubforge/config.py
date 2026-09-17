@@ -99,6 +99,10 @@ DEFAULTS: dict[str, Any] = {
     "server": {
         "port": 8600,
     },
+    "paths": {
+        # HuggingFace 模型缓存; 空=自动复用 VideoLingo-Workspace 的 vl_cache (省数GB下载)
+        "hf_home": "",
+    },
 }
 
 
@@ -161,3 +165,26 @@ def projects_dir() -> Path:
 
 def db_path() -> Path:
     return data_root() / DB_FILE_NAME
+
+
+def resolve_hf_home() -> Path:
+    """HF 模型缓存目录解析: 显式配置 > 已有环境变量 > 复用 VideoLingo vl_cache > data/hf"""
+    explicit = get("paths.hf_home")
+    if explicit:
+        return Path(explicit)
+    env = os.environ.get("HF_HOME")
+    if env:
+        return Path(env)
+    sibling = REPO_ROOT.parent / "VideoLingo-Workspace" / "vl_cache" / "hf"
+    if sibling.is_dir():
+        return sibling
+    return data_root() / "hf"
+
+
+def ensure_hf_env() -> Path:
+    """把解析结果写入进程环境 (faster-whisper/demucs 等 hf 下载器读取 HF_HOME);
+    必须在首次 import 模型库之前调用"""
+    p = resolve_hf_home()
+    p.mkdir(parents=True, exist_ok=True)
+    os.environ["HF_HOME"] = str(p)
+    return p

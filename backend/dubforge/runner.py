@@ -80,9 +80,27 @@ class StepContext:
         return self.write_bytes(name, json.dumps(data, ensure_ascii=False,
                                                  indent=1).encode("utf-8"), kind)
 
+    def register_file(self, name: str, path: Path, kind: str) -> Path:
+        """登记一个已存在于项目目录内的文件为产物 (大文件不复制, 如下载的视频)"""
+        crud.add_artifact(self.project.id, self.step_key, kind, name,
+                          path, str(path.relative_to(self.pdir)))
+        return path
+
     # ---- 配置读取 (每步实时读, 改配置立即生效) ----
     def cfg(self, key: str, default=None):
         return config.get(key, default)
+
+    # ---- 上游产物访问 (执行器保证上游已完成; 拿不到即管线违约) ----
+    def upstream(self, step_key: str, name: str) -> Path:
+        arts = crud.latest_artifacts(self.project.id, [step_key])
+        for a in arts.values():
+            if a.step_key == step_key and a.name == name:
+                p = self.pdir / a.rel_path
+                if p.exists():
+                    return p
+        from dubforge.errors import ArtifactMissingError
+        raise ArtifactMissingError(
+            f"缺少上游产物 {step_key}/{name} (项目 {self.project.uid})")
 
 
 def _cfg_snapshot(cfg_keys: tuple[str, ...]) -> dict:
