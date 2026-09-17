@@ -6,6 +6,7 @@ import vue from '@vitejs/plugin-vue'
 export default defineConfig({
   plugins: [vue()],
   server: {
+    host: '127.0.0.1', // 显式绑 IPv4 (默认 localhost 在 Node24 下只绑 ::1, 脚本探测/浏览器兼容性差)
     port: 5273,
     proxy: {
       '/api': 'http://127.0.0.1:8600',

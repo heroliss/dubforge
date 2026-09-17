@@ -20,22 +20,42 @@
 
 ## 快速开始
 
+**日常启动：双击根目录 `StartDev.bat`** —— 自动拉起前后端两个窗口、等端口就绪后打开浏览器，按回车即可全部停止。
+
+首次使用需初始化依赖：
+
 ```powershell
-# 后端 (首次自动下载 Python 3.13 并装依赖)
+# 后端 (自动下载 Python 3.13 并装依赖)
 cd backend
 uv sync
+
+# 前端
+cd frontend
+npm install
+```
+
+手动方式（等价于 StartDev.bat）：
+
+```powershell
+cd backend
 uv run uvicorn app.main:app --port 8600 --reload
 
 # 前端 (另一终端)
 cd frontend
-npm install
 npm run dev          # http://127.0.0.1:5273, /api 自动代理到 8600
 
 # 生产形态
-cd frontend; npm run build   # 产物 dist/ 由 FastAPI 托管, 只跑 8600 一个进程
+.\scripts\build.ps1          # 构建 dist
+cd backend; uv run uvicorn app.main:app --port 8600   # 单进程托管 API + 页面
 ```
 
 首次使用：复制 `config.example.yaml` → `config.yaml`，填入 LLM API key（该文件已 gitignore）。
+
+## 冒烟自检
+
+```powershell
+.\scripts\smoke.ps1   # pytest + health 检查 + 前端构建, 三关全绿即健康
+```
 
 ## 里程碑
 
