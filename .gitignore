@@ -1,0 +1,20 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+
+# ===== 密钥与本地配置 (真实 key 在这里, 永不入库) =====
+config.yaml
+
+# ===== 运行数据 (项目产物 + 数据库) =====
+data/
+
+# ===== 前端 =====
+frontend/node_modules/
+frontend/dist/
+
+# ===== 杂项 =====
+*.log
+Thumbs.db
+desktop.ini

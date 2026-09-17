@@ -1,0 +1,61 @@
+# DubForge 配置模板 —— 复制为 config.yaml 后填入真实值 (config.yaml 已 gitignore, 永不入库)
+llm:
+  # OpenAI 兼容接口 (智谱 GLM / DeepSeek / OpenAI 等均可)
+  base_url: "https://open.bigmodel.cn/api/paas/v4"
+  api_key: "YOUR_API_KEY"
+  model: "glm-4.7"
+  max_workers: 1
+  temperature: 0.1
+
+download:
+  resolution: 1080
+  cookies_path: ""            # YouTube cookies.txt 完整路径 (可选)
+  proxy: ""                   # 例 "http://127.0.0.1:7897"; 空=读环境变量
+
+separate:
+  enabled: true
+  speaker_diarization: false  # 说话人分离 (需 hf_token)
+  hf_token: ""
+
+asr:
+  backend: "faster_whisper"
+  model: "large-v3-turbo"
+  language: "auto"
+
+split:
+  max_split_length: 22
+
+translate:
+  target_language: "简体中文"
+  style_prompt: ""
+  whole_doc_max_lines: 60
+  global_polish: true
+  summary_length: 8000
+  custom_terms_path: ""
+
+tts:
+  backend: "indextts25"
+  indextts25:
+    url: "http://127.0.0.1:7860/"
+    project_dir: ""           # index-tts 项目根 (空=自动查找)
+    lang: "ZH"
+    timbre_mode: "preset"     # preset / stable / dynamic
+    timbre_audio: ""          # 音色参考 wav 路径 (preset 模式)
+    emo_mode: "preset"        # preset / stable / dynamic / vector
+    emo_audio: ""             # 情感参考 wav 路径 (preset 模式)
+    emo_weight: 1.0
+    emo_vector: [0, 0, 0, 0, 0, 0, 0, 0]
+    duration_factor: 1.0
+  gptsovits:
+    url: "http://127.0.0.1:9880/"
+    character: ""
+
+assemble:
+  bgm_volume: 0.3
+  ducking: true
+  loudnorm: true
+  burn_subtitles: false
+  crf: 18
+
+server:
+  port: 8600
