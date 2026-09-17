@@ -42,6 +42,9 @@ from dubforge.pipeline.step_split import run as _split_run
 from dubforge.pipeline.step_translate import run as _translate_run
 from dubforge.pipeline.step_subtitles import run as _subtitles_run
 
+from dubforge.pipeline.step_dubtask import run as _dubtask_run
+from dubforge.pipeline.step_tts import run as _tts_run
+
 _REAL = {
     "download": _download_run,
     "preprocess": _preprocess_run,
@@ -49,6 +52,8 @@ _REAL = {
     "split": _split_run,
     "translate": _translate_run,
     "subtitles": _subtitles_run,
+    "dubtask": _dubtask_run,
+    "tts": _tts_run,
 }
 
 _RUNNERS = {**_REAL, **{key: _stub(key) for key in STEP_KEYS if key not in _REAL}}

@@ -2,7 +2,8 @@
 """
 M1 执行器测试: 状态机全路径
 ============================
-用仍是桩实现的步骤 (dubtask/tts/assemble) 做状态机验证 —— 不碰网络/真实上游。
+用仍是桩实现的步骤 (assemble) 做状态机验证 —— 不碰网络/真实上游。
+TTS 场景用 mock 后端 (真实现但离线可控)。
 覆盖: 完成产物 / 指纹跳过 / 配置失效重算 / 重跑→下游 stale / 取消 /
 模拟失败 / 崩溃恢复 / API E2E (fresh 标记)
 真实链路 (download→…→subtitles) 的测试在 test_media_chain.py / test_text_chain.py。
@@ -17,37 +18,37 @@ from dubforge.domain import crud
 def test_run_done_and_artifact(make_project, isolated_env):
     uid = make_project()
     runner = _runner()
-    r = runner.start_step(uid, "dubtask")
+    r = runner.start_step(uid, "assemble")
     assert r["status"] == "started"
-    wait_status(uid, "dubtask", {"done"})
+    wait_status(uid, "assemble", {"done"})
 
     project = crud.get_project(uid)
-    arts = crud.latest_artifacts(project.id, ["dubtask"])
-    assert "dubtask/dubtask_result.json" in {f"{a.step_key}/{a.name}"
+    arts = crud.latest_artifacts(project.id, ["assemble"])
+    assert "assemble/assemble_result.json" in {f"{a.step_key}/{a.name}"
                                              for a in arts.values()}
     # 产物文件在盘上, 日志非空
     art = next(iter(arts.values()))
     assert (isolated_env / "data" / "projects" / uid / art.rel_path).exists()
-    log = (isolated_env / "data" / "projects" / uid / "logs" / "dubtask.log")
+    log = (isolated_env / "data" / "projects" / uid / "logs" / "assemble.log")
     assert "开始步骤" in log.read_text(encoding="utf-8")
     # manifest 已刷新为 done
     m = json.loads((isolated_env / "data" / "projects" / uid / "manifest.json")
                    .read_text(encoding="utf-8"))
-    assert m["steps"][6]["status"] == "done"   # dubtask 是第 7 步
+    assert m["steps"][8]["status"] == "done"   # assemble 是第 9 步
 
 
 def test_skip_when_fresh(make_project, isolated_env):
     uid = make_project()
     runner = _runner()
-    runner.start_step(uid, "dubtask")
-    wait_status(uid, "dubtask", {"done"})
+    runner.start_step(uid, "assemble")
+    wait_status(uid, "assemble", {"done"})
 
-    art_path = (isolated_env / "data" / "projects" / uid / "artifacts" / "dubtask"
-                / "dubtask_result.json")
+    art_path = (isolated_env / "data" / "projects" / uid / "artifacts" / "assemble"
+                / "assemble_result.json")
     mtime1 = art_path.stat().st_mtime
 
     # 再跑 (不 force) → 跳过, 产物未动
-    r = runner.start_step(uid, "dubtask", force=False)
+    r = runner.start_step(uid, "assemble", force=False)
     assert r["status"] == "skipped"
     assert art_path.stat().st_mtime == mtime1
 
@@ -55,20 +56,38 @@ def test_skip_when_fresh(make_project, isolated_env):
 def test_config_change_invalidates(make_project, isolated_env, monkeypatch):
     uid = make_project()
     runner = _runner()
-    runner.start_step(uid, "dubtask")
-    wait_status(uid, "dubtask", {"done"})
+    runner.start_step(uid, "assemble")
+    wait_status(uid, "assemble", {"done"})
 
-    # dubtask 的 cfg_keys=("tts",) —— 改其中一项 → 指纹变 → 不再跳过
+    # assemble 的 cfg_keys=("assemble",) —— 改其中一项 → 指纹变 → 不再跳过
     monkeypatch.setenv("DUBFORGE_CONFIG", str(isolated_env / "config.yaml"))
     from dubforge import config as cfgmod
-    cfgmod.set_key("tts.backend", "gptsovits")
-    r = runner.start_step(uid, "dubtask", force=False)
+    cfgmod.set_key("assemble.bgm_volume", 0.6)
+    r = runner.start_step(uid, "assemble", force=False)
     assert r["status"] == "started"
-    wait_status(uid, "dubtask", {"done"})
+    wait_status(uid, "assemble", {"done"})
 
 
-def test_force_rerun_marks_downstream_stale(make_project, isolated_env):
+def test_force_rerun_marks_downstream_stale(make_project, isolated_env, monkeypatch):
+    """tts(mock 后端) → assemble; force 重跑 tts → 下游置 stale"""
     uid = make_project()
+    project = crud.get_project(uid)
+    pdir = crud.project_dir(uid)
+
+    # 伪造上游 dubtask 产物 (tts 真实现需要)
+    pdir.joinpath("artifacts", "dubtask").mkdir(parents=True, exist_ok=True)
+    task = pdir / "artifacts" / "dubtask" / "dubtask.json"
+    task.write_text(json.dumps({"lines": [{"id": 1, "text": "测试", "start": 0.0,
+                                           "end": 2.0}]}), encoding="utf-8")
+    crud.add_artifact(project.id, "dubtask", "json", "dubtask.json",
+                      task, "artifacts/dubtask/dubtask.json")
+
+    from dubforge.backends import tts_indextts25
+    def fake_synth(url, text, out_path, lang, **kw):
+        out_path.write_bytes(b"RIFF")
+        return out_path
+    monkeypatch.setattr(tts_indextts25, "synth", fake_synth)
+
     runner = _runner()
     for key in ("tts", "assemble"):
         runner.start_step(uid, key)
@@ -77,29 +96,29 @@ def test_force_rerun_marks_downstream_stale(make_project, isolated_env):
     # force 重跑 tts → 下游 assemble 置 stale
     runner.start_step(uid, "tts", force=True)
     wait_status(uid, "tts", {"done"})
-    step_a = crud.get_step(crud.get_project(uid).id, "assemble")
+    step_a = crud.get_step(project.id, "assemble")
     assert step_a.status == "stale"
     assert "tts" in step_a.error_message
 
     # stale 后正常重跑 (不 force) 也能执行 (status != done)
     runner.start_step(uid, "assemble", force=False)
     wait_status(uid, "assemble", {"done"})
-    assert crud.get_step(crud.get_project(uid).id, "assemble").status == "done"
+    assert crud.get_step(project.id, "assemble").status == "done"
 
 
 def test_cancel_mid_run(make_project, isolated_env):
-    uid = make_project(params={"delay_step": {"tts": 0.4}})
+    uid = make_project(params={"delay_step": {"assemble": 0.4}})
     runner = _runner()
-    runner.start_step(uid, "tts")
+    runner.start_step(uid, "assemble")
     time.sleep(0.25)                      # 让步骤进入第一个分片
-    r = runner.cancel_step(uid, "tts")
+    r = runner.cancel_step(uid, "assemble")
     assert r["status"] in ("cancelling", "not_running")
-    status = wait_status(uid, "tts", {"failed", "done"}, timeout=10)
-    step = crud.get_step(crud.get_project(uid).id, "tts")
+    status = wait_status(uid, "assemble", {"failed", "done"}, timeout=10)
+    step = crud.get_step(crud.get_project(uid).id, "assemble")
     if status == "failed":                # 在分片间被取消
         assert step.error_code == "STEP_CANCELLED"
         # 无半成品产物
-        arts = crud.latest_artifacts(crud.get_project(uid).id, ["tts"])
+        arts = crud.latest_artifacts(crud.get_project(uid).id, ["assemble"])
         assert not any(a.name.endswith("_result.json") for a in arts.values())
 
 
@@ -118,15 +137,15 @@ def test_crash_recovery(make_project, isolated_env):
     uid = make_project()
     project = crud.get_project(uid)
     # 模拟崩溃残留: step=running + job=running
-    step = crud.get_step(project.id, "tts")
+    step = crud.get_step(project.id, "assemble")
     step.status = "running"
     crud.save_step(step)
-    job = crud.add_job(project.id, "tts", "x.log")
+    job = crud.add_job(project.id, "assemble", "x.log")
 
     runner = _runner()
     result = runner.recover()
     assert result["steps_interrupted"] >= 1
-    step2 = crud.get_step(project.id, "tts")
+    step2 = crud.get_step(project.id, "assemble")
     assert step2.status == "failed"
     assert step2.error_code == "STEP_INTERRUPTED"
     assert "重跑" in step2.error_suggestion
@@ -142,18 +161,18 @@ def test_api_e2e(isolated_env):
         assert r.status_code == 200
         uid = r.json()["uid"]
 
-        r = client.post(f"/api/projects/{uid}/steps/tts/run",
+        r = client.post(f"/api/projects/{uid}/steps/assemble/run",
                         json={"force": False})
         assert r.json()["status"] == "started"
         for _ in range(200):
             steps = client.get(f"/api/projects/{uid}/steps").json()
-            if steps[7]["status"] == "done":
+            if steps[8]["status"] == "done":
                 break
             time.sleep(0.05)
-        assert steps[7]["status"] == "done"
-        assert steps[7]["fresh"] is True          # 指纹一致 → 前端显示"已是最新"
+        assert steps[8]["status"] == "done"
+        assert steps[8]["fresh"] is True          # 指纹一致 → 前端显示"已是最新"
 
-        r = client.get(f"/api/projects/{uid}/steps/tts/log")
+        r = client.get(f"/api/projects/{uid}/steps/assemble/log")
         assert r.status_code == 200
         assert any("开始步骤" in l for l in r.json()["lines"])
 

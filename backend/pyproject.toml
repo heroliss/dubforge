@@ -22,6 +22,8 @@ dependencies = [
     "soundfile>=0.13",
     "pandas>=2.2",
     "openpyxl>=3.1",
+    # ---- M3 配音链 ----
+    "gradio-client>=1.8",
 ]
 
 # torch 走 CUDA wheel (默认 PyPI 在 Windows 只发 CPU 版); 8G 显存 GPU 加速

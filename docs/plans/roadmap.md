@@ -43,12 +43,18 @@
 - [ ] pytest：全部步骤用合成媒体夹具跑通
 
 ## M3 管线后半（步骤 7–9）
-- [ ] dubtask：时长估算（沿用 estimate_duration 思路）+ 语速容忍 + 合并切分
-- [ ] tts：IndexTTS2.5 后端（双维度参考/预设同步/句级缓存）+ GPT-SoVITS 后端
-- [ ] 精修 API：逐句合成/采纳/预览素材流
-- [ ] merge_audio：拼接 + 响度归一
+
+### M3a 配音域 ✅ 2026-09-17（dubtask/tts/工作台 API）
+- [x] dubtask：启发式时长估算 (CJK 4.7字/s 拉丁 3词/s) + 语速容忍分级 + gap 计算
+- [x] tts：IndexTTS2.5 后端（双维度参考 preset/stable/dynamic × 情感含向量，短行自动回退 stable）+ GPT-SoVITS 后端；句级缓存；单句失败不阻断整批
+- [x] 精修 API：workbench state/逐句合成/采纳/音频视频流 (Range)；与正式步骤共享句级缓存
+- [x] 真机验证：IndexTTS 真实合成 3.6s 中文配音 ✓
+- [x] pytest 27 项全绿
+
+### M3b 成片（待做）
+- [ ] merge_audio：逐句铺轨 + 响度归一
 - [ ] assemble：背景混音 + ducking + 可选烧录 + 时间戳归档
-- [ ] pytest：夹具级 TTS mock + 成片参数矩阵
+- [ ] pytest：合成音频样片端到端
 
 ## M4 前端应用
 - [ ] 新建项目（粘贴链接/本地导入）+ 项目列表（状态卡）
