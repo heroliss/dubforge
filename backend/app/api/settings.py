@@ -20,26 +20,14 @@ class SettingsUpdate(BaseModel):
 
 @router.get("")
 def get_settings():
-    # 返回完整配置; 密钥脱敏为 {set, tail} (前端据此显示"已配置/未配置", 明文不回传)
-    cfg = config.load_config()
-    for path in ("llm.api_key", "separate.hf_token"):
-        node = cfg
-        parts = path.split(".")
-        for part in parts[:-1]:
-            node = node.get(part, {})
-        leaf = parts[-1]
-        val = str(node.get(leaf, "") or "")
-        node[leaf] = {"set": bool(val), "tail": val[-4:]}
-    return cfg
+    # 本机单用户应用: api_key 明文回传 (前端密码框直接显示, 可切换明文)
+    return config.load_config()
 
 
 @router.post("")
 def update_settings(body: SettingsUpdate):
     applied = {}
     for key, value in body.updates.items():
-        # 敏感键: 前端传空串表示"保持不变" (避免回传脱敏值覆盖真实 key)
-        if key in _KEEP_IF_EMPTY and (value is None or str(value).strip() == ""):
-            continue
         config.set_key(key, value)
         applied[key] = value
     return {"ok": True, "applied": applied}
@@ -47,12 +35,12 @@ def update_settings(body: SettingsUpdate):
 
 @router.post("/test_llm")
 def test_llm():
-    """LLM 连通性测试: 发一个最小翻译请求, 返回时延与模型回复预览"""
+    """LLM 连通性测试: 按配置池顺序发一个最小翻译请求, 返回时延与回复预览"""
     import time
 
     from dubforge.backends import llm
     if not llm.check_online():
-        return {"ok": False, "message": f"服务不可达: {config.get('llm.base_url')}"}
+        return {"ok": False, "message": f"服务不可达: {llm._profiles()}"}
     t0 = time.time()
     try:
         reply = llm.chat_json(
@@ -67,5 +55,5 @@ def test_llm():
     except Exception as e:  # noqa: BLE001 (测试端点兜底, 不让 500 裸奔)
         return {"ok": False, "message": f"未预期错误: {type(e).__name__}: {e}"}
     dt = time.time() - t0
-    return {"ok": True, "latency": round(dt, 1), "model": config.get("llm.model"),
+    return {"ok": True, "latency": round(dt, 1),
             "reply": json.dumps(reply, ensure_ascii=False)[:200]}

@@ -35,9 +35,8 @@ DB_FILE_NAME = "dubforge.db"
 DEFAULTS: dict[str, Any] = {
     "llm": {
         # OpenAI 兼容接口 (智谱/GLM 等); 翻译与分句语义切共用
-        "base_url": "https://open.bigmodel.cn/api/paas/v4",
-        "api_key": "",
-        "model": "glm-4.7",
+        # 多组 API 配置池: 按顺序降级 (旧版单 base_url/api_key 自动兼容)
+        "profiles": [],
         "max_workers": 1,          # LLM 并发请求数 (本地/弱限流设 1)
         "temperature": 0.1,
         "timeout": 300,            # 读超时秒数 (思考型模型单次可能 >120s)

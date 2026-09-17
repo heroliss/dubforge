@@ -19,21 +19,28 @@ _offline_cache: dict = {}
 _offline_lock = threading.Lock()
 
 
-def _client() -> httpx.Client:
-    base = str(config.get("llm.base_url", "")).rstrip("/")
-    if not base:
-        raise ServiceOfflineError("LLM base_url 未配置",
-                                  suggestion="请在 config.yaml 的 llm 段填写 base_url 与 api_key")
+def _client(base: str) -> httpx.Client:
     read_to = float(config.get("llm.timeout", 300))
-    return httpx.Client(base_url=base,
+    return httpx.Client(base_url=base.rstrip("/"),
                         timeout=httpx.Timeout(connect=10, read=read_to,
                                               write=60, pool=10),
                         trust_env=False)  # 本地代理由 Clash 规则管, 不读环境代理
 
 
-def _payload(messages: list[dict], temperature: float | None, json_mode: bool) -> dict:
+def _profiles() -> list[dict]:
+    """启用的 API 配置池 (按列表顺序; 旧版单配置自动兼容)"""
+    cfg = config.load_config().get("llm", {})
+    ps = [p for p in (cfg.get("profiles") or []) if p.get("enabled", True)]
+    if not ps and cfg.get("base_url") and cfg.get("api_key"):
+        ps = [{"name": "default", "base_url": cfg["base_url"],
+               "api_key": cfg["api_key"], "model": cfg.get("model", "")}]
+    return ps
+
+
+def _payload(provider: dict, messages: list[dict], temperature: float | None,
+             json_mode: bool) -> dict:
     body = {
-        "model": config.get("llm.model", "glm-4.7"),
+        "model": provider.get("model", ""),
         "messages": messages,
         "temperature": temperature if temperature is not None
         else float(config.get("llm.temperature", 0.1)),
@@ -49,11 +56,10 @@ def _payload(messages: list[dict], temperature: float | None, json_mode: bool) -
     return body
 
 
-def _post(body: dict) -> str:
-    key = config.get("llm.api_key", "")
-    if not key:
-        raise ServiceOfflineError("LLM api_key 未配置",
-                                  suggestion="请复制 config.example.yaml 为 config.yaml 并填入 API key")
+def _post(provider: dict, body: dict) -> str:
+    """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
+    key = provider.get("api_key", "")
+    name = provider.get("name", "default")
 
     # 429/5xx/读超时 → 指数退避重试 (思考型模型慢 + 限流都是常态)
     import time as _time
@@ -61,7 +67,7 @@ def _post(body: dict) -> str:
     r = None
     for attempt in range(1, 4):
         try:
-            with _client() as c:
+            with _client(provider.get("base_url", "")) as c:
                 r = c.post("/chat/completions", json=body,
                            headers={"Authorization": f"Bearer {key}"})
             last_exc = None
@@ -69,24 +75,24 @@ def _post(body: dict) -> str:
             last_exc = e
             if isinstance(e, httpx.ConnectError):
                 raise ServiceOfflineError(
-                    f"LLM 服务不可达: {config.get('llm.base_url')}",
+                    f"「{name}」服务不可达: {provider.get('base_url')}",
                     detail=str(e)) from e
             _time.sleep(3 * attempt)
             continue
         if r.status_code == 200 or (r.status_code != 429 and r.status_code < 500):
             break
         retry_after = r.headers.get("Retry-After")
-        wait = float(retry_after) if (retry_after or "").replace(".", "").isdigit()             else 5 * attempt
+        wait = (float(retry_after)
+                if (retry_after or "").replace(".", "").isdigit() else 5 * attempt)
         _time.sleep(wait)
     if last_exc is not None:
         raise StepFailedError(
             f"LLM 请求超时/中断 (已重试): {type(last_exc).__name__}",
             detail=str(last_exc)[:500],
-            suggestion="思考型模型响应慢时可调大 config llm.timeout, 或换更快模型。")
+            suggestion="思考型模型响应慢时可调大 llm.timeout, 或换更快模型。")
     if r.status_code == 401:
         raise ServiceOfflineError("LLM 认证失败 (401)", code="LLM_AUTH",
-                                  suggestion="请检查 config.yaml 的 llm.api_key")
-
+                                  suggestion=f"请检查配置「{name}」的 api_key")
     if r.status_code != 200:
         raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
                               detail=r.text[:800],
@@ -96,18 +102,23 @@ def _post(body: dict) -> str:
 
 
 def check_online() -> bool:
-    """轻量连通性探测 (结果缓存 60s, 避免每句都探)"""
-    key = str(config.get("llm.base_url", ""))
+    """连通性探测: 任何 HTTP 响应都算可达 (404/403 只说明该路径无此端点);
+    只有连接层异常才算不可达。结果缓存 60s。"""
+    profiles = _profiles()
+    if not profiles:
+        return False
     now = __import__("time").time()
+    key = str(profiles[0].get("base_url", ""))
     with _offline_lock:
         hit = _offline_cache.get(key)
         if hit and now - hit[0] < 60:
             return hit[1]
     ok = False
     try:
-        with _client() as c:
-            r = c.get("/models", headers={"Authorization": f"Bearer {config.get('llm.api_key','')}"})
-            ok = r.status_code in (200, 401)   # 401 说明服务在, 只是 key 校验层
+        with _client(profiles[0].get("base_url", "")) as c:
+            c.get("/models", headers={"Authorization":
+                     f"Bearer {profiles[0].get('api_key', '')}"})
+        ok = True                              # 收到任何 HTTP 响应 = 网络可达
     except Exception:
         ok = False
     with _offline_lock:
@@ -117,10 +128,19 @@ def check_online() -> bool:
 
 def chat(prompt: str, system: str | None = None,
          temperature: float | None = None) -> str:
-    """单轮文本补全"""
+    """单轮文本补全: 按启用的配置池顺序尝试, 单个失败自动切换下一个"""
     messages = ([{"role": "system", "content": system}] if system else []) + [
         {"role": "user", "content": prompt}]
-    return _post(_payload(messages, temperature, json_mode=False))
+    errors = []
+    for provider in _profiles():
+        try:
+            return _post(provider, _payload(provider, messages, temperature,
+                                            json_mode=False))
+        except (ServiceOfflineError, StepFailedError) as e:
+            errors.append(f"「{provider.get('name')}」: {e.message}")
+    raise StepFailedError(
+        "全部启用的 API 配置均失败 —— " + "；".join(errors)[:600],
+        suggestion="在设置页用「测试连接」逐个排查; 常见: 密钥无效/资源包不足/地址错误。")
 
 
 def _extract_json(text: str):

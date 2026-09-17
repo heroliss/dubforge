@@ -47,10 +47,10 @@ def test_app_health(isolated_env):
         r = client.get("/api/health")
         assert r.status_code == 200
         assert r.json()["ok"] is True
-        # settings 接口: 密钥脱敏
+        # settings 接口: 本机应用, key 明文回传 (前端密码框显示)
         r2 = client.get("/api/settings")
         assert r2.status_code == 200
-        assert isinstance(r2.json()["llm"]["api_key"], dict)
+        assert "profiles" in r2.json()["llm"]    # 配置池字段存在
         # 更新接口
         r3 = client.post("/api/settings", json={"updates": {"server.port": 8601}})
         assert r3.json()["applied"]["server.port"] == 8601

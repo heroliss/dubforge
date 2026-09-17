@@ -1,11 +1,22 @@
 # DubForge 配置模板 —— 复制为 config.yaml 后填入真实值 (config.yaml 已 gitignore, 永不入库)
 llm:
-  # OpenAI 兼容接口 (智谱 GLM / DeepSeek / OpenAI 等均可)
-  base_url: "https://open.bigmodel.cn/api/paas/v4"
-  api_key: "YOUR_API_KEY"
-  model: "glm-4.7"
+  # 多组 API 配置池: 按顺序依次尝试, 前面的不可用自动切换下一个 (可勾选启用)
+  # 任意 OpenAI 兼容服务商均可 (智谱 / 火山方舟 / DeepSeek / OpenAI / 本地 vLLM)
+  profiles:
+  - name: "服务商A"
+    base_url: "https://open.bigmodel.cn/api/paas/v4"
+    api_key: "YOUR_API_KEY"
+    model: "glm-5.3-flash"
+    enabled: true
+  - name: "服务商B"
+    base_url: "https://api.deepseek.com/v1"
+    api_key: "YOUR_API_KEY_2"
+    model: "deepseek-chat"
+    enabled: true
   max_workers: 1
   temperature: 0.1
+  timeout: 300          # 读超时秒数 (思考型模型建议 >=300)
+  thinking: auto        # auto / disabled / enabled
 
 download:
   resolution: 1080
