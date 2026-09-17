@@ -5,6 +5,7 @@ export const router = createRouter({
   history: createWebHistory(),
   routes: [
     { path: '/', name: 'projects', component: () => import('./views/ProjectsView.vue') },
+    { path: '/projects/:uid', name: 'pipeline', component: () => import('./views/PipelineView.vue') },
     { path: '/workbench', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
     { path: '/about', name: 'about', component: () => import('./views/AboutView.vue') },
