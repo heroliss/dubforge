@@ -44,12 +44,14 @@ def health():
 from app.api import projects as api_projects
 from app.api import settings as api_settings
 from app.api import steps as api_steps
+from app.api import presets as api_presets
 from app.api import workbench as api_workbench
 
 app.include_router(api_settings.router)
 app.include_router(api_projects.router)
 app.include_router(api_steps.router)
 app.include_router(api_workbench.router)
+app.include_router(api_presets.router)
 
 
 # ---- 前端静态托管 (frontend/dist 存在时; 开发期走 vite dev server) ----

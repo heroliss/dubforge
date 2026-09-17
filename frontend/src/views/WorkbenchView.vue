@@ -29,6 +29,36 @@ const shownLines = computed(() => {
     !q || l.text.toLowerCase().includes(q) || String(l.id) === q)
 })
 
+const presets = ref<string[]>([])
+const presetSel = ref('')
+const presetSource = ref('')
+const diffCount = ref(0)
+const applying = ref(false)
+const presetOpts = computed(() => presets.value.map(p => ({ label: p, value: p })))
+
+async function loadPresets() {
+  const r = await fetch('/api/workbench-presets')
+  const j = await r.json()
+  presets.value = j.presets ?? []
+  presetSource.value = j.source ?? ''
+  if (presets.value.length && !presetSel.value)
+    presetSel.value = j.source || presets.value[0]
+  const d = await fetch('/api/workbench-presets/diff').then(x => x.json())
+  diffCount.value = (d.diff ?? []).length
+}
+async function applyPreset() {
+  if (!presetSel.value) return
+  applying.value = true
+  try {
+    await fetch('/api/workbench-presets/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: presetSel.value }),
+    })
+    message.success(`已应用预设「${presetSel.value}」(参数即时生效)`)
+    await loadPresets()
+  } finally { applying.value = false }
+}
+
 async function loadProjects() {
   const r = await fetch('/api/projects')
   projects.value = (await r.json()).filter((p: any) => p.status !== 'created' || true)
@@ -40,6 +70,7 @@ async function load() {
 }
 onMounted(async () => {
   await loadProjects()
+  await loadPresets()
   await load()
   if (!uid.value && projects.value.length) pick(projects.value[0].uid)
   window.addEventListener('keydown', onKey)
@@ -183,6 +214,15 @@ async function preview(mix: boolean) {
     </template>
 
     <template v-else-if="state">
+      <n-card size="small" style="margin-bottom: 12px" v-if="presets.length">
+        <n-space align="center">
+          <n-text style="font-size:13px">WebUI 预设</n-text>
+          <n-select v-model:value="presetSel" :options="presetOpts" size="small" style="width:180px" />
+          <n-button size="small" :loading="applying" @click="applyPreset">应用预设</n-button>
+          <n-tag v-if="diffCount > 0" size="small" type="warning">{{ diffCount }} 项与预设不同</n-tag>
+          <n-text v-else-if="presetSource" depth="3" style="font-size:12px">与预设「{{ presetSource }}」一致</n-text>
+        </n-space>
+      </n-card>
       <n-space justify="space-between" align="center" style="margin-bottom: 8px">
         <n-space align="center">
           <n-h1 style="margin: 0; font-size: 22px">🎧 精修工作台</n-h1>
