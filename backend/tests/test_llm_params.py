@@ -1,6 +1,9 @@
 # -*- coding: utf-8 -*-
 """LLM 专属参数合并: profile.params 覆盖通用默认; 留空则不多发任何字段"""
+import pytest
+
 from dubforge.backends.llm import _payload
+from dubforge.errors import StepFailedError
 
 MSGS = [{"role": "user", "content": "hi"}]
 
@@ -56,3 +59,20 @@ def test_explicit_empty_suggestion_clears_default():
     assert e.suggestion == ""
     assert StepFailedError("x").suggestion          # 不传 → 类默认仍在
     assert StepFailedError("x", suggestion="自拟建议").suggestion == "自拟建议"
+
+
+def test_empty_base_url_gives_friendly_error(isolated_env):
+    # 空/空白接口地址 → 中文友好错误, 而非 httpx 的英文 UnsupportedProtocol
+    from dubforge.backends.llm import test_provider
+    r = test_provider({"name": "空地址", "base_url": "   ",
+                       "api_key": "x", "model": "m"})
+    assert r["ok"] is False
+    assert "接口地址为空" in r["error"]
+
+
+def test_chat_without_enabled_profile(isolated_env):
+    # 没有启用配置 → 明确指引去设置页, 而非含糊的"全部失败"
+    from dubforge.backends.llm import chat
+    with pytest.raises(StepFailedError) as ei:
+        chat("hi")
+    assert "没有已启用的 LLM 配置" in ei.value.message

@@ -132,6 +132,15 @@ onMounted(async () => {
 async function applySettings() {
   saving.value = true
   try {
+    // 专属参数 JSON 写错时后端按空处理, 这里提示一声避免无感
+    const bad = profiles.value
+      .filter(p => (p.paramsJson || '').trim() && (() => {
+        try { JSON.parse(p.paramsJson); return false } catch { return true }
+      })())
+      .map(p => p.name?.trim() || `#${profiles.value.indexOf(p) + 1}`)
+    if (bad.length) {
+      message.warning(`这些组的专属参数 JSON 格式有误，已按空处理：${bad.join('、')}`)
+    }
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {

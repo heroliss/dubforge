@@ -94,6 +94,11 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
     key = provider.get("api_key", "")
     name = provider.get("name", "default")
+    # 空地址在 httpx 里只会报英文 UnsupportedProtocol, 提前拦下给人话
+    if not (provider.get("base_url") or "").strip():
+        raise StepFailedError(
+            f"「{name}」接口地址为空",
+            suggestion="在设置页该组的「接口地址」填入服务商 API 地址后重试")
     # Key 为空 → 不带 Authorization 头 (本地 vLLM/Ollama 等无鉴权服务可裸跑;
     # 带空值反而会被 httpx 拒绝: Illegal header value b'Bearer ')
     headers = {"Authorization": f"Bearer {key}"} if key else {}
@@ -204,10 +209,16 @@ def chat(prompt: str, system: str | None = None,
          temperature: float | None = None,
          log=lambda m: None) -> str:
     """单轮文本补全: 按启用的配置池顺序尝试, 单个失败自动切换下一个"""
+    providers = _profiles()
+    if not providers:
+        raise StepFailedError(
+            "没有已启用的 LLM 配置",
+            suggestion="在设置页至少启用一组配置并「应用设置」; "
+                       "新配置需填入接口地址 / api_key / 模型名。")
     messages = ([{"role": "system", "content": system}] if system else []) + [
         {"role": "user", "content": prompt}]
     errors = []
-    for provider in _profiles():
+    for provider in providers:
         try:
             return _post(provider, _payload(provider, messages, temperature,
                                             json_mode=False), log=log)
