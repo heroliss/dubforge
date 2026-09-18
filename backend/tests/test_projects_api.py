@@ -250,3 +250,17 @@ def test_missing_dir_flag_and_delete(isolated_env, tmp_path):
         assert j["dir_exists"] is False
         assert client.delete(f"/api/projects/{p.uid}").status_code == 200
         assert crud.get_project(p.uid) is None
+
+
+def test_ghost_project_cannot_run(isolated_env):
+    """目录缺失的项目不允许启动 (否则运行会失败并"补回"空目录骨架)"""
+    import shutil as _shutil
+    from dubforge.domain import crud
+    p = crud.create_project(title="幽灵项目")
+    _shutil.rmtree(crud.project_dir(p.uid))
+    with _client() as client:
+        r = client.post(f"/api/projects/{p.uid}/steps/translate/run",
+                        json={"force": False})
+        assert r.status_code == 400
+        assert r.json()["code"] == "PROJECT_DIR_MISSING"
+    assert not crud.project_dir(p.uid).exists()      # 没有补回目录

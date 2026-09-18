@@ -102,7 +102,12 @@ def reveal_step(uid: str, key: str):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     if key not in STEP_MAP:
         raise DubForgeError(f"未知步骤: {key}", code="STEP_UNKNOWN")
-    d = crud.project_dir(uid) / STEP_MAP[key].dir
+    pdir = crud.project_dir(uid)
+    if not pdir.exists():
+        raise DubForgeError("项目目录不在磁盘上 (可能被移动或删除)",
+                            code="PROJECT_DIR_MISSING",
+                            suggestion="从回收站还原目录后重试。")
+    d = pdir / STEP_MAP[key].dir
     d.mkdir(parents=True, exist_ok=True)
     os.startfile(str(d))
     return {"ok": True, "dir": str(d)}

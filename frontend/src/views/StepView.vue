@@ -27,7 +27,17 @@ const blockers = computed(() =>
     .map((k) => nav.stepMap[k])
     .filter((s) => s && !['done', 'stale'].includes(s.status)))
 const running = computed(() => step.value?.status === 'running' || step.value?.status === 'queued')
-const canRun = computed(() => !!step.value && !running.value && blockers.value.length === 0)
+const canRun = computed(() => !!step.value && !running.value
+  && blockers.value.length === 0 && !dirMissing.value)
+
+// 项目目录不在磁盘上 (被移走/删除) → 禁用运行, 从回收站还原后恢复
+const dirMissing = ref(false)
+onMounted(async () => {
+  try {
+    const r = await fetch(`/api/projects/${uid}`)
+    if (r.ok) dirMissing.value = (await r.json()).dir_exists === false
+  } catch { /* 忽略 */ }
+})
 
 const STATUS_TAG: Record<string, 'default' | 'success' | 'error' | 'warning' | 'info'> = {
   pending: 'default', queued: 'warning', running: 'info', done: 'success',
@@ -304,10 +314,11 @@ async function loadText(name: string | null) {
                     @click="revealStep">📁</n-button>
           <n-button v-if="running" type="warning" :disabled="step.cancelling"
                     @click="cancel">⏹ {{ step.cancelling ? '取消中…' : '取消' }}</n-button>
-          <n-button v-else type="primary" :loading="busy" :disabled="!canRun"
+          <n-button v-else type="primary" :loading="busy"
+                    :disabled="!canRun || dirMissing"
                     @click="run(false)">▶ 运行</n-button>
           <n-button v-if="['done', 'stale', 'failed'].includes(step.status)"
-                    :disabled="running" @click="rerunDialog">🔁 强制重跑</n-button>
+                    :disabled="running || dirMissing" @click="rerunDialog">🔁 强制重跑</n-button>
         </n-space>
       </n-space>
       <n-text depth="3" style="font-size: 12px">{{ step.description }}</n-text>
@@ -316,6 +327,13 @@ async function loadText(name: string | null) {
       <n-progress v-if="running" type="line" :percentage="step.progress || 0"
                   indicator-placement="inside" :height="14" processing
                   style="margin-top: 12px" />
+
+      <!-- 幽灵项目门禁: 目录缺失时明确禁用并说明 -->
+      <n-alert v-if="dirMissing" type="error" style="margin-top: 14px"
+               title="项目目录不在磁盘上 —— 运行已禁用">
+        目录可能被移动或删除。从回收站还原目录后刷新本页即可恢复运行;
+        确认不要了可回项目列表删除该项目清理登记。
+      </n-alert>
 
       <!-- 依赖门禁: 明确指出缺哪些上游 -->
       <n-alert v-if="blockers.length" type="warning" :show-icon="true"

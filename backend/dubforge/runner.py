@@ -240,6 +240,13 @@ class Runner:
         project = crud.get_project(uid)
         if not project:
             raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+        # 幽灵项目门禁: 目录不在磁盘上 (被移走/删除) 不允许启动 —— 启动只会
+        # 失败并"补回"一个空目录骨架, 让项目列表失真。从回收站还原目录后即可恢复。
+        pdir = crud.project_dir(uid)
+        if not pdir.exists():
+            raise DubForgeError(
+                f"项目目录不在磁盘上: {pdir}", code="PROJECT_DIR_MISSING",
+                suggestion="目录可能被移动或删除。从回收站还原后重试; 确认不要了可删除该项目清理登记。")
         step = crud.get_step(project.id, step_key)
         if not step:
             raise DubForgeError(f"步骤不存在: {step_key}", code="STEP_NOT_FOUND")
