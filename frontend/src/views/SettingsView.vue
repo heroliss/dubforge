@@ -362,7 +362,7 @@ function extraParamsStr(r: any): string {
           <div class="g-item">
             <n-tooltip trigger="hover" placement="top">
               <template #trigger><span class="g-lb">总工作目录 ⓘ</span></template>
-              所有项目数据 (项目目录 / 数据库 / 上传收件箱) 的根目录
+              所有项目数据 (项目目录 / 数据库) 的根目录
             </n-tooltip>
             <n-input v-model:value="form.data_root" size="small" style="width: 420px"
                      placeholder="留空 = 默认 程序目录\data" />

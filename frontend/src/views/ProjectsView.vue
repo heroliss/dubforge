@@ -87,26 +87,9 @@ const sortedProjects = computed(() => {
 })
 const doneCount = (p: any) =>
   (p.steps ?? []).filter((x: any) => x.status === 'done').length
-
-async function create() {
-  if (!form.value.source_url.trim()) { message.warning('请填写视频链接或本地路径'); return }
-  creating.value = true
-  try {
-    const r = await fetch('/api/projects', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(form.value),
-    })
-    const j = await r.json()
-    if (j.uid) {
-      showNew.value = false
-      message.success('项目已创建')
-      router.push(`/projects/${j.uid}`)
-    } else {
-      message.error(j.message || '创建失败')
-    }
-  } finally {
-    creating.value = false
-  }
+// 项目级状态文案 (步骤级状态用 nav store 的 STATUS_TEXT)
+const PROJECT_STATUS_TEXT: Record<string, string> = {
+  created: '待处理', processing: '进行中', done: '已完成', failed: '有失败步骤',
 }
 
 function openRename(p: any) {
@@ -156,13 +139,18 @@ function remove(p: any) {
   })
 }
 
-// —— 本地文件: 文件夹浏览 + 拖入上传 (服务端即本机, 路径即真实路径) ——
+// —— 本地导入: 拖入 (副本进项目目录) / 浏览 + 粘贴路径 (零拷贝引用) ——
 const showBrowse = ref(false)
 const browsePath = ref('')
 const browseParent = ref<string | null>(null)
 const browseEntries = ref<any[]>([])
 const browseSel = ref<any>(null)
-const uploading = ref('')
+// 拖入: 浏览器拿不到真实路径, 先持有 File, 创建项目后再把内容流式写进项目目录 media/
+const pendingFile = ref<File | null>(null)
+const ingesting = ref(false)
+const ingestPct = ref(0)
+const ingestErr = ref('')
+const newUid = ref<string | null>(null)
 
 async function browseTo(path: string) {
   const r = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`)
@@ -182,6 +170,7 @@ function browseConfirm() {
   if (!browseSel.value) return
   form.value.source_kind = 'local'
   form.value.source_url = browseSel.value.path
+  pendingFile.value = null                    // 后选的路径优先于先前拖入的文件
   if (!form.value.title.trim()) {
     form.value.title = browseSel.value.name.replace(/\.[^.]+$/, '')
   }
@@ -204,26 +193,102 @@ function onDrop(e: DragEvent) {
     return
   }
   form.value.source_kind = 'local'
-  void uploadDropped(f)
-}
-async function uploadDropped(f: File) {
-  uploading.value = f.name
-  try {
-    const fd = new FormData()
-    fd.append('file', f)
-    const r = await fetch('/api/files/upload', { method: 'POST', body: fd })
-    const j = await r.json()
-    if (!r.ok) throw new Error(j.message || '上传失败')
-    form.value.source_url = j.path
-    if (!form.value.title.trim()) form.value.title = j.name.replace(/\.[^.]+$/, '')
-    message.success(`已导入到服务器收件箱: ${j.path}`)
-  } catch (e: any) {
-    message.error(e.message || '上传失败')
-  } finally { uploading.value = '' }
+  form.value.source_url = ''                  // 后拖入的文件优先于先前选的路径
+  pendingFile.value = f
+  if (!form.value.title.trim()) form.value.title = f.name.replace(/\.[^.]+$/, '')
 }
 
-const STATUS_TEXT: Record<string, string> = {
-  created: '待处理', processing: '进行中', done: '已完成', failed: '有失败步骤',
+async function create() {
+  if (form.value.source_kind === 'local' && pendingFile.value) {
+    await createThenIngest()
+    return
+  }
+  if (!form.value.source_url.trim()) { message.warning('请填写视频链接或本地路径'); return }
+  creating.value = true
+  try {
+    const r = await fetch('/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(form.value),
+    })
+    const j = await r.json()
+    if (j.uid) {
+      showNew.value = false
+      message.success('项目已创建')
+      router.push(`/projects/${j.uid}`)
+    } else {
+      message.error(j.message || '创建失败')
+    }
+  } finally {
+    creating.value = false
+  }
+}
+
+// 拖入流程: 先建项目 (项目目录即容器), 再把文件内容流式写进 media/ —— 不经收件箱
+async function createThenIngest() {
+  creating.value = true
+  try {
+    const r = await fetch('/api/projects', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ...form.value, source_url: '' }),
+    })
+    const j = await r.json()
+    if (!j.uid) { message.error(j.message || '创建失败'); return }
+    newUid.value = j.uid
+    await runIngest()
+  } finally { creating.value = false }
+}
+
+async function runIngest() {
+  const f = pendingFile.value
+  if (!newUid.value || !f) return
+  ingestErr.value = ''
+  ingesting.value = true
+  ingestPct.value = 0
+  try {
+    await ingest(newUid.value, f)
+    showNew.value = false
+    message.success('项目已创建, 视频副本已存入项目目录')
+    router.push(`/projects/${newUid.value}`)
+  } catch (e: any) {
+    ingestErr.value = e.message || '导入失败'
+  } finally { ingesting.value = false }
+}
+
+// 用 XHR 而非 fetch: 需要 upload.onprogress 显示复制进度
+function ingest(uid: string, f: File): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', `/api/projects/${uid}/ingest?filename=${encodeURIComponent(f.name)}`)
+    xhr.upload.onprogress = (e) => {
+      if (e.lengthComputable) ingestPct.value = Math.round((e.loaded / e.total) * 100)
+    }
+    xhr.onload = () => {
+      if (xhr.status < 300) { resolve(); return }
+      let msg = `HTTP ${xhr.status}`
+      try { msg = JSON.parse(xhr.responseText).message || msg } catch { /* 原样 */ }
+      reject(new Error(msg))
+    }
+    xhr.onerror = () => reject(new Error('网络错误 —— 请确认后端正在运行'))
+    xhr.send(f)
+  })
+}
+
+// 导入失败时项目刚建、什么都没有: 重试, 或删掉空项目重来
+async function abortIngest() {
+  const uid = newUid.value
+  resetNewForm()
+  showNew.value = false
+  if (uid) {
+    await fetch(`/api/projects/${uid}`, { method: 'DELETE' })
+    message.info('已放弃导入, 空项目已删除')
+  }
+}
+function resetNewForm() {
+  pendingFile.value = null
+  newUid.value = null
+  ingestErr.value = ''
+  ingestPct.value = 0
+  form.value = { source_kind: 'link', source_url: '', title: '' }
 }
 </script>
 
@@ -257,7 +322,7 @@ const STATUS_TEXT: Record<string, string> = {
                 <n-space align="center">
                   <n-text strong style="font-size: 15px">{{ p.title }}</n-text>
                   <n-tag size="small" :type="(STATUS_TAG as any)[p.status] || 'default'">
-                    {{ STATUS_TEXT[p.status] || p.status }}
+                    {{ PROJECT_STATUS_TEXT[p.status] || p.status }}
                   </n-tag>
                   <n-tag v-if="p.running_step" size="small" type="info" :bordered="false">
                     🔄 {{ p.running_label }}
@@ -303,7 +368,8 @@ const STATUS_TEXT: Record<string, string> = {
       </div>
     </n-spin>
 
-    <n-modal v-model:show="showNew" preset="card" title="新建项目" style="width: 560px">
+    <n-modal v-model:show="showNew" preset="card" title="新建项目" style="width: 560px"
+             @after-leave="resetNewForm">
       <div @dragover.prevent @drop.prevent="onDrop">
         <n-form label-placement="left" label-width="90">
           <n-form-item label="来源类型">
@@ -316,7 +382,7 @@ const STATUS_TEXT: Record<string, string> = {
             <n-input-group>
               <n-input v-model:value="form.source_url"
                        :placeholder="form.source_kind === 'local'
-                         ? 'D:\\videos\\my.mp4 · 点「选择文件」或直接拖入视频'
+                         ? 'D:\\videos\\my.mp4 · 或点右侧「📂 选择文件」'
                          : '支持 YouTube / Bilibili / Twitter 等数千个站点 (由 yt-dlp 支持)'" />
               <n-button v-if="form.source_kind === 'local'" @click="openBrowse">
                 📂 选择文件
@@ -328,15 +394,34 @@ const STATUS_TEXT: Record<string, string> = {
                      placeholder="留空自动获取: 优先用视频标题, 其次 文件名/站点+ID" />
           </n-form-item>
         </n-form>
-        <n-text v-if="form.source_kind === 'local' || uploading" depth="3"
-                style="font-size:12px; display:block">
-          {{ uploading ? `⬆️ 正在导入 ${uploading} …` : '提示: 也可以把视频文件直接拖进本窗口' }}
+        <div v-if="ingesting" style="margin-top: 10px">
+          <n-progress type="line" :percentage="ingestPct" indicator-placement="inside" processing />
+          <n-text depth="3" style="font-size:12px; display:block; margin-top:4px">
+            ⬇️ 正在把视频副本写入项目目录… (服务端即本机, 本地磁盘速度)
+          </n-text>
+        </div>
+        <n-text v-else depth="3" style="font-size:12px; display:block; line-height:1.8">
+          <template v-if="pendingFile">
+            已拖入: {{ pendingFile.name }} ({{ fmtSize(pendingFile.size) }}) —— 创建项目时复制一份进项目目录 media\, 随项目存亡
+          </template>
+          <template v-else>
+            提示: 把视频文件<b>拖进本窗口</b> —— 浏览器不提供原文件路径, 内容会作为副本存进项目目录 (随项目存亡)。<br />
+            点「📂 选择文件」或<b>直接粘贴路径</b> —— 零拷贝引用: 只登记原位置, 不复制、不改不动原文件, 大文件推荐这种方式。
+          </template>
         </n-text>
+        <n-alert v-if="ingestErr" type="error" closable style="margin-top: 8px"
+                 @close="ingestErr = ''">
+          视频导入失败: {{ ingestErr }}
+        </n-alert>
       </div>
       <template #footer>
-        <n-space justify="end">
+        <n-space v-if="ingestErr" justify="end">
+          <n-button @click="abortIngest">放弃并删除空项目</n-button>
+          <n-button type="primary" :loading="ingesting" @click="runIngest">重试导入</n-button>
+        </n-space>
+        <n-space v-else justify="end">
           <n-button @click="showNew = false">取消</n-button>
-          <n-button type="primary" :loading="creating" @click="create">创建</n-button>
+          <n-button type="primary" :loading="creating || ingesting" @click="create">创建</n-button>
         </n-space>
       </template>
     </n-modal>

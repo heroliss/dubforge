@@ -2,7 +2,7 @@
 """项目 API: CRUD (M1; M4 前端接手)"""
 import json
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Request
 from pydantic import BaseModel
 
 from dubforge.domain import crud
@@ -53,6 +53,41 @@ def create_project(body: ProjectCreate):
     project = crud.create_project(title=title, source_url=body.source_url,
                                   source_kind=body.source_kind, params=body.params)
     return _project_view(project)
+
+
+@router.post("/{uid}/ingest")
+async def ingest_video(uid: str, request: Request, filename: str = "video.mp4"):
+    """拖入导入: 项目创建后把文件内容流式写进项目目录 media/。
+    浏览器拿不到拖入文件的真实磁盘路径, 只能传内容 —— 先建项目目录作容器,
+    字节流直写最终位置 (不落收件箱/临时目录), 副本即项目自有文件, 随项目存亡。"""
+    import re
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    if project.source_kind != "local":
+        raise DubForgeError("只有本地导入项目可以接收文件内容", code="INGEST_KIND_INVALID")
+    name = re.sub(r'[\\/:*?"<>|]', "_", filename).strip() or "video.mp4"
+    pdir = crud.project_dir(uid)
+    media = pdir / "media"
+    media.mkdir(parents=True, exist_ok=True)
+    # 单一源视频不变式: 换文件重传时清掉旧视频副本 (meta.json 等保留)
+    from app.api.files import VIDEO_EXTS
+    for old in media.iterdir():
+        if old.is_file() and old.suffix.lower() in VIDEO_EXTS:
+            old.unlink(missing_ok=True)
+    dst = media / name
+    size = 0
+    with dst.open("wb") as f:
+        async for chunk in request.stream():
+            f.write(chunk)
+            size += len(chunk)
+    if not size:
+        dst.unlink(missing_ok=True)
+        raise DubForgeError("文件内容为空", code="INGEST_EMPTY")
+    project.source_url = dst.relative_to(pdir).as_posix()    # 相对路径 = 项目目录内副本
+    crud.save_project(project)
+    crud.write_manifest(uid)
+    return {"ok": True, "file": project.source_url, "size": size}
 
 
 class ProjectRename(BaseModel):

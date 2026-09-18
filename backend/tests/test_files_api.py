@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""本地文件 API: 目录浏览 + 拖入上传"""
+"""本地文件 API: 目录浏览 + 拖入导入 (ingest)"""
 from fastapi.testclient import TestClient
 
 
@@ -38,33 +38,64 @@ def test_list_bad_path(isolated_env):
         assert r.json()["code"] == "PATH_NOT_FOUND"
 
 
-def test_upload_into_uploads(isolated_env):
+def test_ingest_into_project_dir(isolated_env):
+    """拖入导入: 内容直接写进项目目录 media/, source_url 记项目内相对路径"""
+    from dubforge.domain import crud
+    from dubforge.pipeline.video_source import resolve_video
     with _client() as client:
-        r = client.post("/api/files/upload",
-                        files={"file": ("我的视频.mp4", b"datadata")})
-        assert r.status_code == 200
-        j = r.json()
-        assert j["name"] == "我的视频.mp4"
-        assert j["path"].endswith("我的视频.mp4")
-        # 同名再传 → 自动加序号, 不覆盖
-        r2 = client.post("/api/files/upload",
-                         files={"file": ("我的视频.mp4", b"2")})
-        assert r2.json()["name"] == "我的视频_1.mp4"
-
-
-def test_upload_deleted_with_project(isolated_env):
-    """拖入上传的文件随项目一起删 (无其他项目引用时)"""
-    from dubforge import config
-    with _client() as client:
-        up = client.post("/api/files/upload",
-                         files={"file": ("a.mp4", b"data")}).json()
         p = client.post("/api/projects", json={
-            "title": "上传项目", "source_kind": "local",
-            "source_url": up["path"]}).json()
+            "title": "拖入项目", "source_kind": "local", "source_url": ""}).json()
         uid = p["uid"]
+        r = client.post(f"/api/projects/{uid}/ingest",
+                        params={"filename": "我的视频.mp4"}, content=b"datadata")
+        assert r.status_code == 200
+        assert r.json()["file"] == "media/我的视频.mp4"
+
+        # 副本就在项目目录内, 且 resolve_video 能按相对 source_url 定位
+        hits = list((crud.config.projects_dir()).glob("*/media/我的视频.mp4"))
+        assert len(hits) == 1
+        project = crud.get_project(uid)
+        assert project.source_url == "media/我的视频.mp4"
+        assert resolve_video(project, crud.project_dir(uid)) == hits[0]
+
+        # 删项目 → 副本随项目目录一起消失
         assert client.delete(f"/api/projects/{uid}").status_code == 200
-        assert not (config.data_root() / "uploads" / "a.mp4").exists()
-        assert not (config.data_root() / "projects" / uid).exists()
+        assert not hits[0].exists()
+        assert not (crud.config.data_root() / "uploads").exists()
+
+
+def test_ingest_replaces_previous_copy(isolated_env):
+    """换文件重传: 清掉旧视频副本, 保持一个项目一个源视频"""
+    from dubforge.domain import crud
+    with _client() as client:
+        p = client.post("/api/projects", json={
+            "title": "重传项目", "source_kind": "local"}).json()
+        uid = p["uid"]
+        assert client.post(f"/api/projects/{uid}/ingest",
+                           params={"filename": "a.mp4"}, content=b"old").status_code == 200
+        assert client.post(f"/api/projects/{uid}/ingest",
+                           params={"filename": "b.mkv"}, content=b"new").status_code == 200
+        media = crud.project_dir(uid) / "media"
+        assert [f.name for f in media.iterdir()] == ["b.mkv"]
+
+
+def test_ingest_guards(isolated_env, tmp_path):
+    """不存在 / 空内容 / 链接项目 → 明确报错"""
+    with _client() as client:
+        assert client.post("/api/projects/nope/ingest",
+                           params={"filename": "a.mp4"}, content=b"x").status_code == 400
+        p = client.post("/api/projects", json={
+            "title": "链接项目", "source_kind": "link", "source_url": "https://x.com/v"}).json()
+        r = client.post(f"/api/projects/{p['uid']}/ingest",
+                        params={"filename": "a.mp4"}, content=b"x")
+        assert r.status_code == 400
+        assert r.json()["code"] == "INGEST_KIND_INVALID"
+        p2 = client.post("/api/projects", json={
+            "title": "空内容", "source_kind": "local"}).json()
+        r2 = client.post(f"/api/projects/{p2['uid']}/ingest",
+                         params={"filename": "a.mp4"}, content=b"")
+        assert r2.status_code == 400
+        assert r2.json()["code"] == "INGEST_EMPTY"
 
 
 def test_external_file_survives_project_delete(isolated_env, tmp_path):

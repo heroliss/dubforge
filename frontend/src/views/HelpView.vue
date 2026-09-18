@@ -14,12 +14,11 @@
       </p>
       <pre class="tree">总工作目录 (data)\
 ├─ dubforge.db              项目索引 (步骤状态/产物登记表; 目录里的事实为准, 删了可重建)
-├─ uploads\                 拖入上传的收件箱 —— 文件随引用它的项目一起删除
 ├─ download_archive.txt     已下载视频去重档案 (同一链接永不重复下载)
 └─ projects\
    ├─ 20260918_1533_我的视频\   ← 一个项目目录 (创建日期_时间_标题, 天然按时间排序)
    │  ├─ manifest.json          项目自述文件: 标题/来源/每步状态/全部产物清单 (记事本可读)
-   │  ├─ media\                 下载的视频 (本地导入的项目此目录为空, 只记引用不复制)
+   │  ├─ media\                 源视频: 下载来源、或拖入导入的副本 (浏览/粘贴路径导入只记引用, 不落此目录)
    │  ├─ audio\                 中间音频: raw.wav 原始音轨 · vocal.wav 分离人声 · background.wav 背景音
    │  ├─ srt\                   字幕: src.srt 源语言 · trans.srt 译文 · bilingual.srt 双语
    │  ├─ artifacts\             各步骤产物 (按步骤分目录)
@@ -41,17 +40,20 @@
 
     <n-card title="你可能看不出来的机制" size="small" style="margin-bottom: 14px">
       <n-collapse>
-        <n-collapse-item title="本地导入是「引用」不是「复制」" name="ref">
+        <n-collapse-item title="本地导入: 什么时候引用、什么时候复制" name="ref">
           <p class="p">
-            导入本地视频时，程序<strong>不复制文件</strong>，只在项目里登记一条指向原文件的引用——
-            几个 GB 的视频导入也是瞬间完成、不占双倍硬盘。代价：项目存续期间<strong>别移动或重命名原文件</strong>，
-            否则重跑「视频获取」会提示原文件不存在。
+            用「📂 选择文件」或<strong>直接粘贴路径</strong>导入时，程序<strong>不复制文件</strong>，
+            只登记一条指向原文件的引用——几个 GB 的视频导入也是瞬间完成、不占双倍硬盘。
+            代价：项目存续期间<strong>别移动或重命名原文件</strong>，否则重跑「视频获取」会提示原文件不存在。<br />
+            把文件<strong>拖进新建窗口</strong>导入时，浏览器出于安全不提供原文件的真实路径，
+            程序只能把内容作为副本存进项目目录 <code>media\</code>——副本随项目存亡，同样不会碰原文件。
           </p>
         </n-collapse-item>
         <n-collapse-item title="删除项目会删什么、不会删什么" name="delete">
           <p class="p">
-            删除项目 = 删除<strong>项目目录</strong>（含全部中间产物）+ 数据库里的登记记录 +
-            收件箱里它上传的文件（若无其他项目共用）。<strong>你磁盘上的原视频是外部引用，永远不会被程序删除或修改。</strong>
+            删除项目 = 删除<strong>项目目录</strong>（含全部中间产物）+ 数据库里的登记记录。
+            拖入导入的副本就在项目目录里，随项目一起删除。
+            <strong>你磁盘上的原视频是外部引用，永远不会被程序删除或修改。</strong>
           </p>
         </n-collapse-item>
         <n-collapse-item title="为什么点另一个任务时，这个任务在「排队中」？" name="queue">

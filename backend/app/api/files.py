@@ -1,15 +1,9 @@
 # -*- coding: utf-8 -*-
-"""本地文件 API: 文件夹浏览 + 拖入上传
-
-服务端与浏览器同机 (本机单用户应用), 浏览服务端目录即浏览用户磁盘;
-拖入的文件上传到 data/uploads/ 作为本地导入的来源 (避免手敲路径)。
-"""
-import re
-import shutil
+"""本地文件 API: 目录浏览 (服务端即本机, 浏览服务端目录即浏览用户磁盘)"""
 import string
 from pathlib import Path
 
-from fastapi import APIRouter, UploadFile
+from fastapi import APIRouter
 
 from dubforge import config
 from dubforge.errors import DubForgeError
@@ -55,19 +49,3 @@ def list_dir(path: str = ""):
         pass               # 无权限目录显示为空列表
     return {"path": str(p), "parent": str(p.parent) if p.parent != p else None,
             "entries": entries, "drives": False}
-
-
-@router.post("/upload")
-def upload(file: UploadFile):
-    """拖入上传: 保存到 data/uploads/ (同名自动加序号), 返回落盘路径"""
-    name = re.sub(r'[\\/:*?"<>|]', "_", file.filename or "video.mp4").strip() or "video.mp4"
-    inbox = config.data_root() / "uploads"
-    inbox.mkdir(parents=True, exist_ok=True)
-    dst = inbox / name
-    i = 1
-    while dst.exists():                       # 同名不覆盖
-        dst = inbox / f"{dst.stem}_{i}{dst.suffix}"
-        i += 1
-    with dst.open("wb") as f:
-        shutil.copyfileobj(file.file, f)
-    return {"path": str(dst), "name": dst.name, "size": dst.stat().st_size}

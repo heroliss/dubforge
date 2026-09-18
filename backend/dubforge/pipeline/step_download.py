@@ -6,9 +6,10 @@
   youtube (source_url 填链接): yt-dlp 下载到 media/video.<ext>
       - 全局去重: data/download_archive.txt 记录已下载 ID, 重复链接直接复用已有项目产物
       - cookies / 代理 / 分辨率 均从 config.download 读取
-  local (source_url 填本地路径): 原文件就地引用, 零拷贝 —— 几个 GB 的视频复制一遍
-      既费时又费盘, 产物登记的是指向原文件的引用 (绝对路径); 原文件被移动/删除后
-      重跑会报 SOURCE_NOT_FOUND。
+  local (source_url 填本地路径): 两种形态 (见 video_source.py) ——
+      外部引用 (绝对路径): 原文件就地引用零拷贝, 产物登记指向原文件;
+      拖入导入 (相对路径): 副本在项目目录 media/ 内, 是项目自有文件。
+      原文件/副本被移动删除后重跑会报 SOURCE_NOT_FOUND。
 
 产物: 下载 → media/video.<ext>; 本地 → 原文件本身 (均登记为 download/video.mp4 逻辑名)
 """
@@ -18,6 +19,7 @@ from pathlib import Path
 
 from dubforge import config
 from dubforge.errors import DubForgeError
+from dubforge.pipeline.video_source import resolve_source
 from dubforge.utils.srt import SubLine, write_srt
 
 
@@ -111,10 +113,12 @@ def run(ctx) -> None:
 
     kind = ctx.project.source_kind
     if kind == "local":
-        src = Path(ctx.project.source_url or "")
-        if not src.exists():
-            raise DubForgeError(f"本地视频不存在: {src}", code="SOURCE_NOT_FOUND",
-                                suggestion="原文件可能被移动或删除; 请确认路径, 或重建项目重新选择文件。")
+        src = resolve_source(ctx.project, ctx.pdir)
+        if not src:
+            raise DubForgeError(
+                f"本地视频不存在: {ctx.project.source_url or '(未提供)'}",
+                code="SOURCE_NOT_FOUND",
+                suggestion="原文件可能被移动或删除; 请确认路径, 或重建项目重新选择文件。")
         ctx.log(f"引用本地视频 (不复制): {src}")
         ctx.report_progress(10)
         title = src.stem

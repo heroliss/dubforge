@@ -90,7 +90,6 @@ def delete_project(uid: str) -> bool:
     if not project:
         return False
     pid = project.id
-    kind, source_url = project.source_kind, project.source_url or ""
     pdir = project_dir(uid)     # 行删除前解析 (语义化目录名要从行里查)
     with session() as s:
         for model in (Artifact, Job, StepRun):
@@ -99,17 +98,6 @@ def delete_project(uid: str) -> bool:
         s.delete(s.get(Project, pid))
         s.commit()
     shutil.rmtree(pdir, ignore_errors=True)
-    # 拖入上传的文件 (data/uploads/ 内) 是程序自己收下的, 跟着项目一起删;
-    # 仅当没有其他项目还引用它。项目目录外的用户文件绝不动 —— 引用随 DB 行一起消失。
-    if kind == "local" and source_url:
-        inbox = (config.data_root() / "uploads").resolve()
-        p = Path(source_url).resolve()
-        if p.is_relative_to(inbox):
-            with session() as s:
-                reused = bool(s.exec(sqlmodel.select(Project).where(
-                    Project.id != pid, Project.source_url == source_url)).all())
-            if not reused:
-                p.unlink(missing_ok=True)
     return True
 
 
@@ -252,11 +240,10 @@ def write_manifest(uid: str) -> None:
         "dir_name": project.dir_name or uid,
         "source": {
             "kind": project.source_kind, "url": project.source_url,
-            # 本地导入 = 引用原文件零拷贝; 原文件不在项目目录里, 删项目也不会动它
+            # 绝对路径 = 引用外部原文件零拷贝; 相对路径 = 拖入的副本, 本就是项目内文件
             "note": ("引用外部原文件 (零拷贝, 删项目不删原文件)"
                      if project.source_kind == "local"
-                     and not Path(project.source_url or "").is_relative_to(
-                         config.data_root() / "uploads")
+                     and Path(project.source_url or "").is_absolute()
                      else ""),
         },
         "status": project.status, "params": json.loads(project.params or "{}"),
