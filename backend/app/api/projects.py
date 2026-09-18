@@ -96,12 +96,17 @@ def delete_project(uid: str):
 
 
 def _project_view(project) -> dict:
+    steps = crud.get_steps(project.id)
+    running = next((s.step_key for s in steps
+                    if s.status in ("running", "queued")), None)
     return {
         "uid": project.uid,
         "title": project.title,
         "source_url": project.source_url,
         "source_kind": project.source_kind,
         "status": project.status,
+        "running_step": running,
+        "running_label": STEP_MAP[running].label if running else None,
         "params": json.loads(project.params or "{}"),
         "created_at": project.created_at.isoformat(),
     }

@@ -169,8 +169,7 @@ const STATUS_TEXT: Record<string, string> = {
       <n-empty v-if="!loading && !projects.length"
                description="还没有项目 —— 点击右上角新建，粘贴视频链接 (YouTube / B站 等网站) 或导入本地视频" />
       <div v-else style="display:flex;flex-direction:column;gap:16px">
-        <n-card v-for="p in projects" :key="p.uid" size="small"
-                style="cursor: pointer" @click="router.push(`/projects/${p.uid}`)">
+        <n-card v-for="p in projects" :key="p.uid" size="small">
           <n-space justify="space-between" align="center">
             <div>
               <n-space align="center">
@@ -178,13 +177,16 @@ const STATUS_TEXT: Record<string, string> = {
                 <n-tag size="small" :type="p.status === 'done' ? 'success' : p.status === 'failed' ? 'error' : p.status === 'processing' ? 'info' : 'default'">
                   {{ STATUS_TEXT[p.status] || p.status }}
                 </n-tag>
+                <n-tag v-if="p.running_step" size="small" type="info" :bordered="false">
+                  🔄 {{ p.running_label }}
+                </n-tag>
               </n-space>
               <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
                 {{ p.source_kind === 'local' ? '本地导入' : p.source_url }} · {{ p.uid }}
               </n-text>
             </div>
             <n-space>
-              <n-button size="small" @click.stop="router.push(`/projects/${p.uid}`)">打开管线</n-button>
+              <n-button size="small" type="primary" @click.stop="router.push(`/projects/${p.uid}`)">打开项目</n-button>
               <n-button size="small" quaternary @click.stop="openRename(p)">✏️ 改名</n-button>
               <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
             </n-space>

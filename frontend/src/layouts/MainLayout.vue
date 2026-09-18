@@ -1,7 +1,8 @@
 <script setup lang="ts">
-// 主布局: 左侧导航 (上下文感知) + 内容区
+// 主布局: 左侧导航 (全局 + 项目两段) + 内容区
 // - 全局四项 (项目/设置/帮助/关于) 永远固定在顶部, 位置不变 —— 视觉稳定
-// - 项目模式 (路由含 :uid): 项目导航项 (总览 + 九步骤实时徽章 + 精修工作台) 直接接在下方
+// - 打开过项目后, 项目导航区 (项目名 + 总览 + 九步骤实时徽章 + 精修工作台)
+//   常驻在全局项下方: 切到设置/帮助等全局页不会清掉; 只有打开另一个项目才替换
 import { computed, h, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import { useNavStore, STEP_ORDER, STATUS_EMOJI } from '../stores/nav'
@@ -10,10 +11,8 @@ const route = useRoute()
 const collapsed = ref(false)
 const nav = useNavStore()
 
-const inProject = computed(() => !!route.params.uid)
 watch(() => route.params.uid, (u) => {
-  if (u) nav.enter(u as string)
-  else nav.leave()
+  if (u && u !== nav.uid) nav.enter(u as string)
 }, { immediate: true })
 
 const globalOptions = [
@@ -46,15 +45,14 @@ const projectOptions = computed(() => [
   },
 ])
 
-const menuOptions = computed(() =>
-  inProject.value ? [...globalOptions, { type: 'divider', key: 'dg' }, ...projectOptions.value]
-                  : globalOptions)
-
-const activeKey = computed(() => {
+const GLOBAL_KEYS = ['projects', 'settings', 'help', 'about']
+const globalActive = computed(() =>
+  GLOBAL_KEYS.includes(route.name as string) ? route.name as string : null)
+const projActive = computed(() => {
   if (route.name === 'step') return route.params.key as string
   if (route.name === 'workbench-p') return 'workbench'
   if (route.name === 'pipeline') return 'overview'
-  return route.name as string
+  return null
 })
 </script>
 
@@ -74,12 +72,15 @@ const activeKey = computed(() => {
         <span class="brand-icon">⚒️</span>
         <span v-if="!collapsed">DubForge</span>
       </div>
-      <div v-if="inProject && !collapsed" class="proj-title" :title="nav.title">
-        {{ nav.title || '…' }}
-      </div>
-      <n-menu :options="menuOptions"
-              :value="activeKey" :collapsed="collapsed" :collapsed-width="64"
-              :collapsed-icon-size="20" />
+      <n-menu :options="globalOptions" :value="globalActive"
+              :collapsed="collapsed" :collapsed-width="64" :collapsed-icon-size="20" />
+      <template v-if="nav.uid">
+        <div v-if="!collapsed" class="proj-title" :title="nav.title">
+          {{ nav.title || '…' }}
+        </div>
+        <n-menu :options="projectOptions" :value="projActive"
+                :collapsed="collapsed" :collapsed-width="64" :collapsed-icon-size="20" />
+      </template>
     </n-layout-sider>
     <n-layout>
       <router-view />
@@ -100,9 +101,9 @@ const activeKey = computed(() => {
 }
 .brand-icon { font-size: 18px; }
 .proj-title {
-  padding: 0 20px 8px;
+  padding: 10px 20px 4px;
   font-size: 12px;
-  opacity: 0.75;
+  opacity: 0.7;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
