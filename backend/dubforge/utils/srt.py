@@ -45,7 +45,11 @@ def parse_srt(path: Path) -> list[SubLine]:
             continue
         t1, t2 = [x.strip() for x in lines[1].split("-->")]
         text = " ".join(lines[2:]) if len(lines) > 2 else ""
-        out.append(SubLine(int(lines[0]), _parse_ts(t1), _parse_ts(t2), text))
+        try:
+            idx = int(lines[0])
+        except ValueError:
+            idx = len(out) + 1      # 索引行缺失/非数字: 容错重排, 不丢整块字幕
+        out.append(SubLine(idx, _parse_ts(t1), _parse_ts(t2), text))
     return out
 
 

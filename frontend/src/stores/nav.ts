@@ -20,6 +20,8 @@ export const STATUS_TAG: Record<string, 'default' | 'success' | 'error' | 'warni
   failed: 'error', stale: 'warning', interrupted: 'error',
 }
 
+let pollSeq = 0                    // 轮询序号 (丢弃过期响应, 防状态闪回)
+
 export const useNavStore = defineStore('nav', {
   state: () => ({
     uid: '',
@@ -29,8 +31,7 @@ export const useNavStore = defineStore('nav', {
     autoSteps: null as string[] | null,   // 勾选集 (null = 全部, 未自定义过)
     chain: [] as string[],                // 待自动续跑队列
     timer: 0 as unknown as ReturnType<typeof setInterval> | 0,
-  }),
-  getters: {
+  }),  getters: {
     stepMap(): Record<string, any> {
       return Object.fromEntries(this.steps.map((x: any) => [x.key, x]))
     },
@@ -44,19 +45,24 @@ export const useNavStore = defineStore('nav', {
   actions: {
     async poll() {
       if (!this.uid) return
+      // 序号守卫: 手动 poll 与 2.5s 定时器并发时, 慢的旧响应不得覆盖新状态
+      const seq = ++pollSeq
       try {
         const [ps, ss] = await Promise.all([
           fetch(`/api/projects/${this.uid}`),
           fetch(`/api/projects/${this.uid}/steps`),
         ])
+        if (seq !== pollSeq) return
         if (ps.ok && ss.ok) {
           const p = await ps.json()
+          const steps = await ss.json()
+          if (seq !== pollSeq) return
           this.title = p.title
           this.status = p.status
           this.autoSteps = Array.isArray(p.params?.auto_steps)
             ? p.params.auto_steps : null
           this.chain = Array.isArray(p.params?._chain) ? p.params._chain : []
-          this.steps = await ss.json()
+          this.steps = steps
         }
       } catch { /* 后端短暂不可达: 保留旧状态, 下一轮再试 */ }
     },

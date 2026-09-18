@@ -7,6 +7,7 @@ import { useDialog, useMessage } from 'naive-ui'
 import MediaInfo from '../components/MediaInfo.vue'
 import AudioTracksPlayer from '../components/AudioTracksPlayer.vue'
 import ParamControl from '../components/ParamControl.vue'
+import { fmtSize } from '../utils/format'
 import { useNavStore, STEP_ORDER, STATUS_TEXT } from '../stores/nav'
 
 const route = useRoute()
@@ -52,13 +53,13 @@ async function run(force = false) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ force }),
     })
-    const j = await r.json()
-    if (!r.ok) { message.error(j.message || '启动失败'); return }
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) { message.error(j.message || `启动失败 (HTTP ${r.status})`); return }
     if (j.status === 'skipped') message.info(j.message)
     else message.success(force ? '已开始强制重跑' : '已启动')
     await nav.poll()
     loadLog()
-  } finally { busy.value = false }
+  } catch { message.error('启动请求失败 (网络异常)') } finally { busy.value = false }
 }
 
 function rerunDialog() {
@@ -90,7 +91,10 @@ function stopDialog() {
 }
 
 async function doCancel() {
-  await fetch(`/api/projects/${uid}/steps/${key}/cancel`, { method: 'POST' })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${key}/cancel`, { method: 'POST' })
+    if (!r.ok) { message.error('停止信号发送失败'); return }
+  } catch { message.error('停止信号发送失败'); return }
   message.info('停止信号已发送, 等待步骤退出；长时间无响应可用「强制结束」')
 }
 
@@ -106,16 +110,22 @@ function forceDialog() {
 }
 
 async function doForce() {
-  await fetch(`/api/projects/${uid}/steps/${key}/force_stop`, { method: 'POST' })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${key}/force_stop`, { method: 'POST' })
+    if (!r.ok) { message.error('强制结束失败'); return }
+  } catch { message.error('强制结束失败'); return }
   message.success('已强制结束')
   await nav.poll()
 }
 
 async function setPause(p: boolean) {
-  await fetch(`/api/projects/${uid}/steps/${key}/pause`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pause: p }),
-  })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${key}/pause`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pause: p }),
+    })
+    if (!r.ok) { message.error(p ? '暂停失败' : '继续失败'); return }
+  } catch { message.error(p ? '暂停失败' : '继续失败'); return }
   await nav.poll()
 }
 
@@ -156,9 +166,12 @@ const logBox = ref<HTMLElement | null>(null)
 let logTimer: number | undefined
 
 async function loadLog() {
-  const r = await fetch(`/api/projects/${uid}/steps/${key}/log?tail=500`)
-  const j = await r.json()
-  logLines.value = j.lines ?? []
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${key}/log?tail=500`)
+    if (!r.ok) return
+    const j = await r.json()
+    logLines.value = j.lines ?? []
+  } catch { /* 后端瞬断: 下轮轮询再取 */ }
   nextTick(() => {
     if (logBox.value && running.value) logBox.value.scrollTop = logBox.value.scrollHeight
   })
@@ -235,14 +248,16 @@ function initDraft() {
 onMounted(loadParamSchema)
 
 async function putParams(updates: Record<string, any>, reset: string[]) {
-  const r = await fetch(`/api/projects/${uid}/step_params`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ updates, reset }),
-  })
-  if (!r.ok) { message.error('参数保存失败'); return false }
-  await loadParamSchema()
-  await nav.poll()
-  return true
+  try {
+    const r = await fetch(`/api/projects/${uid}/step_params`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates, reset }),
+    })
+    if (!r.ok) { message.error('参数保存失败'); return false }
+    await loadParamSchema()
+    await nav.poll()
+    return true
+  } catch { message.error('参数保存失败 (网络异常)'); return false }
 }
 
 async function saveParams() {
@@ -273,13 +288,6 @@ async function resetAll() {
   if (await putParams({}, paths)) message.success('已全部恢复跟随全局默认')
 }
 
-function fmtSize(n: number): string {
-  if (n > 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
-  if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
-  if (n > 1024) return (n / 1024).toFixed(1) + ' KB'
-  return n + ' B'
-}
-
 // ---- download 页媒体信息 (视频右侧信息栏) ----
 const media = ref<any>({ found: false })
 if (key === 'download') {
@@ -289,11 +297,6 @@ if (key === 'download') {
       if (r.ok) media.value = await r.json()
     } catch { /* 忽略 */ }
   })
-}
-function fmtDur(sec?: number): string {
-  if (!sec) return '—'
-  const m = Math.floor(sec / 60)
-  return `${m}分${Math.round(sec % 60).toString().padStart(2, '0')}秒`
 }
 
 // ---- 产出预览: 按步骤类型直接预览对应产物 (视频/音频/文本) ----
@@ -317,7 +320,9 @@ const preview = computed(() => {
     const audios = ['dub_full.wav'].filter(has)
       .map((n) => ({ name: n, label: AUDIO_LABEL[n] ?? n, url: artUrl(n) }))
     if (!fin && !audios.length) return null
-    return { kind: 'video', url: fin ? artUrl(fin.name) : null, audios }
+    // 成片未生成但配音轨已有时退回纯音频预览 (此前 kind 不匹配导致永远不显示)
+    return fin ? { kind: 'video', url: artUrl(fin.name), audios }
+               : { kind: 'audio', url: null, audios }
   }
   if (key === 'preprocess') {
     // 音轨分离: 视频同步预览 + 三轨切换 (AudioTracksPlayer)
@@ -354,6 +359,7 @@ async function loadText(name: string | null) {
   if (!name) { previewText.value = ''; return }
   try {
     const r = await fetch(`/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(name)}/raw`)
+    if (!r.ok) { previewText.value = '(读取失败)'; return }
     previewText.value = (await r.text()).slice(0, TEXT_TRUNCATE)
   } catch { previewText.value = '(读取失败)' }
 }
@@ -387,8 +393,9 @@ async function loadText(name: string | null) {
           <n-button v-else-if="!running" type="primary" :loading="busy"
                     :disabled="!canRun || dirMissing"
                     @click="run(false)">▶ 运行</n-button>
-          <n-button v-if="['done', 'stale', 'failed'].includes(step.status)"
-                    :disabled="running || dirMissing" @click="rerunDialog">🔁 强制重跑</n-button>
+          <n-button v-if="['done', 'stale', 'failed', 'interrupted'].includes(step.status)"
+                    :loading="busy" :disabled="dirMissing"
+                    @click="rerunDialog">🔁 强制重跑</n-button>
         </n-space>
       </n-space>
       <n-text depth="3" style="font-size: 12px">{{ step.description }}</n-text>
@@ -585,8 +592,6 @@ async function loadText(name: string | null) {
   word-break: break-all;
   margin: 0;
 }
-.arts { list-style: none; margin: 0; padding: 0; }
-.arts li { padding: 3px 0; }
 .fsec { font-size: 11.5px; color: rgba(255,255,255,0.45); margin: 8px 0 4px; }
 .fsec:first-child { margin-top: 0; }
 .fline { display: flex; align-items: center; gap: 4px; padding: 2px 0; }

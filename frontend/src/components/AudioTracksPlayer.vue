@@ -6,6 +6,7 @@
 // v3 修复: 此前模板里漏渲染了 <audio> 元素 (勾选任何轨都不会发声),
 // 且播放循环未按勾选过滤 (应只播启用的轨)
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { fmtDur } from '../utils/format'
 
 const props = defineProps<{
   tracks: { name: string, label: string, url: string, peaks: string, size?: number }[]
@@ -19,6 +20,7 @@ const enabled = ref<Set<string>>(new Set())
 const peaksMap = ref<Record<string, number[]>>({})
 const durs = ref<Record<string, number>>({})
 const videoErr = ref(false)
+const trackErr = ref<Set<string>>(new Set())   // 加载失败的音轨 (勾选也没声音, 明示)
 const hasVideo = computed(() => !!props.videoUrl && !videoErr.value)
 let raf = 0
 
@@ -29,24 +31,31 @@ let lastSig = ''
 watch(trackSig, (sig) => {
   if (sig === lastSig) return
   lastSig = sig
+  trackErr.value = new Set()
   // 默认启用第一条 (原始音轨); 其余由用户勾选叠加
   enabled.value = new Set([props.tracks[0]?.name].filter(Boolean) as string[])
   void loadAllPeaks()
 }, { immediate: true })
 
 async function loadAllPeaks() {
+  const seq = lastSig                       // 轨道签名: await 之后若已变化则丢弃结果
   peaksMap.value = {}
   durs.value = {}
+  const got: Record<string, number[]> = {}
+  const gotDur: Record<string, number> = {}
   await Promise.all(props.tracks.map(async (t) => {
     try {
       const r = await fetch(t.peaks)
       if (r.ok) {
         const j = await r.json()
-        peaksMap.value[t.name] = j.points ?? []
-        durs.value[t.name] = j.duration ?? 0
+        got[t.name] = j.points ?? []
+        gotDur[t.name] = j.duration ?? 0
       }
     } catch { /* 波形失败不影响播放 */ }
   }))
+  if (seq !== lastSig) return               // 期间轨道集合变了: 过期结果不写入
+  peaksMap.value = got
+  durs.value = gotDur
   draw()
 }
 
@@ -123,6 +132,9 @@ function onAudioLoaded(name: string) {
   a.currentTime = Math.min(v.currentTime, a.duration || v.currentTime)
   if (!v.paused && enabled.value.has(name)) void a.play().catch(() => {})
 }
+function onAudioError(name: string) {
+  trackErr.value = new Set([...trackErr.value, name])
+}
 
 // —— 波形: 启用轨亮色 / 未启用暗色; 竖线 = 播放位置 ——
 function draw() {
@@ -195,11 +207,6 @@ function fallbackToggle() {
   }
 }
 
-function fmtDur(sec?: number): string {
-  if (!sec) return ''
-  const m = Math.floor(sec / 60)
-  return `${m}:${Math.round(sec % 60).toString().padStart(2, '0')}`
-}
 onBeforeUnmount(() => stopLoop())
 </script>
 
@@ -240,8 +247,14 @@ onBeforeUnmount(() => stopLoop())
   <div style="display: none">
     <audio v-for="t in tracks" :key="t.name"
            :ref="(el) => setAudio(t.name, el as HTMLAudioElement | null)"
-           :src="t.url" preload="auto" @loadedmetadata="onAudioLoaded(t.name)" />
+           :src="t.url" preload="auto"
+           @loadedmetadata="onAudioLoaded(t.name)"
+           @error="onAudioError(t.name)" />
   </div>
+  <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block; margin-top: 6px">
+    ⚠ 音轨加载失败: {{ [...trackErr].map(n => tracks.find(t => t.name === n)?.label ?? n).join('、') }}
+    (文件可能尚未生成或已损坏)
+  </n-text>
 </template>
 
 <style scoped>

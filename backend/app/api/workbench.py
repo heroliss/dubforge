@@ -20,8 +20,6 @@ from dubforge.pipeline.video_source import resolve_video
 
 router = APIRouter(prefix="/api/projects/{uid}/workbench", tags=["workbench"])
 
-_LOCK_GUARD = {}
-
 
 def _confirm_file(pdir) -> Path:
     return pdir / "workbench_confirm.json"
@@ -116,7 +114,6 @@ async def synthesize(uid: str, line_id: int, body: dict | None = None):
 
     force = bool((body or {}).get("force", False))
     r = await run_in_threadpool(synth_line, project, line, pdir, force)
-    import wave
     dur = _wav_dur(r["file"])
     return {"ok": True, "status": r["status"], "duration": dur,
             "url": f"/api/projects/{uid}/workbench/audio/line/{line_id}"}

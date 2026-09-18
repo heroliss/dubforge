@@ -51,7 +51,7 @@ def synth(url: str, text: str, out_path: Path, lang: str = "zh",
             with open(tmp, "wb") as f:
                 for chunk in r.iter_bytes():
                     f.write(chunk)
-    # GPT-SoVITS 返回 wav; 统一 32k mono
+    # GPT-SoVITS 返回 wav; 统一 32k mono (显式 -f wav: .norm 后缀无法推断格式)
     subprocess.run(["ffmpeg", "-y", "-i", str(tmp), "-ar", "32000", "-ac", "1",
                     "-f", "wav", str(out_path.with_suffix(".norm"))],
                    check=True, capture_output=True)

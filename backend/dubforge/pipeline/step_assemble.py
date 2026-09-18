@@ -22,7 +22,9 @@ from dubforge.utils import audio as au
 
 def _ffprobe_duration(path: Path) -> float:
     r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration",
-                        "-of", "csv=p=0", str(path)], capture_output=True, text=True)
+                        "-of", "csv=p=0", str(path)],
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace")
     try:
         return float(r.stdout.strip())
     except ValueError:
@@ -45,6 +47,8 @@ def _mix_timeline(ctx, pdir: Path, total: float) -> Path:
         raise DubForgeError("没有任何已合成的配音句", code="NO_DUB_LINES",
                             suggestion="请先完成 tts 步骤或在工作台合成部分句子。")
     ctx.log(f"铺轨: {len(entries)} 句 → {total:.1f}s 人声轨")
+    # 句首尾 10ms 淡入淡出, 消除逐句拼接处的咔哒声 (au.fade_in_out)
+    entries = [(s, au.fade_in_out(a)) for s, a in entries]
     mixed = au.mix_over_timeline(entries, total)
     mixed = au.peak_normalize(mixed, -3.0)
 

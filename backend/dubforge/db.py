@@ -13,10 +13,22 @@ def get_engine():
     global _engine
     if _engine is None:
         config.data_root().mkdir(parents=True, exist_ok=True)
+        # WAL + 较长 busy 超时: 执行器线程与 API 线程并发读写同一库,
+        # 默认 journal 模式下一边写一边读很容易 "database is locked"
         _engine = sqlmodel.create_engine(
             f"sqlite:///{config.db_path()}",
-            connect_args={"check_same_thread": False},
+            connect_args={"check_same_thread": False, "timeout": 30},
         )
+
+        from sqlalchemy import event
+
+        @event.listens_for(_engine, "connect")
+        def _set_sqlite_pragma(dbapi_conn, _record):
+            cur = dbapi_conn.cursor()
+            cur.execute("PRAGMA journal_mode=WAL")
+            cur.execute("PRAGMA synchronous=NORMAL")
+            cur.execute("PRAGMA foreign_keys=ON")
+            cur.close()
     return _engine
 
 

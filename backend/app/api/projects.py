@@ -71,7 +71,11 @@ async def ingest_video(uid: str, request: Request, filename: str = "video.mp4"):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     if project.source_kind != "local":
         raise DubForgeError("只有本地导入项目可以接收文件内容", code="INGEST_KIND_INVALID")
-    name = re.sub(r'[\\/:*?"<>|]', "_", filename).strip() or "video.mp4"
+    name = re.sub(r'[\\/:*?"<>|]', "_", filename).strip()
+    # "."开头 (隐藏文件/纯点) 与无扩展名一律归一为 video.mp4 —— dst 拼进 media/
+    # 时绝不能出现 ".."/"." 这类路径组件
+    if not name or name.startswith(".") or "." not in name:
+        name = "video.mp4"
     pdir = crud.project_dir(uid)
     media = pdir / "media"
     media.mkdir(parents=True, exist_ok=True)
@@ -340,7 +344,8 @@ def project_files(uid: str):
 
 @router.delete("/{uid}")
 def delete_project(uid: str, force: bool = False):
-    """删除项目; 有运行中/排队步骤时默认拒绝 (force=true: 先取消并等退出, 最多 20s)"""
+    """删除项目; 有运行中/排队步骤时默认拒绝 (force=true: 取消并等退出, 每阶段 8s;
+    温和取消超时自动升级强制结束 —— 子进程立即终止, 进程内计算后台收尾后结果丢弃)"""
     import time
     project = crud.get_project(uid)
     if not project:
@@ -355,21 +360,34 @@ def delete_project(uid: str, force: bool = False):
                 code="PROJECT_BUSY",
                 suggestion="先取消运行中的步骤再删除; 或在确认框中选择「取消任务并删除」。")
         from dubforge.runner import runner as _runner
+
+        def _still_active() -> list:
+            return [s for s in crud.get_steps(project.id)
+                    if s.status in ("running", "queued")]
+
         for s in active:
             _runner.cancel_step(uid, s.step_key)
-        deadline = time.time() + 20
-        while time.time() < deadline:
-            cur = [s for s in crud.get_steps(project.id)
-                   if s.status in ("running", "queued")]
-            if not cur:
-                break
-            time.sleep(0.4)
-        else:
-            raise DubForgeError("取消超时, 任务尚未退出; 请稍后再试",
+        if _wait_idle(_still_active, time.time() + 8):
+            # 温和取消没退完 (如 demucs 进程内计算) → 强制结束: 状态立即落定
+            for s in _still_active():
+                _runner.force_stop(uid, s.step_key)
+            _wait_idle(_still_active, time.time() + 8)
+        if _still_active():
+            raise DubForgeError("任务尚未退出 (后台可能仍在收尾); 请稍后再试",
                                 code="PROJECT_DELETE_TIMEOUT")
     if not crud.delete_project(uid):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     return {"ok": True}
+
+
+def _wait_idle(still_active, deadline: float) -> bool:
+    """等待步骤全部退出; 超时返回 True (调用方决定升级/报错)"""
+    import time
+    while still_active():
+        if time.time() >= deadline:
+            return True
+        time.sleep(0.3)
+    return False
 
 
 def _project_view(project) -> dict:
@@ -414,7 +432,8 @@ def media_info(uid: str):
         r = subprocess.run(
             ["ffprobe", "-v", "error", "-print_format", "json",
              "-show_format", "-show_streams", str(v)],
-            capture_output=True, text=True, timeout=20)
+            capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=20)
         if r.returncode == 0:
             d = json.loads(r.stdout or "{}")
             vs = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), {})

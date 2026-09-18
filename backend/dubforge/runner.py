@@ -114,6 +114,8 @@ class StepContext:
         on_stdout/on_stderr: 按行回调 (实时进度); 返回 (returncode, stdout, stderr)。"""
         proc = subprocess.Popen(
             cmd, cwd=cwd, env=env, text=True,
+            encoding="utf-8", errors="replace",   # 子进程 (yt-dlp/ffmpeg) 输出为 UTF-8;
+                                                  # 不指定时 Windows 按 gbk 解码会乱码
             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         with self._subproc_lock:
             self._subprocs.add(proc)
@@ -457,6 +459,8 @@ class Runner:
             if abandoned:
                 raise StepCancelled("步骤已被强制结束, 本次运行结果按废弃处理")
             step = crud.get_step(project.id, step_key)
+            if step is None:              # 项目/步骤行已被删除 (强制删除流程)
+                raise StepCancelled("项目已删除, 结果丢弃")
             step.status = "done"
             step.progress = 100.0
             step.finished_at = datetime.datetime.now(datetime.timezone.utc)
@@ -466,26 +470,29 @@ class Runner:
             self.continue_chain(project, ctx)
         except StepCancelled as e:
             self._clear_chain(project, "用户取消")
-            with self._lock:
-                abandoned = k in self._abandoned
             step = crud.get_step(project.id, step_key)
-            # 强制结束时 DB 行已由 force_stop 写好 (含「已强制结束」文案), 不覆盖
-            if not abandoned:
-                step.status = "failed"
-                step.error_code, step.error_message = e.code, e.message
-                step.error_suggestion = e.suggestion
-                step.finished_at = datetime.datetime.now(datetime.timezone.utc)
-                crud.save_step(step)
+            # 项目可能已被删除 (强制删除流程): 只留日志, 不把行写回成幽灵
+            if step is not None:
+                with self._lock:
+                    abandoned = k in self._abandoned
+                # 强制结束时 DB 行已由 force_stop 写好 (含「已强制结束」文案), 不覆盖
+                if not abandoned:
+                    step.status = "failed"
+                    step.error_code, step.error_message = e.code, e.message
+                    step.error_suggestion = e.suggestion
+                    step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                    crud.save_step(step)
             job.status, job.error_detail = "cancelled", e.message
             ctx.log(f"⛔ 已取消: {e.message}")
         except DubForgeError as e:
             self._clear_chain(project, f"步骤失败 [{e.code}]")
             step = crud.get_step(project.id, step_key)
-            step.status = "failed"
-            step.error_code, step.error_message = e.code, e.message
-            step.error_suggestion = e.suggestion
-            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
-            crud.save_step(step)
+            if step is not None:
+                step.status = "failed"
+                step.error_code, step.error_message = e.code, e.message
+                step.error_suggestion = e.suggestion
+                step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                crud.save_step(step)
             job.status, job.error_detail = "failed", str(e.detail or e.message)
             ctx.log(f"❌ 失败 [{e.code}]: {e.message}")
         except Exception as e:  # 未知异常兜底: 不让线程静默死亡
@@ -493,12 +500,13 @@ class Runner:
             import traceback
             tb = traceback.format_exc()
             step = crud.get_step(project.id, step_key)
-            step.status = "failed"
-            step.error_code = "UNEXPECTED_ERROR"
-            step.error_message = f"未预期的错误: {type(e).__name__}: {e}"
-            step.error_suggestion = "请查看日志详情; 可直接重跑该步骤。"
-            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
-            crud.save_step(step)
+            if step is not None:
+                step.status = "failed"
+                step.error_code = "UNEXPECTED_ERROR"
+                step.error_message = f"未预期的错误: {type(e).__name__}: {e}"
+                step.error_suggestion = "请查看日志详情; 可直接重跑该步骤。"
+                step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                crud.save_step(step)
             job.status, job.error_detail = "failed", tb
             ctx.log(f"❌ 未预期异常:\n{tb}")
         finally:
@@ -517,8 +525,9 @@ class Runner:
                 self._pauses.pop(k, None)
                 self._ctxs.pop(k, None)
                 self._abandoned.discard(k)
-            crud.write_manifest(project.uid)
-            self._refresh_project_status(project.uid)
+            if crud.get_project(project.uid) is not None:
+                crud.write_manifest(project.uid)
+                self._refresh_project_status(project.uid)
 
     @staticmethod
     def _refresh_project_status(uid: str) -> None:

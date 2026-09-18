@@ -161,3 +161,22 @@ def test_artifact_peaks(isolated_env):
         assert abs(j["duration"] - 0.5) < 0.05
         assert max(j["points"]) <= 1.0
         assert client.get(url).json() == j               # 缓存命中
+
+
+def test_spa_blocks_path_traversal(isolated_env):
+    """SPA 静态托管: 编码穿越 (..%2F) 不允许读到 dist 外的文件 (如仓库 config.yaml)"""
+    from fastapi.testclient import TestClient
+    from app.main import FRONTEND_DIST, app
+    if not FRONTEND_DIST.is_dir():
+        return                        # 前端未构建的环境跳过 (CI 只跑后端时)
+    with TestClient(app) as client:
+        for evil in ("/..%2F..%2Fbackend%2Fpyproject.toml",
+                     "/..%2F..%2Fconfig.yaml",
+                     "%2e%2e%2f%2e%2e%2fbackend%2fpyproject.toml"):
+            r = client.get(evil)
+            # 命中穿越会返回被探测文件的内容; 正常行为是回退 index.html
+            assert "text/html" in r.headers.get("content-type", ""), evil
+            assert "[" not in r.text[:20] or "build-system" not in r.text, evil
+        # 正常静态资源仍可达
+        r = client.get("/index.html")
+        assert r.status_code == 200

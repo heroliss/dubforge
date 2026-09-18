@@ -83,8 +83,9 @@ const projActive = computed(() => {
       </template>
     </n-layout-sider>
     <n-layout>
-      <!-- :key 强制同组件路由切换时重挂载 (步骤页 → 步骤页参数变了但组件会被复用, 内容不刷新) -->
-      <router-view :key="route.fullPath" />
+      <!-- :key 强制同组件路由切换时重挂载 (步骤页参数在 setup 读取, 复用组件不会刷新)。
+           用 path 不用 fullPath: query 变化 (如工作台切换项目) 不必整页重挂载 -->
+      <router-view :key="route.path" />
     </n-layout>
   </n-layout>
 </template>

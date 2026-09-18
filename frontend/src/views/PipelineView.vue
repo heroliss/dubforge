@@ -8,6 +8,7 @@ import {
   useNavStore, STEP_ORDER, STATUS_TAG, STATUS_TEXT, STATUS_EMOJI,
 } from '../stores/nav'
 import MediaInfo from '../components/MediaInfo.vue'
+import { fmtSize } from '../utils/format'
 
 const route = useRoute()
 const message = useMessage()
@@ -17,14 +18,22 @@ const uid = route.params.uid as string
 
 const isAuto = (key: string) => (nav.autoSteps ? nav.autoSteps.includes(key) : true)
 async function toggleAuto(key: string, val: boolean) {
+  const prev = nav.autoSteps
   const set = new Set(nav.autoSteps ?? [...STEP_ORDER])
   if (val) set.add(key)
   else set.delete(key)
   nav.autoSteps = STEP_ORDER.filter((k) => set.has(k))
-  await fetch(`/api/projects/${uid}/auto_steps`, {
-    method: 'PUT', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ steps: nav.autoSteps }),
-  })
+  try {
+    const r = await fetch(`/api/projects/${uid}/auto_steps`, {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steps: nav.autoSteps }),
+    })
+    if (!r.ok) throw new Error(String(r.status))
+  } catch {
+    // 保存失败: 回滚本地勾选并提示, 否则 2.5s 后被轮询静默弹回, 像闹鬼
+    nav.autoSteps = prev ?? null
+    message.error('勾选保存失败 (网络异常)')
+  }
 }
 
 // ---- 原视频 ----
@@ -52,14 +61,6 @@ watch(() => nav.stepMap['download']?.status, (s, o) => {
 })
 const videoSrc = computed(() =>
   media.value.found ? `/api/projects/${uid}/workbench/video?v=${mediaV.value}` : '')
-
-function fmtSize(n?: number): string {
-  if (n == null) return '—'
-  if (n > 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
-  if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
-  if (n > 1024) return (n / 1024).toFixed(1) + ' KB'
-  return n + ' B'
-}
 
 // ---- 项目文件 (排序浏览 + 资源管理器) ----
 const files = ref<any[]>([])
@@ -114,12 +115,12 @@ async function run(step: any, force = false) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ force }),
     })
-    const j = await r.json()
-    if (!r.ok) { message.error(j.message || '启动失败'); return }
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) { message.error(j.message || `启动失败 (HTTP ${r.status})`); return }
     if (j.status === 'skipped') message.info(j.message)
     else message.success(force ? '已开始强制重跑' : `已启动: ${step.label}`)
     await nav.poll()
-  } finally { busyKey.value = '' }
+  } catch { message.error('启动请求失败 (网络异常)') } finally { busyKey.value = '' }
 }
 
 // 勾选链: 从该步骤起连续勾选的步骤
@@ -140,12 +141,12 @@ async function runChain(step: any) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ steps: chain }),
     })
-    const j = await r.json()
-    if (!r.ok) { message.error(j.message || '启动失败'); return }
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) { message.error(j.message || `启动失败 (HTTP ${r.status})`); return }
     message.success(`已启动「${step.label}」` +
       (chain.length > 1 ? `，完成后自动执行后续 ${chain.length - 1} 个勾选步骤` : ''))
     await nav.poll()
-  } finally { busyKey.value = '' }
+  } catch { message.error('启动请求失败 (网络异常)') } finally { busyKey.value = '' }
 }
 function stopDialog(step: any) {
   dialog.warning({
@@ -158,7 +159,10 @@ function stopDialog(step: any) {
   })
 }
 async function doCancel(step: any) {
-  await fetch(`/api/projects/${uid}/steps/${step.key}/cancel`, { method: 'POST' })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${step.key}/cancel`, { method: 'POST' })
+    if (!r.ok) { message.error('停止信号发送失败'); return }
+  } catch { message.error('停止信号发送失败'); return }
   message.info('停止信号已发送 (自动续跑将停止)；长时间无响应可用「强制结束」')
 }
 function forceDialog(step: any) {
@@ -172,15 +176,21 @@ function forceDialog(step: any) {
   })
 }
 async function doForce(step: any) {
-  await fetch(`/api/projects/${uid}/steps/${step.key}/force_stop`, { method: 'POST' })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${step.key}/force_stop`, { method: 'POST' })
+    if (!r.ok) { message.error('强制结束失败'); return }
+  } catch { message.error('强制结束失败'); return }
   message.success('已强制结束')
   await nav.poll()
 }
 async function setPause(step: any, p: boolean) {
-  await fetch(`/api/projects/${uid}/steps/${step.key}/pause`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ pause: p }),
-  })
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${step.key}/pause`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ pause: p }),
+    })
+    if (!r.ok) { message.error(p ? '暂停失败' : '继续失败'); return }
+  } catch { message.error(p ? '暂停失败' : '继续失败'); return }
   await nav.poll()
 }
 function rerunDialog(step: any) {
@@ -308,6 +318,7 @@ const headerStatus = computed(() => {
               <n-button size="small" quaternary type="info"
                         :disabled="s.status === 'running' || s.status === 'queued'
                           || blockersOf(s.key).length > 0"
+                        :loading="busyKey === s.key"
                         @click="runChain(s)">▶▶ 本步及后续</n-button>
             </span>
             <n-button size="small" type="error" secondary

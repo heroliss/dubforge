@@ -1,12 +1,12 @@
 # -*- coding: utf-8 -*-
 """
-步骤实现注册表 (M1: 全部为桩实现; M2/M3 逐个替换为真实管线)
-============================================================
-桩实现契约与真实实现完全一致:
-  - 签名 run(ctx: StepContext), 幂等 (由执行器的指纹跳过机制保证语义)
-  - 通过 ctx.log 打点 / ctx.check_cancel 协作取消 / ctx.write_json 产出原子产物
-  - 测试支持: 项目 params {"fail_step": "translate"} 可让指定步骤模拟失败,
-    {"delay_step": {"translate": 2}} 可模拟耗时 (测取消)
+步骤实现注册表
+==============
+key → run(ctx) 的映射; 九步均已为真实实现。
+契约: 签名 run(ctx: StepContext), 幂等 (由执行器的指纹跳过机制保证语义);
+通过 ctx.log 打点 / ctx.check_cancel / ctx.check_pause 响应停止与暂停 /
+ctx.write_* 原子产出。
+测试可用 stub_heavy_steps 夹具临时替换 _RUNNERS[key] (状态机测试与真实现解耦)。
 """
 import time
 from typing import Callable
@@ -15,6 +15,7 @@ from dubforge.pipeline.registry import STEP_KEYS
 
 
 def _stub(step_key: str):
+    """兜底桩 (当前注册表全覆盖, 仅测试/未来新步骤占位用)"""
     def run(ctx) -> None:
         ctx.log(f"[stub] 桩实现: 模拟 {step_key} 的工作")
         delays = ctx.project_params.get("delay_step", {})

@@ -1,19 +1,8 @@
 <script setup lang="ts">
 // 原视频信息 (共享): 总览页与「获取视频」步骤页复用同一份描述列表
-defineProps<{ media: any }>()
+import { fmtSize, fmtDurCN as fmtDur } from '../utils/format'
 
-function fmtSize(n?: number): string {
-  if (n == null) return '—'
-  if (n > 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
-  if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
-  if (n > 1024) return (n / 1024).toFixed(1) + ' KB'
-  return n + ' B'
-}
-function fmtDur(sec?: number): string {
-  if (!sec) return '—'
-  const m = Math.floor(sec / 60)
-  return `${m}分${Math.round(sec % 60).toString().padStart(2, '0')}秒`
-}
+defineProps<{ media: any }>()
 </script>
 
 <template>

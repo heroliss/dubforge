@@ -84,7 +84,9 @@ const savedRoot = ref('')                 // 已应用状态: 总工作目录
 const savedSteps = ref('')                // 已应用状态: 全局步骤参数
 const cardDirty = computed(() => profiles.value.map((p, i) => {
   if (!dirtyOn.value) return false
-  return i >= savedProfiles.value.length ||
+  // JSON 非法也算"未保存" —— 否则 toWire 归一成 {} 后可能恰好等于基线,
+  // 应用按钮被禁、applySettings 里的格式警告永远走不到
+  return i >= savedProfiles.value.length || paramsJsonBad(p) ||
          JSON.stringify(toWire(p)) !== savedProfiles.value[i]
 }))
 const formDirty = computed(() =>
@@ -123,6 +125,11 @@ onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 function parseParams(p: any): any {
   try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
 }
+// 专属参数 JSON 是否填了但格式非法 (非法 ≠ 未填: 前者必须提示, 且算"未保存")
+function paramsJsonBad(p: any): boolean {
+  if (!(p.paramsJson || '').trim()) return false
+  try { JSON.parse(p.paramsJson); return false } catch { return true }
+}
 
 function addProfile() {
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
@@ -150,7 +157,7 @@ onMounted(async () => {
       paramsJson: (p.params && Object.keys(p.params).length)
         ? JSON.stringify(p.params, null, 1) : '',
     }))
-    form.value.max_workers = Number(llm.max_workers)
+    form.value.max_workers = Number(llm.max_workers) || 1
     form.value.timeout = Number(llm.timeout ?? 300)
     form.value.data_root = String(cfg.value.server?.data_root ?? '')
     form.value.conc = { ...(cfg.value.runner?.step_concurrency ?? {}) }
@@ -167,10 +174,7 @@ async function applySettings() {
   saving.value = true
   try {
     // 专属参数 JSON 写错时后端按空处理, 这里提示一声避免无感
-    const bad = profiles.value
-      .filter(p => (p.paramsJson || '').trim() && (() => {
-        try { JSON.parse(p.paramsJson); return false } catch { return true }
-      })())
+    const bad = profiles.value.filter(paramsJsonBad)
       .map(p => p.name?.trim() || `#${profiles.value.indexOf(p) + 1}`)
     if (bad.length) {
       message.warning(`这些组的专属参数 JSON 格式有误，已按空处理：${bad.join('、')}`)
@@ -504,7 +508,8 @@ function extraParamsStr(r: any): string {
           <n-alert v-if="caps" type="default" :show-icon="false" :bordered="true"
                    style="margin-bottom: 10px">
             🔊 <n-text strong>语言能力</n-text>（随所用后端自动适应）：
-            语音转文字 ({{ caps.asr.backend }}) 支持 {{ caps.asr.langs.length - 1 }} 种语言；
+            语音转文字 ({{ caps.asr.backend }}) 支持
+            {{ caps.asr.langs.filter((l: any) => l[0] !== 'auto').length }} 种语言；
             逐句配音 ({{ caps.tts.backend }}) 支持
             {{ caps.tts.langs.map((l: any) => l[1]).join(' / ') }}。
             这几个就是<b>可贯穿全流程</b>的配音目标语言（识别 → 翻译 → 配音），

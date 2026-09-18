@@ -1,9 +1,10 @@
 <script setup lang="ts">
 // 项目列表: 真实 CRUD + 新建 (yt-dlp 支持的任意站点链接 / 本地导入) + 改名
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
 import { useNavStore, STATUS_TEXT } from '../stores/nav'
+import { fmtSize } from '../utils/format'
 
 const router = useRouter()
 const message = useMessage()
@@ -20,13 +21,13 @@ const renaming = ref<any>(null)
 const renameTitle = ref('')
 const renameSaving = ref(false)
 
-let pollTimer: number | undefined
 async function load(showSpin = false) {
   if (showSpin) loading.value = true
   try {
     const r = await fetch('/api/projects')
+    if (!r.ok) return                      // 失败保留旧列表, 不让垃圾数据进来
     projects.value = await r.json()
-  } finally {
+  } catch { /* 后端不可达: 保留旧列表 */ } finally {
     loading.value = false
   }
 }
@@ -36,7 +37,6 @@ async function refreshList() {
   await load(true)
 }
 onMounted(refreshList)
-onUnmounted(() => pollTimer && clearInterval(pollTimer))
 
 // —— 勾选批量运行 / 单项目运行 / 资源管理器 ——
 const sel = ref<Set<string>>(new Set())
@@ -46,19 +46,23 @@ function toggleSel(uid: string, v: boolean) {
   else s.delete(uid)
   sel.value = s
 }
+const runningMany = ref(false)
 async function runMany(uids: string[]) {
-  if (!uids.length) return
-  const r = await fetch('/api/projects/run_many', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ uids }),
-  })
-  const j = await r.json()
-  if (!r.ok) { message.error(j.message || '批量启动失败'); return }
-  const skipped = j.results.filter((x: any) => x.skipped).map((x: any) => x.skipped)
-  message.success(`已启动 ${j.started} 个项目` +
-    (skipped.length ? `；跳过 ${skipped.length} 个 (${skipped[0]}${skipped.length > 1 ? ' 等' : ''})` : ''))
-  sel.value = new Set()
-  await load()
+  if (!uids.length || runningMany.value) return
+  runningMany.value = true
+  try {
+    const r = await fetch('/api/projects/run_many', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ uids }),
+    })
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok) { message.error(j.message || '批量启动失败'); return }
+    const skipped = (j.results ?? []).filter((x: any) => x.skipped).map((x: any) => x.skipped)
+    message.success(`已启动 ${j.started ?? 0} 个项目` +
+      (skipped.length ? `；跳过 ${skipped.length} 个 (${skipped[0]}${skipped.length > 1 ? ' 等' : ''})` : ''))
+    sel.value = new Set()
+    await load()
+  } catch { message.error('批量启动失败 (网络异常)') } finally { runningMany.value = false }
 }
 function runSelected() { runMany([...sel.value]) }
 function runProject(p: any) { runMany([p.uid]) }
@@ -106,15 +110,15 @@ async function applyRename() {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: renameTitle.value }),
     })
-    const j = await r.json()
-    if (j.uid) {
+    const j = await r.json().catch(() => ({}))
+    if (r.ok && j.uid) {
       renaming.value.title = j.title
       renaming.value = null
       message.success('已改名')
     } else {
-      message.error(j.message || '改名失败')
+      message.error(j.message || `改名失败 (HTTP ${r.status})`)
     }
-  } finally { renameSaving.value = false }
+  } catch { message.error('改名请求失败 (网络异常)') } finally { renameSaving.value = false }
 }
 
 function remove(p: any) {
@@ -154,15 +158,24 @@ const ingestPct = ref(0)
 const ingestErr = ref('')
 const newUid = ref<string | null>(null)
 
+let browseSeq = 0
 async function browseTo(path: string) {
-  const r = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`)
-  const j = await r.json()
-  if (!r.ok) { message.error(j.message || '打开文件夹失败'); return }
-  browsePath.value = j.path
-  browseParent.value = j.parent
-  browseEntries.value = j.entries
-  browseSel.value = null
-  localStorage.setItem('dubforge.browse', j.path)     // 记住浏览位置
+  const seq = ++browseSeq                    // 序号守卫: 快速连点时慢响应不覆盖新路径
+  try {
+    const r = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`)
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}))
+      message.error(j.message || '打开文件夹失败')
+      return
+    }
+    const j = await r.json()
+    if (seq !== browseSeq) return            // 已有更新的浏览请求, 丢弃过期结果
+    browsePath.value = j.path
+    browseParent.value = j.parent
+    browseEntries.value = j.entries
+    browseSel.value = null
+    localStorage.setItem('dubforge.browse', j.path)     // 记住浏览位置
+  } catch { message.error('浏览请求失败 (网络异常)') }
 }
 function openBrowse() {
   showBrowse.value = true
@@ -178,17 +191,10 @@ function browseConfirm() {
   }
   showBrowse.value = false
 }
-function fmtSize(n: number) {
-  if (!n) return ''
-  const u = ['B', 'KB', 'MB', 'GB', 'TB']
-  let i = 0
-  let v = n
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
-  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${u[i]}`
-}
 function onDrop(e: DragEvent) {
   const files = e.dataTransfer?.files
   if (!files?.length) { message.warning('未识别到文件'); return }
+  if (files.length > 1) message.info('一次只支持一个视频, 已取第一个')
   const f = files[0]
   if (f.size === 0 && f.type === '') {
     message.warning('似乎拖入的是文件夹 —— 请拖入视频文件')
@@ -304,7 +310,7 @@ function resetNewForm() {
         <n-button size="small" @click="sortDesc = !sortDesc">
           {{ sortDesc ? '↓ 降序' : '↑ 升序' }}
         </n-button>
-        <n-button v-if="sel.size" type="primary" @click="runSelected">
+        <n-button v-if="sel.size" type="primary" :loading="runningMany" @click="runSelected">
           ▶▶ 运行选中 ({{ sel.size }})
         </n-button>
         <n-button size="small" quaternary title="重新对账并刷新列表 (回收站还原的项目会自动找回)"

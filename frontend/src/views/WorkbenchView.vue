@@ -16,9 +16,15 @@ const sel = ref<number | null>(null)
 const filter = ref('')
 const volDub = ref(1.0), volBg = ref(0.3), syncVideo = ref(true)
 const busyLine = ref<number | null>(null)
-const playing = ref(false)
 
-onUnmounted(() => { if (_keyHandler) window.removeEventListener('keydown', _keyHandler) })
+onUnmounted(() => {
+  if (_keyHandler) window.removeEventListener('keydown', _keyHandler)
+  // WebAudio 资源收口: 浏览器 AudioContext 数量有上限, 反复进出不释放会耗尽
+  try { ctx?.close() } catch { /* 已关闭 */ }
+  ctx = null
+  bgBuf = null
+  bufCache.clear()
+})
 const videoEl = ref<HTMLVideoElement>()
 const lineListEl = ref<HTMLElement>()
 
@@ -50,23 +56,33 @@ async function applyPreset() {
   if (!presetSel.value) return
   applying.value = true
   try {
-    await fetch('/api/workbench-presets/apply', {
+    const r = await fetch('/api/workbench-presets/apply', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ name: presetSel.value }),
     })
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok || !j.ok) { message.error(j.message || `预设应用失败 (HTTP ${r.status})`); return }
     message.success(`已应用预设「${presetSel.value}」(参数即时生效)`)
     await loadPresets()
   } finally { applying.value = false }
 }
 
 async function loadProjects() {
-  const r = await fetch('/api/projects')
-  projects.value = (await r.json()).filter((p: any) => p.status !== 'created' || true)
+  try {
+    const r = await fetch('/api/projects')
+    if (!r.ok) return
+    projects.value = await r.json()
+  } catch { /* 后端不可达: 保留空列表 */ }
 }
 async function load() {
   if (!uid.value) return
-  const r = await fetch(`/api/projects/${uid.value}/workbench`)
-  state.value = await r.json()
+  try {
+    const r = await fetch(`/api/projects/${uid.value}/workbench`)
+    if (!r.ok) { state.value = null; return }
+    const j = await r.json()
+    // 结构守卫: 后端异常/老版本响应缺 lines 时不能让页面崩成白屏
+    state.value = Array.isArray(j.lines) ? j : { ...j, lines: [] }
+  } catch { state.value = null }
 }
 onMounted(async () => {
   await loadProjects()
@@ -96,8 +112,8 @@ function fmt(t: number) {
 
 async function select(id: number) {
   sel.value = id
-  const l = state.value.lines.find((x: any) => x.id === id)
-  if (l && videoEl.value && state.value.video.found) {
+  const l = state.value?.lines?.find((x: any) => x.id === id)
+  if (l && videoEl.value && state.value?.video?.found) {
     videoEl.value.currentTime = l.start
   }
   await nextTick()
@@ -119,21 +135,24 @@ async function synth(force = false) {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ force }),
     })
-    const j = await r.json()
-    if (!j.ok) { message.error(j.message || j.detail || '合成失败'); return }
+    const j = await r.json().catch(() => ({}))
+    if (!r.ok || !j.ok) { message.error(j.message || j.detail || `合成失败 (HTTP ${r.status})`); return }
     message.success(j.status === 'skipped' ? '已有缓存, 直接试听' : '合成完成')
     await load()
     preview(false)
-  } finally { busyLine.value = null }
+  } catch { message.error('合成请求失败 (网络/服务异常)') } finally { busyLine.value = null }
 }
 
 async function toggleConfirm() {
   if (!sel.value) return
-  const l = state.value.lines.find((x: any) => x.id === sel.value)
-  await fetch(`/api/projects/${uid.value}/workbench/lines/${sel.value}/confirm`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ confirmed: !l.confirmed }),
-  })
+  const l = state.value?.lines?.find((x: any) => x.id === sel.value)
+  try {
+    const r = await fetch(`/api/projects/${uid.value}/workbench/lines/${sel.value}/confirm`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ confirmed: !l?.confirmed }),
+    })
+    if (!r.ok) { message.error('采纳状态保存失败'); return }
+  } catch { message.error('采纳状态保存失败'); return }
   await load()
 }
 
@@ -151,7 +170,7 @@ function actx() {
 }
 function stopAll() {
   live.forEach(s => { try { s.stop() } catch {} }); live = []
-  clearTimeout(stopTimer); playing.value = false
+  clearTimeout(stopTimer)
   if (videoEl.value) videoEl.value.pause()
 }
 async function getBuf(url: string): Promise<AudioBuffer> {
@@ -190,7 +209,6 @@ async function preview(mix: boolean) {
   if (syncVideo.value && state.value.video.found && videoEl.value) {
     videoEl.value.muted = true; videoEl.value.currentTime = l.start; videoEl.value.play()
   }
-  playing.value = true
   const span = Math.max(end - t0, l.end - l.start) + 0.6
   stopTimer = window.setTimeout(stopAll, span * 1000)
 }

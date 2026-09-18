@@ -74,9 +74,12 @@ if FRONTEND_DIST.is_dir():
 
     @app.get("/{full_path:path}")
     def spa(full_path: str):
-        # API 之外的路径全部回退到 index.html; index 禁缓存 (防旧资源清单)
+        # API 之外的路径全部回退到 index.html; index 禁缓存 (防旧资源清单)。
+        # 候选路径必须仍在 dist 内 (resolve 后校验) —— 挡住 /..%2F..%2Fconfig.yaml
+        # 这类路径穿越, 防止把仓库里的密钥文件当静态资源吐出去。
         headers = {"Cache-Control": "no-store"}
-        candidate = FRONTEND_DIST / full_path
-        if full_path and candidate.is_file():
-            return FileResponse(candidate, headers=headers)
+        if full_path:
+            candidate = (FRONTEND_DIST / full_path).resolve()
+            if candidate.is_relative_to(FRONTEND_DIST) and candidate.is_file():
+                return FileResponse(candidate, headers=headers)
         return FileResponse(FRONTEND_DIST / "index.html", headers=headers)
