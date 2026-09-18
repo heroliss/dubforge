@@ -30,12 +30,12 @@ async function load(showSpin = false) {
     loading.value = false
   }
 }
-onMounted(async () => {
-  // 进列表页先对账一次: 回收站还原/手动拷入的项目目录自动重新登记
-  try { await fetch('/api/settings/rebuild_db', { method: 'POST' }) } catch { /* 后端未起也照常加载 */ }
-  load(true)
-  pollTimer = window.setInterval(() => load(false), 4000)   // 运行徽章/进度条保鲜
-})
+async function refreshList() {
+  // 对账一次 (回收站还原/手动拷入的目录自动重新登记) 再重新拉列表
+  try { await fetch('/api/settings/rebuild_db', { method: 'POST' }) } catch { /* 忽略 */ }
+  await load(true)
+}
+onMounted(refreshList)
 onUnmounted(() => pollTimer && clearInterval(pollTimer))
 
 // —— 勾选批量运行 / 单项目运行 / 资源管理器 ——
@@ -122,8 +122,8 @@ function remove(p: any) {
   dialog.warning({
     title: '删除项目',
     content: hasRun
-      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出；项目将从列表移除，目录移入系统回收站 —— ⚠ 若系统回收站被禁用，删除将无法找回。`
-      : `确定删除「${p.title}」？项目将从列表移除，目录移入系统回收站。⚠ 若系统回收站被禁用，删除将无法找回。（反悔：从回收站还原目录后，可在「设置 → 从项目目录重建索引」重新登记）`,
+      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出，然后删除项目并移动文件到回收站 —— 如果系统没开启回收站将永久删除。`
+      : `确定删除「${p.title}」？删除项目并移动文件到回收站 —— 如果系统没开启回收站将永久删除。`,
     positiveText: hasRun ? '取消任务并删除' : '删除',
     negativeText: '取消',
     onPositiveClick: async () => {
@@ -307,6 +307,8 @@ function resetNewForm() {
         <n-button v-if="sel.size" type="primary" @click="runSelected">
           ▶▶ 运行选中 ({{ sel.size }})
         </n-button>
+        <n-button size="small" quaternary title="重新对账并刷新列表 (回收站还原的项目会自动找回)"
+                  @click="refreshList">🔄 刷新</n-button>
         <n-button type="primary" @click="showNew = true">＋ 新建项目</n-button>
       </n-space>
     </n-space>
@@ -352,7 +354,7 @@ function resetNewForm() {
                 <template #trigger>
                   <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
                 </template>
-                删除项目: 目录移入系统回收站; ⚠ 若回收站被禁用则永久删除、无法找回
+                删除项目并移动文件到回收站；如果系统没开启回收站将永久删除
               </n-tooltip>
             </n-space>
           </n-space>

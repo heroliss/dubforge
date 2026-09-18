@@ -124,18 +124,6 @@ function parseParams(p: any): any {
   try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
 }
 
-// —— 从项目目录重建索引 (数据库只是可重建索引; 只补缺不覆盖) ——
-const rebuilding = ref(false)
-async function rebuildDb() {
-  rebuilding.value = true
-  try {
-    const r = await fetch('/api/settings/rebuild_db', { method: 'POST' })
-    const j = await r.json()
-    if (!r.ok) { message.error('重建失败'); return }
-    message.success(`已扫描项目目录: 新收编项目 ${j.projects} 个 (步骤 ${j.steps} 行 / 产物 ${j.artifacts} 条)`)
-  } finally { rebuilding.value = false }
-}
-
 function addProfile() {
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
                         base_url: '', api_key: '', model: '', enabled: true,
@@ -502,12 +490,9 @@ function extraParamsStr(r: any): string {
               ● 有未应用的修改
             </n-text>
           </div>
-          <div style="margin-top: 10px">
-            <n-button size="small" :loading="rebuilding" @click="rebuildDb">🔄 从项目目录重建索引</n-button>
-            <n-text depth="3" style="font-size:12px; margin-left:8px">
-              只补缺不覆盖；手动拷进 projects\ 的项目文件夹也会被收编 (拷文件夹 = 搬项目)
-            </n-text>
-          </div>
+          <n-text depth="3" style="font-size:12px; display:block; margin-top:6px">
+            回收站还原的项目目录会在进入「项目」列表时自动重新登记 (也可点列表右上角「刷新」)。
+          </n-text>
         </n-card>
 
         <!-- ============ 全局步骤参数 (schema 驱动, 项目未覆盖时使用) ============ -->

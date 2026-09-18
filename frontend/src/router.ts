@@ -12,5 +12,7 @@ export const router = createRouter({
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },
     { path: '/about', name: 'about', component: () => import('./views/AboutView.vue') },
     { path: '/help', name: 'help', component: () => import('./views/HelpView.vue') },
+    // 兜底: 未知路径 (如手输 /projects) 回到项目列表, 避免 router-view 空白
+    { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
 })
