@@ -109,6 +109,23 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     return data["choices"][0]["message"]["content"]
 
 
+def test_provider(provider: dict) -> dict:
+    """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果"""
+    import time as _time
+    t0 = _time.time()
+    try:
+        body = _payload(provider, [
+            {"role": "user", "content": "请只回复两个字母: OK"}], 0.0, json_mode=False)
+        reply = _post(provider, body, log=lambda m: None)
+        return {"ok": True, "latency": round(_time.time() - t0, 1),
+                "model": provider.get("model", ""),
+                "reply": str(reply)[:60]}
+    except DubForgeError as e:
+        return {"ok": False, "error": e.message, "suggestion": e.suggestion}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+
+
 def check_online() -> bool:
     """连通性探测: 任何 HTTP 响应都算可达 (404/403 只说明该路径无此端点);
     只有连接层异常才算不可达。结果缓存 60s。"""

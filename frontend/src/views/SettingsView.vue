@@ -11,6 +11,28 @@ const saving = ref(false)
 const testing = ref(false)
 const testResult = ref<null | { ok: boolean; text: string }>(null)
 const loadError = ref('')
+const testResults = ref<Record<number, any>>({})
+const testingIdx = ref<number | 'all' | null>(null)
+
+async function runTest(body: any) {
+  const r = await fetch('/api/settings/test_llm', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  })
+  const j = await r.json()
+  if (!r.ok) throw new Error(j.message || j.detail || '测试请求失败')
+  for (const res of (j.results ?? [])) {
+    testResults.value[res.index] = res
+  }
+  return j
+}
+async function testOne(i: number) {
+  await save(false)
+  testingIdx.value = i
+  try { await runTest({ index: i }) }
+  catch (e: any) { message.error(e.message) }
+  finally { testingIdx.value = null }
+}
 
 const profiles = ref<any[]>([])
 const form = ref({
@@ -93,15 +115,13 @@ async function save(showTip = true) {
 async function testConnection() {
   await save(false)
   testing.value = true
-  testResult.value = null
+  testResults.value = {}
   try {
-    const r = await fetch('/api/settings/test_llm', { method: 'POST' })
-    const j = await r.json()
-    testResult.value = j.ok
-      ? { ok: true, text: `${j.latency}s · 回复: ${j.reply}` }
-      : { ok: false, text: j.message + (j.suggestion ? ` — ${j.suggestion}` : '') }
+    const j = await runTest({})
+    const okN = (j.results ?? []).filter((r: any) => r.ok).length
+    message.info(`并行测试完成: ${okN}/${j.results.length} 组可用`)
   } catch (e: any) {
-    testResult.value = { ok: false, text: `请求失败: ${e.message}` }
+    message.error(e.message)
   } finally { testing.value = false }
 }
 </script>
@@ -137,6 +157,9 @@ async function testConnection() {
                           @click="move(i, 1)">↓</n-button>
                 <n-button size="tiny" quaternary type="error"
                           @click="delProfile(i)">删除</n-button>
+                <n-button size="tiny" quaternary
+                          :loading="testingIdx === i || testingIdx === 'all'"
+                          @click.stop="testOne(i)">测试</n-button>
                 <n-text depth="3" style="font-size: 11px">
                   按此列表顺序依次尝试，前面的不可用自动切到下一个
                 </n-text>
@@ -169,14 +192,20 @@ async function testConnection() {
                          style="margin-top:4px"
                          placeholder='JSON, 如 {"temperature":1,"top_p":0.95,"reasoning_effort":"max"}' />
               </div>
+              <n-alert v-if="testResults[i]" :type="testResults[i].ok ? 'success' : 'error'"
+                       :show-icon="false" size="small" style="margin-top:6px">
+                {{ testResults[i].ok
+                   ? `✓ ${testResults[i].latency}s · ${testResults[i].model} · ${testResults[i].reply}`
+                   : `✗ ${testResults[i].error}` }}
+              </n-alert>
             </div>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
           </div>
           <n-space style="margin-top:12px">
             <n-button type="primary" :loading="saving" @click="save()">保存全部</n-button>
-            <n-button :loading="testing" @click="testConnection">🔌 测试连接</n-button>
+            <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
             <n-text depth="3" style="font-size: 12px">
-              测试连接会先用当前表单值保存，再按配置池顺序发一个最小翻译请求
+              先保存当前表单值，再并行测试所有「启用」的配置；也可在每组配置卡上单独测试
             </n-text>
           </n-space>
           <n-alert v-if="testResult" :type="testResult.ok ? 'success' : 'error'"

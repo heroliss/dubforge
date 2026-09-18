@@ -34,26 +34,37 @@ def update_settings(body: SettingsUpdate):
 
 
 @router.post("/test_llm")
-def test_llm():
-    """LLM 连通性测试: 按配置池顺序发一个最小翻译请求, 返回时延与回复预览"""
-    import time
+def test_llm(body: dict | None = None):
+    """LLM 连通性测试。
+
+    - body 为空: 并行测试全部「启用」的配置, 返回逐个结果
+    - body {"index": i}: 只测第 i 组配置 (含停用的, 便于启用前验证)
+    """
+    from concurrent.futures import ThreadPoolExecutor
 
     from dubforge.backends import llm
-    if not llm.check_online():
-        return {"ok": False, "message": f"服务不可达: {llm._profiles()}"}
-    t0 = time.time()
-    try:
-        reply = llm.chat_json(
-            '请把这一行字幕翻译成简体中文, 输出 JSON 数组 [{"id": 1, "dst": "..."}]:\n\n'
-            '1. Hello world, this is a connection test.',
-            validator=lambda o: o if isinstance(o, list) and o else (_ for _ in ()).throw(
-                ValueError("输出不是非空数组")),
-            temperature=0.0)
-    except DubForgeError as e:
-        return {"ok": False, "message": f"{e.message}",
-                "suggestion": e.suggestion, "detail": str(e.detail or "")[:300]}
-    except Exception as e:  # noqa: BLE001 (测试端点兜底, 不让 500 裸奔)
-        return {"ok": False, "message": f"未预期错误: {type(e).__name__}: {e}"}
-    dt = time.time() - t0
-    return {"ok": True, "latency": round(dt, 1),
-            "reply": json.dumps(reply, ensure_ascii=False)[:200]}
+
+    all_profiles = config.load_config().get("llm", {}).get("profiles") or []
+    # 兼容旧版单配置
+    if not all_profiles and config.get("llm.base_url"):
+        all_profiles = [{"name": "default", "enabled": True,
+                         **{k: config.get(f"llm.{k}") for k in
+                            ("base_url", "api_key", "model")}}]
+
+    idx = (body or {}).get("index")
+    if idx is not None:
+        idx = int(idx)
+        if idx < 0 or idx >= len(all_profiles):
+            raise DubForgeError(f"配置序号不存在: {idx}", code="PROFILE_NOT_FOUND")
+        return {"results": [{**llm.test_provider(all_profiles[idx]),
+                             "index": idx, "name": all_profiles[idx].get("name")}]}
+    enabled = [(i, p) for i, p in enumerate(all_profiles) if p.get("enabled", True)]
+    if not enabled:
+        raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
+                            suggestion="在设置页勾选至少一组配置的「启用」开关。")
+    with ThreadPoolExecutor(max_workers=len(enabled)) as pool:
+        results = list(pool.map(
+            lambda ip: {**llm.test_provider(ip[1]), "index": ip[0],
+                        "name": ip[1].get("name")}, enabled))
+    return {"results": results,
+            "ok": any(r["ok"] for r in results)}
