@@ -2,7 +2,8 @@
 // 设置页: LLM 多组配置池 (任意 OpenAI 兼容服务商, 按顺序降级) + 其余组只读概览
 // 注意: v-for 容器一律用原生 flex div —— naive-ui 2.45 的 n-space 在嵌套 n-card
 // 场景会把组件子项渲染成空注释 (已踩坑, 见 git 历史)
-import { onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { onBeforeRouteLeave } from 'vue-router'
 import { useMessage } from 'naive-ui'
 
 const message = useMessage()
@@ -61,6 +62,36 @@ const form = ref({
   timeout: 300 as number, thinking: 'auto',
 })
 
+// —— 未应用修改的追踪 —— 表单是草稿, 「应用」写入 config.yaml 才生效 ——
+const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
+const savedProfiles = ref<string[]>([])   // 已应用状态: 每组配置的序列化值 (按下标)
+const savedGlobals = ref('')              // 已应用状态: 通用参数的序列化值
+const cardDirty = computed(() => profiles.value.map((p, i) => {
+  if (!dirtyOn.value) return false
+  return i >= savedProfiles.value.length ||
+         JSON.stringify(toWire(p)) !== savedProfiles.value[i]
+}))
+const globalsDirty = computed(() =>
+  dirtyOn.value && savedGlobals.value !== '' &&
+  JSON.stringify(toGlobals()) !== savedGlobals.value)
+const isDirty = computed(() =>
+  dirtyOn.value && (globalsDirty.value || cardDirty.value.some(Boolean) ||
+                    profiles.value.length !== savedProfiles.value.length))
+function markApplied() {
+  savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
+  savedGlobals.value = JSON.stringify(toGlobals())
+  dirtyOn.value = true
+}
+// 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
+onBeforeRouteLeave(() => {
+  if (isDirty.value &&
+      !window.confirm('有未应用的修改，离开将丢失。仍要离开吗？')) return false
+})
+function warnUnload(e: BeforeUnloadEvent) {
+  if (isDirty.value) { e.preventDefault(); e.returnValue = '' }
+}
+onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
+
 const THINKING_OPTIONS = [
   { label: 'auto — 不传参数（跟随服务端默认）', value: 'auto' },
   { label: 'disabled — 关闭思考（若服务端支持）', value: 'disabled' },
@@ -102,29 +133,35 @@ onMounted(async () => {
     form.value.max_workers = Number(llm.max_workers)
     form.value.timeout = Number(llm.timeout ?? 300)
     form.value.thinking = llm.thinking ?? 'auto'
+    markApplied()                     // 以载入状态为"已应用"基线
+    window.addEventListener('beforeunload', warnUnload)
   } catch (e: any) {
     loadError.value = `加载失败 (${e.message}) —— 请确认后端窗口正在运行 (8600)`
   }
 })
 
-async function save(showTip = true) {
+// 「应用」是唯一写入口: 把整张卡片的草稿 (配置组 + 通用参数) 写入 config.yaml
+async function applySettings() {
   saving.value = true
   try {
-    const list = profiles.value.map((p: any) => {
-      const { paramsJson, ...rest } = p
-      return { ...rest, params: parseParams(p) }
-    })
-    await fetch('/api/settings', {
+    const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {
-        'llm.profiles': list,
+        'llm.profiles': profiles.value.map(p => {
+          const { paramsJson, ...rest } = p
+          return { ...rest, params: parseParams(p) }
+        }),
         'llm.temperature': form.value.temperature,
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
         'llm.thinking': form.value.thinking,
       } }),
     })
-    if (showTip) message.success('已保存')
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    markApplied()
+    message.success('已应用并写入 config.yaml')
+  } catch (e: any) {
+    message.error(`应用失败: ${e.message}`)
   } finally { saving.value = false }
 }
 
@@ -177,6 +214,8 @@ function extraParamsStr(r: any): string {
               <!-- 头行: 序号 / 启用 / 名称 / (弹性空隙) / 测试 / 排序 / 删除 -->
               <div class="p-head">
                 <n-tag size="small" :bordered="false" round>#{{ i + 1 }}</n-tag>
+                <n-tag v-if="cardDirty[i]" size="small" type="warning"
+                       :bordered="false">未应用</n-tag>
                 <n-switch v-model:value="p.enabled" size="small">
                   <template #checked>启用</template><template #unchecked>停用</template>
                 </n-switch>
@@ -251,9 +290,13 @@ function extraParamsStr(r: any): string {
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
           </div>
           <!-- 通用参数: 全局默认值, 组内"专属参数"可覆盖同名项 -->
-          <n-text depth="3" style="font-size:12px; display:block; margin-top:14px">
-            通用参数（所有配置组共用；组内「专属参数」可覆盖 Temperature 等同名项）：
-          </n-text>
+          <div class="globals-cap">
+            <n-text depth="3" style="font-size:12px">
+              通用参数（所有配置组共用；组内「专属参数」可覆盖 Temperature 等同名项）：
+            </n-text>
+            <n-tag v-if="globalsDirty" size="small" type="warning"
+                   :bordered="false">未应用</n-tag>
+          </div>
           <div class="globals">
             <div class="g-item">
               <n-tooltip trigger="hover" placement="top">
@@ -290,12 +333,16 @@ function extraParamsStr(r: any): string {
                         :options="THINKING_OPTIONS" style="width:230px" />
             </div>
           </div>
-          <!-- 保存是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
+          <!-- 「应用」是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
           <div class="actions">
-            <n-button type="primary" :loading="saving" @click="save()">💾 保存全部设置</n-button>
+            <n-button type="primary" :loading="saving" :disabled="!isDirty"
+                      @click="applySettings()">💾 应用设置</n-button>
             <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
-            <n-text depth="3" style="font-size: 12px">
-              保存 = 写入 config.yaml（配置组 + 通用参数）；测试只探测表单内容，不会保存
+            <n-text v-if="isDirty" type="warning" style="font-size: 12px">
+              ● 有未应用的修改 —— 不应用不生效
+            </n-text>
+            <n-text v-else depth="3" style="font-size: 12px">
+              ✓ 无未应用的修改；测试只探测表单内容，不写入
             </n-text>
           </div>
         </n-card>
@@ -344,6 +391,7 @@ function extraParamsStr(r: any): string {
 .tl.warn { color: #d29922; }
 .tl.dim { color: #8b949e; }
 .actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.globals-cap { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
 .globals { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; }
 .g-item { display: flex; flex-direction: column; gap: 4px; }
 .g-lb { font-size: 12px; cursor: help; width: fit-content; }
