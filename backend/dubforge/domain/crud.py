@@ -65,6 +65,7 @@ def delete_project(uid: str) -> bool:
     if not project:
         return False
     pid = project.id
+    kind, source_url = project.source_kind, project.source_url or ""
     with session() as s:
         for model in (Artifact, Job, StepRun):
             for row in s.exec(sqlmodel.select(model).where(model.project_id == pid)).all():
@@ -72,6 +73,17 @@ def delete_project(uid: str) -> bool:
         s.delete(s.get(Project, pid))
         s.commit()
     shutil.rmtree(project_dir(uid), ignore_errors=True)
+    # 拖入上传的文件 (data/uploads/ 内) 是程序自己收下的, 跟着项目一起删;
+    # 仅当没有其他项目还引用它。项目目录外的用户文件绝不动 —— 引用随 DB 行一起消失。
+    if kind == "local" and source_url:
+        inbox = (config.data_root() / "uploads").resolve()
+        p = Path(source_url).resolve()
+        if p.is_relative_to(inbox):
+            with session() as s:
+                reused = bool(s.exec(sqlmodel.select(Project).where(
+                    Project.id != pid, Project.source_url == source_url)).all())
+            if not reused:
+                p.unlink(missing_ok=True)
     return True
 
 

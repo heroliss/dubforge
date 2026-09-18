@@ -50,3 +50,31 @@ def test_upload_into_uploads(isolated_env):
         r2 = client.post("/api/files/upload",
                          files={"file": ("我的视频.mp4", b"2")})
         assert r2.json()["name"] == "我的视频_1.mp4"
+
+
+def test_upload_deleted_with_project(isolated_env):
+    """拖入上传的文件随项目一起删 (无其他项目引用时)"""
+    from dubforge import config
+    with _client() as client:
+        up = client.post("/api/files/upload",
+                         files={"file": ("a.mp4", b"data")}).json()
+        p = client.post("/api/projects", json={
+            "title": "上传项目", "source_kind": "local",
+            "source_url": up["path"]}).json()
+        uid = p["uid"]
+        assert client.delete(f"/api/projects/{uid}").status_code == 200
+        assert not (config.data_root() / "uploads" / "a.mp4").exists()
+        assert not (config.data_root() / "projects" / uid).exists()
+
+
+def test_external_file_survives_project_delete(isolated_env, tmp_path):
+    """引用的外部视频 (项目目录外) 删项目时绝不受伤"""
+    from dubforge import config
+    src = tmp_path / "movie.mp4"
+    src.write_bytes(b"original")
+    with _client() as client:
+        p = client.post("/api/projects", json={
+            "title": "引用项目", "source_kind": "local",
+            "source_url": str(src)}).json()
+        assert client.delete(f"/api/projects/{p['uid']}").status_code == 200
+    assert src.read_bytes() == b"original"
