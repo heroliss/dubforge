@@ -7,7 +7,7 @@ from fastapi import APIRouter, Query
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.registry import STEP_MAP
-from dubforge.runner import compute_fingerprint, runner
+from dubforge.runner import _cfg_snapshot, compute_fingerprint, runner
 
 router = APIRouter(prefix="/api/projects/{uid}/steps", tags=["steps"])
 
@@ -18,6 +18,10 @@ def list_steps(uid: str):
     if not project:
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     steps = crud.get_steps(project.id)
+    arts_by_step: dict[str, list] = {}
+    for a in crud.latest_artifacts(project.id, None).values():
+        arts_by_step.setdefault(a.step_key, []).append(
+            {"name": a.name, "file": a.rel_path, "size": a.size})
     return [{
         "key": s.step_key,
         "label": STEP_MAP[s.step_key].label,
@@ -29,6 +33,8 @@ def list_steps(uid: str):
         "fresh": bool(s.status == "done" and s.input_fingerprint ==
                       compute_fingerprint(project, s.step_key)),
         "retry_count": s.retry_count,
+        "artifacts": arts_by_step.get(s.step_key, []),
+        "cfg": _cfg_snapshot(STEP_MAP[s.step_key].cfg_keys),
     } for s in steps]
 
 

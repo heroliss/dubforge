@@ -4,7 +4,7 @@ import json
 import subprocess
 import time
 
-from conftest import wait_status
+from conftest import mark_upstream_done, wait_status
 from dubforge.domain import crud
 from dubforge.pipeline.step_dubtask import estimate_seconds, speed_flag
 from dubforge.utils.srt import SubLine, write_srt
@@ -33,6 +33,7 @@ def _seed_transcribe(uid, lines, total=None):
 
 
 def _run_until(uid, key, statuses={"done"}, timeout=60):
+    mark_upstream_done(uid, key)   # 链式测试手工播种产物, 上游状态直接置 done 越过门禁
     _runner().start_step(uid, key)
     return wait_status(uid, key, statuses, timeout=timeout)
 

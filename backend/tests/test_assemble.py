@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from conftest import wait_status
+from conftest import mark_upstream_done, wait_status
 from dubforge.domain import crud
 from dubforge.utils import audio as au
 
@@ -98,6 +98,7 @@ def test_assemble_full_mux(make_project, isolated_env, monkeypatch):
                     str(pdir / "audio" / "background.wav")], check=True)
     _mock_tts(monkeypatch, pdir)
 
+    mark_upstream_done(uid, "tts")   # 手工播种产物越过依赖门禁
     for key in ("tts", "assemble"):
         _runner().start_step(uid, key)
         wait_status(uid, key, {"done"}, timeout=180)
@@ -125,6 +126,7 @@ def test_assemble_burn_subtitles(make_project, isolated_env, monkeypatch):
     cfgmod.set_key("assemble.burn_subtitles", True)
     cfgmod.set_key("assemble.loudnorm", False)   # 加速测试
 
+    mark_upstream_done(uid, "tts")   # 手工播种产物越过依赖门禁
     for key in ("tts", "assemble"):
         _runner().start_step(uid, key)
         wait_status(uid, key, {"done"}, timeout=180)

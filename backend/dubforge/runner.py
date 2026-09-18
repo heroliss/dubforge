@@ -209,6 +209,20 @@ class Runner:
             raise DubForgeError("该步骤正在运行或排队中", code="STEP_RUNNING",
                                 suggestion="请等待完成, 或先取消再重跑。")
 
+        # 依赖门禁: 上游步骤必须至少产出过 (done/stale), 否则入口处明确拒绝 ——
+        # 跑到一半才报"缺少上游产物"是陷阱; stale 上游不算阻塞 (产物在盘上, 重跑下游正是其语义)
+        idx = STEP_KEYS.index(step_key)
+        if idx:
+            steps_by_key = {s.step_key: s for s in crud.get_steps(project.id)}
+            blockers = [f"「{STEP_MAP[k].label}」({steps_by_key[k].status})"
+                        for k in STEP_KEYS[:idx]
+                        if steps_by_key[k].status not in ("done", "stale")]
+            if blockers:
+                raise DubForgeError(
+                    f"无法运行 [{step_def.label}] —— 上游步骤未就绪: {', '.join(blockers)}",
+                    code="DEPS_NOT_MET",
+                    suggestion="请先运行上游步骤; 依赖就绪后本步骤才能执行。")
+
         # 非 force 且已完成且指纹未变 → 跳过 (配置/上游都没变, 无需重算)
         fp = compute_fingerprint(project, step_key)
         if not force and step.status == "done" and step.input_fingerprint == fp:

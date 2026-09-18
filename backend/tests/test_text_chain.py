@@ -2,7 +2,7 @@
 """M2b 文本链测试: 全部 mock LLM (零 token), 覆盖三档策略/缓存/id 对齐/鲁棒回退"""
 import json
 
-from conftest import wait_status
+from conftest import mark_upstream_done, wait_status
 from dubforge.utils.srt import SubLine, write_srt
 
 
@@ -53,6 +53,7 @@ def _mock_llm(monkeypatch, responder):
 
 
 def _run_until(uid, key, timeout=30):
+    mark_upstream_done(uid, key)   # 链式测试手工播种产物, 上游状态直接置 done 越过门禁
     _runner().start_step(uid, key)
     return wait_status(uid, key, {"done", "failed"}, timeout=timeout)
 

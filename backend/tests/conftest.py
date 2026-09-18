@@ -97,3 +97,15 @@ def pdir_fixture(isolated_env):
         from dubforge.domain import crud
         return crud.project_dir(uid)
     return _get
+
+
+def mark_upstream_done(uid: str, key: str) -> None:
+    """把 key 的全部上游步骤状态置 done。
+    链式测试手工播种产物/状态机测试直接跑下游时, 用它越过依赖门禁 (DEPS_NOT_MET)。"""
+    from dubforge.pipeline.registry import STEP_KEYS
+    from dubforge.domain import crud
+    project = crud.get_project(uid)
+    for k in STEP_KEYS[:STEP_KEYS.index(key)]:
+        st = crud.get_step(project.id, k)
+        st.status = "done"
+        crud.save_step(st)

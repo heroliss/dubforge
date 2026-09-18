@@ -6,6 +6,7 @@ export const router = createRouter({
   routes: [
     { path: '/', name: 'projects', component: () => import('./views/ProjectsView.vue') },
     { path: '/projects/:uid', name: 'pipeline', component: () => import('./views/PipelineView.vue') },
+    { path: '/projects/:uid/steps/:key', name: 'step', component: () => import('./views/StepView.vue') },
     { path: '/projects/:uid/workbench', name: 'workbench-p', component: () => import('./views/WorkbenchView.vue') },
     { path: '/workbench', name: 'workbench', component: () => import('./views/WorkbenchView.vue') },
     { path: '/settings', name: 'settings', component: () => import('./views/SettingsView.vue') },

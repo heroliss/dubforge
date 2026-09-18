@@ -11,7 +11,7 @@ TTS 场景用 mock 后端 (真实现但离线可控)。
 import json
 import time
 
-from conftest import wait_status
+from conftest import mark_upstream_done, wait_status
 from dubforge.domain import crud
 
 
@@ -19,6 +19,7 @@ def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps, pdi
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
+    mark_upstream_done(uid, "assemble")
     r = runner.start_step(uid, "assemble")
     assert r["status"] == "started"
     wait_status(uid, "assemble", {"done"})
@@ -42,6 +43,7 @@ def test_skip_when_fresh(make_project, isolated_env, stub_heavy_steps, pdir):
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
+    mark_upstream_done(uid, "assemble")
     runner.start_step(uid, "assemble")
     wait_status(uid, "assemble", {"done"})
 
@@ -59,6 +61,7 @@ def test_config_change_invalidates(make_project, isolated_env, monkeypatch, stub
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
+    mark_upstream_done(uid, "assemble")
     runner.start_step(uid, "assemble")
     wait_status(uid, "assemble", {"done"})
 
@@ -77,6 +80,7 @@ def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_hea
     uid = make_project()
     project = crud.get_project(uid)
     runner = _runner()
+    mark_upstream_done(uid, "tts")
     for key in ("tts", "assemble"):
         runner.start_step(uid, key)
         wait_status(uid, key, {"done"})
@@ -98,6 +102,7 @@ def test_cancel_mid_run(make_project, isolated_env, stub_heavy_steps):
     stub_heavy_steps("assemble")
     uid = make_project(params={"delay_step": {"assemble": 0.4}})
     runner = _runner()
+    mark_upstream_done(uid, "assemble")
     runner.start_step(uid, "assemble")
     time.sleep(0.25)                      # 让步骤进入第一个分片
     r = runner.cancel_step(uid, "assemble")
@@ -115,6 +120,7 @@ def test_fail_step_records_error(make_project, isolated_env, stub_heavy_steps):
     stub_heavy_steps("assemble")
     uid = make_project(params={"fail_step": "assemble"})
     runner = _runner()
+    mark_upstream_done(uid, "assemble")
     runner.start_step(uid, "assemble")
     wait_status(uid, "assemble", {"failed"})
     step = crud.get_step(crud.get_project(uid).id, "assemble")
@@ -152,6 +158,7 @@ def test_api_e2e(isolated_env, stub_heavy_steps):
         assert r.status_code == 200
         uid = r.json()["uid"]
 
+        mark_upstream_done(uid, "assemble")
         r = client.post(f"/api/projects/{uid}/steps/assemble/run",
                         json={"force": False})
         assert r.json()["status"] == "started"
@@ -221,3 +228,21 @@ def test_recover_resets_queued(make_project, isolated_env):
 
     _runner().recover()
     assert crud.get_step(crud.get_project(uid).id, "download").status == "pending"
+
+
+def test_deps_gate_blocks_pending_upstream(make_project, isolated_env, stub_heavy_steps):
+    """依赖门禁: 上游未就绪 → 入口处明确拒绝 (DEPS_NOT_MET), 而不是运行时才报缺产物"""
+    from dubforge.errors import DubForgeError
+    stub_heavy_steps("assemble")
+    uid = make_project()
+    try:
+        _runner().start_step(uid, "assemble")
+        raised = None
+    except DubForgeError as e:
+        raised = e
+    assert raised is not None and raised.code == "DEPS_NOT_MET"
+    assert "转录" in raised.message          # 指名阻塞步骤
+    # 上游置 done 后可运行
+    mark_upstream_done(uid, "assemble")
+    r = _runner().start_step(uid, "assemble")
+    assert r["status"] == "started"
