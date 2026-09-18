@@ -56,19 +56,6 @@ const form = ref({
   timeout: 300 as number, thinking: 'auto',
 })
 
-// 官方依据的参数模板 (选定后自动填入, 可再手动改; 其余服务商请查其官方文档)
-const PARAM_TPLS: Record<string, { label: string, params: any }> = {
-  glm53: { label: 'GLM-5.3-flash 官方推荐 (思考型)',
-           params: { temperature: 1, top_p: 0.95, reasoning_effort: 'max' } },
-  low_random: { label: '翻译通用 (低随机, 更稳定)', params: { temperature: 0.2 } },
-  clear: { label: '清空 (留空 = 用服务商默认)', params: {} },
-}
-function applyTpl(p: any, key: string) {
-  if (!key || !PARAM_TPLS[key]) return
-  const params = PARAM_TPLS[key].params
-  p.paramsJson = Object.keys(params).length ? JSON.stringify(params, null, 1) : ''
-}
-
 // 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
 function parseParams(p: any): any {
   try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
@@ -204,13 +191,13 @@ function extraParamsStr(r: any): string {
                          show-password-on="click" size="small"
                          placeholder="密钥保存在本地 config.yaml" />
                 <n-text depth="3" class="lb lb-top">专属参数</n-text>
-                <div class="c-span params-row">
-                  <n-select size="small" :value="null" class="tpl-select"
-                            :options="Object.entries(PARAM_TPLS).map(([k, v]) => ({ label: v.label, value: k }))"
-                            placeholder="参数模板 (官方推荐值)…"
-                            @update:value="(v: string) => applyTpl(p, v)" />
+                <div class="c-span">
                   <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
-                           placeholder="可选, 留空 = 使用服务商默认值; JSON 如 {&quot;temperature&quot;:1,&quot;top_p&quot;:0.95}" />
+                           placeholder='可选, 留空 = 使用服务商默认值; JSON 原样合并进请求, 如 {"temperature":1,"top_p":0.95}' />
+                  <div class="param-hint">
+                    核心参数各家通用 (OpenAI 协议: temperature / top_p / max_tokens 等)；
+                    厂家私有参数 (如 GLM 的 reasoning_effort、thinking) 也写在这里原样发送
+                  </div>
                 </div>
               </div>
               <!-- 测试过程/结果: 发送了什么 / 过程事件 / 收到了什么 -->
@@ -287,8 +274,7 @@ function extraParamsStr(r: any): string {
 .lb { font-size: 12px; white-space: nowrap; }
 .lb-top { align-self: start; padding-top: 6px; }
 .c-span { grid-column: 2 / 5; }
-.params-row { display: flex; gap: 8px; }
-.tpl-select { width: 280px; flex: none; }
+.param-hint { font-size: 11px; line-height: 1.6; margin-top: 3px; }
 
 /* 测试详情框: 深色终端风, 展示发送/过程/接收 */
 .test-box {
