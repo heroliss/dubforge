@@ -33,11 +33,12 @@ def test_test_provider_failure_returns_error_dict(isolated_env):
 
 
 def test_status_title_carries_brief_meaning():
-    # 标题只带错误码的简短含义, 不含修复建议
+    # 标题 = 状态码 + 码义 + 该场景最可能的原因 (只指来源, 不写修复步骤)
     from dubforge.backends.llm import _status_title
-    assert _status_title(404) == "LLM 请求失败 HTTP 404 —— 接口路径不存在"
-    assert "限流" in _status_title(429)
-    assert "服务器错误" in _status_title(502)
+    assert _status_title(404) == \
+        "LLM 请求失败 HTTP 404 —— 接口路径不存在（大概率是接口地址填错）"
+    assert "限流" in _status_title(429) and "配额" in _status_title(429)
+    assert "服务器错误" in _status_title(502) and "与本地配置无关" in _status_title(502)
     assert _status_title(418).endswith("HTTP 418")   # 无含义的码只显示数字
 
 

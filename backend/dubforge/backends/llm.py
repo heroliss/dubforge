@@ -59,22 +59,32 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
+# 常见状态码: (码义, 该场景下最可能的原因 —— 只指出问题来源, 不写修复步骤)
+_STATUS_MEANING = {
+    400: ("请求格式或参数有误", "大概率是模型名或专属参数不被该服务商接受"),
+    401: ("身份验证未通过", "大概率是 api_key 不对"),
+    403: ("已认证但无权访问", "大概率是该 key 未开通此模型"),
+    404: ("接口路径不存在", "大概率是接口地址填错"),
+    405: ("请求方法不被允许", "大概率也是接口地址不对"),
+    408: ("请求超时", None),
+    413: ("请求体过大", None),
+    422: ("参数校验失败", "大概率是专属参数不符合该服务商要求"),
+    429: ("请求过于频繁 (限流)", "大概率是并发太高或配额用完"),
+}
+
+
 def _status_title(status: int) -> str:
-    """非 200 状态码的标题: 状态码 + 简短含义 (只解释码义, 不含修复建议)"""
-    meaning = {
-        400: "请求格式或参数有误",
-        401: "身份验证未通过",
-        403: "已认证但无权访问",
-        404: "接口路径不存在",
-        405: "请求方法不被允许",
-        408: "请求超时",
-        413: "请求体过大",
-        422: "参数校验失败",
-        429: "请求过于频繁 (限流)",
-    }.get(status)
+    """非 200 状态码的标题: 状态码 + 码义 + 最可能的原因"""
+    m = _STATUS_MEANING.get(status)
     if status >= 500:
-        meaning = "服务商服务器错误"
-    return f"LLM 请求失败 HTTP {status}" + (f" —— {meaning}" if meaning else "")
+        m = ("服务商服务器错误", "大概率与本地配置无关")
+    if not m:
+        return f"LLM 请求失败 HTTP {status}"
+    meaning, cause = m
+    title = f"LLM 请求失败 HTTP {status} —— {meaning}"
+    if cause:
+        title += f"（{cause}）"
+    return title
 
 
 def _post(provider: dict, body: dict, log=lambda m: None) -> str:
@@ -116,8 +126,9 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
             suggestion="思考型模型响应慢时可调大 llm.timeout, 或换更快模型。")
     if r.status_code == 401:
         # 服务器已响应 → 认证信息以服务端返回为准, 不再自造建议
-        raise ServiceOfflineError("LLM 认证失败 (401) —— 身份验证未通过",
-                                  code="LLM_AUTH", suggestion="")
+        raise ServiceOfflineError(
+            "LLM 认证失败 (401) —— 身份验证未通过（大概率是 api_key 不对）",
+            code="LLM_AUTH", suggestion="")
     if r.status_code == 400 and provider.get("params"):
         # 该服务商不认某个专属参数 → 自适应降级: 剥离专属参数重发一次
         log(f"⚠ 「{name}」拒绝了专属参数, 已自动剥离重试 ({r.text[:120]})")
