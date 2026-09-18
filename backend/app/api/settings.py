@@ -28,12 +28,16 @@ def rebuild_db():
 
 @router.get("/step_params")
 def step_params():
-    """每步骤可编辑参数的 schema + 当前值 (值实时读 config, 步骤页表单用)"""
+    """每步骤可编辑参数的 schema + 当前值 (值实时读 config, 步骤页表单用);
+    附带语言能力 caps (各后端声明的 LANGUAGES, 用于下拉注入与能力展示)"""
     from dubforge import config as cfg
-    from dubforge.pipeline.step_params import STEP_PARAM_SCHEMA, schema_view
+    from dubforge.pipeline.step_params import (STEP_PARAM_SCHEMA,
+                                               language_capabilities,
+                                               schema_view)
     values = {f.path: cfg.get(f.path)
               for fields in STEP_PARAM_SCHEMA.values() for f in fields}
-    return {"ok": True, "steps": schema_view(values)}
+    caps = language_capabilities()
+    return {"ok": True, "steps": schema_view(values, caps), "caps": caps}
 
 
 @router.get("")

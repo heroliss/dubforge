@@ -38,6 +38,14 @@ def is_online(url: str) -> bool:
         return False
 
 
+# 本后端支持的语言 (index-tts webui.py 的 lang_dropdown 写死五项; 换版本时同步)
+# 中文名与「翻译目标语言」的取值对齐 —— 相同名字即可贯穿全流程 (识别→翻译→配音)
+LANGUAGES: tuple[tuple[str, str], ...] = (
+    ("ZH", "简体中文"), ("EN", "English"), ("JA", "日本語"),
+    ("AR", "阿拉伯语"), ("ES", "西班牙语"),
+)
+
+
 def synth(url: str, text: str, out_path: Path, lang: str,
           timbre_ref: Path, emo_mode: str = "preset", emo_ref: Path | None = None,
           emo_weight: float = 1.0, emo_vector: list | None = None,

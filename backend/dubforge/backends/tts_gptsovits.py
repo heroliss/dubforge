@@ -22,6 +22,12 @@ def is_online(url: str) -> bool:
         return False
 
 
+# 本后端实际可发音的语言 (synth 里 text_lang 只映射 zh/en; 其他一律当英语)
+LANGUAGES: tuple[tuple[str, str], ...] = (
+    ("zh", "简体中文"), ("en", "English"),
+)
+
+
 def synth(url: str, text: str, out_path: Path, lang: str = "zh",
           character: str | None = None, log=lambda m: None) -> Path:
     if not is_online(url):

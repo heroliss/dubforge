@@ -70,7 +70,7 @@ def run(ctx) -> None:
     ctx.log(f"转录中 (device={device}, lang={lang})...")
     segments, info = model.transcribe(
         str(raw_wav),
-        language=None if lang == "auto" else lang,
+        language=None if lang == "auto" else lang.lower(),  # whisper 要小写 ISO 码
         word_timestamps=True,
         vad_filter=True,
         vad_parameters={"min_silence_duration_ms": 500},

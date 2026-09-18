@@ -242,6 +242,7 @@ async function applyRoot() {
 // —— 全局步骤参数 (各项目未单独覆盖时的默认值) ——
 const stepSchema = ref<Record<string, any>>({})
 const stepDraft = ref<Record<string, any>>({})
+const caps = ref<any>(null)
 const savingSteps = ref(false)
 const stepsDirty = computed(() =>
   savedSteps.value !== '' && JSON.stringify(stepDraft.value) !== savedSteps.value)
@@ -252,6 +253,7 @@ async function loadStepParams() {
     if (!r.ok) return
     const j = await r.json()
     stepSchema.value = j.steps || {}
+    caps.value = j.caps || null
     const d: Record<string, any> = {}
     for (const node of Object.values<any>(j.steps || {})) {
       for (const f of node.fields as any[]) {
@@ -497,6 +499,15 @@ function extraParamsStr(r: any): string {
             每个项目的步骤页可以单独覆盖这些默认值 (覆盖项会标「项目已改」)；
             修改全局默认不影响已单独覆盖的项目。
           </n-text>
+          <n-alert v-if="caps" type="default" :show-icon="false" :bordered="true"
+                   style="margin-bottom: 10px">
+            🔊 <n-text strong>语言能力</n-text>（随所用后端自动适应）：
+            语音转文字 ({{ caps.asr.backend }}) 支持 {{ caps.asr.langs.length - 1 }} 种语言；
+            逐句配音 ({{ caps.tts.backend }}) 支持
+            {{ caps.tts.langs.map((l: any) => l[1]).join(' / ') }}。
+            这几个就是<b>可贯穿全流程</b>的配音目标语言（识别 → 翻译 → 配音），
+            翻译目标语言下拉里会分组标注；其他语言只能出字幕。
+          </n-alert>
           <n-collapse size="small">
             <n-collapse-item v-for="(label, sk) in STEP_LABELS" :key="sk" :name="sk"
                              :title="`${label} — ${(stepSchema[sk]?.fields ?? []).length} 项`">

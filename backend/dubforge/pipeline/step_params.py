@@ -8,6 +8,8 @@
 """
 from dataclasses import dataclass, field
 
+from dubforge.backends import asr_faster_whisper, tts_gptsovits, tts_indextts25
+
 
 @dataclass(frozen=True)
 class ParamField:
@@ -16,9 +18,13 @@ class ParamField:
     type: str                      # bool | int | float | str | password | text | select
     help: str = ""
     options: tuple[tuple[str, object], ...] = ()   # select 用: (显示文本, 值)
+    editable: bool = False         # select 允许手输列表外的自定义值
     min: float | None = None
     max: float | None = None
     step: float | None = None
+
+
+# 语言表由各后端模块自己声明 (LANGUAGES) —— 换后端自动适应, 见 language_capabilities()
 
 
 STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
@@ -50,8 +56,9 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
                    options=(("large-v3-turbo", "large-v3-turbo"), ("large-v3", "large-v3"),
                             ("large-v2", "large-v2"), ("medium", "medium"),
                             ("small", "small"), ("base", "base"))),
-        ParamField("asr.language", "源语言", "str",
-                   help="auto=自动检测; 也可填 zh / en / ja / ko 等加速并更稳"),
+        ParamField("asr.language", "源语言", "select",
+                   help="Whisper 支持的语言; auto=自动检测。指定语言更快更稳",
+                   options=asr_faster_whisper.LANGUAGES),
     ),
     "split": (
         ParamField("split.max_split_length", "粗切块词数上限", "int", min=8, max=80, step=1,
@@ -60,8 +67,13 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
                    help="关闭则只用 NLP 粗切 (更快, 断句略糙)"),
     ),
     "translate": (
-        ParamField("translate.target_language", "目标语言", "str",
-                   help="例 简体中文 / 繁體中文 / English"),
+        ParamField("translate.target_language", "目标语言", "select", editable=True,
+                   help="可下拉选择, 也可直接输入任意语言名称 (喂给 LLM)",
+                   options=(("简体中文", "简体中文"), ("繁體中文", "繁體中文"),
+                            ("English", "English"), ("日本語", "日本語"),
+                            ("한국어", "한국어"), ("Deutsch", "Deutsch"),
+                            ("Français", "Français"), ("Español", "Español"),
+                            ("Русский", "Русский"), ("Português", "Português"))),
         ParamField("translate.style_prompt", "风格提示词", "text",
                    help="翻译人设/语气要求, 例: 口语化, 忌翻译腔"),
         ParamField("translate.whole_doc_max_lines", "整篇直译行数上限", "int", min=20, max=200, step=5,
@@ -96,7 +108,9 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
         ParamField("tts.indextts25.emo_weight", "情感权重", "float", min=0, max=1, step=0.05),
         ParamField("tts.indextts25.duration_factor", "时长因子", "float", min=0.5, max=2, step=0.05,
                    help="参考音频时长对合成语速的影响系数, 1.0=跟随参考"),
-        ParamField("tts.indextts25.lang", "语言", "str", help="ZH / EN / AUTO"),
+        ParamField("tts.indextts25.lang", "合成语言", "select",
+                   help="IndexTTS2.5 支持的语言 (取自其 WebUI 选项)",
+                   options=tts_indextts25.LANGUAGES),
     ),
     "assemble": (
         ParamField("assemble.bgm_volume", "背景音音量", "float", min=0, max=1, step=0.05,
@@ -112,18 +126,52 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
 }
 
 
-def schema_view(values: dict) -> dict:
+def language_capabilities() -> dict:
+    """当前配置的后端各自的语言能力 (换后端自动适应):
+    {asr: {backend, langs}, tts: {backend, langs}}
+    langs = [(code, 中文名)]; 中文名与「翻译目标语言」取值对齐,
+    交集即"可贯穿全流程"的语言 (识别→翻译→配音)。"""
+    from dubforge import config
+    asr_backend = str(config.get("asr.backend") or "faster_whisper")
+    tts_backend = str(config.get("tts.backend") or "indextts25")
+    asr_mod = {"faster_whisper": asr_faster_whisper}.get(asr_backend)
+    tts_mod = {"indextts25": tts_indextts25, "gptsovits": tts_gptsovits}.get(tts_backend)
+    return {
+        "asr": {"backend": asr_backend,
+                "langs": list(getattr(asr_mod, "LANGUAGES", ()) or ())},
+        "tts": {"backend": tts_backend,
+                "langs": list(getattr(tts_mod, "LANGUAGES", ()) or ())},
+    }
+
+
+def schema_view(values: dict, caps: dict | None = None) -> dict:
     """序列化给前端: {step_key: {fields: [...], values: {path: 当前值}}}
     values 由调用方按 path 从 config 提取"""
-    return {
-        key: {
-            "fields": [
-                {"path": f.path, "label": f.label, "type": f.type, "help": f.help,
-                 "options": [{"label": lb, "value": v} for lb, v in f.options],
-                 "min": f.min, "max": f.max, "step": f.step}
-                for f in fields
-            ],
-            "values": {f.path: values.get(f.path) for f in fields},
-        }
-        for key, fields in STEP_PARAM_SCHEMA.items()
-    }
+    caps = caps or language_capabilities()
+    tts_names = {name for _, name in caps["tts"]["langs"]}
+    out: dict[str, dict] = {}
+    for key, fields in STEP_PARAM_SCHEMA.items():
+        fl = []
+        for f in fields:
+            options = [{"label": lb, "value": v} for lb, v in f.options]
+            # 语言能力注入 (取自当前后端模块的声明, 换后端自动适应):
+            if f.path == "asr.language" and caps["asr"]["langs"]:
+                options = [{"label": lb, "value": v} for v, lb in caps["asr"]["langs"]]
+            elif f.path == "translate.target_language":
+                # 分组: TTS 能发音的目标语言 = 可贯穿全流程 (识别→翻译→配音);
+                # 其余仅能出字幕。editable 仍允许输入任意语言名。
+                dub, sub = [], []
+                for lb, v in f.options:
+                    (dub if v in tts_names else sub).append({"label": lb, "value": v})
+                options = []
+                if dub:
+                    options.append({"type": "group", "label": "可配音 · 贯穿全流程",
+                                    "key": "dub", "children": dub})
+                if sub:
+                    options.append({"type": "group", "label": "仅字幕 (当前配音引擎不支持发音)",
+                                    "key": "sub", "children": sub})
+            fl.append({"path": f.path, "label": f.label, "type": f.type, "help": f.help,
+                       "options": options, "editable": f.editable,
+                       "min": f.min, "max": f.max, "step": f.step})
+        out[key] = {"fields": fl, "values": {f.path: values.get(f.path) for f in fields}}
+    return out

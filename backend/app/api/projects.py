@@ -257,6 +257,8 @@ def get_project_step_params(uid: str):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     ov = crud.project_step_params(project)
     values, overridden, defaults = {}, {}, {}
+    from dubforge.pipeline.step_params import language_capabilities
+    caps = language_capabilities()
     for fields in STEP_PARAM_SCHEMA.values():
         for f in fields:
             defaults[f.path] = cfg.get(f.path)
@@ -266,8 +268,8 @@ def get_project_step_params(uid: str):
             else:
                 values[f.path] = defaults[f.path]
                 overridden[f.path] = False
-    return {"ok": True, "steps": schema_view(values),
-            "overridden": overridden, "defaults": defaults}
+    return {"ok": True, "steps": schema_view(values, caps),
+            "overridden": overridden, "defaults": defaults, "caps": caps}
 
 
 class StepParamsUpdate(BaseModel):

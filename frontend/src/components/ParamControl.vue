@@ -12,7 +12,8 @@ const val = computed({
 
 <template>
   <n-switch v-if="field.type === 'bool'" v-model:value="val" />
-  <n-select v-else-if="field.type === 'select'" v-model:value="val" :options="field.options" />
+  <n-select v-else-if="field.type === 'select'" v-model:value="val" :options="field.options"
+            filterable :tag="!!field.editable" />
   <n-input-number v-else-if="field.type === 'int' || field.type === 'float'"
                   v-model:value="val" :min="field.min" :max="field.max"
                   :step="field.step ?? (field.type === 'int' ? 1 : 0.1)"
