@@ -61,23 +61,30 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
 
 # 常见状态码: (码义, 该场景下最可能的原因 —— 只指出问题来源, 不写修复步骤)
 _STATUS_MEANING = {
-    400: ("请求格式或参数有误", "大概率是模型名或专属参数不被该服务商接受"),
-    401: ("身份验证未通过", "大概率是 api_key 不对"),
-    403: ("已认证但无权访问", "大概率是该 key 未开通此模型"),
-    404: ("接口路径不存在", "大概率是接口地址填错"),
-    405: ("请求方法不被允许", "大概率也是接口地址不对"),
+    400: ("请求格式或参数有误", "可能是模型名或专属参数不被该服务商接受"),
+    401: ("身份验证未通过", "可能是 api_key 不对"),
+    403: ("已认证但无权访问", "可能是该 key 未开通此模型"),
+    405: ("请求方法不被允许", "可能也是接口地址不对"),
     408: ("请求超时", None),
     413: ("请求体过大", None),
-    422: ("参数校验失败", "大概率是专属参数不符合该服务商要求"),
-    429: ("请求过于频繁 (限流)", "大概率是并发太高或配额用完"),
+    422: ("参数校验失败", "可能是专属参数不符合该服务商要求"),
+    429: ("请求过于频繁 (限流)", "可能是并发太高或配额用完"),
 }
 
 
-def _status_title(status: int) -> str:
-    """非 200 状态码的标题: 状态码 + 码义 + 最可能的原因"""
+def _status_title(status: int, body: str = "") -> str:
+    """非 200 状态码的标题: 状态码 + 码义 + 该场景下最可能的原因
+
+    404 特殊: OpenAI 惯例把"模型不存在"也报成 404, 兼容厂商沿用,
+    所以用响应内容区分是模型名错还是接口地址错。
+    """
+    if status == 404:
+        if "model" in body.lower() or "模型" in body:
+            return "LLM 请求失败 HTTP 404 —— 资源不存在（可能是模型名不对）"
+        return "LLM 请求失败 HTTP 404 —— 资源不存在（可能是接口地址填错）"
     m = _STATUS_MEANING.get(status)
     if status >= 500:
-        m = ("服务商服务器错误", "大概率与本地配置无关")
+        m = ("服务商服务器错误", "可能与本地配置无关")
     if not m:
         return f"LLM 请求失败 HTTP {status}"
     meaning, cause = m
@@ -127,7 +134,7 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     if r.status_code == 401:
         # 服务器已响应 → 认证信息以服务端返回为准, 不再自造建议
         raise ServiceOfflineError(
-            "LLM 认证失败 (401) —— 身份验证未通过（大概率是 api_key 不对）",
+            "LLM 认证失败 (401) —— 身份验证未通过（可能是 api_key 不对）",
             code="LLM_AUTH", suggestion="")
     if r.status_code == 400 and provider.get("params"):
         # 该服务商不认某个专属参数 → 自适应降级: 剥离专属参数重发一次
@@ -139,7 +146,7 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     if r.status_code != 200:
         # 服务器有响应 → 错误码与原因以服务端返回为准 (detail), 本地只给
         # 状态码标题 + 码义; 显式清空 suggestion, 避免泄漏管线页默认建议
-        raise StepFailedError(_status_title(r.status_code),
+        raise StepFailedError(_status_title(r.status_code, r.text),
                               detail=r.text[:800], suggestion="")
     data = r.json()
     return data["choices"][0]["message"]["content"]

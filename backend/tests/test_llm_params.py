@@ -35,9 +35,14 @@ def test_test_provider_failure_returns_error_dict(isolated_env):
 def test_status_title_carries_brief_meaning():
     # 标题 = 状态码 + 码义 + 该场景最可能的原因 (只指来源, 不写修复步骤)
     from dubforge.backends.llm import _status_title
-    assert _status_title(404) == \
-        "LLM 请求失败 HTTP 404 —— 接口路径不存在（大概率是接口地址填错）"
-    assert "限流" in _status_title(429) and "配额" in _status_title(429)
+    # 404 特殊: OpenAI 惯例"模型不存在"也报 404, 按响应内容区分
+    assert _status_title(404, '{"error":{"message":"模型不存在"}}') == \
+        "LLM 请求失败 HTTP 404 —— 资源不存在（可能是模型名不对）"
+    assert _status_title(404, "The model `x` does not exist") == \
+        "LLM 请求失败 HTTP 404 —— 资源不存在（可能是模型名不对）"
+    assert _status_title(404, '{"detail":"Not Found"}') == \
+        "LLM 请求失败 HTTP 404 —— 资源不存在（可能是接口地址填错）"
+    assert "限流" in _status_title(429, "") and "配额" in _status_title(429, "")
     assert "服务器错误" in _status_title(502) and "与本地配置无关" in _status_title(502)
     assert _status_title(418).endswith("HTTP 418")   # 无含义的码只显示数字
 
