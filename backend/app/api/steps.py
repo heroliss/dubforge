@@ -75,9 +75,8 @@ _ART_MIME = {
 }
 
 
-@router.get("/{key}/artifacts/{name}/raw")
-def artifact_raw(uid: str, key: str, name: str):
-    """按登记产物提供原文/原文件 (预览用); 只允许本步骤已登记的名字, 不接受路径"""
+def _artifact_file(uid: str, key: str, name: str) -> Path:
+    """登记产物 → 磁盘路径 (raw/peaks 共用的白名单校验: 只允许本步骤已登记的名字)"""
     project = crud.get_project(uid)
     if not project:
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
@@ -91,6 +90,58 @@ def artifact_raw(uid: str, key: str, name: str):
         p = crud.project_dir(uid) / p
     if not p.exists():
         raise DubForgeError("产物文件已不在磁盘", code="ARTIFACT_MISSING")
+    return p
+
+
+@router.get("/{key}/artifacts/{name}/raw")
+def artifact_raw(uid: str, key: str, name: str):
+    """按登记产物提供原文/原文件 (预览用); 只允许本步骤已登记的名字, 不接受路径"""
+    p = _artifact_file(uid, key, name)
     mime = _ART_MIME.get(p.suffix.lower(), "application/octet-stream")
     return FileResponse(p, media_type=mime,
                         headers={"Cache-Control": "no-store"})
+
+
+@router.get("/{key}/artifacts/{name}/peaks")
+def artifact_peaks(uid: str, key: str, name: str, buckets: int = 900):
+    """音频波形峰值序列 (前端画波形): ffmpeg 降采样为 4kHz 单声道后按桶取最大幅值。
+    结果缓存在 artifacts/<key>/peaks_<name>.json (重跑清产物时一并失效)。"""
+    import json as _json
+    p = _artifact_file(uid, key, name)
+    if p.suffix.lower() != ".wav":
+        raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
+    cache = crud.project_dir(uid) / "artifacts" / key / f"peaks_{name}.json"
+    if cache.exists():
+        try:
+            data = _json.loads(cache.read_text(encoding="utf-8"))
+            if data.get("src_size") == p.stat().st_size:
+                data.pop("src_size", None)
+                return data
+        except Exception:
+            pass
+
+    import subprocess
+    r = subprocess.run(["ffmpeg", "-i", str(p), "-vn", "-ac", "1", "-ar", "4000",
+                        "-f", "s16le", "-"], capture_output=True)
+    if r.returncode != 0 or not r.stdout:
+        raise DubForgeError("波形计算失败 (ffmpeg)", code="PEAKS_FAIL",
+                            detail=r.stderr[-500:])
+    import numpy as np
+    amp = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
+    duration = round(len(amp) / 4000.0, 3)
+    n = max(1, min(buckets, len(amp)))
+    pad = (-len(amp)) % n
+    if pad:
+        amp = np.concatenate([amp, np.zeros(pad, dtype=np.float32)])
+    peaks = np.abs(amp).reshape(n, -1).max(axis=1).round(3).tolist()
+    data = {"points": peaks, "duration": duration}
+    try:
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        tmp = cache.with_suffix(".json.tmp")
+        tmp.write_text(_json.dumps({"src_size": p.stat().st_size, **data}),
+                       encoding="utf-8")
+        import os
+        os.replace(tmp, cache)
+    except Exception:
+        pass                          # 缓存写失败不影响返回
+    return data

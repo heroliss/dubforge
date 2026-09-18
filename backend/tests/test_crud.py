@@ -133,3 +133,17 @@ def test_rebuild_admits_copied_dir(isolated_env):
     steps = {st.step_key: st for st in crud.get_steps(proj.id)}
     assert len(steps) == len(STEP_KEYS)          # 缺的步骤补 pending
     assert steps["download"].status == "done"
+
+
+def test_step_param_change_alters_fingerprint(isolated_env):
+    """步骤参数修改 → 输入指纹变化 (已完成步骤自动「已过期」, 重跑按新参数)"""
+    from dubforge import config
+    from dubforge.domain import crud
+    from dubforge.runner import compute_fingerprint
+    p = crud.create_project(title="指纹项目")
+    fp1 = compute_fingerprint(p, "preprocess")
+    config.set_key("separate.model", "htdemucs_ft")
+    try:
+        assert compute_fingerprint(p, "preprocess") != fp1
+    finally:
+        config.set_key("separate.model", "htdemucs")

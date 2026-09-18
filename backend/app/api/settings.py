@@ -26,6 +26,16 @@ def rebuild_db():
     return {"ok": True, **crud.rebuild_from_dirs()}
 
 
+@router.get("/step_params")
+def step_params():
+    """每步骤可编辑参数的 schema + 当前值 (值实时读 config, 步骤页表单用)"""
+    from dubforge import config as cfg
+    from dubforge.pipeline.step_params import STEP_PARAM_SCHEMA, schema_view
+    values = {f.path: cfg.get(f.path)
+              for fields in STEP_PARAM_SCHEMA.values() for f in fields}
+    return {"ok": True, "steps": schema_view(values)}
+
+
 @router.get("")
 def get_settings():
     # 本机单用户应用: api_key 明文回传 (前端密码框直接显示, 可切换明文)

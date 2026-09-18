@@ -124,3 +124,40 @@ def test_find_final_video_skips_partial(tmp_path):
     assert find_final_video(media) is None                       # 全是过程文件 → None
     (media / "video.mp4").write_bytes(b"final")
     assert find_final_video(media) == media / "video.mp4"        # 完成后精确名优先
+
+
+def test_artifact_peaks(isolated_env):
+    """波形端点: 正弦 wav → 峰值序列 + 时长; 第二次命中缓存同结果"""
+    import math
+    import struct
+    import wave as wavmod
+    from dubforge.domain import crud
+    from dubforge.domain.models import Artifact
+    p = crud.create_project(title="波形项目")
+    adir = crud.project_dir(p.uid) / "audio"
+    adir.mkdir(parents=True, exist_ok=True)
+    path = adir / "tone.wav"
+    sr = 8000
+    frames = b"".join(struct.pack("<h", int(12000 * math.sin(2 * math.pi * 440 * i / sr)))
+                      for i in range(sr // 2))            # 0.5s 440Hz 正弦
+    with wavmod.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(sr)
+        w.writeframes(frames)
+    with crud.session() as s:
+        s.add(Artifact(project_id=p.id, step_key="preprocess", name="tone.wav",
+                       rel_path="audio/tone.wav", size=path.stat().st_size))
+        s.commit()
+
+    from fastapi.testclient import TestClient
+    from app.main import app
+    with TestClient(app) as client:
+        url = f"/api/projects/{p.uid}/steps/preprocess/artifacts/tone.wav/peaks"
+        r = client.get(url)
+        assert r.status_code == 200
+        j = r.json()
+        assert 0 < len(j["points"]) <= 900
+        assert abs(j["duration"] - 0.5) < 0.05
+        assert max(j["points"]) <= 1.0
+        assert client.get(url).json() == j               # 缓存命中

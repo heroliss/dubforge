@@ -57,6 +57,9 @@ DEFAULTS: dict[str, Any] = {
     },
     "separate": {
         "enabled": True,            # demucs 人声/背景分离
+        "model": "htdemucs",        # htdemucs | htdemucs_ft (精调: 更优, 约慢一倍)
+        "shifts": 0,                # 位移平均次数 (0=快; 1~2 更好, 按倍变慢)
+        "overlap": 0.25,            # 长音频分块处理的重叠比例
         "speaker_diarization": False,  # pyannote 说话人分离 (需 hf_token)
         "hf_token": "",
     },

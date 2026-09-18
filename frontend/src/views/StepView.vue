@@ -5,6 +5,7 @@ import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import MediaInfo from '../components/MediaInfo.vue'
+import AudioTracksPlayer from '../components/AudioTracksPlayer.vue'
 import { useNavStore, STEP_ORDER, STATUS_TEXT } from '../stores/nav'
 
 const route = useRoute()
@@ -86,10 +87,12 @@ function syncLogPolling() {
   if (need && !logTimer) {
     loadLog()
     logTimer = window.setInterval(loadLog, 1500)
-  } else if (!need && logTimer) {
-    clearInterval(logTimer)
-    logTimer = undefined
-    loadLog()                    // 收尾: 拉最后一次完整日志
+  } else if (!need) {
+    if (logTimer) {
+      clearInterval(logTimer)
+      logTimer = undefined
+    }
+    loadLog()                    // 初始挂载 / 运行收尾: 拉当前日志
   }
 }
 watch(running, syncLogPolling, { immediate: true })
@@ -110,6 +113,56 @@ const cfgRows = computed(() => {
   }
   return rows
 })
+
+// ---- 本步骤参数 (可编辑; schema 全局缓存, 值来自 config 实时快照) ----
+const _paramSchema = ref<Record<string, any> | null>(null)
+const paramFields = computed<any[]>(() => _paramSchema.value?.[key]?.fields ?? [])
+const draft = ref<Record<string, any>>({})
+const savedDraft = ref('')
+const savingParams = ref(false)
+const paramsDirty = computed(() => savedDraft.value !== '' &&
+  JSON.stringify(draft.value) !== savedDraft.value)
+const extraCfgRows = computed(() =>
+  cfgRows.value.filter((r) => !paramFields.value.some((f) => f.path === r.k)))
+
+async function loadParamSchema() {
+  if (_paramSchema.value) { initDraft(); return }
+  try {
+    const r = await fetch('/api/settings/step_params')
+    if (!r.ok) return
+    _paramSchema.value = (await r.json()).steps
+    initDraft()
+  } catch { /* 拿不到 schema 时退回只读展示 */ }
+}
+function initDraft() {
+  const d: Record<string, any> = {}
+  for (const f of paramFields.value) {
+    let v = _paramSchema.value?.[key]?.values?.[f.path]
+    if (v === null || v === undefined) {
+      v = f.type === 'bool' ? false : (f.type === 'int' || f.type === 'float' ? 0 : '')
+    }
+    d[f.path] = v
+  }
+  draft.value = d
+  savedDraft.value = JSON.stringify(d)
+}
+onMounted(loadParamSchema)
+
+async function saveParams() {
+  savingParams.value = true
+  try {
+    const updates: Record<string, any> = {}
+    for (const f of paramFields.value) updates[f.path] = draft.value[f.path]
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates }),
+    })
+    if (!r.ok) { message.error('参数保存失败'); return }
+    savedDraft.value = JSON.stringify(draft.value)
+    message.success('已写入 config.yaml —— 本步骤下次运行按新参数执行')
+    await nav.poll()
+  } finally { savingParams.value = false }
+}
 
 function fmtSize(n: number): string {
   if (n > 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
@@ -158,9 +211,17 @@ const preview = computed(() => {
     return { kind: 'video', url: fin ? artUrl(fin.name) : null, audios }
   }
   if (key === 'preprocess') {
+    // 音轨分离: 视频同步预览 + 三轨切换 (AudioTracksPlayer)
     const audios = ['raw.wav', 'vocal.wav', 'background.wav'].filter(has)
-      .map((n) => ({ name: n, label: AUDIO_LABEL[n] ?? n, url: artUrl(n) }))
-    return audios.length ? { kind: 'audio', audios } : null
+      .map((n) => {
+        const art = (step.value?.artifacts ?? []).find((a: any) => a.name === n)
+        const base = `/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(n)}`
+        return { name: n, label: AUDIO_LABEL[n] ?? n, url: `${base}/raw`,
+                 peaks: `${base}/peaks`, size: art?.size }
+      })
+    return audios.length
+      ? { kind: 'tracks', audios, videoUrl: `/api/projects/${uid}/workbench/video` }
+      : null
   }
   if (key === 'tts') {
     return { kind: 'workbench' }
@@ -249,13 +310,17 @@ async function loadText(name: string | null) {
             </n-gi>
           </n-grid>
         </template>
+        <AudioTracksPlayer v-else-if="preview.kind === 'tracks'"
+                           :tracks="preview.audios" :video-url="preview.videoUrl" />
         <video v-else-if="preview.kind === 'video' && preview.url" :src="preview.url"
                controls preload="metadata"
                style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
-        <div v-for="a in preview.audios ?? []" :key="a.name" class="audio-row">
-          <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
-          <audio :src="a.url" controls style="width: 100%; height: 36px" />
-        </div>
+        <template v-if="preview.kind === 'audio'">
+          <div v-for="a in preview.audios ?? []" :key="a.name" class="audio-row">
+            <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
+            <audio :src="a.url" controls style="width: 100%; height: 36px" />
+          </div>
+        </template>
         <pre v-if="preview.kind === 'text'" class="textprev">{{ previewText || '(空)' }}</pre>
         <n-text v-if="preview.kind === 'text' && previewText.length >= 6000"
                 depth="3" style="font-size: 11px">
@@ -274,14 +339,50 @@ async function loadText(name: string | null) {
             <pre ref="logBox" class="logbox">{{ logLines.join('\n') || '(暂无日志)' }}</pre>
           </n-card>
         </n-gi>
-        <!-- 本步配置 -->
+        <!-- 本步骤参数: schema 驱动的可编辑表单 + schema 外关联配置的只读展示 -->
         <n-gi v-if="cfgRows.length">
-          <n-card size="small" title="本步骤当前配置 (只读, 全局修改在设置页)">
-            <n-descriptions :column="1" label-placement="left" size="small" bordered>
-              <n-descriptions-item v-for="row in cfgRows" :key="row.k" :label="row.k">
+          <n-card size="small" title="本步骤参数 (写入 config.yaml)">
+            <n-form v-if="paramFields.length" label-placement="left" label-width="170"
+                    size="small" style="margin-bottom: 10px">
+              <n-form-item v-for="f in paramFields" :key="f.path" :label="f.label">
+                <n-tooltip trigger="hover" placement="top" :delay="200">
+                  <template #trigger>
+                    <span class="ctl">
+                      <n-switch v-if="f.type === 'bool'" v-model:value="draft[f.path]" />
+                      <n-select v-else-if="f.type === 'select'" v-model:value="draft[f.path]"
+                                :options="f.options" />
+                      <n-input-number v-else-if="f.type === 'int' || f.type === 'float'"
+                                      v-model:value="draft[f.path]" :min="f.min" :max="f.max"
+                                      :step="f.step ?? (f.type === 'int' ? 1 : 0.1)"
+                                      style="width: 150px" />
+                      <n-input v-else-if="f.type === 'text'" v-model:value="draft[f.path]"
+                               type="textarea" :rows="2" />
+                      <n-input v-else-if="f.type === 'password'" v-model:value="draft[f.path]"
+                               type="password" show-password-on="click" />
+                      <n-input v-else v-model:value="draft[f.path]" />
+                    </span>
+                  </template>
+                  {{ f.help || f.path }}
+                </n-tooltip>
+              </n-form-item>
+              <div>
+                <n-button size="small" type="primary" :loading="savingParams"
+                          :disabled="!paramsDirty" @click="saveParams">💾 应用本步参数</n-button>
+                <n-text v-if="paramsDirty" type="warning" style="font-size: 12px; margin-left: 8px">
+                  ● 有未应用的修改 —— 不应用不生效
+                </n-text>
+              </div>
+            </n-form>
+            <n-descriptions v-if="extraCfgRows.length" :column="1" label-placement="left"
+                            size="small" bordered>
+              <n-descriptions-item v-for="row in extraCfgRows" :key="row.k" :label="row.k">
                 {{ row.v }}
               </n-descriptions-item>
             </n-descriptions>
+            <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 8px">
+              悬停参数可看说明; 参数一改输入指纹就变, 已完成的本步/下游会标记「已过期」, 重跑即按新参数执行。
+              其余关联配置 (如 LLM 密钥) 在「⚙️ 设置」页修改。
+            </n-text>
           </n-card>
         </n-gi>
         <!-- 产物清单 -->
@@ -326,6 +427,7 @@ async function loadText(name: string | null) {
 }
 .arts { list-style: none; margin: 0; padding: 0; }
 .arts li { padding: 3px 0; }
+.ctl { display: block; width: 100%; }
 .audio-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 .textprev {
   background: #0d1117;

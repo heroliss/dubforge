@@ -4,12 +4,13 @@
 ============================
 产物:
   audio/raw.wav          16kHz 单声道源音轨 (供转录与 ASR 备用)
-  audio/vocal.wav        demucs 人声 (供动态情感参考 + 精修工作台"听原声")
-  audio/background.wav   demucs 背景音 (供成片混音; 供工作台混音试听)
+  audio/vocal.wav        demucs 人声 44.1k 立体声 (供动态情感参考 + 工作台)
+  audio/background.wav   demucs 背景音 44.1k 立体声 (供成片混音)
   separate.json          分离元信息
 
-- demucs 用 htdemucs_ft 模型 (vl_cache 已缓存 HTDemucs); 显存不足自动降 two-stems CPU
-- ctx.check_cancel 在分块回调间检查 (demucs 无细粒度回调, 取消粒度=整曲, 可接受)
+- 分离输入恒为 44.1kHz 立体声 (从原视频抽取, 用完即删) —— htdemucs 的训练规格;
+  模型/位移平均/重叠比例可配 (separate.model/shifts/overlap, 步骤页可改)
+- 显存不足自动降级; ctx.check_cancel 取消粒度=整曲 (demucs 无细粒度回调)
 - "取消不产生半成品" 由临时目录保证: 输出写 artifacts/preprocess/.tmp_* 完成后改名
 """
 import json
@@ -35,13 +36,16 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     os.replace(tmp, out_wav)
 
 
-def _run_demucs(ctx, raw_wav, out_dir) -> tuple:
-    """htdemucs 分离人声/伴奏; 返回 (vocal_path, background_path)"""
+def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
+    """htdemucs 分离人声/伴奏; 输入须为 44.1kHz 立体声 (模型训练规格)"""
     from dubforge import config
     config.ensure_hf_env()
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    ctx.log(f"demucs 分离中 (device={device}, model=htdemucs)")
+    model_name = str(ctx.cfg("separate.model", "htdemucs"))
+    shifts = int(ctx.cfg("separate.shifts", 0) or 0)
+    overlap = float(ctx.cfg("separate.overlap", 0.25) or 0.25)
+    ctx.log(f"demucs 分离中 (device={device}, model={model_name}, shifts={shifts})")
 
     tmp_out = out_dir / ".demucs_tmp"
     if tmp_out.exists():
@@ -53,24 +57,23 @@ def _run_demucs(ctx, raw_wav, out_dir) -> tuple:
     import soundfile as sf
     import torch as th
 
-    model = pretrained.get_model("htdemucs")
+    model = pretrained.get_model(model_name)
     model.to(device)
     model.eval()
 
-    # 输入恒为 16k pcm_s16le wav (preprocess 自己产出), soundfile 足够且
-    # 避免 torchaudio 新版的 torchcodec 后端依赖 (需 FFmpeg7 共享库, 坑)
-    import soundfile as sf
-    data, sr = sf.read(str(raw_wav), dtype="float32", always_2d=True)
-    wav = torch.from_numpy(data.T)          # [channels=1, samples]
+    data, sr = sf.read(str(src_wav), dtype="float32", always_2d=True)
+    wav = torch.from_numpy(data.T)          # [channels, samples]
     if wav.shape[0] == 1:
         wav = wav.repeat(2, 1)              # htdemucs 要求立体声输入, 单声道复制
+    if sr != model.samplerate:
+        ctx.log(f"⚠ 输入采样率 {sr} ≠ 模型规格 {model.samplerate}, 分离质量会下降")
     wav = wav.to(device)
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
     with th.no_grad():
         sources = apply_model(model, wav[None], device=device,
-                              split=True, overlap=0.25,
+                              split=True, overlap=overlap, shifts=shifts,
                               progress=False)[0]
     # htdemucs stems 顺序: drums, bass, other, vocals
     vocals = sources[-1]
@@ -114,10 +117,23 @@ def run(ctx) -> None:
         ctx.log("vocal/background 已存在, 跳过分离")
     else:
         ctx.report_progress(30)
-        v, b = _run_demucs(ctx, raw_wav, audio_dir)
-        vocal, bg = v, b
+        # htdemucs 按 44.1kHz 立体声训练 —— 喂 16k 单声道会频谱错位、严重劣化。
+        # 从原视频抽全规格音轨作分离输入, 用完即删 (重跑重新提取只需几秒)。
+        src441 = audio_dir / ".tmp_src44100.wav"
+        cmd = ["ffmpeg", "-y", "-i", str(video), "-vn",
+               "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
+               "-f", "wav", str(src441)]
+        r = subprocess.run(cmd, capture_output=True, text=True)
+        if r.returncode != 0:
+            raise DubForgeError("分离输入音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
+                                detail=r.stderr[-1500:])
+        try:
+            vocal, bg = _run_demucs(ctx, src441, audio_dir)
+        finally:
+            src441.unlink(missing_ok=True)
         ctx.report_progress(85)
     ctx.register_file("vocal.wav", vocal, "audio")
     ctx.register_file("background.wav", bg, "audio")
-    ctx.write_json("separate.json", {"separated": True, "model": "htdemucs"})
+    ctx.write_json("separate.json",
+                   {"separated": True, "model": str(ctx.cfg("separate.model", "htdemucs"))})
     ctx.log("✅ 预处理完成 (raw + vocal + background)")
