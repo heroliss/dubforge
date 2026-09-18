@@ -153,19 +153,15 @@ async function applySettings() {
 
 async function testConnection() {
   testing.value = true
-  testResults.value = {}
-  // 只测「启用」的组; 记录它们在表单里的原始下标, 结果按位置映射回去
-  const idxMap: number[] = []
-  const list = profiles.value
+  // 每组独立发请求: 谁先返回谁先显示, 不互相等待最慢的
+  const targets = profiles.value
     .map((p, idx) => ({ p, idx }))
     .filter(x => x.p.enabled)
+  targets.forEach(x => { delete testResults.value[x.idx] })
   try {
-    const results = await postTest(list.map(x => { idxMap.push(x.idx); return toWire(x.p) }))
-    results.forEach((res: any, pos: number) => { testResults.value[idxMap[pos]] = res })
-    const okN = results.filter((r: any) => r.ok).length
-    message.info(`并行测试完成: ${okN}/${results.length} 组可用`)
-  } catch (e: any) {
-    message.error(e.message)
+    await Promise.allSettled(targets.map(x => testOne(x.idx)))
+    const okN = targets.filter(x => testResults.value[x.idx]?.ok).length
+    message.info(`并行测试完成: ${okN}/${targets.length} 组可用`)
   } finally { testing.value = false }
 }
 
