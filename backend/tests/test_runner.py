@@ -175,3 +175,49 @@ def test_api_e2e(isolated_env, stub_heavy_steps):
 def _runner():
     from dubforge.runner import runner
     return runner
+
+
+def test_global_serial_with_queued_status(make_project, isolated_env, monkeypatch):
+    """跨项目全局串行 (单线程池保护显存): 占住池时后提交的步骤显示排队中,
+    且排队中可取消"""
+    import threading
+    import dubforge.pipeline.steps as steps_mod
+
+    gate = threading.Event()      # 控制第一个步骤何时放行
+    started = threading.Event()
+
+    def blocker(ctx):
+        started.set()
+        gate.wait(10)
+
+    monkeypatch.setattr(steps_mod, "get_runner", lambda key: blocker)
+    uid1, uid2 = make_project(), make_project()
+    runner = _runner()
+    runner.start_step(uid1, "download")
+    assert started.wait(5), "第一个步骤未开始执行"
+
+    # 池被占住 → 第二个项目的步骤进入排队态 (跨项目同样串行)
+    runner.start_step(uid2, "download")
+    wait_status(uid2, "download", {"queued"})
+    pid1 = crud.get_project(uid1).id
+    assert crud.get_step(pid1, "download").status == "running"
+
+    # 排队中取消 → 不执行, 标记取消
+    runner.cancel_step(uid2, "download")
+    gate.set()
+    wait_status(uid1, "download", {"done"})
+    wait_status(uid2, "download", {"failed"})
+    step2 = crud.get_step(crud.get_project(uid2).id, "download")
+    assert step2.error_code == "STEP_CANCELLED"
+
+
+def test_recover_resets_queued(make_project, isolated_env):
+    """崩溃恢复: 排队中的步骤没跑过 → 直接回待运行"""
+    from dubforge.domain.models import StepRun
+    uid = make_project()
+    step = crud.get_step(crud.get_project(uid).id, "download")
+    step.status = "queued"
+    crud.save_step(step)
+
+    _runner().recover()
+    assert crud.get_step(crud.get_project(uid).id, "download").status == "pending"

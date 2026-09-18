@@ -20,6 +20,7 @@ const busy = ref(false)
 
 const STATUS_META: Record<string, { tag: 'default' | 'success' | 'error' | 'warning' | 'info', text: string }> = {
   pending: { tag: 'default', text: '待运行' },
+  queued: { tag: 'warning', text: '⏳ 排队中 (其他任务占用)' },
   running: { tag: 'info', text: '运行中' },
   done: { tag: 'success', text: '✓ 完成' },
   failed: { tag: 'error', text: '✗ 失败' },
@@ -119,8 +120,8 @@ function openWorkbench() {
             <n-tag v-if="s.status === 'done' && s.fresh" size="small" type="success" bordered={false}>已是最新</n-tag>
           </n-space>
           <n-space @click.stop>
-            <n-button v-if="s.status === 'running'" size="tiny" type="warning"
-                      @click="cancel(s)">取消</n-button>
+            <n-button v-if="s.status === 'running' || s.status === 'queued'" size="tiny"
+                      type="warning" @click="cancel(s)">取消</n-button>
             <n-button v-else size="tiny" :loading="busy" @click="run(s)">运行</n-button>
             <n-button v-if="s.status === 'done'" size="tiny" quaternary
                       @click="rerunDialog(s)">强制重跑</n-button>

@@ -172,6 +172,12 @@ class Runner:
                 step.finished_at = now
                 s.add(step)
                 steps_fixed += 1
+            # queued = 还在线程池队列里没开跑 → 直接回待运行 (无半成品)
+            for step in s.exec(sqlmodel.select(StepRun).where(
+                    StepRun.status == "queued")).all():
+                step.status = "pending"
+                s.add(step)
+                steps_fixed += 1
             s.commit()
         if steps_fixed or jobs_fixed:
             logging.warning("崩溃恢复: %d 个步骤判中断, %d 个 Job 判 dead",
@@ -191,8 +197,8 @@ class Runner:
         step = crud.get_step(project.id, step_key)
         if not step:
             raise DubForgeError(f"步骤不存在: {step_key}", code="STEP_NOT_FOUND")
-        if step.status == "running":
-            raise DubForgeError("该步骤正在运行中", code="STEP_RUNNING",
+        if step.status in ("running", "queued"):
+            raise DubForgeError("该步骤正在运行或排队中", code="STEP_RUNNING",
                                 suggestion="请等待完成, 或先取消再重跑。")
 
         # 非 force 且已完成且指纹未变 → 跳过 (配置/上游都没变, 无需重算)
@@ -208,6 +214,11 @@ class Runner:
         cancel = threading.Event()
         with self._lock:
             self._cancels[(project.id, step_key)] = cancel
+
+        # 线程池全局串行 (max_workers=1, 保护显存): 提交后先显示排队,
+        # 轮到它执行时 _execute 再置 running
+        step.status = "queued"
+        crud.save_step(step)
 
         log_file = crud.project_dir(uid) / "logs" / f"{step_key}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
@@ -303,7 +314,7 @@ class Runner:
             return
         steps = crud.get_steps(project.id)
         statuses = {s.status for s in steps}
-        if "running" in statuses:
+        if "running" in statuses or "queued" in statuses:
             new = "processing"
         elif "failed" in statuses:
             new = "failed"
