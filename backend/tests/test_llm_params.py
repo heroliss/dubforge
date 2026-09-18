@@ -30,3 +30,13 @@ def test_test_provider_failure_returns_error_dict(isolated_env):
     assert r["ok"] is False
     assert r.get("error")
     assert r["request"]["url"].endswith("/chat/completions")
+
+
+def test_status_hint_is_status_specific():
+    # 修复建议必须与状态码对应 (回归: 曾对一切非 200 都提示 429 限流)
+    from dubforge.backends.llm import _status_hint
+    assert "限流" in _status_hint(429)
+    assert "/chat/completions" in _status_hint(404)
+    assert "api_key" in _status_hint(403)
+    assert _status_hint(502) is not None
+    assert _status_hint(418) is None          # 无合适建议 → 不显示

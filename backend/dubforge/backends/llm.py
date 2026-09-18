@@ -59,10 +59,27 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
+def _status_hint(status: int) -> str | None:
+    """按 HTTP 状态码给针对性修复建议; 没有合适建议的状态码返回 None (不显示)"""
+    hint = {
+        429: "配额限流: 稍后重试, 或调小翻译并发数 (llm.max_workers)",
+        404: "接口地址可能有误: 完整地址 = 接口地址 + /chat/completions, 请核对"
+             " (常见: base_url 少了 /v1, 或多了多余路径)",
+        400: "请求被拒绝: 检查模型名是否正确、专属参数是否为该服务商支持",
+        403: "无权限: 检查 api_key 是否开通了该模型",
+    }.get(status)
+    if status >= 500:
+        hint = "服务商服务端错误, 稍后重试"
+    return hint
+
+
 def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
     key = provider.get("api_key", "")
     name = provider.get("name", "default")
+    # Key 为空 → 不带 Authorization 头 (本地 vLLM/Ollama 等无鉴权服务可裸跑;
+    # 带空值反而会被 httpx 拒绝: Illegal header value b'Bearer ')
+    headers = {"Authorization": f"Bearer {key}"} if key else {}
 
     # 429/5xx/读超时 → 指数退避重试 (思考型模型慢 + 限流都是常态)
     import time as _time
@@ -71,15 +88,15 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     for attempt in range(1, 4):
         try:
             with _client(provider.get("base_url", "")) as c:
-                r = c.post("/chat/completions", json=body,
-                           headers={"Authorization": f"Bearer {key}"})
+                r = c.post("/chat/completions", json=body, headers=headers)
             last_exc = None
         except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError) as e:
             last_exc = e
             if isinstance(e, httpx.ConnectError):
                 raise ServiceOfflineError(
                     f"「{name}」服务不可达: {provider.get('base_url')}",
-                    detail=str(e)) from e
+                    detail=str(e),
+                    suggestion="检查接口地址与端口是否正确, 对应服务是否已启动") from e
             _time.sleep(3 * attempt)
             continue
         if r.status_code == 200 or (r.status_code != 429 and r.status_code < 500):
@@ -102,12 +119,13 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
         core = {k: v for k, v in body.items()
                 if k not in (provider.get("params") or {})}
         with _client(provider.get("base_url", "")) as c:
-            r = c.post("/chat/completions", json=core,
-                       headers={"Authorization": f"Bearer {key}"})
+            r = c.post("/chat/completions", json=core, headers=headers)
     if r.status_code != 200:
+        # 无专属建议的状态码用中性兜底, 避免泄漏 StepFailedError 的管线页默认建议
         raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
                               detail=r.text[:800],
-                              suggestion="429=配额限流 (稍后重试); 其他码见 detail。")
+                              suggestion=_status_hint(r.status_code)
+                              or "核对该服务商的接口文档与接口地址 (服务端返回见下)。")
     data = r.json()
     return data["choices"][0]["message"]["content"]
 
