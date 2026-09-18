@@ -110,20 +110,30 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
 
 
 def test_provider(provider: dict) -> dict:
-    """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果"""
+    """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果 + 请求/响应详情
+
+    request: 实际发送了什么 (url/model/temperature/专属参数/prompt);
+    logs:    测试过程中的事件 (如专属参数被拒自动剥离重试); reply/detail: 收到了什么。
+    """
     import time as _time
     t0 = _time.time()
+    logs: list[str] = []
+    prompt = "请只回复两个字母: OK"
+    body = _payload(provider, [{"role": "user", "content": prompt}], 0.0, json_mode=False)
+    req_info = {"url": provider.get("base_url", "").rstrip("/") + "/chat/completions",
+                "model": body.get("model"), "temperature": body.get("temperature"),
+                "extra_params": provider.get("params") or {}, "prompt": prompt}
     try:
-        body = _payload(provider, [
-            {"role": "user", "content": "请只回复两个字母: OK"}], 0.0, json_mode=False)
-        reply = _post(provider, body, log=lambda m: None)
+        reply = _post(provider, body, log=logs.append)
         return {"ok": True, "latency": round(_time.time() - t0, 1),
-                "model": provider.get("model", ""),
-                "reply": str(reply)[:60]}
+                "model": provider.get("model", ""), "reply": str(reply)[:120],
+                "request": req_info, "logs": logs}
     except DubForgeError as e:
-        return {"ok": False, "error": e.message, "suggestion": e.suggestion}
+        return {"ok": False, "error": e.message, "suggestion": e.suggestion,
+                "detail": str(e.detail or "")[:400], "request": req_info, "logs": logs}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "error": f"{type(e).__name__}: {e}"}
+        return {"ok": False, "error": f"{type(e).__name__}: {e}",
+                "request": req_info, "logs": logs}
 
 
 def check_online() -> bool:
