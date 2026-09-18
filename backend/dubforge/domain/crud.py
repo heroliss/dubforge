@@ -9,7 +9,6 @@
 import datetime
 import json
 import re
-import shutil
 import secrets
 from pathlib import Path
 
@@ -86,18 +85,23 @@ def list_projects() -> list[Project]:
 
 
 def delete_project(uid: str) -> bool:
+    """删除项目: 取消登记 + 目录移入系统回收站。
+    反悔 = 从回收站还原目录 → 设置页「从项目目录重建索引」即可整个找回;
+    回收站被禁用时由系统永久删除 (删除确认弹窗里已说明)。"""
     project = get_project(uid)
     if not project:
         return False
     pid = project.id
     pdir = project_dir(uid)     # 行删除前解析 (语义化目录名要从行里查)
+    # 目录先进回收站, 再删登记行 —— 目录送不进去 (文件被占用等) 就整体不动
+    from send2trash import send2trash
+    send2trash(str(pdir))
     with session() as s:
         for model in (Artifact, Job, StepRun):
             for row in s.exec(sqlmodel.select(model).where(model.project_id == pid)).all():
                 s.delete(row)
         s.delete(s.get(Project, pid))
         s.commit()
-    shutil.rmtree(pdir, ignore_errors=True)
     return True
 
 

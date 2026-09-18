@@ -120,8 +120,8 @@ function remove(p: any) {
   dialog.warning({
     title: '删除项目',
     content: hasRun
-      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出，然后删除项目目录与全部产物，不可恢复。`
-      : `确定删除「${p.title}」？项目目录与全部产物将一并删除，不可恢复。`,
+      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出；项目将从列表移除，目录移入系统回收站（可还原找回）。`
+      : `确定删除「${p.title}」？项目将从列表移除，项目目录移入系统回收站 —— 反悔可从回收站还原目录，再到「设置 → 从项目目录重建索引」整个找回（若回收站被禁用则为永久删除）。`,
     positiveText: hasRun ? '取消任务并删除' : '删除',
     negativeText: '取消',
     onPositiveClick: async () => {
@@ -338,7 +338,12 @@ function resetNewForm() {
               <n-button size="small" @click.stop="runProject(p)">▶ 运行项目</n-button>
               <n-button size="small" quaternary @click.stop="reveal(p)">📁</n-button>
               <n-button size="small" quaternary @click.stop="openRename(p)">✏️ 改名</n-button>
-              <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
+              <n-tooltip trigger="hover" :delay="200" placement="top">
+                <template #trigger>
+                  <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
+                </template>
+                删除项目 —— 目录移入系统回收站 (可还原找回); 反悔: 还原后到设置页「重建索引」
+              </n-tooltip>
             </n-space>
           </n-space>
           <!-- 分段进度条: 每段 = 一个步骤, 悬停看详情, 点击进步骤页 -->
