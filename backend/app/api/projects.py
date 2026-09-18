@@ -105,3 +105,41 @@ def _project_view(project) -> dict:
         "params": json.loads(project.params or "{}"),
         "created_at": project.created_at.isoformat(),
     }
+
+
+@router.get("/{uid}/media")
+def media_info(uid: str):
+    """原视频信息 (总览页): 路径解析 + ffprobe 提取格式/分辨率/时长"""
+    import subprocess
+
+    from dubforge.pipeline.video_source import resolve_video
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    v = resolve_video(project, crud.project_dir(uid))
+    if v is None:
+        return {"found": False}
+    info = {"found": True, "name": v.name, "size": v.stat().st_size,
+            "path": str(v),
+            "external": v.resolve().is_relative_to(crud.project_dir(uid).resolve()) is False}
+    try:
+        r = subprocess.run(
+            ["ffprobe", "-v", "error", "-print_format", "json",
+             "-show_format", "-show_streams", str(v)],
+            capture_output=True, text=True, timeout=20)
+        if r.returncode == 0:
+            d = json.loads(r.stdout or "{}")
+            vs = next((s for s in d.get("streams", []) if s.get("codec_type") == "video"), {})
+            au = next((s for s in d.get("streams", []) if s.get("codec_type") == "audio"), {})
+            fmt = d.get("format", {})
+            dur = fmt.get("duration")
+            info.update({
+                "container": fmt.get("format_name"),
+                "duration": round(float(dur), 1) if dur else None,
+                "width": vs.get("width"), "height": vs.get("height"),
+                "vcodec": vs.get("codec_name"), "fps": vs.get("r_frame_rate"),
+                "acodec": au.get("codec_name"), "sample_rate": au.get("sample_rate"),
+            })
+    except Exception:
+        pass                      # ffprobe 不可用/超时: 只返回基础信息, 不阻塞总览
+    return info

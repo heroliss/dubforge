@@ -1,86 +1,186 @@
 <script setup lang="ts">
-// 流程总览: 项目信息 + 九步骤/工作台进度一览 (点击进入步骤专属页)。
-// 只负责"看"——运行/日志/配置在每步自己的页面, 由左侧导航直达。
-import { computed } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
-import { useNavStore, STEP_ORDER, STATUS_EMOJI, STATUS_TEXT } from '../stores/nav'
+// 总览: 项目信息 + 原视频 (信息+播放预览) + 各步骤关键信息与快捷运行。
+// 只负责"看"与快捷操作, 不放步骤页跳转入口 (左侧导航已承担); 运行/日志/配置在步骤专属页。
+import { computed, onMounted, ref, watch } from 'vue'
+import { useRoute } from 'vue-router'
+import { useDialog, useMessage } from 'naive-ui'
+import { useNavStore, STATUS_TAG, STATUS_TEXT, STATUS_EMOJI } from '../stores/nav'
 
 const route = useRoute()
-const router = useRouter()
+const message = useMessage()
+const dialog = useDialog()
 const nav = useNavStore()
 const uid = route.params.uid as string
 
-const project = computed(() => ({
-  title: nav.title,
-  status: nav.status,
-  steps: nav.steps,
-}))
+// ---- 原视频信息 (ffprobe, 随 download 完成后刷新) ----
+const media = ref<any>({ found: false })
+async function loadMedia() {
+  try {
+    const r = await fetch(`/api/projects/${uid}/media`)
+    if (r.ok) media.value = await r.json()
+  } catch { /* 忽略, 显示未就绪 */ }
+}
+onMounted(loadMedia)
+watch(() => nav.stepMap['download']?.status, (s) => { if (s === 'done') loadMedia() })
 
-const dubtaskDone = computed(() => nav.stepMap['dubtask']?.status === 'done')
-const items = computed(() => [
-  ...STEP_ORDER.map((k) => ({ key: k, to: `/projects/${uid}/steps/${k}`, step: nav.stepMap[k] })),
-  { key: 'workbench', to: `/projects/${uid}/workbench`, step: null },
-])
+function fmtSize(n?: number): string {
+  if (n == null) return '—'
+  if (n > 1 << 30) return (n / (1 << 30)).toFixed(2) + ' GB'
+  if (n > 1 << 20) return (n / (1 << 20)).toFixed(1) + ' MB'
+  if (n > 1024) return (n / 1024).toFixed(1) + ' KB'
+  return n + ' B'
+}
+function fmtDur(s?: number): string {
+  if (!s) return '—'
+  const m = Math.floor(s / 60), sec = Math.round(s % 60)
+  return `${m}分${sec.toString().padStart(2, '0')}秒`
+}
+
+// ---- 步骤关键信息 + 快捷运行 ----
+const busyKey = ref('')
+function blockersOf(key: string): any[] {
+  const idx = nav.steps.findIndex((s: any) => s.key === key)
+  return nav.steps.slice(0, idx < 0 ? 0 : idx)
+    .filter((s: any) => !['done', 'stale'].includes(s.status))
+}
+const artsSize = (s: any) => (s.artifacts ?? []).reduce((a: number, x: any) => a + (x.size || 0), 0)
+
+async function run(step: any, force = false) {
+  busyKey.value = step.key
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${step.key}/run`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+    })
+    const j = await r.json()
+    if (!r.ok) { message.error(j.message || '启动失败'); return }
+    if (j.status === 'skipped') message.info(j.message)
+    else message.success(force ? '已开始强制重跑' : `已启动: ${step.label}`)
+    await nav.poll()
+  } finally { busyKey.value = '' }
+}
+async function cancel(step: any) {
+  await fetch(`/api/projects/${uid}/steps/${step.key}/cancel`, { method: 'POST' })
+  message.info('取消信号已发送')
+}
+function rerunDialog(step: any) {
+  const downstream = nav.steps.slice(nav.steps.findIndex(s => s.key === step.key) + 1)
+    .filter((s: any) => s.status === 'done' || s.status === 'stale')
+  dialog.warning({
+    title: `强制重跑「${step.label}」`,
+    content: downstream.length
+      ? `将删除本步产物并重新执行；下游 ${downstream.length} 个步骤将被标记为「已过期」（需要重跑）。`
+      : '将删除本步产物并重新执行。',
+    positiveText: '强制重跑',
+    negativeText: '取消',
+    onPositiveClick: () => run(step, true),
+  })
+}
+
+const videoSrc = computed(() =>
+  media.value.found ? `/api/projects/${uid}/workbench/video` : '')
 </script>
 
 <template>
   <n-layout-content content-style="padding: 24px;">
     <n-space justify="space-between" align="center">
-      <n-h1 style="margin: 0; font-size: 20px">{{ project.title || '…' }}</n-h1>
-      <n-tag size="small">{{ project.status }}</n-tag>
+      <n-h1 style="margin: 0; font-size: 20px">{{ nav.title || '…' }}</n-h1>
+      <n-tag size="small">{{ nav.status }}</n-tag>
     </n-space>
 
-    <n-card size="small" style="margin-top: 16px" title="流程进度">
-      <div class="flow">
-        <template v-for="(it, i) in items" :key="it.key">
-          <div class="node" :class="{ dim: it.key === 'workbench' && !dubtaskDone }"
-               @click="router.push(it.to)">
-            <div class="emoji">{{ it.step ? (STATUS_EMOJI[it.step.status] ?? '⚪') : '🎧' }}</div>
-            <div class="lbl">{{ it.step?.label ?? '精修工作台' }}</div>
-            <div class="st">
-              {{ it.step ? (STATUS_TEXT[it.step.status] ?? it.step.status)
-                          : (dubtaskDone ? '逐句精修' : '需先完成配音任务') }}
-            </div>
-          </div>
-          <div v-if="i < items.length - 1" class="arrow">→</div>
-        </template>
-      </div>
+    <!-- ============ 原视频 ============ -->
+    <n-card size="small" title="原视频" style="margin-top: 16px">
+      <template #header-extra>
+        <n-text v-if="media.found && media.external" depth="3" style="font-size: 11.5px">
+          外部引用 (零拷贝, 未复制进项目)
+        </n-text>
+      </template>
+      <n-grid :cols="2" :x-gap="16" v-if="media.found">
+        <n-gi>
+          <video v-if="videoSrc" :src="videoSrc" controls preload="metadata"
+                 style="width: 100%; max-height: 320px; border-radius: 8px; background: #000" />
+        </n-gi>
+        <n-gi>
+          <n-descriptions :column="1" label-placement="left" size="small" bordered>
+            <n-descriptions-item label="文件名">{{ media.name }}</n-descriptions-item>
+            <n-descriptions-item label="大小">{{ fmtSize(media.size) }}</n-descriptions-item>
+            <n-descriptions-item label="时长">{{ fmtDur(media.duration) }}</n-descriptions-item>
+            <n-descriptions-item label="分辨率">
+              <template v-if="media.width">{{ media.width }} × {{ media.height }}</template>
+              <template v-else>—</template>
+            </n-descriptions-item>
+            <n-descriptions-item label="封装格式">{{ media.container || '—' }}</n-descriptions-item>
+            <n-descriptions-item label="视频编码">
+              {{ media.vcodec || '—' }}
+              <n-text v-if="media.fps" depth="3" style="font-size: 11px"> @{{ media.fps }}</n-text>
+            </n-descriptions-item>
+            <n-descriptions-item label="音频编码">
+              {{ media.acodec || '—' }}
+              <n-text v-if="media.sample_rate" depth="3" style="font-size: 11px">
+                {{ (media.sample_rate / 1000).toFixed(1) }}kHz
+              </n-text>
+            </n-descriptions-item>
+          </n-descriptions>
+        </n-gi>
+      </n-grid>
+      <n-empty v-else description="还没有视频 —— 运行「下载/导入」后这里会显示信息与预览"
+               size="small" style="margin: 8px 0" />
     </n-card>
 
-    <n-card size="small" style="margin-top: 14px" title="说明">
-      <n-text depth="3" style="font-size: 12.5px; line-height: 1.8">
-        点击任意步骤进入其专属页面 (运行 / 日志 / 配置 / 产物)；
-        左侧导航可随时切换步骤并显示实时状态。目录结构与各产物含义见「📖 帮助」页。
+    <!-- ============ 各步骤关键信息 + 快捷运行 ============ -->
+    <n-card size="small" style="margin-top: 14px"
+            :title="`步骤进度 (${nav.doneCount}/${nav.steps.length})`">
+      <div class="rows">
+        <div v-for="s in nav.steps" :key="s.key" class="row">
+          <span class="emoji">{{ STATUS_EMOJI[s.status] ?? '⚪' }}</span>
+          <span class="lbl">{{ s.label }}</span>
+          <n-tag size="small" :type="STATUS_TAG[s.status] || 'default'"
+                 :bordered="s.status !== 'pending'">
+            {{ STATUS_TEXT[s.status] || s.status }}
+          </n-tag>
+          <n-tag v-if="s.status === 'done' && s.fresh" size="small" type="success"
+                 :bordered="false">已是最新</n-tag>
+          <span class="info">
+            {{ (s.artifacts?.length ?? 0)
+              ? `产物 ${s.artifacts.length} 个 · ${fmtSize(artsSize(s))}` : '—' }}
+          </span>
+          <span class="err" v-if="s.error" :title="s.error.message">⚠ {{ s.error.message }}</span>
+          <span class="ops">
+            <n-button v-if="s.status === 'running' || s.status === 'queued'"
+                      size="tiny" type="warning" @click="cancel(s)">取消</n-button>
+            <template v-else>
+              <n-button size="tiny" type="primary"
+                        :disabled="blockersOf(s.key).length > 0"
+                        :loading="busyKey === s.key"
+                        :title="blockersOf(s.key).length
+                          ? `上游未就绪: ${blockersOf(s.key).map(b => b.label).join('、')}` : ''"
+                        @click="run(s)">运行</n-button>
+              <n-button v-if="['done', 'stale', 'failed'].includes(s.status)"
+                        size="tiny" quaternary @click="rerunDialog(s)">强制重跑</n-button>
+            </template>
+          </span>
+        </div>
+      </div>
+      <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 8px">
+        详细日志 / 配置 / 产物预览请从左侧导航进入各步骤页面。
       </n-text>
     </n-card>
   </n-layout-content>
 </template>
 
 <style scoped>
-.flow {
-  display: flex;
-  align-items: stretch;
-  gap: 6px;
-  overflow-x: auto;
-  padding: 4px 0;
+.rows { display: flex; flex-direction: column; }
+.row {
+  display: flex; align-items: center; gap: 10px;
+  padding: 7px 4px; border-bottom: 1px dashed rgba(128, 128, 128, 0.18);
 }
-.node {
-  min-width: 92px;
-  padding: 10px 8px;
-  border: 1px solid rgba(128, 128, 128, 0.3);
-  border-radius: 8px;
-  text-align: center;
-  cursor: pointer;
-  transition: border-color 0.15s;
+.row:last-child { border-bottom: none; }
+.emoji { width: 20px; text-align: center; }
+.lbl { font-size: 13px; font-weight: 600; width: 84px; }
+.info { font-size: 11.5px; opacity: 0.65; flex: 1; }
+.err {
+  font-size: 11.5px; color: #e88080; max-width: 260px;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.node:hover { border-color: var(--accent, #4da3ff); }
-.node.dim { opacity: 0.55; }
-.emoji { font-size: 20px; }
-.lbl { font-size: 12.5px; font-weight: 600; margin-top: 4px; }
-.st { font-size: 11px; opacity: 0.7; margin-top: 2px; }
-.arrow {
-  align-self: center;
-  opacity: 0.4;
-  font-size: 14px;
-}
+.ops { display: flex; gap: 6px; }
 </style>

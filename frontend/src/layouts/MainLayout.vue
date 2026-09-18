@@ -1,8 +1,7 @@
 <script setup lang="ts">
 // 主布局: 左侧导航 (上下文感知) + 内容区
-// - 全局模式: 项目 / 设置 / 帮助 / 关于
-// - 项目模式 (路由含 :uid): 该项目的流程导航 —— 总览 + 九步骤 (实时状态徽章) + 精修工作台;
-//   全局入口收拢到菜单底部。左侧导航即"全流程总览", 右侧内容区专注单步。
+// - 全局四项 (项目/设置/帮助/关于) 永远固定在顶部, 位置不变 —— 视觉稳定
+// - 项目模式 (路由含 :uid): 项目导航项 (总览 + 九步骤实时徽章 + 精修工作台) 直接接在下方
 import { computed, h, ref, watch } from 'vue'
 import { RouterLink, useRoute } from 'vue-router'
 import { useNavStore, STEP_ORDER, STATUS_EMOJI } from '../stores/nav'
@@ -25,13 +24,11 @@ const globalOptions = [
 ]
 
 const projectOptions = computed(() => [
-  { label: () => h(RouterLink, { to: '/' }, { default: () => '⬅ 项目列表' }), key: 'back' },
   {
     label: () => h(RouterLink, { to: `/projects/${nav.uid}` },
-      { default: () => `📊 流程总览 (${nav.doneCount}/${STEP_ORDER.length})` }),
+      { default: () => `📊 总览 (${nav.doneCount}/${STEP_ORDER.length})` }),
     key: 'overview',
   },
-  { type: 'divider', key: 'd1' },
   ...STEP_ORDER.map((k) => {
     const s = nav.stepMap[k]
     const emoji = s ? (STATUS_EMOJI[s.status] ?? '⚪') : '⚪'
@@ -47,10 +44,11 @@ const projectOptions = computed(() => [
       { default: () => '🎧 精修工作台' }),
     key: 'workbench',
   },
-  { type: 'divider', key: 'd3' },
-  { label: () => h(RouterLink, { to: '/settings' }, { default: () => '⚙️ 设置' }), key: 'settings' },
-  { label: () => h(RouterLink, { to: '/help' }, { default: () => '📖 帮助' }), key: 'help' },
 ])
+
+const menuOptions = computed(() =>
+  inProject.value ? [...globalOptions, { type: 'divider', key: 'dg' }, ...projectOptions.value]
+                  : globalOptions)
 
 const activeKey = computed(() => {
   if (route.name === 'step') return route.params.key as string
@@ -79,7 +77,7 @@ const activeKey = computed(() => {
       <div v-if="inProject && !collapsed" class="proj-title" :title="nav.title">
         {{ nav.title || '…' }}
       </div>
-      <n-menu :options="inProject ? projectOptions : globalOptions"
+      <n-menu :options="menuOptions"
               :value="activeKey" :collapsed="collapsed" :collapsed-width="64"
               :collapsed-icon-size="20" />
     </n-layout-sider>

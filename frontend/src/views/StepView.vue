@@ -120,6 +120,60 @@ function fmtSize(n: number): string {
   if (n > 1024) return (n / 1024).toFixed(1) + ' KB'
   return n + ' B'
 }
+
+// ---- 产出预览: 按步骤类型直接预览对应产物 (视频/音频/文本) ----
+const AUDIO_LABEL: Record<string, string> = {
+  'raw.wav': '原始音轨', 'vocal.wav': '分离人声', 'background.wav': '背景音',
+  'dub_full.wav': '完整配音轨',
+}
+const TEXT_TRUNCATE = 6000
+
+const preview = computed(() => {
+  const arts = step.value?.artifacts ?? []
+  const has = (n: string) => arts.some((a: any) => a.name === n)
+  const artUrl = (n: string) => `/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(n)}/raw`
+  if (key === 'download') {
+    // 本地引用/下载统一走 workbench 视频端点 (支持 Range 拖动)
+    return step.value?.status === 'done'
+      ? { kind: 'video', url: `/api/projects/${uid}/workbench/video`, audios: [] } : null
+  }
+  if (key === 'assemble') {
+    const fin = arts.find((a: any) => a.name.startsWith('final_') && a.name.endsWith('.mp4'))
+    const audios = ['dub_full.wav'].filter(has)
+      .map((n) => ({ name: n, label: AUDIO_LABEL[n] ?? n, url: artUrl(n) }))
+    if (!fin && !audios.length) return null
+    return { kind: 'video', url: fin ? artUrl(fin.name) : null, audios }
+  }
+  if (key === 'preprocess') {
+    const audios = ['raw.wav', 'vocal.wav', 'background.wav'].filter(has)
+      .map((n) => ({ name: n, label: AUDIO_LABEL[n] ?? n, url: artUrl(n) }))
+    return audios.length ? { kind: 'audio', audios } : null
+  }
+  if (key === 'tts') {
+    return { kind: 'workbench' }
+  }
+  // 文本类: 转录/分句/翻译/字幕/配音任务 → 取第一个存在的文本产物
+  const textArts: Record<string, string[]> = {
+    transcribe: ['src.srt', 'transcribe.json'],
+    split: ['split.json'],
+    translate: ['translate.json'],
+    subtitles: ['bilingual.srt', 'trans.srt'],
+    dubtask: ['dubtask.json'],
+  }
+  const name = (textArts[key] ?? []).find(has)
+  return name ? { kind: 'text', name } : null
+})
+
+const previewText = ref('')
+watch(() => (preview.value?.kind === 'text' ? (preview.value as any).name : null),
+      loadText, { immediate: true })
+async function loadText(name: string | null) {
+  if (!name) { previewText.value = ''; return }
+  try {
+    const r = await fetch(`/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(name)}/raw`)
+    previewText.value = (await r.text()).slice(0, TEXT_TRUNCATE)
+  } catch { previewText.value = '(读取失败)' }
+}
 </script>
 
 <template>
@@ -162,6 +216,26 @@ function fmtSize(n: number): string {
         <n-text depth="3" style="font-size: 12px">[{{ step.error.code }}]
           {{ step.error.suggestion }}</n-text>
       </n-alert>
+
+      <!-- 产出预览: 有对应产物时直接展示 -->
+      <n-card v-if="preview" size="small" title="产出预览" style="margin-top: 14px">
+        <video v-if="preview.kind === 'video' && preview.url" :src="preview.url"
+               controls preload="metadata"
+               style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
+        <div v-for="a in preview.audios ?? []" :key="a.name" class="audio-row">
+          <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
+          <audio :src="a.url" controls style="width: 100%; height: 36px" />
+        </div>
+        <pre v-if="preview.kind === 'text'" class="textprev">{{ previewText || '(空)' }}</pre>
+        <n-text v-if="preview.kind === 'text' && previewText.length >= 6000"
+                depth="3" style="font-size: 11px">
+          (内容较长, 仅显示前 6000 字符; 完整文件见项目目录)
+        </n-text>
+        <n-text v-if="preview.kind === 'workbench'" depth="3" style="font-size: 12.5px">
+          逐句音频的试听与参数精修请进入「🎧 精修工作台」(左侧导航) —— 每句可单独合成、
+          试听、调参考音色与情感、采纳后进入成片合成。
+        </n-text>
+      </n-card>
 
       <n-grid :cols="2" :x-gap="14" style="margin-top: 14px">
         <!-- 日志 -->
@@ -222,4 +296,18 @@ function fmtSize(n: number): string {
 }
 .arts { list-style: none; margin: 0; padding: 0; }
 .arts li { padding: 3px 0; }
+.audio-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+.textprev {
+  background: #0d1117;
+  border: 1px solid #2a343f;
+  border-radius: 6px;
+  padding: 10px 14px;
+  max-height: 300px;
+  overflow-y: auto;
+  font-size: 12px;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  margin: 0;
+}
 </style>

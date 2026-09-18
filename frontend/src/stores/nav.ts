@@ -15,6 +15,11 @@ export const STATUS_TEXT: Record<string, string> = {
   failed: '✗ 失败', stale: '⟳ 已过期', interrupted: '已中断',
 }
 
+export const STATUS_TAG: Record<string, 'default' | 'success' | 'error' | 'warning' | 'info'> = {
+  pending: 'default', queued: 'warning', running: 'info', done: 'success',
+  failed: 'error', stale: 'warning', interrupted: 'error',
+}
+
 export const useNavStore = defineStore('nav', {
   state: () => ({
     uid: '',
