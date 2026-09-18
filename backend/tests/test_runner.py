@@ -31,6 +31,7 @@ def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps, pdi
     # 产物文件在盘上, 日志非空
     art = next(iter(arts.values()))
     assert (pdir(uid) / art.rel_path).exists()
+    assert crud.get_step(crud.get_project(uid).id, "assemble").progress == 100.0
     log = (pdir(uid) / "logs" / "assemble.log")
     assert "开始步骤" in log.read_text(encoding="utf-8")
     # manifest 已刷新为 done
@@ -241,7 +242,7 @@ def test_deps_gate_blocks_pending_upstream(make_project, isolated_env, stub_heav
     except DubForgeError as e:
         raised = e
     assert raised is not None and raised.code == "DEPS_NOT_MET"
-    assert "转录" in raised.message          # 指名阻塞步骤
+    assert "语音转文字" in raised.message          # 指名阻塞步骤
     # 上游置 done 后可运行
     mark_upstream_done(uid, "assemble")
     r = _runner().start_step(uid, "assemble")

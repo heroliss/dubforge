@@ -139,8 +139,9 @@ def run(ctx) -> None:
     lines = parse_srt(src_srt)
     out: list[dict] = []
     next_id = 1
-    for line in lines:
+    for li, line in enumerate(lines):
         ctx.check_cancel()
+        ctx.report_progress(li / max(1, len(lines)) * 100)
         if _wc(line.text) <= max_len:
             out.append({"id": next_id, "text": line.text,
                         "start": round(line.start, 3), "end": round(line.end, 3)})

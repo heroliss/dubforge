@@ -96,6 +96,17 @@ class StepContext:
     def cfg(self, key: str, default=None):
         return config.get(key, default)
 
+    # ---- 进度上报 (0-99; 整数变化才落盘, 完成时执行器置 100) ----
+    def report_progress(self, pct: float) -> None:
+        pct = max(0.0, min(99.0, float(pct)))
+        if int(pct) <= getattr(self, "_last_pct", -1):
+            return
+        self._last_pct = int(pct)
+        step = crud.get_step(self.project.id, self.step_key)
+        if step:
+            step.progress = pct
+            crud.save_step(step)
+
     # ---- 上游产物访问 (执行器保证上游已完成; 拿不到即管线违约) ----
     def upstream(self, step_key: str, name: str) -> Path:
         arts = crud.latest_artifacts(self.project.id, [step_key])
@@ -272,6 +283,7 @@ class Runner:
         step.finished_at = None
         step.error_code = step.error_message = step.error_suggestion = ""
         step.input_fingerprint = fingerprint
+        step.progress = 0.0
         crud.save_step(step)
         with self._lock:
             self._active_jobs[job.id] = job
@@ -285,6 +297,7 @@ class Runner:
             run_fn(ctx)
             step = crud.get_step(project.id, step_key)
             step.status = "done"
+            step.progress = 100.0
             step.finished_at = datetime.datetime.now(datetime.timezone.utc)
             crud.save_step(step)
             job.status = "done"
@@ -362,6 +375,11 @@ class Runner:
             return {"status": "not_running", "message": "该步骤当前没有在运行的任务"}
         ev.set()
         return {"status": "cancelling", "message": "取消信号已发送, 等待步骤在下一个检查点退出"}
+
+    def is_cancelling(self, project_id: int, step_key: str) -> bool:
+        """该步骤是否已发出取消信号且尚未退出 (前端显示「取消中…」)"""
+        with self._lock:
+            return (project_id, step_key) in self._cancels
 
     # ============ 心跳 ============
 

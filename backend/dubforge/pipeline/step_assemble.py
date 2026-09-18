@@ -130,14 +130,16 @@ def run(ctx) -> None:
     video = resolve_video(ctx.project, pdir)
     if video is None:
         raise DubForgeError("项目没有可用的源视频", code="VIDEO_MISSING",
-                            suggestion="本地导入的项目请确认原文件还在原位置; 下载项目请重跑「视频获取」。")
+                            suggestion="本地导入的项目请确认原文件还在原位置; 下载项目请重跑「获取视频」。")
 
     total = _ffprobe_duration(video)
     if total <= 0:
         raise DubForgeError("无法探测视频时长", code="VIDEO_DURATION")
 
     dub = _mix_timeline(ctx, pdir, total)
+    ctx.report_progress(40)
     ctx.log("人声轨就绪, 开始封装...")
+    ctx.report_progress(70)
 
     out_dir = pdir / "output"
     out_dir.mkdir(exist_ok=True)

@@ -81,6 +81,8 @@ def run(ctx) -> None:
         ctx.check_cancel()
         for w in (seg.words or []):
             words.append({"start": w.start, "end": w.end, "word": w.word})
+        if info.duration:
+            ctx.report_progress(seg.end / info.duration * 100)
         if int(seg.end) % 30 == 0:
             ctx.log(f"进度: {seg.end:.0f}s")
 

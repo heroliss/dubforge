@@ -79,13 +79,28 @@ function rerunDialog(step: any) {
 
 const videoSrc = computed(() =>
   media.value.found ? `/api/projects/${uid}/workbench/video` : '')
+
+// 项目动态状态: 「翻译」运行中… / 正在取消「翻译」… / 「X」排队中…
+const headerStatus = computed(() => {
+  const run = nav.steps.find((s: any) => s.status === 'running')
+  const que = nav.steps.find((s: any) => s.status === 'queued')
+  if (run) return { text: run.cancelling ? `正在取消「${run.label}」…`
+                                         : `正在「${run.label}」…`, type: 'info' }
+  if (que) return { text: `「${que.label}」排队中…`, type: 'warning' }
+  const map: Record<string, [string, string]> = {
+    done: ['已完成', 'success'], failed: ['有失败步骤', 'error'],
+    processing: ['部分完成', 'default'], created: ['待开始', 'default'],
+  }
+  const [text, type] = map[nav.status] ?? [nav.status, 'default']
+  return { text, type }
+})
 </script>
 
 <template>
   <n-layout-content content-style="padding: 24px;">
     <n-space justify="space-between" align="center">
       <n-h1 style="margin: 0; font-size: 20px">{{ nav.title || '…' }}</n-h1>
-      <n-tag size="small">{{ nav.status }}</n-tag>
+      <n-tag size="small" :type="headerStatus.type as any">{{ headerStatus.text }}</n-tag>
     </n-space>
 
     <!-- ============ 原视频 ============ -->
@@ -95,12 +110,12 @@ const videoSrc = computed(() =>
           外部引用 (零拷贝, 未复制进项目)
         </n-text>
       </template>
-      <n-grid :cols="2" :x-gap="16" v-if="media.found">
-        <n-gi>
+      <n-grid :cols="5" :x-gap="16" v-if="media.found">
+        <n-gi :span="3">
           <video v-if="videoSrc" :src="videoSrc" controls preload="metadata"
-                 style="width: 100%; max-height: 320px; border-radius: 8px; background: #000" />
+                 style="width: 100%; max-height: 440px; border-radius: 8px; background: #000" />
         </n-gi>
-        <n-gi>
+        <n-gi :span="2">
           <n-descriptions :column="1" label-placement="left" size="small" bordered>
             <n-descriptions-item label="文件名">{{ media.name }}</n-descriptions-item>
             <n-descriptions-item label="大小">{{ fmtSize(media.size) }}</n-descriptions-item>
@@ -123,7 +138,7 @@ const videoSrc = computed(() =>
           </n-descriptions>
         </n-gi>
       </n-grid>
-      <n-empty v-else description="还没有视频 —— 运行「下载/导入」后这里会显示信息与预览"
+      <n-empty v-else description="还没有视频 —— 运行「获取视频」后这里会显示信息与预览"
                size="small" style="margin: 8px 0" />
     </n-card>
 
@@ -144,10 +159,16 @@ const videoSrc = computed(() =>
             {{ (s.artifacts?.length ?? 0)
               ? `产物 ${s.artifacts.length} 个 · ${fmtSize(artsSize(s))}` : '—' }}
           </span>
+          <span class="pbar" v-if="s.status === 'running'">
+            <n-progress type="line" :percentage="s.progress || 0" :show-indicator="false"
+                        style="width: 110px" />
+            <n-text depth="3" style="font-size: 11px">{{ Math.round(s.progress || 0) }}%</n-text>
+          </span>
           <span class="err" v-if="s.error" :title="s.error.message">⚠ {{ s.error.message }}</span>
           <span class="ops">
             <n-button v-if="s.status === 'running' || s.status === 'queued'"
-                      size="tiny" type="warning" @click="cancel(s)">取消</n-button>
+                      size="tiny" type="warning" :disabled="s.cancelling"
+                      @click="cancel(s)">{{ s.cancelling ? '取消中…' : '取消' }}</n-button>
             <template v-else>
               <n-button size="tiny" type="primary"
                         :disabled="blockersOf(s.key).length > 0"
@@ -183,4 +204,5 @@ const videoSrc = computed(() =>
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ops { display: flex; gap: 6px; }
+.pbar { display: flex; align-items: center; gap: 6px; }
 </style>

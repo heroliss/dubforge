@@ -101,6 +101,7 @@ def run(ctx) -> None:
         ctx.log("提取 16kHz 单声道音轨...")
         _extract_audio(ctx, video, raw_wav)
     ctx.register_file("raw.wav", raw_wav, "audio")
+    ctx.report_progress(20)
 
     if not ctx.cfg("separate.enabled", True):
         ctx.log("配置关闭了人声分离, 跳过 demucs")
@@ -112,8 +113,10 @@ def run(ctx) -> None:
     if vocal.exists() and bg.exists():
         ctx.log("vocal/background 已存在, 跳过分离")
     else:
+        ctx.report_progress(30)
         v, b = _run_demucs(ctx, raw_wav, audio_dir)
         vocal, bg = v, b
+        ctx.report_progress(85)
     ctx.register_file("vocal.wav", vocal, "audio")
     ctx.register_file("background.wav", bg, "audio")
     ctx.write_json("separate.json", {"separated": True, "model": "htdemucs"})

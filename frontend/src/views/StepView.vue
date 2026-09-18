@@ -1,7 +1,7 @@
 <script setup lang="ts">
 // 步骤专属页: 说明 / 状态 / 依赖门禁 / 本步配置 / 完整日志 / 产物清单 / 运行操作
 // 由左侧流程导航进入, 一页只专注一个步骤; 依赖未就绪时明确指出并禁用运行
-import { computed, nextTick, onUnmounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import { useNavStore, STEP_ORDER, STATUS_TEXT } from '../stores/nav'
@@ -121,6 +121,22 @@ function fmtSize(n: number): string {
   return n + ' B'
 }
 
+// ---- download 页媒体信息 (视频右侧信息栏) ----
+const media = ref<any>({ found: false })
+if (key === 'download') {
+  onMounted(async () => {
+    try {
+      const r = await fetch(`/api/projects/${uid}/media`)
+      if (r.ok) media.value = await r.json()
+    } catch { /* 忽略 */ }
+  })
+}
+function fmtDur(sec?: number): string {
+  if (!sec) return '—'
+  const m = Math.floor(sec / 60)
+  return `${m}分${Math.round(sec % 60).toString().padStart(2, '0')}秒`
+}
+
 // ---- 产出预览: 按步骤类型直接预览对应产物 (视频/音频/文本) ----
 const AUDIO_LABEL: Record<string, string> = {
   'raw.wav': '原始音轨', 'vocal.wav': '分离人声', 'background.wav': '背景音',
@@ -190,7 +206,8 @@ async function loadText(name: string | null) {
                  :bordered="false">已是最新</n-tag>
         </n-space>
         <n-space>
-          <n-button v-if="running" type="warning" @click="cancel">⏹ 取消</n-button>
+          <n-button v-if="running" type="warning" :disabled="step.cancelling"
+                    @click="cancel">⏹ {{ step.cancelling ? '取消中…' : '取消' }}</n-button>
           <n-button v-else type="primary" :loading="busy" :disabled="!canRun"
                     @click="run(false)">▶ 运行</n-button>
           <n-button v-if="['done', 'stale', 'failed'].includes(step.status)"
@@ -198,6 +215,11 @@ async function loadText(name: string | null) {
         </n-space>
       </n-space>
       <n-text depth="3" style="font-size: 12px">{{ step.description }}</n-text>
+      <n-tag v-if="running && step.cancelling" size="small" type="warning"
+             :bordered="false" style="margin-left: 10px">正在取消…</n-tag>
+      <n-progress v-if="running" type="line" :percentage="step.progress || 0"
+                  indicator-placement="inside" :height="14" processing
+                  style="margin-top: 12px" />
 
       <!-- 依赖门禁: 明确指出缺哪些上游 -->
       <n-alert v-if="blockers.length" type="warning" :show-icon="true"
@@ -219,7 +241,39 @@ async function loadText(name: string | null) {
 
       <!-- 产出预览: 有对应产物时直接展示 -->
       <n-card v-if="preview" size="small" title="产出预览" style="margin-top: 14px">
-        <video v-if="preview.kind === 'video' && preview.url" :src="preview.url"
+        <template v-if="key === 'download' && media.found">
+          <n-grid :cols="2" :x-gap="16">
+            <n-gi>
+              <video v-if="preview.url" :src="preview.url" controls preload="metadata"
+                     style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
+            </n-gi>
+            <n-gi>
+              <n-descriptions :column="1" label-placement="left" size="small" bordered>
+                <n-descriptions-item label="文件名">{{ media.name }}</n-descriptions-item>
+                <n-descriptions-item label="大小">{{ fmtSize(media.size) }}</n-descriptions-item>
+                <n-descriptions-item label="时长">{{ fmtDur(media.duration) }}</n-descriptions-item>
+                <n-descriptions-item label="分辨率">
+                  {{ media.width ? `${media.width} × ${media.height}` : '—' }}</n-descriptions-item>
+                <n-descriptions-item label="封装">{{ media.container || '—' }}</n-descriptions-item>
+                <n-descriptions-item label="视频编码">{{ media.vcodec || '—' }}</n-descriptions-item>
+                <n-descriptions-item label="音频编码">
+                  {{ media.acodec || '—'
+                  }}<n-text v-if="media.sample_rate" depth="3" style="font-size: 11px">
+                    {{ (media.sample_rate / 1000).toFixed(1) }}kHz</n-text>
+                </n-descriptions-item>
+                <n-descriptions-item label="文件位置">
+                  <n-text :title="media.path" depth="3"
+                          style="font-size: 11px; word-break: break-all">
+                    {{ media.path }}
+                    <n-tag v-if="media.external" size="tiny" :bordered="false"
+                           style="margin-left: 4px">外部引用</n-tag>
+                  </n-text>
+                </n-descriptions-item>
+              </n-descriptions>
+            </n-gi>
+          </n-grid>
+        </template>
+        <video v-else-if="preview.kind === 'video' && preview.url" :src="preview.url"
                controls preload="metadata"
                style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
         <div v-for="a in preview.audios ?? []" :key="a.name" class="audio-row">

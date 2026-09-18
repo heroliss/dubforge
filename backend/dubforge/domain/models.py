@@ -40,6 +40,7 @@ class StepRun(SQLModel, table=True):
     project_id: int = Field(index=True, foreign_key="project.id")
     step_key: str = Field(index=True)                  # download/preprocess/...
     status: str = "pending"                            # pending/running/done/failed/stale/interrupted
+    progress: float = 0.0                              # 运行进度 0-100 (running 时上报, done=100)
     input_fingerprint: str = ""                        # 输入指纹 (配置+上游产物哈希)
     error_code: str = ""
     error_message: str = ""

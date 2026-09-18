@@ -99,8 +99,9 @@ def run(ctx) -> None:
     task = json.loads(ctx.upstream("dubtask", "dubtask.json").read_text(encoding="utf-8"))
     pdir = ctx.pdir
     done = skipped = failed = 0
-    for line in task["lines"]:
+    for li, line in enumerate(task["lines"]):
         ctx.check_cancel()
+        ctx.report_progress(li / max(1, len(task["lines"])) * 99)
         if not line["text"].strip():
             continue
         try:

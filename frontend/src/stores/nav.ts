@@ -64,5 +64,14 @@ export const useNavStore = defineStore('nav', {
       this.poll()
       if (!this.timer) this.timer = setInterval(() => this.poll(), 2500)
     },
+    reset() {
+      this.uid = ''
+      this.title = ''
+      this.steps = []
+      if (this.timer) {
+        clearInterval(this.timer)
+        this.timer = 0
+      }
+    },
   },
 })

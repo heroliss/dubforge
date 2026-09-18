@@ -37,6 +37,8 @@ def list_steps(uid: str):
         "retry_count": s.retry_count,
         "artifacts": arts_by_step.get(s.step_key, []),
         "cfg": _cfg_snapshot(STEP_MAP[s.step_key].cfg_keys),
+        "progress": round(s.progress or 0, 1),
+        "cancelling": runner.is_cancelling(project.id, s.step_key),
     } for s in steps]
 
 

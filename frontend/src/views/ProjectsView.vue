@@ -3,10 +3,12 @@
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
+import { useNavStore } from '../stores/nav'
 
 const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
+const nav = useNavStore()
 
 const projects = ref<any[]>([])
 const loading = ref(true)
@@ -74,14 +76,24 @@ async function applyRename() {
 }
 
 function remove(p: any) {
+  const hasRun = !!p.running_step
   dialog.warning({
     title: '删除项目',
-    content: `确定删除「${p.title}」？\n项目目录与全部产物将一并删除，不可恢复。`,
-    positiveText: '删除',
+    content: hasRun
+      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出，然后删除项目目录与全部产物，不可恢复。`
+      : `确定删除「${p.title}」？项目目录与全部产物将一并删除，不可恢复。`,
+    positiveText: hasRun ? '取消任务并删除' : '删除',
     negativeText: '取消',
     onPositiveClick: async () => {
-      await fetch(`/api/projects/${p.uid}`, { method: 'DELETE' })
+      const url = hasRun ? `/api/projects/${p.uid}?force=true` : `/api/projects/${p.uid}`
+      const r = await fetch(url, { method: 'DELETE' })
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}))
+        message.error(j.message || '删除失败')
+        return
+      }
       message.success('已删除')
+      if (nav.uid === p.uid) nav.reset()
       await load()
     },
   })

@@ -257,6 +257,7 @@ def run(ctx) -> None:
             results = llm.chat_json(
                 _faith_prompt(lines, "", ""),
                 validator=_valid_ids(lines), system=system, log=ctx.log)
+            ctx.report_progress(90)
             ctx.log(f"整篇直译完成 ({__import__('time').time()-t1:.1f}s)")
             _store(ctx, key, results)
     else:
@@ -269,6 +270,7 @@ def run(ctx) -> None:
             next_head = chunks[ci + 1][0]["text"] if ci < len(chunks) - 1 else ""
             results.update(_translate_chunk_two_step(
                 ctx, chunk, system, prev_tail, next_head))
+            ctx.report_progress((ci + 1) / len(chunks) * 60)
             ctx.log(f"块 {ci + 1}/{len(chunks)} 完成")
 
         if ctx.cfg("translate.global_polish", True):
@@ -276,6 +278,7 @@ def run(ctx) -> None:
             for ci, chunk in enumerate(chunks):
                 ctx.check_cancel()
                 results.update(_translate_chunk_polish(ctx, chunk, system, whole_draft))
+                ctx.report_progress(60 + (ci + 1) / len(chunks) * 35)
                 ctx.log(f"全局审校 {ci + 1}/{len(chunks)} 完成")
 
     out = [{"id": l["id"], "src": l["text"], "dst": results[l["id"]]}

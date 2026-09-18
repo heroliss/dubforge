@@ -109,3 +109,19 @@ def test_data_root_config_resolution(isolated_env):
         os.environ["DUBFORGE_DATA_ROOT"] = str(isolated_env / "data")
         config.set_key("server.data_root", "")
     assert Path(config.data_root()) == Path(os.environ["DUBFORGE_DATA_ROOT"])
+
+
+def test_delete_running_project_guard(isolated_env, stub_heavy_steps, make_project):
+    """删除运行中项目: 默认拒绝 (PROJECT_BUSY); force 先取消等待再删"""
+    from conftest import mark_upstream_done
+    stub_heavy_steps("assemble")
+    uid = make_project(params={"delay_step": {"assemble": 0.4}})
+    mark_upstream_done(uid, "assemble")
+    with _client() as client:
+        client.post(f"/api/projects/{uid}/steps/assemble/run")
+        r = client.delete(f"/api/projects/{uid}")
+        assert r.status_code == 400 and r.json()["code"] == "PROJECT_BUSY"
+        r = client.delete(f"/api/projects/{uid}?force=true")
+        assert r.status_code == 200, r.json()
+        rr = client.get(f"/api/projects/{uid}")
+        assert rr.json()["code"] == "PROJECT_NOT_FOUND"

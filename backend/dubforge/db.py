@@ -33,6 +33,11 @@ def _ensure_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE project ADD COLUMN dir_name VARCHAR DEFAULT '' NOT NULL")
             conn.commit()
+        cols2 = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(steprun)")}
+        if "progress" not in cols2:
+            conn.exec_driver_sql(
+                "ALTER TABLE steprun ADD COLUMN progress FLOAT DEFAULT 0 NOT NULL")
+            conn.commit()
 
 
 def reset_engine() -> None:

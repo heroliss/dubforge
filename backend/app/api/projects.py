@@ -89,7 +89,34 @@ def get_project(uid: str):
 
 
 @router.delete("/{uid}")
-def delete_project(uid: str):
+def delete_project(uid: str, force: bool = False):
+    """删除项目; 有运行中/排队步骤时默认拒绝 (force=true: 先取消并等退出, 最多 20s)"""
+    import time
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    active = [s for s in crud.get_steps(project.id)
+              if s.status in ("running", "queued")]
+    if active:
+        names = ", ".join(f"「{STEP_MAP[s.step_key].label}」" for s in active)
+        if not force:
+            raise DubForgeError(
+                f"项目正在运行或排队: {names}, 不能直接删除",
+                code="PROJECT_BUSY",
+                suggestion="先取消运行中的步骤再删除; 或在确认框中选择「取消任务并删除」。")
+        from dubforge.runner import runner as _runner
+        for s in active:
+            _runner.cancel_step(uid, s.step_key)
+        deadline = time.time() + 20
+        while time.time() < deadline:
+            cur = [s for s in crud.get_steps(project.id)
+                   if s.status in ("running", "queued")]
+            if not cur:
+                break
+            time.sleep(0.4)
+        else:
+            raise DubForgeError("取消超时, 任务尚未退出; 请稍后再试",
+                                code="PROJECT_DELETE_TIMEOUT")
     if not crud.delete_project(uid):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     return {"ok": True}

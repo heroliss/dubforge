@@ -71,6 +71,10 @@ def _progress_hook(ctx):
             pct = d.get("_percent_str", "").strip()
             speed = d.get("_speed_str", "").strip()
             ctx.log(f"下载中 {pct} {speed}")
+            try:
+                ctx.report_progress(float(pct.rstrip("%")))
+            except ValueError:
+                pass
         elif d.get("status") == "finished":
             ctx.log(f"下载完成: {d.get('filename')}")
     return hook
@@ -112,6 +116,7 @@ def run(ctx) -> None:
             raise DubForgeError(f"本地视频不存在: {src}", code="SOURCE_NOT_FOUND",
                                 suggestion="原文件可能被移动或删除; 请确认路径, 或重建项目重新选择文件。")
         ctx.log(f"引用本地视频 (不复制): {src}")
+        ctx.report_progress(10)
         title = src.stem
         dst = src
     elif kind in ("youtube", "link"):   # yt-dlp 支持的任意视频站点 (YouTube/B站/Twitter...)
@@ -129,6 +134,7 @@ def run(ctx) -> None:
     else:
         raise DubForgeError(f"未知来源类型: {kind}", code="SOURCE_KIND_UNKNOWN")
 
+    ctx.report_progress(90)
     # 简单元数据产物 (标题供项目列表展示; duration 供后续步骤参考)
     meta = {"title": title, "file": dst.name, "size": dst.stat().st_size}
     (media / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=1),
