@@ -81,9 +81,15 @@ class StepContext:
                                                  indent=1).encode("utf-8"), kind)
 
     def register_file(self, name: str, path: Path, kind: str) -> Path:
-        """登记一个已存在于项目目录内的文件为产物 (大文件不复制, 如下载的视频)"""
+        """登记一个已存在的文件为产物 (大文件不复制)。
+        项目目录内存相对路径; 外部引用文件 (本地导入零拷贝) 存绝对路径。"""
+        path = Path(path)
+        try:
+            rel = str(path.relative_to(self.pdir))
+        except ValueError:
+            rel = str(path)
         crud.add_artifact(self.project.id, self.step_key, kind, name,
-                          path, str(path.relative_to(self.pdir)))
+                          path, rel)
         return path
 
     # ---- 配置读取 (每步实时读, 改配置立即生效) ----
@@ -95,7 +101,9 @@ class StepContext:
         arts = crud.latest_artifacts(self.project.id, [step_key])
         for a in arts.values():
             if a.step_key == step_key and a.name == name:
-                p = self.pdir / a.rel_path
+                p = Path(a.rel_path)
+                if not p.is_absolute():     # 外部引用文件 (本地导入) 存的是绝对路径
+                    p = self.pdir / p
                 if p.exists():
                     return p
         from dubforge.errors import ArtifactMissingError

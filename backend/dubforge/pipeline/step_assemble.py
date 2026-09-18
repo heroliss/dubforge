@@ -126,9 +126,11 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path) -> None:
 
 def run(ctx) -> None:
     pdir = ctx.pdir
-    video = next((p for p in sorted((pdir / "media").glob("video.*")) if p.exists()), None)
+    from dubforge.pipeline.video_source import resolve_video
+    video = resolve_video(ctx.project, pdir)
     if video is None:
-        raise DubForgeError("项目目录没有源视频", code="VIDEO_MISSING")
+        raise DubForgeError("项目没有可用的源视频", code="VIDEO_MISSING",
+                            suggestion="本地导入的项目请确认原文件还在原位置; 下载项目请重跑「视频获取」。")
 
     total = _ffprobe_duration(video)
     if total <= 0:

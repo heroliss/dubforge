@@ -6,14 +6,14 @@
   youtube (source_url 填链接): yt-dlp 下载到 media/video.<ext>
       - 全局去重: data/download_archive.txt 记录已下载 ID, 重复链接直接复用已有项目产物
       - cookies / 代理 / 分辨率 均从 config.download 读取
-  local (source_url 填本地路径): 校验存在后复制进 media/ (复制而非引用: 项目目录自包含,
-      删源文件不影响流水线; 超大文件场景后续可加 link 模式)
+  local (source_url 填本地路径): 原文件就地引用, 零拷贝 —— 几个 GB 的视频复制一遍
+      既费时又费盘, 产物登记的是指向原文件的引用 (绝对路径); 原文件被移动/删除后
+      重跑会报 SOURCE_NOT_FOUND。
 
-产物: media/video.<ext> (登记为 download/video.mp4 逻辑名)
+产物: 下载 → media/video.<ext>; 本地 → 原文件本身 (均登记为 download/video.mp4 逻辑名)
 """
 import json
 import re
-import shutil
 from pathlib import Path
 
 from dubforge import config
@@ -110,11 +110,10 @@ def run(ctx) -> None:
         src = Path(ctx.project.source_url or "")
         if not src.exists():
             raise DubForgeError(f"本地视频不存在: {src}", code="SOURCE_NOT_FOUND",
-                                suggestion="请确认路径正确, 或重新创建项目并选择有效文件。")
-        dst = media / f"video{src.suffix.lower()}"
-        ctx.log(f"导入本地视频: {src}")
-        shutil.copy2(src, dst)
+                                suggestion="原文件可能被移动或删除; 请确认路径, 或重建项目重新选择文件。")
+        ctx.log(f"引用本地视频 (不复制): {src}")
         title = src.stem
+        dst = src
     elif kind in ("youtube", "link"):   # yt-dlp 支持的任意视频站点 (YouTube/B站/Twitter...)
         url = ctx.project.source_url
         if not url:

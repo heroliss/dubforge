@@ -35,8 +35,9 @@ def test_segment_from_words(isolated_env):
 
 
 def test_download_local_import_and_idempotent(make_project, isolated_env):
-    """本地导入: 造一个假视频文件 (ffmpeg 合成 1s 彩条) → 跑两遍 → 第二遍跳过"""
+    """本地导入: 零拷贝 —— 原文件就地引用, 项目里不落副本; 重跑不碰原文件"""
     import subprocess
+    from pathlib import Path
     src = isolated_env / "sample.mp4"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=1",
@@ -52,16 +53,22 @@ def test_download_local_import_and_idempotent(make_project, isolated_env):
     runner.start_step(uid, "download")
     wait_status(uid, "download", {"done"})
 
-    video = isolated_env / "data" / "projects" / uid / "media" / "video.mp4"
-    assert video.exists()
-    # 幂等: 文件 mtime 不变
-    mtime = video.stat().st_mtime
-    runner.start_step(uid, "download", force=True)   # force 复用已有视频 (media 不删)
+    pdir = isolated_env / "data" / "projects" / uid
+    assert not list((pdir / "media").glob("video.*"))       # 零拷贝: media/ 无副本
+    mtime = src.stat().st_mtime
+    arts = crud.latest_artifacts(p.id, ["download"])
+    art = next(a for a in arts.values() if a.name == "video.mp4")
+    assert Path(art.rel_path).is_absolute()                 # 外部引用登记绝对路径
+    assert Path(art.rel_path) == src
+    meta = json.loads((pdir / "artifacts" / "download" / "meta.json")
+                      .read_text(encoding="utf-8"))
+    assert meta["file"] == "sample.mp4"
+
+    # force 重跑会先 delete_step_artifacts: 外部引用文件绝不能被删
+    runner.start_step(uid, "download", force=True)
     wait_status(uid, "download", {"done"})
-    assert video.stat().st_mtime == mtime
-    # meta 产物
-    meta = json.loads((video.parent / "meta.json").read_text(encoding="utf-8"))
-    assert meta["file"] == "video.mp4"
+    assert src.stat().st_mtime == mtime
+    assert not list((pdir / "media").glob("video.*"))
 
 
 def test_preprocess_and_transcribe_local(make_project, isolated_env):

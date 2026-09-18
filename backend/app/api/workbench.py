@@ -16,6 +16,7 @@ from starlette.concurrency import run_in_threadpool
 from dubforge import config
 from dubforge.domain import crud
 from dubforge.pipeline.step_tts import synth_line
+from dubforge.pipeline.video_source import resolve_video
 
 router = APIRouter(prefix="/api/projects/{uid}/workbench", tags=["workbench"])
 
@@ -70,8 +71,7 @@ def state(uid: str):
     elif cfg_tts == "gptsovits":
         online = tts_gptsovits.is_online(config.get("tts.gptsovits.url"))
 
-    video = next((p for p in sorted((pdir / "media").glob("video.*"))
-                  if p.exists()), None)
+    video = resolve_video(project, pdir)
     return {
         "lines": lines,
         "video": {"found": video is not None,
@@ -155,8 +155,10 @@ def bg_audio(uid: str):
 
 @router.get("/video")
 def video(uid: str):
-    media = crud.project_dir(uid) / "media"
-    v = next((p for p in sorted(media.glob("video.*")) if p.exists()), None)
+    project = crud.get_project(uid)
+    if not project:
+        return Response("no project", status_code=404)
+    v = resolve_video(project, crud.project_dir(uid))
     if v is None:
         return Response("no video", status_code=404)
     return FileResponse(v, media_type="video/mp4",

@@ -133,14 +133,18 @@ def delete_step_artifacts(project_id: int, step_key: str) -> None:
 
     例外: media/ 下的源视频不删 —— 获取步骤没有"过期"概念, 本地文件在/链接已
     归档就应复用 (step_download 的幂等分支依赖它); 真要删请整项目删除。
+    项目目录外的引用文件 (本地导入零拷贝, rel_path 为绝对路径) 是用户原文件,
+    无论如何绝不删除。
     """
     with session() as s:
         rows = list(s.exec(sqlmodel.select(Artifact).where(
             Artifact.project_id == project_id, Artifact.step_key == step_key)))
         pdir = project_dir_by_id(s, project_id)
         for a in rows:
-            p = pdir / a.rel_path
-            if not a.rel_path.replace("\\", "/").startswith("media/"):
+            p = Path(a.rel_path)
+            if not p.is_absolute():
+                p = pdir / a.rel_path
+            if p.is_relative_to(pdir) and not a.rel_path.replace("\\", "/").startswith("media/"):
                 p.unlink(missing_ok=True)
             s.delete(a)
         s.commit()
