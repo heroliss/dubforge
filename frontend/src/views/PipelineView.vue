@@ -36,9 +36,14 @@ async function loadMedia() {
   } catch { /* 忽略 */ }
 }
 onMounted(loadMedia)
-watch(() => nav.stepMap['download']?.status, (s) => { if (s === 'done') loadMedia() })
+// 获取视频从未完成变为完成: 重取媒体信息 + 视频地址加版本号 ——
+// <video> 对同一 src 不会自己重新加载, 不 bump 会一直挂着下载中取到的旧资源 (无声)
+const mediaV = ref(0)
+watch(() => nav.stepMap['download']?.status, (s, o) => {
+  if (s === 'done' && o && o !== 'done') { mediaV.value++; loadMedia() }
+})
 const videoSrc = computed(() =>
-  media.value.found ? `/api/projects/${uid}/workbench/video` : '')
+  media.value.found ? `/api/projects/${uid}/workbench/video?v=${mediaV.value}` : '')
 
 function fmtSize(n?: number): string {
   if (n == null) return '—'

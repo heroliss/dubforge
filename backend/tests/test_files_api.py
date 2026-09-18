@@ -109,3 +109,18 @@ def test_external_file_survives_project_delete(isolated_env, tmp_path):
             "source_url": str(src)}).json()
         assert client.delete(f"/api/projects/{p['uid']}").status_code == 200
     assert src.read_bytes() == b"original"
+
+
+def test_find_final_video_skips_partial(tmp_path):
+    """yt-dlp 过程文件 (.part / .fNNN 单流中间产物) 不算源视频 —— 否则下载中途
+    预览会拿到无音轨的纯视频流"""
+    from dubforge.pipeline.video_source import find_final_video
+    media = tmp_path / "media"
+    media.mkdir()
+    assert find_final_video(media) is None                       # 空目录
+    (media / "video.f137.mp4.part").write_bytes(b"x")            # 下载中的单流
+    (media / "video.f251.webm").write_bytes(b"x")                # 合并前的单流
+    (media / "video.mp4.ytdl").write_bytes(b"x")
+    assert find_final_video(media) is None                       # 全是过程文件 → None
+    (media / "video.mp4").write_bytes(b"final")
+    assert find_final_video(media) == media / "video.mp4"        # 完成后精确名优先

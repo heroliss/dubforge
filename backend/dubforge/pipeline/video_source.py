@@ -9,6 +9,20 @@
 下游 (preprocess/assemble/workbench) 一律从这里解析, 不各自 glob。
 """
 from pathlib import Path
+import re
+
+# yt-dlp 过程文件: .part (下载中) / .ytdl; 合并前的单流中间产物 video.f137.mp4 —— 只有画面没有音轨
+_PARTIAL = re.compile(r"\.part$|\.ytdl$|\.f\d+\.", re.IGNORECASE)
+
+
+def find_final_video(media_dir: Path) -> Path | None:
+    """media/ 里找"最终"视频文件: 精确名优先; 过程文件一律不算 (否则下载中途会把
+    无声的单流中间产物当成源视频, 预览就没声音了)"""
+    for pat in ("video.mp4", "video.mkv", "video.webm", "video.*"):
+        hits = [h for h in sorted(media_dir.glob(pat)) if not _PARTIAL.search(h.name)]
+        if hits:
+            return hits[0]
+    return None
 
 
 def resolve_source(project, pdir: Path) -> Path | None:
@@ -27,9 +41,4 @@ def resolve_video(project, pdir: Path) -> Path | None:
     if src:
         return src
     # 下载来源; 兼容旧项目 (本地导入曾复制进 media/) 或源文件被移走的项目
-    media = Path(pdir) / "media"
-    for pat in ("video.mp4", "video.mkv", "video.webm", "video.*"):
-        hits = sorted(media.glob(pat))
-        if hits:
-            return hits[0]
-    return None
+    return find_final_video(Path(pdir) / "media")

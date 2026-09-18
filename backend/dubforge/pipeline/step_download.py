@@ -19,7 +19,7 @@ from pathlib import Path
 
 from dubforge import config
 from dubforge.errors import DubForgeError
-from dubforge.pipeline.video_source import resolve_source
+from dubforge.pipeline.video_source import find_final_video, resolve_source
 from dubforge.utils.srt import SubLine, write_srt
 
 
@@ -83,12 +83,8 @@ def _progress_hook(ctx):
 
 
 def _find_downloaded(media_dir: Path) -> Path | None:
-    """在 media/ 里找视频文件 (yt-dlp 输出名可能带后缀变化)"""
-    for pat in ("video.mp4", "video.mkv", "video.webm", "video.*"):
-        hits = sorted(media_dir.glob(pat))
-        if hits:
-            return hits[0]
-    return None
+    """在 media/ 里找视频文件 (yt-dlp 输出名可能带后缀变化; 过程文件不算)"""
+    return find_final_video(media_dir)
 
 
 def run(ctx) -> None:
