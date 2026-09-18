@@ -221,7 +221,9 @@ function extraParamsStr(r: any): string {
                   <div v-for="(l, li) in testResults[i].logs || []" :key="li"
                        class="tl warn">· {{ l }}</div>
                   <template v-if="!testResults[i].ok">
-                    <div class="tl dim">修复建议: {{ testResults[i].suggestion || '—' }}</div>
+                    <div v-if="testResults[i].suggestion" class="tl dim">
+                    修复建议: {{ testResults[i].suggestion }}
+                  </div>
                     <div v-if="testResults[i].detail" class="tl dim">
                       服务端返回: {{ testResults[i].detail }}
                     </div>

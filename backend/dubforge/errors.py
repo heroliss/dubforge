@@ -19,7 +19,9 @@ class DubForgeError(Exception):
                  code: str | None = None, detail: Any = None):
         super().__init__(message)
         self.message = message
-        if suggestion:
+        # 传字符串覆盖类默认; 传 "" 显式清除 (服务器已响应、无需本地建议的场景);
+        # 传 None / 不传 → 用类默认
+        if suggestion is not None:
             self.suggestion = suggestion
         if code:
             self.code = code

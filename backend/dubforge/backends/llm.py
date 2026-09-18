@@ -59,20 +59,6 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
-def _status_hint(status: int) -> str | None:
-    """按 HTTP 状态码给针对性修复建议; 没有合适建议的状态码返回 None (不显示)"""
-    hint = {
-        429: "配额限流: 稍后重试, 或调小翻译并发数 (llm.max_workers)",
-        404: "接口地址可能有误: 完整地址 = 接口地址 + /chat/completions, 请核对"
-             " (常见: base_url 少了 /v1, 或多了多余路径)",
-        400: "请求被拒绝: 检查模型名是否正确、专属参数是否为该服务商支持",
-        403: "无权限: 检查 api_key 是否开通了该模型",
-    }.get(status)
-    if status >= 500:
-        hint = "服务商服务端错误, 稍后重试"
-    return hint
-
-
 def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
     key = provider.get("api_key", "")
@@ -111,8 +97,9 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
             detail=str(last_exc)[:500],
             suggestion="思考型模型响应慢时可调大 llm.timeout, 或换更快模型。")
     if r.status_code == 401:
+        # 服务器已响应 → 认证信息以服务端返回为准, 不再自造建议
         raise ServiceOfflineError("LLM 认证失败 (401)", code="LLM_AUTH",
-                                  suggestion=f"请检查配置「{name}」的 api_key")
+                                  suggestion="")
     if r.status_code == 400 and provider.get("params"):
         # 该服务商不认某个专属参数 → 自适应降级: 剥离专属参数重发一次
         log(f"⚠ 「{name}」拒绝了专属参数, 已自动剥离重试 ({r.text[:120]})")
@@ -121,11 +108,10 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
         with _client(provider.get("base_url", "")) as c:
             r = c.post("/chat/completions", json=core, headers=headers)
     if r.status_code != 200:
-        # 无专属建议的状态码用中性兜底, 避免泄漏 StepFailedError 的管线页默认建议
+        # 服务器有响应 → 错误码与原因以服务端返回为准 (detail), 本地只给状态码标题;
+        # 显式清空 suggestion, 避免泄漏 StepFailedError 的管线页默认建议
         raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
-                              detail=r.text[:800],
-                              suggestion=_status_hint(r.status_code)
-                              or "核对该服务商的接口文档与接口地址 (服务端返回见下)。")
+                              detail=r.text[:800], suggestion="")
     data = r.json()
     return data["choices"][0]["message"]["content"]
 

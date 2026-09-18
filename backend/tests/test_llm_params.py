@@ -32,11 +32,12 @@ def test_test_provider_failure_returns_error_dict(isolated_env):
     assert r["request"]["url"].endswith("/chat/completions")
 
 
-def test_status_hint_is_status_specific():
-    # 修复建议必须与状态码对应 (回归: 曾对一切非 200 都提示 429 限流)
-    from dubforge.backends.llm import _status_hint
-    assert "限流" in _status_hint(429)
-    assert "/chat/completions" in _status_hint(404)
-    assert "api_key" in _status_hint(403)
-    assert _status_hint(502) is not None
-    assert _status_hint(418) is None          # 无合适建议 → 不显示
+def test_explicit_empty_suggestion_clears_default():
+    # 服务器已响应的错误不再自造建议: 传 "" 显式清除类默认
+    # (回归: 曾把 StepFailedError 的管线页默认建议泄漏到设置页)
+    from dubforge.errors import StepFailedError
+    e = StepFailedError("LLM 请求失败 HTTP 404", detail=r'{"detail":"Not Found"}',
+                        suggestion="")
+    assert e.suggestion == ""
+    assert StepFailedError("x").suggestion          # 不传 → 类默认仍在
+    assert StepFailedError("x", suggestion="自拟建议").suggestion == "自拟建议"
