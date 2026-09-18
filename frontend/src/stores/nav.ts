@@ -26,6 +26,8 @@ export const useNavStore = defineStore('nav', {
     title: '',
     status: '',
     steps: [] as any[],
+    autoSteps: null as string[] | null,   // 勾选集 (null = 全部, 未自定义过)
+    chain: [] as string[],                // 待自动续跑队列
     timer: 0 as unknown as ReturnType<typeof setInterval> | 0,
   }),
   getters: {
@@ -51,6 +53,9 @@ export const useNavStore = defineStore('nav', {
           const p = await ps.json()
           this.title = p.title
           this.status = p.status
+          this.autoSteps = Array.isArray(p.params?.auto_steps)
+            ? p.params.auto_steps : null
+          this.chain = Array.isArray(p.params?._chain) ? p.params._chain : []
           this.steps = await ss.json()
         }
       } catch { /* 后端短暂不可达: 保留旧状态, 下一轮再试 */ }

@@ -7,7 +7,7 @@ from pydantic import BaseModel
 
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
-from dubforge.pipeline.registry import STEP_MAP
+from dubforge.pipeline.registry import STEP_KEYS, STEP_MAP
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
 
@@ -88,6 +88,162 @@ def get_project(uid: str):
     return _project_view(project)
 
 
+class RunMany(BaseModel):
+    uids: list[str]
+
+
+def _auto_chain_of(project) -> list[str]:
+    """项目的勾选链: params.auto_steps (未自定义 = 全部步骤)。
+    语义: 从第一个勾选步骤起, 连续勾选段; 段内已完成的由链自动跳过。"""
+    params = json.loads(project.params or "{}")
+    auto = params.get("auto_steps")
+    if auto is None:
+        return list(STEP_KEYS)
+    auto_set = set(auto)
+    chain: list[str] = []
+    started_collecting = False
+    for k in STEP_KEYS:
+        if k in auto_set:
+            started_collecting = True
+            chain.append(k)
+        elif started_collecting:
+            break
+    return chain
+
+
+@router.post("/run_many")
+def run_many(body: RunMany):
+    """批量运行勾选的项目: 每个项目按其勾选链启动 (跳过已完成/进行中);
+    实际并发度由 runner.step_concurrency 按步骤控制 (GPU 类自动排队)"""
+    from dubforge.runner import runner
+    results = []
+    for uid in body.uids:
+        try:
+            project = crud.get_project(uid)
+            if not project:
+                results.append({"uid": uid, "skipped": "项目不存在"})
+                continue
+            steps = {s.step_key: s for s in crud.get_steps(project.id)}
+            if all(steps[k].status == "done" for k in STEP_KEYS):
+                results.append({"uid": uid, "skipped": "已完成, 跳过"})
+                continue
+            chain = _auto_chain_of(project)
+            if not chain:
+                results.append({"uid": uid, "skipped": "未勾选任何步骤"})
+                continue
+            head = chain[0]
+            if steps[head].status in ("running", "queued"):
+                results.append({"uid": uid,
+                                "skipped": f"「{STEP_MAP[head].label}」进行中"})
+                continue
+            # 剩余链入队 (首步由 start_step 启动)
+            params = json.loads(project.params or "{}")
+            params["_chain"] = chain[1:]
+            project.params = json.dumps(params, ensure_ascii=False)
+            crud.save_project(project)
+            r = runner.start_step(uid, head)
+            if r["status"] == "skipped":      # 首步已最新 → 让链继续
+                info = runner.continue_chain(project)
+                results.append({"uid": uid,
+                                "started": STEP_MAP[info["started"]].label
+                                if info["started"] else "全部已是最新, 跳过"})
+            else:
+                results.append({"uid": uid, "started": STEP_MAP[head].label})
+        except DubForgeError as e:
+            results.append({"uid": uid, "skipped": e.message})
+    started_n = sum(1 for r in results if "started" in r)
+    return {"ok": True, "started": started_n, "results": results}
+
+
+class AutoSteps(BaseModel):
+    steps: list[str]
+
+
+@router.put("/{uid}/auto_steps")
+def set_auto_steps(uid: str, body: AutoSteps):
+    """保存项目的勾选步骤集 (链式执行的依据; 未保存过 = 全部)"""
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    valid = [k for k in STEP_KEYS if k in set(body.steps)]
+    params = json.loads(project.params or "{}")
+    params["auto_steps"] = valid
+    project.params = json.dumps(params, ensure_ascii=False)
+    crud.save_project(project)
+    return {"ok": True, "auto_steps": valid}
+
+
+class RunChain(BaseModel):
+    steps: list[str]
+
+
+@router.post("/{uid}/run_chain")
+def run_chain(uid: str, body: RunChain):
+    """运行勾选链: 从 steps[0] 起, 每步完成后自动续跑下一个,
+    直到链尾; 失败/取消即停止。steps 必须按管线顺序。"""
+    from dubforge.runner import runner
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    if not body.steps:
+        raise DubForgeError("没有勾选任何步骤", code="CHAIN_EMPTY",
+                            suggestion="勾选要自动执行的步骤后再点「运行本步及后续」。")
+    try:
+        idxs = [STEP_KEYS.index(k) for k in body.steps]
+    except ValueError:
+        raise DubForgeError("包含未知步骤", code="CHAIN_INVALID")
+    if idxs != sorted(idxs) or len(set(idxs)) != len(idxs):
+        raise DubForgeError("勾选链必须按管线顺序连续排列", code="CHAIN_INVALID")
+    params = json.loads(project.params or "{}")
+    params["_chain"] = body.steps[1:]
+    project.params = json.dumps(params, ensure_ascii=False)
+    crud.save_project(project)
+    try:
+        r = runner.start_step(uid, body.steps[0])
+    except DubForgeError:
+        params["_chain"] = []
+        project.params = json.dumps(params, ensure_ascii=False)
+        crud.save_project(project)
+        raise
+    if r["status"] == "skipped":               # 首步已最新 → 继续链
+        info = runner.continue_chain(project)
+        return {"ok": True, "started": info["started"], "stopped": info["stopped"]}
+    return {"ok": True, "started": body.steps[0], "stopped": None}
+
+
+@router.post("/{uid}/reveal")
+def reveal_project(uid: str):
+    """在系统文件资源管理器中显示项目目录 (服务端即本机)"""
+    import subprocess
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    pdir = crud.project_dir(uid)
+    if not pdir.exists():
+        raise DubForgeError("项目目录不存在", code="PROJECT_DIR_MISSING")
+    subprocess.Popen(["explorer", f"/select,{pdir}"])
+    return {"ok": True, "dir": str(pdir)}
+
+
+@router.get("/{uid}/files")
+def project_files(uid: str):
+    """项目目录文件清单 (总览文件浏览; 前端自行排序)"""
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    pdir = crud.project_dir(uid)
+    entries = []
+    if pdir.exists():
+        for p in sorted(pdir.rglob("*")):
+            if p.is_file():
+                st = p.stat()
+                entries.append({"file": str(p.relative_to(pdir)),
+                                "size": st.st_size,
+                                "mtime": st.st_mtime,
+                                "ctime": st.st_ctime})
+    return {"dir": str(pdir), "entries": entries[:2000]}
+
+
 @router.delete("/{uid}")
 def delete_project(uid: str, force: bool = False):
     """删除项目; 有运行中/排队步骤时默认拒绝 (force=true: 先取消并等退出, 最多 20s)"""
@@ -136,6 +292,10 @@ def _project_view(project) -> dict:
         "running_label": STEP_MAP[running].label if running else None,
         "params": json.loads(project.params or "{}"),
         "created_at": project.created_at.isoformat(),
+        # 分段进度条数据源: 每步状态+进度
+        "steps": [{"key": s.step_key, "label": STEP_MAP[s.step_key].label,
+                   "status": s.status, "progress": round(s.progress or 0, 1),
+                   "error": s.error_message or None} for s in steps],
     }
 
 

@@ -191,6 +191,8 @@ def test_global_serial_with_queued_status(make_project, isolated_env, monkeypatc
     import threading
     import dubforge.pipeline.steps as steps_mod
 
+    from dubforge import config as cfgmod
+    cfgmod.set_key("runner.step_concurrency", {"download": 1})   # 显式串行
     gate = threading.Event()      # 控制第一个步骤何时放行
     started = threading.Event()
 

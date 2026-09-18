@@ -4,6 +4,7 @@
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
+import MediaInfo from '../components/MediaInfo.vue'
 import { useNavStore, STEP_ORDER, STATUS_TEXT } from '../stores/nav'
 
 const route = useRoute()
@@ -248,28 +249,7 @@ async function loadText(name: string | null) {
                      style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
             </n-gi>
             <n-gi>
-              <n-descriptions :column="1" label-placement="left" size="small" bordered>
-                <n-descriptions-item label="文件名">{{ media.name }}</n-descriptions-item>
-                <n-descriptions-item label="大小">{{ fmtSize(media.size) }}</n-descriptions-item>
-                <n-descriptions-item label="时长">{{ fmtDur(media.duration) }}</n-descriptions-item>
-                <n-descriptions-item label="分辨率">
-                  {{ media.width ? `${media.width} × ${media.height}` : '—' }}</n-descriptions-item>
-                <n-descriptions-item label="封装">{{ media.container || '—' }}</n-descriptions-item>
-                <n-descriptions-item label="视频编码">{{ media.vcodec || '—' }}</n-descriptions-item>
-                <n-descriptions-item label="音频编码">
-                  {{ media.acodec || '—'
-                  }}<n-text v-if="media.sample_rate" depth="3" style="font-size: 11px">
-                    {{ (media.sample_rate / 1000).toFixed(1) }}kHz</n-text>
-                </n-descriptions-item>
-                <n-descriptions-item label="文件位置">
-                  <n-text :title="media.path" depth="3"
-                          style="font-size: 11px; word-break: break-all">
-                    {{ media.path }}
-                    <n-tag v-if="media.external" size="tiny" :bordered="false"
-                           style="margin-left: 4px">外部引用</n-tag>
-                  </n-text>
-                </n-descriptions-item>
-              </n-descriptions>
+              <MediaInfo :media="media" />
             </n-gi>
           </n-grid>
         </template>

@@ -55,7 +55,17 @@ function isTesting(i: number): boolean {
 
 const profiles = ref<any[]>([])
 const form = ref({ max_workers: 1 as number, timeout: 300 as number,
-                   data_root: '' as string })
+                   data_root: '' as string,
+                   conc: {} as Record<string, number> })
+
+// 每步骤并行上限 (GPU 类保持 1; 修改应用后对新启动的步骤即时生效)
+const CONC_ITEMS = [
+  { k: 'download', t: '获取视频' }, { k: 'preprocess', t: '音轨分离' },
+  { k: 'transcribe', t: '语音转文字' }, { k: 'split', t: '拆分句子' },
+  { k: 'translate', t: '翻译' }, { k: 'subtitles', t: '生成字幕' },
+  { k: 'dubtask', t: '配音计划' }, { k: 'tts', t: '逐句配音' },
+  { k: 'assemble', t: '合成成片' },
+]
 
 // —— 未应用修改的追踪 —— 表单是草稿, 「应用」写入 config.yaml 才生效 ——
 const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
@@ -70,7 +80,8 @@ const formDirty = computed(() =>
   dirtyOn.value && savedForm.value !== '' &&
   JSON.stringify({ max_workers: form.value.max_workers,
                    timeout: form.value.timeout,
-                   data_root: form.value.data_root }) !== savedForm.value)
+                   data_root: form.value.data_root,
+                   conc: form.value.conc }) !== savedForm.value)
 const isDirty = computed(() =>
   dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean) ||
                     profiles.value.length !== savedProfiles.value.length))
@@ -78,7 +89,8 @@ function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
   savedForm.value = JSON.stringify({ max_workers: form.value.max_workers,
                                      timeout: form.value.timeout,
-                                     data_root: form.value.data_root })
+                                     data_root: form.value.data_root,
+                                     conc: form.value.conc })
   dirtyOn.value = true
 }
 // 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
@@ -125,6 +137,7 @@ onMounted(async () => {
     form.value.max_workers = Number(llm.max_workers)
     form.value.timeout = Number(llm.timeout ?? 300)
     form.value.data_root = String(cfg.value.server?.data_root ?? '')
+    form.value.conc = { ...(cfg.value.runner?.step_concurrency ?? {}) }
     markApplied()                     // 以载入状态为"已应用"基线
     window.addEventListener('beforeunload', warnUnload)
   } catch (e: any) {
@@ -155,6 +168,7 @@ async function applySettings() {
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
         'server.data_root': form.value.data_root.trim(),
+        'runner.step_concurrency': { ...form.value.conc },
       } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -326,6 +340,23 @@ function extraParamsStr(r: any): string {
           </div>
         </n-card>
 
+        <!-- ============ 运行并行度 ============ -->
+        <n-card title="运行并行度 (多项目同时跑时的每步骤并发上限)" size="small"
+                style="margin-top: 14px">
+          <div class="conc">
+            <div v-for="c in CONC_ITEMS" :key="c.k" class="c-item">
+              <n-text depth="3" style="font-size: 12px">{{ c.t }}</n-text>
+              <n-input-number v-model:value="form.conc[c.k]" size="small"
+                              :min="1" :max="4" style="width: 76px" />
+            </div>
+          </div>
+          <n-text depth="3" style="font-size:12px; display:block; margin-top: 8px">
+            勾选多个项目点「运行选中」时：下载/LLM 类可并行推进，GPU 类
+            (音轨分离/语音转文字/逐句配音/合成成片) 保持 1 排队保护显存。
+            修改并「应用设置」后，对之后新启动的步骤即时生效。
+          </n-text>
+        </n-card>
+
         <!-- ============ 存储 ============ -->
         <n-card title="存储" size="small">
           <div class="g-item">
@@ -389,4 +420,6 @@ function extraParamsStr(r: any): string {
 .globals { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; }
 .g-item { display: flex; flex-direction: column; gap: 4px; }
 .g-lb { font-size: 12px; cursor: help; width: fit-content; }
+.conc { display: flex; flex-wrap: wrap; gap: 10px 18px; }
+.c-item { display: flex; align-items: center; gap: 6px; }
 </style>

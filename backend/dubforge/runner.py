@@ -158,10 +158,12 @@ def compute_fingerprint(project: Project, step_key: str) -> str:
 class Runner:
     """全局单例: 串行线程池 + 取消标志 + 心跳"""
 
-    def __init__(self, max_workers: int = 1):
+    def __init__(self, max_workers: int = 8):
         self._pool = ThreadPoolExecutor(max_workers=max_workers,
                                         thread_name_prefix="dubforge-step")
         self._cancels: dict[tuple[int, str], threading.Event] = {}
+        self._held: dict[str, int] = {}          # 每步骤当前占用的并行槽位
+        self._slot_cond = threading.Condition()
         self._lock = threading.Lock()
         self._active_jobs: dict[int, Job] = {}          # job.id -> Job (心跳用)
         self._heartbeat_stop = threading.Event()
@@ -276,15 +278,9 @@ class Runner:
         pdir = crud.project_dir(project.uid)
         ctx = StepContext(project, step_key, pdir, log_file, cancel)
 
-        # 取 DB 里的最新 step 行 (start_step 读到的可能是旧快照)
+        # 取 DB 里的最新 step 行 (start_step 读到的可能是旧快照);
+        # 拿到并发额度前状态保持 queued
         step = crud.get_step(project.id, step_key)
-        step.status = "running"
-        step.started_at = datetime.datetime.now(datetime.timezone.utc)
-        step.finished_at = None
-        step.error_code = step.error_message = step.error_suggestion = ""
-        step.input_fingerprint = fingerprint
-        step.progress = 0.0
-        crud.save_step(step)
         with self._lock:
             self._active_jobs[job.id] = job
 
@@ -292,9 +288,16 @@ class Runner:
             # 队列中已被取消 → 直接退出
             if cancel.is_set():
                 raise StepCancelled("步骤在排队时被取消")
-            ctx.log(f"▶ 开始步骤 [{step_def.label}] ({step_key})")
-            run_fn = get_runner(step_key)
-            run_fn(ctx)
+            # 并发闸门: 每步骤独立并行度 (GPU 类=1, 下载/LLM 类可多并行)
+            self.acquire_slot(step_key)
+            try:
+                if cancel.is_set():   # 等额度期间被取消 → 不执行
+                    raise StepCancelled("步骤在排队时被取消")
+                self._begin_running(ctx, step, step_def, fingerprint)
+                run_fn = get_runner(step_key)
+                run_fn(ctx)
+            finally:
+                self.release_slot(step_key)
             step = crud.get_step(project.id, step_key)
             step.status = "done"
             step.progress = 100.0
@@ -302,7 +305,9 @@ class Runner:
             crud.save_step(step)
             job.status = "done"
             ctx.log("✅ 步骤完成")
+            self.continue_chain(project, ctx)
         except StepCancelled as e:
+            self._clear_chain(project, "用户取消")
             step = crud.get_step(project.id, step_key)
             step.status = "failed"
             step.error_code, step.error_message = e.code, e.message
@@ -312,6 +317,7 @@ class Runner:
             job.status, job.error_detail = "cancelled", "用户取消"
             ctx.log(f"⛔ 已取消: {e.message}")
         except DubForgeError as e:
+            self._clear_chain(project, f"步骤失败 [{e.code}]")
             step = crud.get_step(project.id, step_key)
             step.status = "failed"
             step.error_code, step.error_message = e.code, e.message
@@ -321,6 +327,7 @@ class Runner:
             job.status, job.error_detail = "failed", str(e.detail or e.message)
             ctx.log(f"❌ 失败 [{e.code}]: {e.message}")
         except Exception as e:  # 未知异常兜底: 不让线程静默死亡
+            self._clear_chain(project, "未预期异常")
             import traceback
             tb = traceback.format_exc()
             step = crud.get_step(project.id, step_key)
@@ -381,6 +388,78 @@ class Runner:
         with self._lock:
             return (project_id, step_key) in self._cancels
 
+    def _begin_running(self, ctx: StepContext, step: StepRun, step_def,
+                       fingerprint: str) -> None:
+        """拿到并发额度后: 置 running + 清错误 + 进度归零"""
+        step.status = "running"
+        step.started_at = datetime.datetime.now(datetime.timezone.utc)
+        step.finished_at = None
+        step.error_code = step.error_message = step.error_suggestion = ""
+        step.input_fingerprint = fingerprint
+        step.progress = 0.0
+        crud.save_step(step)
+        ctx.log(f"▶ 开始步骤 [{step_def.label}] ({step.step_key})")
+
+    def acquire_slot(self, step_key: str) -> None:
+        """占用一个并行槽位 (每次获取都实时读配置 → 改并行数即时生效);
+        额度满则阻塞等待, 期间可被取消 (获取后由调用方复查取消事件)"""
+        with self._slot_cond:
+            while True:
+                held = self._held.get(step_key, 0)
+                if held < self.concurrency_limit(step_key):
+                    self._held[step_key] = held + 1
+                    return
+                self._slot_cond.wait(0.5)
+
+    def release_slot(self, step_key: str) -> None:
+        with self._slot_cond:
+            self._held[step_key] = max(0, self._held.get(step_key, 0) - 1)
+            self._slot_cond.notify_all()
+
+    def concurrency_limit(self, step_key: str) -> int:
+        conf = config.get("runner.step_concurrency", {}) or {}
+        return max(1, int(conf.get(step_key, 1) or 1))
+
+    # ---- 自动续跑链 (params._chain: 剩余待自动执行的步骤) ----
+
+    def continue_chain(self, project: Project, ctx: StepContext | None = None) -> dict:
+        """步骤成功完成后调用: 链队列非空则启动下一个 (已最新则跳过继续)。
+        链空了/启动失败(依赖未就绪等) → 清链停止。"""
+        from dubforge.pipeline.registry import STEP_KEYS, STEP_MAP
+        while True:
+            params = json.loads(project.params or "{}")
+            chain = params.get("_chain") or []
+            if not chain:
+                return {"started": None, "stopped": None}
+            head = chain.pop(0)
+            if head not in STEP_KEYS:
+                params["_chain"] = chain
+                project.params = json.dumps(params, ensure_ascii=False)
+                crud.save_project(project)
+                continue
+            params["_chain"] = chain
+            project.params = json.dumps(params, ensure_ascii=False)
+            crud.save_project(project)
+            try:
+                r = self.start_step(project.uid, head)
+            except DubForgeError as e:
+                self._clear_chain(project, f"「{STEP_MAP[head].label}」无法启动: {e.message}")
+                if ctx:
+                    ctx.log(f"⛓ 自动续跑停止: 「{STEP_MAP[head].label}」{e.message}")
+                return {"started": None, "stopped": STEP_MAP[head].label}
+            if r.get("status") == "started":
+                if ctx:
+                    ctx.log(f"⛓ 自动续跑: 已启动「{STEP_MAP[head].label}」")
+                return {"started": head, "stopped": None}
+            # skipped (已是最新) → 继续下一个
+
+    def _clear_chain(self, project: Project, reason: str) -> None:
+        params = json.loads(project.params or "{}")
+        if params.pop("_chain", None) is not None:
+            project.params = json.dumps(params, ensure_ascii=False)
+            crud.save_project(project)
+            logging.info("自动续跑已停止 (%s): 项目 %s", reason, project.uid)
+
     # ============ 心跳 ============
 
     def _heartbeat_loop(self) -> None:
@@ -405,4 +484,4 @@ class Runner:
                 crud.save_step(s)
 
 
-runner = Runner()
+runner = Runner(max_workers=max(2, int(config.get("runner.pool_size", 8) or 8)))

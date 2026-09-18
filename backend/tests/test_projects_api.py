@@ -125,3 +125,75 @@ def test_delete_running_project_guard(isolated_env, stub_heavy_steps, make_proje
         assert r.status_code == 200, r.json()
         rr = client.get(f"/api/projects/{uid}")
         assert rr.json()["code"] == "PROJECT_NOT_FOUND"
+
+
+def test_run_chain_auto_continue(isolated_env, stub_heavy_steps, make_project):
+    """勾选链: split 完成后自动续跑 translate, 链空后清空"""
+    import time
+    from conftest import mark_upstream_done
+    stub_heavy_steps("split", "translate")
+    uid = make_project()
+    mark_upstream_done(uid, "split")
+    with _client() as client:
+        r = client.post(f"/api/projects/{uid}/run_chain",
+                        json={"steps": ["split", "translate"]})
+        assert r.status_code == 200, r.json()
+        st = {}
+        for _ in range(200):
+            steps = client.get(f"/api/projects/{uid}/steps").json()
+            st = {s["key"]: s["status"] for s in steps}
+            if st["split"] == "done" and st["translate"] == "done":
+                break
+            time.sleep(0.05)
+        assert st["split"] == "done" and st["translate"] == "done"
+        p = client.get(f"/api/projects/{uid}").json()
+        assert not p["params"].get("_chain")          # 链跑完清空
+
+
+def test_run_chain_stops_on_failure(isolated_env, stub_heavy_steps, make_project):
+    """链中步骤失败 → 自动续跑停止, _chain 清空"""
+    import time
+    from conftest import mark_upstream_done
+    stub_heavy_steps("split", "translate")
+    uid = make_project(params={"fail_step": "translate"})
+    mark_upstream_done(uid, "split")
+    with _client() as client:
+        client.post(f"/api/projects/{uid}/run_chain",
+                    json={"steps": ["split", "translate"]})
+        st = {}
+        for _ in range(200):
+            steps = client.get(f"/api/projects/{uid}/steps").json()
+            st = {s["key"]: s["status"] for s in steps}
+            if st["translate"] == "failed":
+                break
+            time.sleep(0.05)
+        assert st["translate"] == "failed"
+        p = client.get(f"/api/projects/{uid}").json()
+        assert not p["params"].get("_chain")
+
+
+def test_auto_steps_and_run_many(isolated_env, stub_heavy_steps, make_project):
+    """勾选集持久化; run_many 按勾选链启动并自动续跑; 空链/已完成跳过"""
+    import time
+    from conftest import mark_upstream_done
+    stub_heavy_steps("split", "translate")
+    uid = make_project()
+    mark_upstream_done(uid, "split")
+    with _client() as client:
+        client.put(f"/api/projects/{uid}/auto_steps",
+                   json={"steps": ["split", "translate"]})
+        r = client.post("/api/projects/run_many", json={"uids": [uid]})
+        assert r.status_code == 200
+        assert r.json()["results"][0]["started"] == "拆分句子"
+        st = {}
+        for _ in range(200):
+            steps = client.get(f"/api/projects/{uid}/steps").json()
+            st = {s["key"]: s["status"] for s in steps}
+            if st["translate"] == "done":
+                break
+            time.sleep(0.05)
+        assert st["translate"] == "done"
+        # 全部完成 → 再 run_many 跳过
+        r = client.post("/api/projects/run_many", json={"uids": [uid]})
+        res = r.json()["results"][0]
+        assert res.get("skipped") or "跳过" in res.get("started", "")

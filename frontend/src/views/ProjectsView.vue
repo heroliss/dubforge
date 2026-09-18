@@ -1,9 +1,9 @@
 <script setup lang="ts">
 // 项目列表: 真实 CRUD + 新建 (yt-dlp 支持的任意站点链接 / 本地导入) + 改名
-import { onMounted, ref } from 'vue'
+import { onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
-import { useNavStore } from '../stores/nav'
+import { useNavStore, STATUS_TEXT } from '../stores/nav'
 
 const router = useRouter()
 const message = useMessage()
@@ -20,8 +20,9 @@ const renaming = ref<any>(null)
 const renameTitle = ref('')
 const renameSaving = ref(false)
 
-async function load() {
-  loading.value = true
+let pollTimer: number | undefined
+async function load(showSpin = false) {
+  if (showSpin) loading.value = true
   try {
     const r = await fetch('/api/projects')
     projects.value = await r.json()
@@ -29,7 +30,45 @@ async function load() {
     loading.value = false
   }
 }
-onMounted(load)
+onMounted(() => {
+  load(true)
+  pollTimer = window.setInterval(() => load(false), 4000)   // 运行徽章/进度条保鲜
+})
+onUnmounted(() => pollTimer && clearInterval(pollTimer))
+
+// —— 勾选批量运行 / 单项目运行 / 资源管理器 ——
+const sel = ref<Set<string>>(new Set())
+function toggleSel(uid: string, v: boolean) {
+  const s = new Set(sel.value)
+  if (v) s.add(uid)
+  else s.delete(uid)
+  sel.value = s
+}
+async function runMany(uids: string[]) {
+  if (!uids.length) return
+  const r = await fetch('/api/projects/run_many', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ uids }),
+  })
+  const j = await r.json()
+  if (!r.ok) { message.error(j.message || '批量启动失败'); return }
+  const skipped = j.results.filter((x: any) => x.skipped).map((x: any) => x.skipped)
+  message.success(`已启动 ${j.started} 个项目` +
+    (skipped.length ? `；跳过 ${skipped.length} 个 (${skipped[0]}${skipped.length > 1 ? ' 等' : ''})` : ''))
+  sel.value = new Set()
+  await load()
+}
+function runSelected() { runMany([...sel.value]) }
+function runProject(p: any) { runMany([p.uid]) }
+async function reveal(p: any) {
+  const r = await fetch(`/api/projects/${p.uid}/reveal`, { method: 'POST' })
+  if (!r.ok) message.error('打开文件管理器失败')
+}
+const STATUS_TAG: Record<string, string> = {
+  done: 'success', failed: 'error', processing: 'info', created: 'default',
+}
+const doneCount = (p: any) =>
+  (p.steps ?? []).filter((x: any) => x.status === 'done').length
 
 async function create() {
   if (!form.value.source_url.trim()) { message.warning('请填写视频链接或本地路径'); return }
@@ -174,7 +213,12 @@ const STATUS_TEXT: Record<string, string> = {
   <n-layout-content content-style="padding: 24px;">
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
       <n-h1 style="margin: 0">项目</n-h1>
-      <n-button type="primary" @click="showNew = true">＋ 新建项目</n-button>
+      <n-space>
+        <n-button v-if="sel.size" type="primary" @click="runSelected">
+          ▶▶ 运行选中 ({{ sel.size }})
+        </n-button>
+        <n-button type="primary" @click="showNew = true">＋ 新建项目</n-button>
+      </n-space>
     </n-space>
 
     <n-spin :show="loading">
@@ -183,26 +227,48 @@ const STATUS_TEXT: Record<string, string> = {
       <div v-else style="display:flex;flex-direction:column;gap:16px">
         <n-card v-for="p in projects" :key="p.uid" size="small">
           <n-space justify="space-between" align="center">
-            <div>
-              <n-space align="center">
-                <n-text strong style="font-size: 15px">{{ p.title }}</n-text>
-                <n-tag size="small" :type="p.status === 'done' ? 'success' : p.status === 'failed' ? 'error' : p.status === 'processing' ? 'info' : 'default'">
-                  {{ STATUS_TEXT[p.status] || p.status }}
-                </n-tag>
-                <n-tag v-if="p.running_step" size="small" type="info" :bordered="false">
-                  🔄 {{ p.running_label }}
-                </n-tag>
-              </n-space>
-              <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
-                {{ p.source_kind === 'local' ? '本地导入' : p.source_url }} · {{ p.uid }}
-              </n-text>
+            <div style="display:flex;align-items:center;gap:12px">
+              <n-checkbox size="small" :checked="sel.has(p.uid)"
+                          @update:checked="(v: boolean) => toggleSel(p.uid, v)" />
+              <div>
+                <n-space align="center">
+                  <n-text strong style="font-size: 15px">{{ p.title }}</n-text>
+                  <n-tag size="small" :type="(STATUS_TAG as any)[p.status] || 'default'">
+                    {{ STATUS_TEXT[p.status] || p.status }}
+                  </n-tag>
+                  <n-tag v-if="p.running_step" size="small" type="info" :bordered="false">
+                    🔄 {{ p.running_label }}
+                  </n-tag>
+                </n-space>
+                <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
+                  {{ p.source_kind === 'local' ? '本地导入' : p.source_url }} · {{ p.uid }}
+                </n-text>
+              </div>
             </div>
             <n-space>
               <n-button size="small" type="primary" @click.stop="router.push(`/projects/${p.uid}`)">打开项目</n-button>
+              <n-button size="small" @click.stop="runProject(p)">▶ 运行项目</n-button>
+              <n-button size="small" quaternary @click.stop="reveal(p)">📁</n-button>
               <n-button size="small" quaternary @click.stop="openRename(p)">✏️ 改名</n-button>
               <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
             </n-space>
           </n-space>
+          <!-- 分段进度条: 每段 = 一个步骤, 悬停看详情, 点击进步骤页 -->
+          <div class="segwrap" v-if="(p.steps || []).length">
+            <div class="segbar">
+              <div v-for="st in p.steps" :key="st.key" class="seg"
+                   :class="'seg-' + st.status"
+                   :title="`${st.label} · ${STATUS_TEXT[st.status] || st.status}${st.status === 'running' ? ' ' + Math.round(st.progress || 0) + '%' : ''}${st.error ? ' — ' + st.error : ''}`"
+                   @click.stop="router.push(`/projects/${p.uid}/steps/${st.key}`)">
+                <div class="fill" v-if="st.status === 'running'"
+                     :style="{ width: (st.progress || 0) + '%' }" />
+              </div>
+            </div>
+            <n-text depth="3" style="font-size: 11px">
+              已完成 {{ doneCount(p) }}/{{ (p.steps || []).length }}
+              <span v-if="p.running_label"> · 正在「{{ p.running_label }}」…</span>
+            </n-text>
+          </div>
         </n-card>
       </div>
     </n-spin>
@@ -315,4 +381,17 @@ const STATUS_TEXT: Record<string, string> = {
 .browse-item.sel {
   background: rgba(24, 160, 88, 0.25);
 }
+.segwrap { margin-top: 10px; }
+.segbar { display: flex; gap: 3px; }
+.seg {
+  flex: 1; height: 8px; border-radius: 3px;
+  background: rgba(128, 128, 128, 0.25);
+  overflow: hidden; cursor: pointer; position: relative;
+}
+.seg:hover { outline: 1px solid rgba(255, 255, 255, 0.4); }
+.seg-done { background: #2ea44f; }
+.seg-failed, .seg-interrupted { background: #e5534b; }
+.seg-stale { background: #d29922; }
+.seg-running { background: rgba(77, 163, 255, 0.25); }
+.seg-running .fill { height: 100%; background: #4da3ff; }
 </style>

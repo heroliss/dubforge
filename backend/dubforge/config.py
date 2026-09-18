@@ -105,6 +105,15 @@ DEFAULTS: dict[str, Any] = {
         "burn_subtitles": False,    # 烧录字幕 (默认外挂)
         "crf": 18,
     },
+    "runner": {
+        # 全局线程池大小 (应 ≥ 各步骤并行上限之和的预期峰值)
+        "pool_size": 8,
+        # 每步骤并行上限: 下载/LLM 类可并行, GPU 类保持 1 保护显存。修改后重启生效。
+        "step_concurrency": {
+            "download": 2, "preprocess": 1, "transcribe": 1, "split": 2,
+            "translate": 2, "subtitles": 2, "dubtask": 2, "tts": 1, "assemble": 1,
+        },
+    },
     "server": {
         "port": 8600,
         # 总工作目录: 所有项目数据 (项目目录/数据库/上传收件箱) 的根。
