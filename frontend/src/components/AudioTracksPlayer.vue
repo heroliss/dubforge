@@ -1,8 +1,10 @@
 <script setup lang="ts">
-// 音轨同步播放器 v2: 视频为主控 (静音), 右侧三条波形各带启用勾选 ——
+// 音轨同步播放器 v3: 视频为主控 (静音), 右侧三条波形各带启用勾选 ——
 // 多轨同时启用即叠加混音 (每个音轨一个隐藏 audio 元素, 浏览器原生混音);
 // 全部按头部对齐跟随视频 (拖动/倍速/暂停同步, 漂移>0.3s 校正);
 // 每条波形画出播放位置竖线, 点击波形跳转
+// v3 修复: 此前模板里漏渲染了 <audio> 元素 (勾选任何轨都不会发声),
+// 且播放循环未按勾选过滤 (应只播启用的轨)
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 
 const props = defineProps<{
@@ -20,7 +22,13 @@ const videoErr = ref(false)
 const hasVideo = computed(() => !!props.videoUrl && !videoErr.value)
 let raf = 0
 
-watch(() => props.tracks, () => {
+// 轮询会不断重建 tracks 数组 (内容不变) —— 按名字签名去重,
+// 只有音轨集合真正变化时才重置勾选/重载波形
+const trackSig = computed(() => props.tracks.map(t => t.name).join('|'))
+let lastSig = ''
+watch(trackSig, (sig) => {
+  if (sig === lastSig) return
+  lastSig = sig
   // 默认启用第一条 (原始音轨); 其余由用户勾选叠加
   enabled.value = new Set([props.tracks[0]?.name].filter(Boolean) as string[])
   void loadAllPeaks()
@@ -42,11 +50,29 @@ async function loadAllPeaks() {
   draw()
 }
 
+function enabledAudios(): HTMLAudioElement[] {
+  return props.tracks
+    .filter(t => enabled.value.has(t.name))
+    .map(t => audioEls.get(t.name))
+    .filter((a): a is HTMLAudioElement => !!a)
+}
+
 function toggle(name: string, v: boolean) {
   const s = new Set(enabled.value)
   if (v) s.add(name)
   else s.delete(name)
   enabled.value = s
+  // 播放中切换: 新勾选的轨立即跟上, 取消勾选的轨立即停
+  const a = audioEls.get(name)
+  const vid = videoEl.value
+  if (!a) return
+  if (!v) {
+    a.pause()
+  } else if (vid && !vid.paused) {
+    a.playbackRate = vid.playbackRate
+    a.currentTime = Math.min(vid.currentTime, a.duration || vid.currentTime)
+    void a.play().catch(() => {})
+  }
 }
 
 function setCanvas(name: string, el: HTMLCanvasElement | null) {
@@ -72,7 +98,7 @@ function resync(hard = false) {
 function onVideoPlay() {
   resync()
   startLoop()
-  for (const a of audioEls.values()) void a.play().catch(() => {})
+  for (const a of enabledAudios()) void a.play().catch(() => {})
 }
 function onVideoPause() {
   for (const a of audioEls.values()) a.pause()
@@ -95,7 +121,7 @@ function onAudioLoaded(name: string) {
   if (!a || !v) return
   a.playbackRate = v.playbackRate
   a.currentTime = Math.min(v.currentTime, a.duration || v.currentTime)
-  if (!v.paused) void a.play().catch(() => {})
+  if (!v.paused && enabled.value.has(name)) void a.play().catch(() => {})
 }
 
 // —— 波形: 启用轨亮色 / 未启用暗色; 竖线 = 播放位置 ——
@@ -164,7 +190,7 @@ function fallbackToggle() {
     for (const a of audioEls.values()) a.pause()
     stopLoop()
   } else {
-    for (const a of audioEls.values()) void a.play().catch(() => {})
+    for (const a of enabledAudios()) void a.play().catch(() => {})
     startLoop()
   }
 }
@@ -210,6 +236,12 @@ onBeforeUnmount(() => stopLoop())
       </n-text>
     </n-gi>
   </n-grid>
+  <!-- 隐藏音轨元素: 实际发声者 (浏览器原生混音); 必须留在 DOM 里 -->
+  <div style="display: none">
+    <audio v-for="t in tracks" :key="t.name"
+           :ref="(el) => setAudio(t.name, el as HTMLAudioElement | null)"
+           :src="t.url" preload="auto" @loadedmetadata="onAudioLoaded(t.name)" />
+  </div>
 </template>
 
 <style scoped>

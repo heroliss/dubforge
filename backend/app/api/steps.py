@@ -39,6 +39,11 @@ def list_steps(uid: str):
         "cfg": _cfg_snapshot(STEP_MAP[s.step_key].cfg_keys),
         "progress": round(s.progress or 0, 1),
         "cancelling": runner.is_cancelling(project.id, s.step_key),
+        "pausing": runner.is_paused(project.id, s.step_key),
+        "inputs": [{"step": up, "name": name, "desc": desc}
+                   for up, name, desc in STEP_MAP[s.step_key].inputs],
+        "outputs": [{"name": name, "desc": desc}
+                    for name, desc in STEP_MAP[s.step_key].outputs],
     } for s in steps]
 
 
@@ -51,6 +56,18 @@ def run_step(uid: str, key: str, body: dict | None = None):
 @router.post("/{key}/cancel")
 def cancel_step(uid: str, key: str):
     return runner.cancel_step(uid, key)
+
+
+@router.post("/{key}/pause")
+def pause_step(uid: str, key: str, body: dict | None = None):
+    """暂停/继续 (协作式: 当前单元结束后停; body.pause=false 为继续)"""
+    return runner.pause_step(uid, key, pause=bool((body or {}).get("pause", True)))
+
+
+@router.post("/{key}/force_stop")
+def force_stop_step(uid: str, key: str):
+    """强制结束: 子进程立即终止, 步骤立刻按已取消呈现 (进程内计算后台收尾后丢弃)"""
+    return runner.force_stop(uid, key)
 
 
 @router.get("/{key}/log")
@@ -112,6 +129,15 @@ def reveal_step(uid: str, key: str):
     from dubforge.utils.reveal import reveal_in_explorer
     reveal_in_explorer(str(d))
     return {"ok": True, "dir": str(d)}
+
+
+@router.post("/{key}/artifacts/{name}/reveal")
+def reveal_artifact(uid: str, key: str, name: str):
+    """在资源管理器中定位单个产物文件 (上游产物由其所属步骤的登记表校验)"""
+    p = _artifact_file(uid, key, name)
+    from dubforge.utils.reveal import reveal_in_explorer
+    reveal_in_explorer(str(p))
+    return {"ok": True, "path": str(p)}
 
 
 @router.get("/{key}/artifacts/{name}/raw")

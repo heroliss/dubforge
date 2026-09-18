@@ -19,10 +19,12 @@ import hashlib
 import json
 import logging
 import os
+import shutil
+import subprocess
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Callable
 
 from dubforge import config
 from dubforge.domain import crud
@@ -38,17 +40,51 @@ class StepCancelled(DubForgeError):
     suggestion = "步骤已取消, 可随时重新运行; 产物不会留下半成品。"
 
 
+# 临时/半成品文件的清扫模式: 取消、失败、强制结束后清一遍 (原子写保证正式产物
+# 永远完整, 这里清的只是过程文件: ffmpeg/yt-dlp 片段、步骤内临时名、demucs 工作目录)
+_TEMP_FILE_PATTERNS = ("*.tmp", "*.part", "*.ytdl", ".tmp_*")
+_TEMP_DIR_NAMES = (".demucs_tmp",)
+
+
+def _sweep_temp_files(pdir: Path, log=None) -> list[str]:
+    """删除项目目录下的过程临时文件, 返回清理清单 (不存在则静默通过)"""
+    removed: list[str] = []
+    if not pdir.exists():
+        return removed
+    for pat in _TEMP_FILE_PATTERNS:
+        for f in pdir.rglob(pat):
+            if f.is_file():
+                try:
+                    f.unlink()
+                    removed.append(str(f.relative_to(pdir)))
+                except OSError:
+                    pass
+    for name in _TEMP_DIR_NAMES:
+        for d in pdir.rglob(name):
+            if d.is_dir():
+                shutil.rmtree(d, ignore_errors=True)
+                removed.append(str(d.relative_to(pdir)) + "/")
+    if removed and log:
+        head = ", ".join(removed[:8])
+        log(f"🧹 已清理临时文件 {len(removed)} 个: {head}{'…' if len(removed) > 8 else ''}")
+    return removed
+
+
 class StepContext:
     """步骤运行上下文: 步骤实现只依赖它, 不接触 DB/线程细节"""
 
     def __init__(self, project: Project, step_key: str, pdir: Path,
-                 log_file: Path, cancel_event: threading.Event):
+                 log_file: Path, cancel_event: threading.Event,
+                 pause_event: threading.Event | None = None):
         self.project = project
         self.step_key = step_key
         self.pdir = pdir
         self._log_file = log_file
         self._cancel = cancel_event
+        self._pause = pause_event or threading.Event()
         self._log_lock = threading.Lock()   # 分块并行时多线程写同一日志
+        self._subprocs: set = set()          # 本步骤启动的子进程 (取消/强制结束时终止)
+        self._subproc_lock = threading.Lock()
         self.project_params: dict = json.loads(project.params or "{}")
 
     # ---- 日志 (带时间戳追加; 立即落盘, 崩溃后可读到最后状态) ----
@@ -61,6 +97,83 @@ class StepContext:
     def check_cancel(self) -> None:
         if self._cancel.is_set():
             raise StepCancelled("步骤被用户取消")
+
+    # ---- 暂停 (协作式: 循环间的暂停点; 暂停期间阻塞等待, 取消优先) ----
+    def check_pause(self) -> None:
+        while self._pause.is_set() and not self._cancel.is_set():
+            time.sleep(0.2)
+        self.check_cancel()
+
+    def is_paused(self) -> bool:
+        return self._pause.is_set()
+
+    # ---- 子进程: 取消信号一到立即终止 (ffmpeg / yt-dlp 可即时停下) ----
+    def run_subprocess(self, cmd: list, *, cwd=None, env=None,
+                       on_stdout=None, on_stderr=None) -> tuple[int, str, str]:
+        """启动子进程并等待; 期间轮询取消信号, 取消即终止进程树并抛 StepCancelled。
+        on_stdout/on_stderr: 按行回调 (实时进度); 返回 (returncode, stdout, stderr)。"""
+        proc = subprocess.Popen(
+            cmd, cwd=cwd, env=env, text=True,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        with self._subproc_lock:
+            self._subprocs.add(proc)
+        out_lines: list[str] = []
+        err_lines: list[str] = []
+
+        def _pump(pipe, sink, cb):
+            try:
+                for line in iter(pipe.readline, ""):
+                    sink.append(line)
+                    if cb:
+                        try:
+                            cb(line.rstrip("\r\n"))
+                        except Exception:
+                            pass
+            finally:
+                try:
+                    pipe.close()
+                except OSError:
+                    pass
+
+        t_out = threading.Thread(target=_pump, args=(proc.stdout, out_lines, on_stdout),
+                                 daemon=True)
+        t_err = threading.Thread(target=_pump, args=(proc.stderr, err_lines, on_stderr),
+                                 daemon=True)
+        t_out.start()
+        t_err.start()
+        try:
+            while True:
+                try:
+                    rc = proc.wait(timeout=0.2)
+                    break
+                except subprocess.TimeoutExpired:
+                    if self._cancel.is_set():
+                        self._kill_proc(proc)
+                        self.check_cancel()   # 抛 StepCancelled
+        finally:
+            with self._subproc_lock:
+                self._subprocs.discard(proc)
+            t_out.join(timeout=5)
+            t_err.join(timeout=5)
+        return rc, "".join(out_lines), "".join(err_lines)
+
+    @staticmethod
+    def _kill_proc(proc) -> None:
+        """终止进程及其子进程 (yt-dlp 会派生 ffmpeg 合并进程, 必须整树杀)"""
+        try:
+            if os.name == "nt":
+                subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)],
+                               capture_output=True)
+            else:
+                proc.kill()
+        except Exception:
+            pass
+
+    def kill_all_subprocesses(self) -> None:
+        with self._subproc_lock:
+            procs = list(self._subprocs)
+        for p in procs:
+            self._kill_proc(p)
 
     # ---- 产物写入 (原子: tmp → os.replace → 登记 sha256) ----
     def artifact_dir(self) -> Path:
@@ -187,6 +300,9 @@ class Runner:
         self._pool = ThreadPoolExecutor(max_workers=max_workers,
                                         thread_name_prefix="dubforge-step")
         self._cancels: dict[tuple[int, str], threading.Event] = {}
+        self._pauses: dict[tuple[int, str], threading.Event] = {}
+        self._ctxs: dict[tuple[int, str], StepContext] = {}
+        self._abandoned: set[tuple[int, str]] = set()   # 强制结束后等待后台收尾的步骤
         self._held: dict[str, int] = {}          # 每步骤当前占用的并行槽位
         self._slot_cond = threading.Condition()
         self._lock = threading.Lock()
@@ -279,8 +395,10 @@ class Runner:
             self._mark_downstream_stale(project.id, step_key)
 
         cancel = threading.Event()
+        pause = threading.Event()
         with self._lock:
             self._cancels[(project.id, step_key)] = cancel
+            self._pauses[(project.id, step_key)] = pause
 
         # 线程池全局串行 (max_workers=1, 保护显存): 提交后先显示排队,
         # 轮到它执行时 _execute 再置 running
@@ -295,7 +413,7 @@ class Runner:
 
         job = crud.add_job(project.id, step_key, str(log_file))
         fut = self._pool.submit(self._execute, project, step_key, step_def, job,
-                                log_file, cancel, fp)
+                                log_file, cancel, pause, fp)
         # future 异常必须被观测, 否则线程池静默吞错 (排查问题时是盲区)
         fut.add_done_callback(
             lambda f: f.exception() and logging.error(
@@ -305,23 +423,26 @@ class Runner:
     # ============ 执行体 (线程池内) ============
 
     def _execute(self, project: Project, step_key: str, step_def, job: Job,
-                 log_file: Path, cancel: threading.Event, fingerprint: str) -> None:
+                 log_file: Path, cancel: threading.Event,
+                 pause: threading.Event, fingerprint: str) -> None:
         from dubforge.pipeline.steps import get_runner
         pdir = crud.project_dir(project.uid)
-        ctx = StepContext(project, step_key, pdir, log_file, cancel)
+        ctx = StepContext(project, step_key, pdir, log_file, cancel, pause)
+        k = (project.id, step_key)
 
         # 取 DB 里的最新 step 行 (start_step 读到的可能是旧快照);
         # 拿到并发额度前状态保持 queued
         step = crud.get_step(project.id, step_key)
         with self._lock:
             self._active_jobs[job.id] = job
+            self._ctxs[k] = ctx
 
         try:
             # 队列中已被取消 → 直接退出
             if cancel.is_set():
                 raise StepCancelled("步骤在排队时被取消")
             # 并发闸门: 每步骤独立并行度 (GPU 类=1, 下载/LLM 类可多并行)
-            self.acquire_slot(step_key)
+            self.acquire_slot(step_key, cancel)
             try:
                 if cancel.is_set():   # 等额度期间被取消 → 不执行
                     raise StepCancelled("步骤在排队时被取消")
@@ -330,6 +451,11 @@ class Runner:
                 run_fn(ctx)
             finally:
                 self.release_slot(step_key)
+            # 强制结束过的运行: 结果一律丢弃, 保持 failed 呈现
+            with self._lock:
+                abandoned = k in self._abandoned
+            if abandoned:
+                raise StepCancelled("步骤已被强制结束, 本次运行结果按废弃处理")
             step = crud.get_step(project.id, step_key)
             step.status = "done"
             step.progress = 100.0
@@ -340,13 +466,17 @@ class Runner:
             self.continue_chain(project, ctx)
         except StepCancelled as e:
             self._clear_chain(project, "用户取消")
+            with self._lock:
+                abandoned = k in self._abandoned
             step = crud.get_step(project.id, step_key)
-            step.status = "failed"
-            step.error_code, step.error_message = e.code, e.message
-            step.error_suggestion = e.suggestion
-            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
-            crud.save_step(step)
-            job.status, job.error_detail = "cancelled", "用户取消"
+            # 强制结束时 DB 行已由 force_stop 写好 (含「已强制结束」文案), 不覆盖
+            if not abandoned:
+                step.status = "failed"
+                step.error_code, step.error_message = e.code, e.message
+                step.error_suggestion = e.suggestion
+                step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                crud.save_step(step)
+            job.status, job.error_detail = "cancelled", e.message
             ctx.log(f"⛔ 已取消: {e.message}")
         except DubForgeError as e:
             self._clear_chain(project, f"步骤失败 [{e.code}]")
@@ -372,11 +502,21 @@ class Runner:
             job.status, job.error_detail = "failed", tb
             ctx.log(f"❌ 未预期异常:\n{tb}")
         finally:
+            # 收尾兜底: 暂停标志必须清掉, 否则后续运行会在第一个暂停点卡死
+            pause.clear()
+            # 半成品清扫: 原子写保证正式产物完整, 这里清的是过程临时文件
+            try:
+                _sweep_temp_files(pdir, log=ctx.log)
+            except Exception:
+                logging.exception("临时文件清扫失败: %s", pdir)
             job.finished_at = datetime.datetime.now(datetime.timezone.utc)
             crud.update_job(job)
             with self._lock:
                 self._active_jobs.pop(job.id, None)
-                self._cancels.pop((project.id, step_key), None)
+                self._cancels.pop(k, None)
+                self._pauses.pop(k, None)
+                self._ctxs.pop(k, None)
+                self._abandoned.discard(k)
             crud.write_manifest(project.uid)
             self._refresh_project_status(project.uid)
 
@@ -415,10 +555,72 @@ class Runner:
         ev.set()
         return {"status": "cancelling", "message": "取消信号已发送, 等待步骤在下一个检查点退出"}
 
+    def pause_step(self, uid: str, step_key: str, pause: bool = True) -> dict:
+        """暂停/继续: 协作式 —— 步骤在循环间的暂停点阻塞 (GPU 计算/单次 LLM 调用
+        进行中无法立即暂停, 会在当前单元结束后停下)"""
+        project = crud.get_project(uid)
+        if not project:
+            raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+        with self._lock:
+            ev = self._pauses.get((project.id, step_key))
+        if ev is None:
+            return {"status": "not_running", "message": "该步骤当前没有在运行的任务"}
+        (ev.set if pause else ev.clear)()
+        if pause:
+            with self._lock:
+                ctx = self._ctxs.get((project.id, step_key))
+            if ctx:
+                ctx.log("⏸ 收到暂停请求, 将在当前单元结束后暂停")
+        return {"status": "paused" if pause else "resumed",
+                "message": "已暂停" if pause else "已继续"}
+
+    def force_stop(self, uid: str, step_key: str) -> dict:
+        """强制结束: 取消信号 + 立即终止本步骤的全部子进程 (ffmpeg/yt-dlp 即刻死),
+        步骤行立刻按「已取消」呈现。进程内计算 (demucs/torch) 无法腰斩 —— 线程仍在
+        后台跑完当前单元, 但结果会被丢弃 (abandoned), 不产生半成品。"""
+        project = crud.get_project(uid)
+        if not project:
+            raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+        k = (project.id, step_key)
+        with self._lock:
+            ev = self._cancels.get(k)
+            ctx = self._ctxs.get(k)
+        if ev is None and ctx is None:
+            return {"status": "not_running", "message": "该步骤当前没有在运行的任务"}
+        if ev:
+            ev.set()
+        if ctx:
+            ctx.kill_all_subprocesses()
+            ctx.log("⛔ 收到强制结束: 已终止全部子进程")
+        with self._lock:
+            self._abandoned.add(k)
+            job = next((j for j in self._active_jobs.values()
+                        if j.project_id == project.id and j.step_key == step_key), None)
+        if job is not None:      # 就地改内存对象, 防心跳把状态写回 running
+            job.status, job.error_detail = "cancelled", "强制结束"
+        step = crud.get_step(project.id, step_key)
+        if step and step.status in ("running", "queued"):
+            step.status = "failed"
+            step.error_code = "STEP_FORCE_STOPPED"
+            step.error_message = "已强制结束"
+            step.error_suggestion = ("子进程已即时终止; 进程内计算 (如音轨分离) 若仍在"
+                                     "后台收尾, 结果会自动丢弃。可直接重跑。")
+            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+            crud.save_step(step)
+        self._clear_chain(project, "强制结束")
+        crud.write_manifest(uid)
+        self._refresh_project_status(uid)
+        return {"status": "force_stopped", "message": "已强制结束 (后台残余计算将自动丢弃结果)"}
+
     def is_cancelling(self, project_id: int, step_key: str) -> bool:
         """该步骤是否已发出取消信号且尚未退出 (前端显示「取消中…」)"""
         with self._lock:
             return (project_id, step_key) in self._cancels
+
+    def is_paused(self, project_id: int, step_key: str) -> bool:
+        with self._lock:
+            ev = self._pauses.get((project_id, step_key))
+        return bool(ev and ev.is_set())
 
     def _begin_running(self, ctx: StepContext, step: StepRun, step_def,
                        fingerprint: str) -> None:
@@ -432,11 +634,13 @@ class Runner:
         crud.save_step(step)
         ctx.log(f"▶ 开始步骤 [{step_def.label}] ({step.step_key})")
 
-    def acquire_slot(self, step_key: str) -> None:
+    def acquire_slot(self, step_key: str, cancel: threading.Event | None = None) -> None:
         """占用一个并行槽位 (每次获取都实时读配置 → 改并行数即时生效);
-        额度满则阻塞等待, 期间可被取消 (获取后由调用方复查取消事件)"""
+        额度满则阻塞等待, 期间可被取消 (排队等待不是黑洞 —— 取消信号一到就退出)"""
         with self._slot_cond:
             while True:
+                if cancel is not None and cancel.is_set():
+                    raise StepCancelled("步骤在排队时被取消")
                 held = self._held.get(step_key, 0)
                 if held < self.concurrency_limit(step_key):
                     self._held[step_key] = held + 1

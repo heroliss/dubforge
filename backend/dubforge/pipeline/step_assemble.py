@@ -12,6 +12,7 @@
 """
 import datetime
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -53,16 +54,18 @@ def _mix_timeline(ctx, pdir: Path, total: float) -> Path:
     tmp = out.with_suffix(".wav.tmp")
     # .tmp 后缀无法推断格式, 显式指定 WAV (与 ffmpeg 原子写同理)
     sf.write(str(tmp), mixed, au.SR, subtype="PCM_16", format="WAV")
-    import os
     os.replace(tmp, out)
 
     # EBU R128 响度归一 (单遍, 足够配音场景)
     if ctx.cfg("assemble.loudnorm", True):
-        norm = out.with_suffix(".norm.wav")
-        subprocess.run(["ffmpeg", "-y", "-i", str(out),
-                        "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
-                        "-ar", "32000", "-ac", "1", "-f", "wav", str(norm)],
-                       check=True, capture_output=True)
+        norm = out.with_suffix(".tmp_norm.wav")
+        rc, _, err = ctx.run_subprocess(
+            ["ffmpeg", "-y", "-i", str(out),
+             "-af", "loudnorm=I=-16:TP=-1.5:LRA=11",
+             "-ar", "32000", "-ac", "1", "-f", "wav", str(norm)])
+        if rc != 0:
+            raise DubForgeError("响度归一失败 (ffmpeg)", code="FFMPEG_FAIL",
+                                detail=err[-1500:])
         os.replace(norm, out)
         ctx.log("响度归一 (EBU R128, I=-16) 完成")
     ctx.register_file("dub_full.wav", out, "audio")
@@ -115,13 +118,18 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path) -> None:
     else:
         cwd = None
 
-    r = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd)
-    if r.returncode != 0:
+    # 先写临时名, 成功才转正 —— 中断/取消不留下半成品 mp4
+    tmp_out = out.with_name(f".tmp_{out.name}")
+    if cwd:
+        cmd[cmd.index(out.name)] = tmp_out.name
+    else:
+        cmd[cmd.index(str(out))] = str(tmp_out)
+    rc, _, err = ctx.run_subprocess(cmd, cwd=cwd)
+    if rc != 0:
+        tmp_out.unlink(missing_ok=True)
         raise DubForgeError("成片封装失败 (ffmpeg)", code="FFMPEG_FAIL",
-                            detail=r.stderr[-1500:])
-    if cwd:  # 烧录分支: 输出在工作目录, 移回 output/
-        import os
-        os.replace(cwd / out.name, out)
+                            detail=err[-1500:])
+    os.replace((cwd / tmp_out.name) if cwd else tmp_out, out)
 
 
 def run(ctx) -> None:
@@ -138,6 +146,7 @@ def run(ctx) -> None:
 
     dub = _mix_timeline(ctx, pdir, total)
     ctx.report_progress(40)
+    ctx.check_pause()
     ctx.log("人声轨就绪, 开始封装...")
     ctx.report_progress(70)
 

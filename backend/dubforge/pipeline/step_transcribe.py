@@ -78,6 +78,7 @@ def run(ctx) -> None:
 
     words: list[dict] = []
     for seg in segments:
+        ctx.check_pause()
         ctx.check_cancel()
         for w in (seg.words or []):
             words.append({"start": w.start, "end": w.end, "word": w.word})

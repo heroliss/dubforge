@@ -29,57 +29,66 @@ def _ydl_format(resolution: int) -> str:
             f"best[height<={resolution}]/best")
 
 
-def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
-    """库方式调 yt-dlp; 返回 info_dict 关键字段"""
-    import yt_dlp
+def _ytdlp_cmd(ctx, url: str, out_template: str) -> list[str]:
+    """yt-dlp 子进程命令行 (与库方式同参: 归档/cookies/代理/格式)。
+    子进程化是为了可即时终止 —— 下载是最长的步骤, 取消必须马上停。"""
+    import sys
     dcfg = ctx.cfg("download") or {}
     archive = config.data_root() / "download_archive.txt"
     archive.touch(exist_ok=True)
-
-    opts = {
-        "format": _ydl_format(int(dcfg.get("resolution", 1080))),
-        "outtmpl": out_template,
-        "download_archive": str(archive),      # 全局去重: 同 ID 不重下
-        "merge_output_format": "mp4",
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-        "retries": 3,
-        "progress_hooks": [_progress_hook(ctx)],
-        # Windows 下断点续传的文件片段
-        "continuedl": True,
-    }
+    cmd = [
+        sys.executable, "-m", "yt_dlp",
+        "-f", _ydl_format(int(dcfg.get("resolution", 1080))),
+        "-o", out_template,
+        "--merge-output-format", "mp4",
+        "--no-playlist", "--newline", "--progress", "--retries", "3",
+        "--download-archive", str(archive),   # 全局去重: 同 ID 不重下
+        "--print", "after_move:%(filepath)s",
+        "--print", "after_move:%(title)s",
+        url,
+    ]
     cookies = dcfg.get("cookies_path")
     if cookies and Path(cookies).exists():
-        opts["cookiefile"] = cookies
+        cmd += ["--cookies", str(cookies)]
     proxy = dcfg.get("proxy")
     if proxy:
-        opts["proxy"] = proxy
-
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        # extract_info 对已归档视频也返回 info (download=None), 正好用于幂等
-        return {
-            "id": info.get("id"),
-            "title": info.get("title") or "",
-            "duration": info.get("duration"),
-            "filepath": ydl.prepare_filename(info),
-        }
+        cmd += ["--proxy", str(proxy)]
+    return cmd
 
 
-def _progress_hook(ctx):
-    def hook(d):
-        if d.get("status") == "downloading":
-            pct = d.get("_percent_str", "").strip()
-            speed = d.get("_speed_str", "").strip()
-            ctx.log(f"下载中 {pct} {speed}")
-            try:
-                ctx.report_progress(float(pct.rstrip("%")))
-            except ValueError:
-                pass
-        elif d.get("status") == "finished":
-            ctx.log(f"下载完成: {d.get('filename')}")
-    return hook
+_VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m4v"}
+
+
+def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
+    """子进程方式调 yt-dlp; 取消即终止进程树; 返回 {title, filepath}"""
+    cmd = _ytdlp_cmd(ctx, url, out_template)
+    ctx.log(f"yt-dlp: {url}")
+    last_pct = -1
+
+    def on_stderr(line: str) -> None:
+        # [download]  12.3% of  ~45.20MiB at  1.23MiB/s ETA 00:30
+        nonlocal last_pct
+        m = re.match(r"\[download\]\s+(\d{1,3}(?:\.\d+)?)%", line)
+        if m:
+            pct = float(m.group(1))
+            if int(pct) != last_pct and int(pct) % 5 == 0:
+                ctx.log(f"下载中 {pct:.1f}%")
+                last_pct = int(pct)
+            ctx.report_progress(min(89.0, pct * 0.89))
+
+    rc, out, err = ctx.run_subprocess(cmd, on_stderr=on_stderr)
+    if rc != 0:
+        raise DubForgeError("yt-dlp 下载失败", code="DOWNLOAD_FAIL",
+                            detail=(err or out)[-1500:])
+    # stdout 只有 --print 的两行: 文件路径 + 标题 (顺序与参数一致)
+    lines = [ln.strip() for ln in out.splitlines() if ln.strip()]
+    filepath = next((ln for ln in lines
+                     if Path(ln).suffix.lower() in _VIDEO_EXT), "")
+    title = next((ln for ln in lines if ln != filepath), "")
+    if not filepath:
+        # 归档命中 (此前下过且文件已删) 时 yt-dlp 不产出 → 让调用方走兜底检查
+        ctx.log("yt-dlp 未报告输出文件 (可能命中全局下载归档)")
+    return {"title": title, "filepath": filepath}
 
 
 def _find_downloaded(media_dir: Path) -> Path | None:
@@ -125,12 +134,14 @@ def run(ctx) -> None:
             raise DubForgeError("项目没有填写视频链接", code="SOURCE_URL_EMPTY")
         ctx.log(f"开始下载: {url}")
         info = _run_ytdlp(ctx, url, str(media / "video.%(ext)s"))
-        title = info["title"]
+        title = info["title"] or "未命名视频"
         ctx.log(f"标题: {title}")
-        dst = _find_downloaded(media)
+        ctx.check_cancel()
+        dst = (Path(info["filepath"]) if info["filepath"] else None)
+        if not dst or not dst.exists():
+            dst = _find_downloaded(media)     # 归档命中/改名兜底: 扫 media/
         if not dst:
-            raise DubForgeError("yt-dlp 报告完成但未找到视频文件", code="DOWNLOAD_UNKNOWN",
-                                detail=json.dumps(info, ensure_ascii=False)[:2000])
+            raise DubForgeError("yt-dlp 报告完成但未找到视频文件", code="DOWNLOAD_UNKNOWN")
     else:
         raise DubForgeError(f"未知来源类型: {kind}", code="SOURCE_KIND_UNKNOWN")
 

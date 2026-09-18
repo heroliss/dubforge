@@ -443,7 +443,7 @@ function resetNewForm() {
       </template>
     </n-modal>
 
-    <n-modal :show="showBrowse" preset="card" title="选择视频文件" style="width: 680px">
+    <n-modal v-model:show="showBrowse" preset="card" title="选择视频文件" style="width: 680px">
       <div style="display:flex;gap:8px;margin-bottom:8px">
         <n-input v-model:value="browsePath" size="small" placeholder="输入文件夹路径后回车"
                  @keyup.enter="browseTo(browsePath)" />
@@ -480,7 +480,8 @@ function resetNewForm() {
       </template>
     </n-modal>
 
-    <n-modal :show="!!renaming" preset="card" title="重命名项目" style="width: 460px">
+    <n-modal :show="!!renaming" preset="card" title="重命名项目" style="width: 460px"
+             @update:show="v => !v && (renaming = null)">
       <n-input v-model:value="renameTitle" maxlength="200" show-count
                placeholder="输入新的标题" @keyup.enter="applyRename" />
       <template #footer>

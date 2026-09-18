@@ -100,6 +100,7 @@ def run(ctx) -> None:
     pdir = ctx.pdir
     done = skipped = failed = 0
     for li, line in enumerate(task["lines"]):
+        ctx.check_pause()
         ctx.check_cancel()
         ctx.report_progress(li / max(1, len(task["lines"])) * 99)
         if not line["text"].strip():

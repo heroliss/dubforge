@@ -222,6 +222,7 @@ def _valid_ids(chunk: list[dict]):
 def _translate_chunk(ctx, chunk: list[dict], system: str,
                      prev_tail: str, next_head: str) -> dict[int, str]:
     """单块翻译: 默认单步一次成稿; two_step=先忠实直译再润色 (两次请求)"""
+    ctx.check_pause()          # 并行 worker 的暂停点: 暂停时不发起新的 LLM 请求
     two_step = bool(ctx.cfg("translate.two_step", False))
     stage = "two_step" if two_step else "single"
     key = _chunk_key(ctx, chunk, stage, prev_tail + "|" + next_head)
@@ -242,6 +243,7 @@ def _translate_chunk(ctx, chunk: list[dict], system: str,
 
 
 def _translate_chunk_polish(ctx, chunk: list[dict], system: str, whole_draft: str) -> dict[int, str]:
+    ctx.check_pause()
     key = _chunk_key(ctx, chunk, "polish", whole_draft[:200])
     hit = _cached(ctx, key)
     if hit:
@@ -267,7 +269,7 @@ def _run_chunks_parallel(ctx, chunks: list, work_fn, p_from: float, p_to: float,
             done += 1
             ctx.report_progress(p_from + done / len(chunks) * (p_to - p_from))
             ctx.log(f"{log_prefix} {done}/{len(chunks)} 完成")
-            ctx.check_cancel()
+            ctx.check_pause()
     except BaseException:
         ex.shutdown(wait=False, cancel_futures=True)   # 不再派发排队中的块
         raise

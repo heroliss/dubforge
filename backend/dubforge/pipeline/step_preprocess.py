@@ -13,10 +13,8 @@
 - 显存不足自动降级; ctx.check_cancel 取消粒度=整曲 (demucs 无细粒度回调)
 - "取消不产生半成品" 由临时目录保证: 输出写 artifacts/preprocess/.tmp_* 完成后改名
 """
-import json
 import os
 import shutil
-import subprocess
 from pathlib import Path
 
 from dubforge.errors import DubForgeError
@@ -29,10 +27,10 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     cmd = ["ffmpeg", "-y", "-i", str(video), "-vn",
            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
            "-f", "wav", str(tmp)]
-    r = subprocess.run(cmd, capture_output=True, text=True)
-    if r.returncode != 0:
+    rc, _, err = ctx.run_subprocess(cmd)
+    if rc != 0:
         raise DubForgeError("音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
-                            detail=r.stderr[-1500:])
+                            detail=err[-1500:])
     os.replace(tmp, out_wav)
 
 
@@ -117,21 +115,26 @@ def run(ctx) -> None:
         ctx.log("vocal/background 已存在, 跳过分离")
     else:
         ctx.report_progress(30)
+        ctx.check_pause()
         # htdemucs 按 44.1kHz 立体声训练 —— 喂 16k 单声道会频谱错位、严重劣化。
         # 从原视频抽全规格音轨作分离输入, 用完即删 (重跑重新提取只需几秒)。
         src441 = audio_dir / ".tmp_src44100.wav"
         cmd = ["ffmpeg", "-y", "-i", str(video), "-vn",
                "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
                "-f", "wav", str(src441)]
-        r = subprocess.run(cmd, capture_output=True, text=True)
-        if r.returncode != 0:
+        rc, _, err = ctx.run_subprocess(cmd)
+        if rc != 0:
             raise DubForgeError("分离输入音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
-                                detail=r.stderr[-1500:])
+                                detail=err[-1500:])
         try:
+            ctx.check_cancel()
+            ctx.log("分离引擎在进程内计算, 取消/暂停将在本曲结束后生效"
+                    " (强制结束可立即标记, 后台结果自动丢弃)")
             vocal, bg = _run_demucs(ctx, src441, audio_dir)
         finally:
             src441.unlink(missing_ok=True)
         ctx.report_progress(85)
+        ctx.check_cancel()
     ctx.register_file("vocal.wav", vocal, "audio")
     ctx.register_file("background.wav", bg, "audio")
     ctx.write_json("separate.json",

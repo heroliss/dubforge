@@ -75,14 +75,79 @@ function rerunDialog() {
   })
 }
 
-async function cancel() {
+// ---- 停止 / 强制结束 / 暂停 (都有防误触确认) ----
+const pausing = computed(() => !!step.value?.pausing)
+
+function stopDialog() {
+  dialog.warning({
+    title: `停止「${step.value.label}」？`,
+    content: '正在运行的子进程 (下载/ffmpeg 等) 将立即终止；进程内计算会在当前单元结束后退出。'
+      + '过程临时文件自动清理，已完成的正式产物保留。',
+    positiveText: '确认停止',
+    negativeText: '继续运行',
+    onPositiveClick: () => doCancel(),
+  })
+}
+
+async function doCancel() {
   await fetch(`/api/projects/${uid}/steps/${key}/cancel`, { method: 'POST' })
-  message.info('取消信号已发送, 等待步骤在检查点退出')
+  message.info('停止信号已发送, 等待步骤退出；长时间无响应可用「强制结束」')
+}
+
+function forceDialog() {
+  dialog.error({
+    title: `强制结束「${step.value.label}」？`,
+    content: '仅建议在「取消中」长时间无响应时使用：子进程立即终止，状态立刻按已取消呈现；'
+      + '进程内计算若仍在后台收尾，其结果将被自动丢弃。',
+    positiveText: '强制结束',
+    negativeText: '返回',
+    onPositiveClick: () => doForce(),
+  })
+}
+
+async function doForce() {
+  await fetch(`/api/projects/${uid}/steps/${key}/force_stop`, { method: 'POST' })
+  message.success('已强制结束')
+  await nav.poll()
+}
+
+async function setPause(p: boolean) {
+  await fetch(`/api/projects/${uid}/steps/${key}/pause`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pause: p }),
+  })
+  await nav.poll()
 }
 
 async function revealStep() {
   const r = await fetch(`/api/projects/${uid}/steps/${key}/reveal`, { method: 'POST' })
   if (!r.ok) message.error('打开目录失败')
+}
+
+async function revealArt(stepKey: string, name: string) {
+  const r = await fetch(
+    `/api/projects/${uid}/steps/${stepKey}/artifacts/${encodeURIComponent(name)}/reveal`,
+    { method: 'POST' })
+  if (!r.ok) message.error('定位失败 (文件可能已不在磁盘)')
+}
+
+// ---- 文件清单: 上游文件 / 计划产物 / 实际产物 ----
+function upInfo(inp: { step: string, name: string }) {
+  const up = nav.stepMap[inp.step]
+  const art = up?.artifacts?.find((a: any) => a.name === inp.name)
+  return { ok: !!art, size: art?.size, label: up?.label ?? inp.step }
+}
+function producedCount(pattern: string): number | null {
+  if (!pattern.includes('*')) return null
+  const re = new RegExp('^'
+    + pattern.replace(/[.*+?^${}()|[\]\\]/g, (m) => (m === '*' ? '.*' : `\\${m}`)) + '$')
+  return (step.value?.artifacts ?? []).filter((a: any) => re.test(a.name)).length
+}
+function isProduced(name: string): boolean {
+  const n = producedCount(name)
+  return n === null
+    ? (step.value?.artifacts ?? []).some((a: any) => a.name === name)
+    : n > 0
 }
 
 // ---- 日志: 运行态 1.5s 轮询并自动滚底 ----
@@ -312,9 +377,14 @@ async function loadText(name: string | null) {
         <n-space>
           <n-button size="small" quaternary title="在文件浏览器中打开本步骤目录"
                     @click="revealStep">📁</n-button>
+          <n-button v-if="running" size="small" secondary :disabled="step.cancelling"
+                    :title="pausing ? '继续执行' : '在当前单元结束后暂停 (如 demucs 单曲计算中会等它算完)'"
+                    @click="setPause(!pausing)">{{ pausing ? '▶ 继续' : '⏸ 暂停' }}</n-button>
           <n-button v-if="running" type="warning" :disabled="step.cancelling"
-                    @click="cancel">⏹ {{ step.cancelling ? '取消中…' : '取消' }}</n-button>
-          <n-button v-else type="primary" :loading="busy"
+                    @click="stopDialog">⏹ {{ step.cancelling ? '取消中…' : '停止' }}</n-button>
+          <n-button v-if="running && step.cancelling" type="error" secondary
+                    @click="forceDialog">⛔ 强制结束</n-button>
+          <n-button v-else-if="!running" type="primary" :loading="busy"
                     :disabled="!canRun || dirMissing"
                     @click="run(false)">▶ 运行</n-button>
           <n-button v-if="['done', 'stale', 'failed'].includes(step.status)"
@@ -447,20 +517,48 @@ async function loadText(name: string | null) {
             </n-text>
           </n-card>
         </n-gi>
-        <!-- 产物清单 -->
+        <!-- 文件清单: 上游文件 / 计划产物 / 实际产物, 每行可点击定位 -->
         <n-gi>
-          <n-card size="small" title="产物">
+          <n-card size="small" title="文件 (上游 / 计划 / 实际)">
+            <template v-if="(step.inputs?.length ?? 0) || step.artifacts?.length">
+              <div class="fsec">上游文件</div>
+              <div v-for="inp in step.inputs" :key="inp.step + '/' + inp.name" class="fline">
+                <span class="dot" :class="upInfo(inp).ok ? 'ok' : 'miss'" />
+                <n-text style="font-size: 12.5px">{{ inp.name }}</n-text>
+                <n-text depth="3" style="font-size: 11.5px; margin-left: 6px; flex: 1">
+                  「{{ upInfo(inp).label }}」{{ inp.desc }}<template v-if="upInfo(inp).ok">
+                    · {{ fmtSize(upInfo(inp).size) }}</template><template v-else> · 未生成</template>
+                </n-text>
+                <n-button v-if="upInfo(inp).ok" size="tiny" quaternary title="在文件浏览器中定位"
+                          @click="revealArt(inp.step, inp.name)">📍</n-button>
+              </div>
+              <div class="fsec">计划产物</div>
+              <div v-for="o in step.outputs" :key="o.name" class="fline">
+                <span class="dot" :class="isProduced(o.name) ? 'ok' : 'plan'" />
+                <n-text style="font-size: 12.5px">{{ o.name }}</n-text>
+                <n-text depth="3" style="font-size: 11.5px; margin-left: 6px; flex: 1">
+                  {{ o.desc }}<template v-if="producedCount(o.name) !== null">
+                    · 已有 {{ producedCount(o.name) }} 个</template>
+                </n-text>
+              </div>
+            </template>
+            <div class="fsec">
+              实际产物<template v-if="step.artifacts?.length"> ({{ step.artifacts.length }})</template>
+            </div>
             <n-text v-if="!step.artifacts?.length" depth="3" style="font-size: 12px">
               (暂无产物)
             </n-text>
-            <ul v-else class="arts">
-              <li v-for="a in step.artifacts" :key="a.name">
-                <n-text style="font-size: 12.5px">{{ a.name }}</n-text>
-                <n-text depth="3" style="font-size: 11.5px; margin-left: 8px">
-                  {{ a.file }} · {{ fmtSize(a.size) }}
-                </n-text>
-              </li>
-            </ul>
+            <div v-for="a in step.artifacts" :key="a.name" class="fline">
+              <n-text style="font-size: 12.5px">{{ a.name }}</n-text>
+              <n-text depth="3" style="font-size: 11.5px; margin-left: 8px; flex: 1">
+                {{ a.file }} · {{ fmtSize(a.size) }}
+              </n-text>
+              <n-button size="tiny" quaternary title="在文件浏览器中定位"
+                        @click="revealArt(key, a.name)">📍</n-button>
+            </div>
+            <n-text depth="3" style="font-size: 11px; display: block; margin-top: 8px">
+              📍 在 Windows 资源管理器中显示该文件 (由系统决定窗口是否前置)。
+            </n-text>
           </n-card>
         </n-gi>
       </n-grid>
@@ -489,6 +587,13 @@ async function loadText(name: string | null) {
 }
 .arts { list-style: none; margin: 0; padding: 0; }
 .arts li { padding: 3px 0; }
+.fsec { font-size: 11.5px; color: rgba(255,255,255,0.45); margin: 8px 0 4px; }
+.fsec:first-child { margin-top: 0; }
+.fline { display: flex; align-items: center; gap: 4px; padding: 2px 0; }
+.dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-right: 4px; }
+.dot.ok { background: #18a058; }
+.dot.miss { background: #d03050; }
+.dot.plan { background: rgba(255,255,255,0.25); }
 .ctl { display: block; width: 100%; }
 .frow { display: flex; align-items: center; gap: 4px; width: 100%; }
 .plabel { display: inline-flex; align-items: center; gap: 4px; }

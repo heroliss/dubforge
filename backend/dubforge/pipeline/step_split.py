@@ -140,6 +140,7 @@ def run(ctx) -> None:
     out: list[dict] = []
     next_id = 1
     for li, line in enumerate(lines):
+        ctx.check_pause()
         ctx.check_cancel()
         ctx.report_progress(li / max(1, len(lines)) * 100)
         if _wc(line.text) <= max_len:

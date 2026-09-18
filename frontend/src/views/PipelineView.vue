@@ -147,9 +147,41 @@ async function runChain(step: any) {
     await nav.poll()
   } finally { busyKey.value = '' }
 }
-async function cancel(step: any) {
+function stopDialog(step: any) {
+  dialog.warning({
+    title: `停止「${step.label}」？`,
+    content: '正在运行的子进程 (下载/ffmpeg 等) 将立即终止；进程内计算会在当前单元结束后退出。'
+      + '过程临时文件自动清理，已完成的正式产物保留。自动续跑链将停止。',
+    positiveText: '确认停止',
+    negativeText: '继续运行',
+    onPositiveClick: () => doCancel(step),
+  })
+}
+async function doCancel(step: any) {
   await fetch(`/api/projects/${uid}/steps/${step.key}/cancel`, { method: 'POST' })
-  message.info('取消信号已发送 (自动续跑将停止)')
+  message.info('停止信号已发送 (自动续跑将停止)；长时间无响应可用「强制结束」')
+}
+function forceDialog(step: any) {
+  dialog.error({
+    title: `强制结束「${step.label}」？`,
+    content: '仅建议在「取消中」长时间无响应时使用：子进程立即终止，状态立刻按已取消呈现；'
+      + '进程内计算若仍在后台收尾，其结果将被自动丢弃。',
+    positiveText: '强制结束',
+    negativeText: '返回',
+    onPositiveClick: () => doForce(step),
+  })
+}
+async function doForce(step: any) {
+  await fetch(`/api/projects/${uid}/steps/${step.key}/force_stop`, { method: 'POST' })
+  message.success('已强制结束')
+  await nav.poll()
+}
+async function setPause(step: any, p: boolean) {
+  await fetch(`/api/projects/${uid}/steps/${step.key}/pause`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ pause: p }),
+  })
+  await nav.poll()
 }
 function rerunDialog(step: any) {
   const downstream = nav.steps.slice(nav.steps.findIndex(s => s.key === step.key) + 1)
@@ -252,8 +284,13 @@ const headerStatus = computed(() => {
           <span class="ops">
             <n-button v-if="s.status === 'running' || s.status === 'queued'"
                       size="small" type="warning" secondary :disabled="s.cancelling"
-                      @click="cancel(s)">{{ s.cancelling ? '⏹ 取消中…' : '⏹ 取消' }}</n-button>
-            <n-button v-else size="small" type="primary" secondary
+                      @click="stopDialog(s)">{{ s.cancelling ? '⏹ 取消中…' : '⏹ 停止' }}</n-button>
+            <n-button v-if="s.status === 'running' && !s.cancelling" size="small" secondary
+                      @click="setPause(s, !s.pausing)">{{ s.pausing ? '▶ 继续' : '⏸ 暂停' }}</n-button>
+            <n-button v-if="s.cancelling" size="small" type="error" secondary
+                      @click="forceDialog(s)">⛔ 强制结束</n-button>
+            <n-button v-else-if="s.status !== 'running' && s.status !== 'queued'"
+                      size="small" type="primary" secondary
                       :disabled="blockersOf(s.key).length > 0"
                       :loading="busyKey === s.key"
                       :title="blockersOf(s.key).length
