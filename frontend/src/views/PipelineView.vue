@@ -35,6 +35,14 @@ async function loadMedia() {
     if (r.ok) media.value = await r.json()
   } catch { /* 忽略 */ }
 }
+// 项目目录是否还在磁盘上 (被移走/删除 → 头部标注)
+const dirMissing = ref(false)
+onMounted(async () => {
+  try {
+    const r = await fetch(`/api/projects/${uid}`)
+    if (r.ok) dirMissing.value = (await r.json()).dir_exists === false
+  } catch { /* 忽略 */ }
+})
 onMounted(loadMedia)
 // 获取视频从未完成变为完成: 重取媒体信息 + 视频地址加版本号 ——
 // <video> 对同一 src 不会自己重新加载, 不 bump 会一直挂着下载中取到的旧资源 (无声)
@@ -178,6 +186,12 @@ const headerStatus = computed(() => {
     <n-space justify="space-between" align="center">
       <n-h1 style="margin: 0; font-size: 20px">{{ nav.title || '…' }}</n-h1>
       <n-tag size="small" :type="headerStatus.type as any">{{ headerStatus.text }}</n-tag>
+      <n-tooltip v-if="dirMissing" trigger="hover" :delay="0" placement="top">
+        <template #trigger>
+          <n-tag size="small" type="error" :bordered="false">⚠ 项目目录缺失</n-tag>
+        </template>
+        项目目录不在磁盘上 (可能被移动或删除)。从回收站还原后刷新页面标记即消失。
+      </n-tooltip>
     </n-space>
 
     <!-- ============ 原视频 ============ -->

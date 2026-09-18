@@ -30,7 +30,9 @@ async function load(showSpin = false) {
     loading.value = false
   }
 }
-onMounted(() => {
+onMounted(async () => {
+  // 进列表页先对账一次: 回收站还原/手动拷入的项目目录自动重新登记
+  try { await fetch('/api/settings/rebuild_db', { method: 'POST' }) } catch { /* 后端未起也照常加载 */ }
   load(true)
   pollTimer = window.setInterval(() => load(false), 4000)   // 运行徽章/进度条保鲜
 })
@@ -120,8 +122,8 @@ function remove(p: any) {
   dialog.warning({
     title: '删除项目',
     content: hasRun
-      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出；项目将从列表移除，目录移入系统回收站（可还原找回）。`
-      : `确定删除「${p.title}」？项目将从列表移除，项目目录移入系统回收站 —— 反悔可从回收站还原目录，再到「设置 → 从项目目录重建索引」整个找回（若回收站被禁用则为永久删除）。`,
+      ? `「${p.title}」正在运行「${p.running_label}」。删除将先取消该任务并等待退出；项目将从列表移除，目录移入系统回收站 —— ⚠ 若系统回收站被禁用，删除将无法找回。`
+      : `确定删除「${p.title}」？项目将从列表移除，目录移入系统回收站。⚠ 若系统回收站被禁用，删除将无法找回。（反悔：从回收站还原目录后，可在「设置 → 从项目目录重建索引」重新登记）`,
     positiveText: hasRun ? '取消任务并删除' : '删除',
     negativeText: '取消',
     onPositiveClick: async () => {
@@ -327,6 +329,14 @@ function resetNewForm() {
                   <n-tag v-if="p.running_step" size="small" type="info" :bordered="false">
                     🔄 {{ p.running_label }}
                   </n-tag>
+                  <n-tooltip v-if="p.dir_exists === false" trigger="hover" :delay="0"
+                             placement="top">
+                    <template #trigger>
+                      <n-tag size="small" type="error" :bordered="false">⚠ 目录缺失</n-tag>
+                    </template>
+                    项目目录不在磁盘上 —— 可能被移动或删除。从回收站还原后此标记会自动消失;
+                    确认不再需要可点「删除」清理登记。
+                  </n-tooltip>
                 </n-space>
                 <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
                   {{ p.source_kind === 'local' ? '本地导入' : p.source_url }} · {{ p.uid }}
@@ -342,7 +352,7 @@ function resetNewForm() {
                 <template #trigger>
                   <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
                 </template>
-                删除项目 —— 目录移入系统回收站 (可还原找回); 反悔: 还原后到设置页「重建索引」
+                删除项目: 目录移入系统回收站; ⚠ 若回收站被禁用则永久删除、无法找回
               </n-tooltip>
             </n-space>
           </n-space>

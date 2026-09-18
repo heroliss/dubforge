@@ -237,3 +237,16 @@ def test_project_step_params_layering(isolated_env):
         assert j["overridden"]["separate.model"] is False
         assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs"
     assert compute_fingerprint(crud.get_project(p.uid), "preprocess") == fp0
+
+
+def test_missing_dir_flag_and_delete(isolated_env, tmp_path):
+    """目录被外部移走: 列表标 dir_exists=false; 删除仍成功 (跳过回收站只清登记)"""
+    import shutil as _shutil
+    from dubforge.domain import crud
+    p = crud.create_project(title="目录丢失项目")
+    _shutil.rmtree(crud.project_dir(p.uid))
+    with _client() as client:
+        j = client.get(f"/api/projects/{p.uid}").json()
+        assert j["dir_exists"] is False
+        assert client.delete(f"/api/projects/{p.uid}").status_code == 200
+        assert crud.get_project(p.uid) is None

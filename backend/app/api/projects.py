@@ -381,6 +381,8 @@ def _project_view(project) -> dict:
         "running_label": STEP_MAP[running].label if running else None,
         "params": json.loads(project.params or "{}"),
         "created_at": project.created_at.isoformat(),
+        # 项目目录是否还在磁盘上 (被移走/删除 → 列表标注「目录缺失」)
+        "dir_exists": crud.project_dir(project.uid).exists(),
         # 分段进度条数据源: 每步状态+进度
         "steps": [{"key": s.step_key, "label": STEP_MAP[s.step_key].label,
                    "status": s.status, "progress": round(s.progress or 0, 1),

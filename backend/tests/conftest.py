@@ -46,6 +46,16 @@ def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15
                        f"{step.status}{err}")
 
 
+@pytest.fixture(autouse=True)
+def _no_real_recycle_bin(monkeypatch):
+    """测试里删除项目不允许碰真实系统回收站 (send2trash 会把隔离环境里的
+    临时目录扔进用户回收站) —— 一律替换为普通删除。"""
+    import shutil as _shutil
+    import send2trash as _st
+    monkeypatch.setattr(_st, "send2trash", lambda p: _shutil.rmtree(p, ignore_errors=True))
+
+
+
 @pytest.fixture()
 def stub_heavy_steps(monkeypatch):
     """把指定步骤的运行函数临时替换为桩行为 (状态机测试与真实现解耦)。
