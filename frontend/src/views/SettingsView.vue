@@ -1,5 +1,7 @@
 <script setup lang="ts">
 // 设置页: LLM 多组配置池 (任意 OpenAI 兼容服务商, 按顺序降级) + 其余组只读概览
+// 注意: v-for 容器一律用原生 flex div —— naive-ui 2.45 的 n-space 在嵌套 n-card
+// 场景会把组件子项渲染成空注释 (已踩坑, 见 git 历史)
 import { onMounted, ref } from 'vue'
 import { useMessage } from 'naive-ui'
 
@@ -22,9 +24,21 @@ const THINKING_OPTIONS = [
   { label: 'enabled — 开启思考', value: 'enabled' },
 ]
 
+// 官方依据的参数模板 (选定后自动填入, 可再手动改; 其余服务商请查其官方文档)
+const PARAM_TPLS: Record<string, { label: string, params: any }> = {
+  glm53: { label: 'GLM-5.3-flash 官方推荐 (思考型)',
+           params: { temperature: 1, top_p: 0.95, reasoning_effort: 'max' } },
+  low_random: { label: '翻译通用 (低随机, 更稳定)', params: { temperature: 0.2 } },
+  clear: { label: '清空', params: {} },
+}
+function applyTpl(p: any, key: string) {
+  if (key && PARAM_TPLS[key]) p.paramsJson = JSON.stringify(PARAM_TPLS[key].params, null, 1)
+}
+
 function addProfile() {
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
-                        base_url: '', api_key: '', model: '', enabled: true })
+                        base_url: '', api_key: '', model: '', enabled: true,
+                        params: {}, paramsJson: '{}' })
 }
 function delProfile(i: number) { profiles.value.splice(i, 1) }
 function move(i: number, d: number) {
@@ -42,7 +56,7 @@ onMounted(async () => {
     profiles.value = (llm.profiles?.length ? llm.profiles :
       [{ name: '默认', base_url: llm.base_url, api_key: llm.api_key,
          model: llm.model, enabled: true }]).map((p: any) => ({
-      ...p, paramsJson: JSON.stringify(p.params ?? {}, null, 1),
+      ...p, params: p.params ?? {}, paramsJson: JSON.stringify(p.params ?? {}, null, 1),
     }))
     form.value.temperature = Number(llm.temperature)
     form.value.max_workers = Number(llm.max_workers)
@@ -53,29 +67,19 @@ onMounted(async () => {
   }
 })
 
-// 官方依据的参数模板 (选定后自动填入, 可再手动改; 其余服务商请查其官方文档)
-const PARAM_TPLS: Record<string, { label: string, params: any }> = {
-  glm53: { label: 'GLM-5.3-flash 官方推荐 (思考型)',
-           params: { temperature: 1, top_p: 0.95, reasoning_effort: 'max' } },
-  low_random: { label: '翻译通用 (低随机, 更稳定)', params: { temperature: 0.2 } },
-  clear: { label: '清空', params: {} },
-}
-function applyTpl(p: any, key: string) {
-  if (key && PARAM_TPLS[key]) p.paramsJson = JSON.stringify(PARAM_TPLS[key].params, null, 1)
-}
-
 async function save(showTip = true) {
   saving.value = true
   try {
-    const r = await fetch('/api/settings', {
+    const list = profiles.value.map((p: any) => {
+      let params: any = {}
+      try { params = JSON.parse(p.paramsJson || '{}') } catch { /* 保持空 */ }
+      const { paramsJson, ...rest } = p
+      return { ...rest, params }
+    })
+    await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {
-        'llm.profiles': profiles.value.map((p: any) => {
-          let params: any = {}
-          try { params = JSON.parse(p.paramsJson || '{}') } catch { /* 留空 */ }
-          const { paramsJson, ...rest } = p
-          return { ...rest, params }
-        }),
+        'llm.profiles': list,
         'llm.temperature': form.value.temperature,
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
@@ -114,18 +118,19 @@ async function testConnection() {
 
     <n-alert v-if="loadError" type="error">{{ loadError }}</n-alert>
     <n-spin :show="!cfg && !loadError">
-      <n-space vertical size="large" v-if="cfg">
+      <div v-if="cfg" style="display:flex;flex-direction:column;gap:16px">
         <!-- ============ LLM 配置池 (可编辑) ============ -->
         <n-card title="🌐 大模型 (LLM) — 翻译与分句" size="small">
-          <n-space vertical size="small">
-            <n-card v-for="(p, i) in profiles" :key="i" size="tiny"
-                    :style="p.enabled ? '' : 'opacity:.55'">
-              <n-space align="center" style="margin-bottom: 6px">
+          <div style="display:flex;flex-direction:column;gap:8px">
+            <div v-for="(p, i) in profiles" :key="i"
+                 style="border:1px solid #2a343f; border-radius:8px; padding:10px 12px;
+                        opacity: p.enabled ? 1 : .55">
+              <div style="display:flex;align-items:center;gap:8px;margin-bottom:8px">
                 <n-switch v-model:value="p.enabled" size="small">
                   <template #checked>启用</template><template #unchecked>停用</template>
                 </n-switch>
                 <n-input v-model:value="p.name" size="small" placeholder="名称"
-                         style="width: 140px" />
+                         style="width: 150px" />
                 <n-button size="tiny" quaternary :disabled="i === 0"
                           @click="move(i, -1)">↑</n-button>
                 <n-button size="tiny" quaternary :disabled="i === profiles.length - 1"
@@ -135,82 +140,43 @@ async function testConnection() {
                 <n-text depth="3" style="font-size: 11px">
                   按此列表顺序依次尝试，前面的不可用自动切到下一个
                 </n-text>
-              </n-space>
-              <n-grid :cols="2" :x-gap="12">
-                <n-form-item-gi label="接口地址">
+              </div>
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px 12px">
+                <div>
+                  <n-text depth="3" style="font-size:12px">接口地址</n-text>
                   <n-input v-model:value="p.base_url" size="small"
                            placeholder="https://ark.cn-beijing.volces.com/api/plan/v3" />
-                </n-form-item-gi>
-                <n-form-item-gi label="模型名">
+                </div>
+                <div>
+                  <n-text depth="3" style="font-size:12px">模型名</n-text>
                   <n-input v-model:value="p.model" size="small"
                            placeholder="如 glm-5.3-flash / deepseek-chat" />
-                </n-form-item-gi>
-              </n-grid>
-              <n-form-item label-placement="left" label="API Key">
+                </div>
+              </div>
+              <div style="margin-top:8px">
+                <n-text depth="3" style="font-size:12px">API Key</n-text>
                 <n-input v-model:value="p.api_key" type="password"
                          show-password-on="click" size="small"
-                         placeholder="密钥直接保存在本地 config.yaml" />
-              </n-form-item>
-              <n-form-item label-placement="left" label="专属参数">
-                <n-space vertical size="tiny" style="width:100%">
-                  <n-select size="small" :value="''"
-                            :options="Object.entries(PARAM_TPLS).map(([k, v]) => ({ label: v.label, value: k }))"
-                            placeholder="选择参数模板 (官方推荐值)…"
-                            @update:value="(v: string) => applyTpl(p, v)" />
-                  <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
-                           placeholder='JSON, 原样合并进请求体, 如 {"temperature":1,"reasoning_effort":"max"}' />
-                </n-space>
-              </n-form-item>
-            </n-card>
+                         placeholder="密钥保存在本地 config.yaml" />
+              </div>
+              <div style="margin-top:8px">
+                <n-text depth="3" style="font-size:12px">专属参数 (该服务商的模型参数, 原样合并进请求体)</n-text>
+                <n-select size="small" :value="''" style="margin-top:2px"
+                          :options="Object.entries(PARAM_TPLS).map(([k, v]) => ({ label: v.label, value: k }))"
+                          placeholder="选择参数模板 (官方推荐值)…"
+                          @update:value="(v: string) => applyTpl(p, v)" />
+                <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
+                         style="margin-top:4px"
+                         placeholder='JSON, 如 {"temperature":1,"top_p":0.95,"reasoning_effort":"max"}' />
+              </div>
+            </div>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
-          </n-space>
-        </n-card>
-
-        <!-- ============ 全局生成参数 (可编辑 + 悬浮说明) ============ -->
-        <n-card title="生成参数" size="small">
-          <n-grid :cols="4" :x-gap="12">
-            <n-form-item-gi label-placement="left" label="Temperature">
-              <n-tooltip trigger="hover" placement="top" style="max-width: 280px">
-                <template #trigger>
-                  <n-input-number v-model:value="form.temperature" :min="0" :max="2" :step="0.05" style="width:100%" />
-                </template>
-                控制 LLM 输出的随机性：越低越稳定、越贴合原文；越高越发散。<br />
-                字幕翻译建议 <b>0.1~0.3</b>。出现漏译/错位时优先调低。
-              </n-tooltip>
-            </n-form-item-gi>
-            <n-form-item-gi label-placement="left" label="并发数">
-              <n-tooltip trigger="hover" placement="top" style="max-width: 280px">
-                <template #trigger>
-                  <n-input-number v-model:value="form.max_workers" :min="1" :max="16" :step="1" style="width:100%" />
-                </template>
-                同时发出的 LLM 请求数。<br />
-                <b>1</b> = 串行最稳（限流严的服务商首选）；配额充裕可设 <b>2~4</b> 加速翻译。
-              </n-tooltip>
-            </n-form-item-gi>
-            <n-form-item-gi label-placement="left" label="读超时(秒)">
-              <n-tooltip trigger="hover" placement="top" style="max-width: 280px">
-                <template #trigger>
-                  <n-input-number v-model:value="form.timeout" :min="30" :max="900" :step="30" style="width:100%" />
-                </template>
-                单次请求最长等待秒数。<br />
-                思考型模型（GLM-4.7 / 5.3 等）单次可能超过 120 秒，建议 <b>≥300</b>。
-              </n-tooltip>
-            </n-form-item-gi>
-            <n-form-item-gi label-placement="left" label="思考模式">
-              <n-tooltip trigger="hover" placement="top" style="max-width: 280px">
-                <template #trigger>
-                  <n-select v-model:value="form.thinking" :options="THINKING_OPTIONS" />
-                </template>
-                思考型模型（GLM-4.7/5.3 等）会先长推理再输出，慢但更聪明。<br />
-                字幕翻译建议 <b>auto</b>；若服务端支持 disabled 可大幅提速。
-              </n-tooltip>
-            </n-form-item-gi>
-          </n-grid>
-          <n-space>
+          </div>
+          <n-space style="margin-top:12px">
             <n-button type="primary" :loading="saving" @click="save()">保存全部</n-button>
             <n-button :loading="testing" @click="testConnection">🔌 测试连接</n-button>
             <n-text depth="3" style="font-size: 12px">
-              测试连接先保存，再按配置池顺序发一个最小翻译请求
+              测试连接会先用当前表单值保存，再按配置池顺序发一个最小翻译请求
             </n-text>
           </n-space>
           <n-alert v-if="testResult" :type="testResult.ok ? 'success' : 'error'"
@@ -230,7 +196,7 @@ async function testConnection() {
             <n-descriptions-item label="成片 Ducking">{{ cfg.assemble.ducking ? '开' : '关' }}</n-descriptions-item>
           </n-descriptions>
         </n-card>
-      </n-space>
+      </div>
     </n-spin>
   </n-layout-content>
 </template>

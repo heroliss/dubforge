@@ -74,7 +74,7 @@ const STATUS_TEXT: Record<string, string> = {
 
     <n-spin :show="loading">
       <n-empty v-if="!loading && !projects.length" description="还没有项目 —— 点击右上角新建，粘贴 YouTube 链接或导入本地视频" />
-      <n-space vertical size="large" v-else>
+      <div v-else style="display:flex;flex-direction:column;gap:16px">
         <n-card v-for="p in projects" :key="p.uid" size="small"
                 style="cursor: pointer" @click="router.push(`/projects/${p.uid}`)">
           <n-space justify="space-between" align="center">
@@ -95,7 +95,7 @@ const STATUS_TEXT: Record<string, string> = {
             </n-space>
           </n-space>
         </n-card>
-      </n-space>
+      </div>
     </n-spin>
 
     <n-modal v-model:show="showNew" preset="card" title="新建项目" style="width: 560px">

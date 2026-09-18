@@ -104,7 +104,7 @@ function openWorkbench() {
       <n-tag size="small" style="margin-left: 4px">{{ project.status }}</n-tag>
     </n-text>
 
-    <n-space vertical size="medium" style="margin-top: 16px">
+    <div style="display:flex;flex-direction:column;gap:12px;margin-top:16px">
       <n-card v-for="s in steps" :key="s.key" size="small"
               :style="selected === s.key ? 'border-color: var(--accent, #4da3ff)' : ''"
               @click="select(s.key)">
@@ -152,7 +152,7 @@ function openWorkbench() {
           <n-button size="small">进入</n-button>
         </n-space>
       </n-card>
-    </n-space>
+    </div>
   </n-layout-content>
 </template>
 
