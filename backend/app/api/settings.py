@@ -35,36 +35,33 @@ def update_settings(body: SettingsUpdate):
 
 @router.post("/test_llm")
 def test_llm(body: dict | None = None):
-    """LLM 连通性测试。
+    """LLM 连通性测试 —— 只探测传入的表单值, 不读写 config.yaml (保存是唯一写入口)。
 
-    - body 为空: 并行测试全部「启用」的配置, 返回逐个结果
-    - body {"index": i}: 只测第 i 组配置 (含停用的, 便于启用前验证)
+    body: {"profiles": [配置...], "globals": {"temperature": .., "thinking": ".."}}
+      - profiles: 前端当前表单里的配置 (一组=单测, 多组=并行测)
+      - 不传 profiles 时兼容旧行为: 测 config 中所有启用组
+    返回 {"results": [{index(传入数组中的位置), name, ok, ...}], "ok": 任一组可用}
     """
     from concurrent.futures import ThreadPoolExecutor
 
     from dubforge.backends import llm
 
-    all_profiles = config.load_config().get("llm", {}).get("profiles") or []
-    # 兼容旧版单配置
-    if not all_profiles and config.get("llm.base_url"):
-        all_profiles = [{"name": "default", "enabled": True,
-                         **{k: config.get(f"llm.{k}") for k in
-                            ("base_url", "api_key", "model")}}]
+    body = body or {}
+    profiles = body.get("profiles")
+    if not profiles:  # 兼容: 未传则测 config 启用组
+        profiles = [p for p in (config.load_config().get("llm", {})
+                                .get("profiles") or []) if p.get("enabled", True)]
+        if not profiles:
+            raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
+                                suggestion="在设置页勾选至少一组配置的「启用」开关。")
+    globals_ = body.get("globals") or {}
 
-    idx = (body or {}).get("index")
-    if idx is not None:
-        idx = int(idx)
-        if idx < 0 or idx >= len(all_profiles):
-            raise DubForgeError(f"配置序号不存在: {idx}", code="PROFILE_NOT_FOUND")
-        return {"results": [{**llm.test_provider(all_profiles[idx]),
-                             "index": idx, "name": all_profiles[idx].get("name")}]}
-    enabled = [(i, p) for i, p in enumerate(all_profiles) if p.get("enabled", True)]
-    if not enabled:
-        raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
-                            suggestion="在设置页勾选至少一组配置的「启用」开关。")
-    with ThreadPoolExecutor(max_workers=len(enabled)) as pool:
-        results = list(pool.map(
-            lambda ip: {**llm.test_provider(ip[1]), "index": ip[0],
-                        "name": ip[1].get("name")}, enabled))
-    return {"results": results,
-            "ok": any(r["ok"] for r in results)}
+    def probe(item):
+        i, p = item
+        return {**llm.test_provider(p, temperature=globals_.get("temperature"),
+                                    thinking=globals_.get("thinking")),
+                "index": i, "name": p.get("name")}
+
+    with ThreadPoolExecutor(max_workers=min(len(profiles), 8)) as pool:
+        results = list(pool.map(probe, enumerate(profiles)))
+    return {"results": results, "ok": any(r["ok"] for r in results)}

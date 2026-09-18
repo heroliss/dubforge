@@ -13,24 +13,29 @@ const loadError = ref('')
 const testResults = ref<Record<number, any>>({})
 const testingMap = ref<Record<number, boolean>>({}) // 每组独立的测试中状态 → 各组可并行测试
 
-async function runTest(body: any) {
+// 组装要发给后端探测的配置 (只含表单当前值, 不读写 config.yaml)
+function toWire(p: any) {
+  const { paramsJson, ...rest } = p
+  return { ...rest, params: parseParams(p) }
+}
+function toGlobals() {
+  return { temperature: form.value.temperature, thinking: form.value.thinking }
+}
+async function postTest(profileList: any[]) {
   const r = await fetch('/api/settings/test_llm', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body: JSON.stringify({ profiles: profileList, globals: toGlobals() }),
   })
   const j = await r.json()
   if (!r.ok) throw new Error(j.message || j.detail || '测试请求失败')
-  for (const res of (j.results ?? [])) {
-    testResults.value[res.index] = res
-  }
-  return j
+  return j.results ?? []
 }
 async function testOne(i: number) {
-  await save(false)
   delete testResults.value[i]
   testingMap.value[i] = true
   try {
-    await runTest({ index: i })
+    const results = await postTest([toWire(profiles.value[i])])
+    testResults.value[i] = results[0]
   } catch (e: any) {
     // 测试请求本身失败 (后端不可达/接口报错) 也归一成结果, 与成功信息显示在同一个详情框
     const p = profiles.value[i] ?? {}
@@ -124,13 +129,18 @@ async function save(showTip = true) {
 }
 
 async function testConnection() {
-  await save(false)
   testing.value = true
   testResults.value = {}
+  // 只测「启用」的组; 记录它们在表单里的原始下标, 结果按位置映射回去
+  const idxMap: number[] = []
+  const list = profiles.value
+    .map((p, idx) => ({ p, idx }))
+    .filter(x => x.p.enabled)
   try {
-    const j = await runTest({})
-    const okN = (j.results ?? []).filter((r: any) => r.ok).length
-    message.info(`并行测试完成: ${okN}/${j.results.length} 组可用`)
+    const results = await postTest(list.map(x => { idxMap.push(x.idx); return toWire(x.p) }))
+    results.forEach((res: any, pos: number) => { testResults.value[idxMap[pos]] = res })
+    const okN = results.filter((r: any) => r.ok).length
+    message.info(`并行测试完成: ${okN}/${results.length} 组可用`)
   } catch (e: any) {
     message.error(e.message)
   } finally { testing.value = false }
@@ -160,6 +170,7 @@ function extraParamsStr(r: any): string {
           <n-text depth="3" style="font-size:12px">
             配置按列表顺序作为降级链：前面的失败时自动切换到下一个。
             每组可用右侧「⚡ 测试」单独验证；各组测试互相独立、可同时进行，详情会显示发送与收到的内容。
+            测试只探测表单当前填写的内容，不会保存。
           </n-text>
           <div class="profiles">
             <div v-for="(p, i) in profiles" :key="i" class="profile" :class="{ off: !p.enabled }">
@@ -239,13 +250,6 @@ function extraParamsStr(r: any): string {
             </div>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
           </div>
-          <div class="actions">
-            <n-button type="primary" :loading="saving" @click="save()">保存全部</n-button>
-            <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
-            <n-text depth="3" style="font-size: 12px">
-              先保存表单值，再同时测试所有「启用」的配置；与单组测试互不影响
-            </n-text>
-          </div>
           <!-- 通用参数: 全局默认值, 组内"专属参数"可覆盖同名项 -->
           <n-text depth="3" style="font-size:12px; display:block; margin-top:14px">
             通用参数（所有配置组共用；组内「专属参数」可覆盖 Temperature 等同名项）：
@@ -285,6 +289,14 @@ function extraParamsStr(r: any): string {
               <n-select v-model:value="form.thinking" size="small"
                         :options="THINKING_OPTIONS" style="width:230px" />
             </div>
+          </div>
+          <!-- 保存是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
+          <div class="actions">
+            <n-button type="primary" :loading="saving" @click="save()">💾 保存全部设置</n-button>
+            <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
+            <n-text depth="3" style="font-size: 12px">
+              保存 = 写入 config.yaml（配置组 + 通用参数）；测试只探测表单内容，不会保存
+            </n-text>
           </div>
         </n-card>
 

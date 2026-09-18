@@ -38,7 +38,7 @@ def _profiles() -> list[dict]:
 
 
 def _payload(provider: dict, messages: list[dict], temperature: float | None,
-             json_mode: bool) -> dict:
+             json_mode: bool, thinking: str | None = None) -> dict:
     body = {
         "model": provider.get("model", ""),
         "messages": messages,
@@ -48,10 +48,11 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     if json_mode:
         body["response_format"] = {"type": "json_object"}
     # 思考模式: GLM-4.5+ 支持请求级开关; 字幕翻译不需要长思考, 关闭可大幅提速
-    thinking = str(config.get("llm.thinking", "auto"))
-    if thinking == "disabled":
+    # thinking 参数优先 (测试连接传表单值), 否则读全局配置
+    think = thinking if thinking is not None else str(config.get("llm.thinking", "auto"))
+    if think == "disabled":
         body["thinking"] = {"type": "disabled"}
-    elif thinking == "enabled":
+    elif think == "enabled":
         body["thinking"] = {"type": "enabled"}
     # 专属参数最后合并: 同名键覆盖上面的通用默认 (如该模型官方推荐 temperature:1);
     # 留空 {} 则不多发任何字段, 完全跟随服务商默认
@@ -152,18 +153,20 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def test_provider(provider: dict) -> dict:
+def test_provider(provider: dict, *, temperature: float | None = None,
+                  thinking: str | None = None) -> dict:
     """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果 + 请求/响应详情
 
     request: 实际发送了什么 (url/model/temperature/专属参数/prompt);
     logs:    测试过程中的事件 (如专属参数被拒自动剥离重试); reply/detail: 收到了什么。
-    temperature 传 None → 与真实翻译完全一致 (全局默认 + 专属参数覆盖)。
+    temperature/thinking 传调用方的表单值 (None → 读全局配置), 保证"测的就是所填的"。
     """
     import time as _time
     t0 = _time.time()
     logs: list[str] = []
     prompt = "请只回复两个字母: OK"
-    body = _payload(provider, [{"role": "user", "content": prompt}], None, json_mode=False)
+    body = _payload(provider, [{"role": "user", "content": prompt}], temperature,
+                    json_mode=False, thinking=thinking)
     req_info = {"url": provider.get("base_url", "").rstrip("/") + "/chat/completions",
                 "model": body.get("model"), "temperature": body.get("temperature"),
                 "extra_params": provider.get("params") or {}, "prompt": prompt}
