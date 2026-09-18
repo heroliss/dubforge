@@ -115,7 +115,7 @@ def run(ctx) -> None:
         ctx.log(f"导入本地视频: {src}")
         shutil.copy2(src, dst)
         title = src.stem
-    elif kind == "youtube":
+    elif kind in ("youtube", "link"):   # yt-dlp 支持的任意视频站点 (YouTube/B站/Twitter...)
         url = ctx.project.source_url
         if not url:
             raise DubForgeError("项目没有填写视频链接", code="SOURCE_URL_EMPTY")

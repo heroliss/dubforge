@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// 项目列表: 真实 CRUD + 新建 (YouTube 链接 / 本地导入)
+// 项目列表: 真实 CRUD + 新建 (yt-dlp 支持的任意站点链接 / 本地导入) + 改名
 import { onMounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
@@ -12,7 +12,11 @@ const projects = ref<any[]>([])
 const loading = ref(true)
 const showNew = ref(false)
 const creating = ref(false)
-const form = ref({ source_kind: 'youtube', source_url: '', title: '' })
+const form = ref({ source_kind: 'link', source_url: '', title: '' })
+// 改名
+const renaming = ref<any>(null)
+const renameTitle = ref('')
+const renameSaving = ref(false)
 
 async function load() {
   loading.value = true
@@ -46,6 +50,29 @@ async function create() {
   }
 }
 
+function openRename(p: any) {
+  renaming.value = p
+  renameTitle.value = p.title
+}
+async function applyRename() {
+  if (!renameTitle.value.trim()) { message.warning('标题不能为空'); return }
+  renameSaving.value = true
+  try {
+    const r = await fetch(`/api/projects/${renaming.value.uid}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ title: renameTitle.value }),
+    })
+    const j = await r.json()
+    if (j.uid) {
+      renaming.value.title = j.title
+      renaming.value = null
+      message.success('已改名')
+    } else {
+      message.error(j.message || '改名失败')
+    }
+  } finally { renameSaving.value = false }
+}
+
 function remove(p: any) {
   dialog.warning({
     title: '删除项目',
@@ -73,7 +100,8 @@ const STATUS_TEXT: Record<string, string> = {
     </n-space>
 
     <n-spin :show="loading">
-      <n-empty v-if="!loading && !projects.length" description="还没有项目 —— 点击右上角新建，粘贴 YouTube 链接或导入本地视频" />
+      <n-empty v-if="!loading && !projects.length"
+               description="还没有项目 —— 点击右上角新建，粘贴视频链接 (YouTube / B站 等网站) 或导入本地视频" />
       <div v-else style="display:flex;flex-direction:column;gap:16px">
         <n-card v-for="p in projects" :key="p.uid" size="small"
                 style="cursor: pointer" @click="router.push(`/projects/${p.uid}`)">
@@ -86,11 +114,12 @@ const STATUS_TEXT: Record<string, string> = {
                 </n-tag>
               </n-space>
               <n-text depth="3" style="font-size: 12px; display: block; margin-top: 4px">
-                {{ p.source_kind === 'youtube' ? p.source_url : '本地导入' }} · {{ p.uid }}
+                {{ p.source_kind === 'local' ? '本地导入' : p.source_url }} · {{ p.uid }}
               </n-text>
             </div>
             <n-space>
               <n-button size="small" @click.stop="router.push(`/projects/${p.uid}`)">打开管线</n-button>
+              <n-button size="small" quaternary @click.stop="openRename(p)">✏️ 改名</n-button>
               <n-button size="small" quaternary type="error" @click.stop="remove(p)">删除</n-button>
             </n-space>
           </n-space>
@@ -102,24 +131,36 @@ const STATUS_TEXT: Record<string, string> = {
       <n-form label-placement="left" label-width="90">
         <n-form-item label="来源类型">
           <n-radio-group v-model:value="form.source_kind">
-            <n-radio value="youtube">YouTube / 链接下载</n-radio>
+            <n-radio value="link">视频链接 (YouTube / B站 等网站)</n-radio>
             <n-radio value="local">本地视频导入</n-radio>
           </n-radio-group>
         </n-form-item>
-        <n-form-item :label="form.source_kind === 'youtube' ? '视频链接' : '本地路径'">
+        <n-form-item :label="form.source_kind === 'local' ? '本地路径' : '视频链接'">
           <n-input v-model:value="form.source_url"
-                   :placeholder="form.source_kind === 'youtube'
-                     ? 'https://www.youtube.com/watch?v=...'
-                     : 'D:\\videos\\my.mp4'" />
+                   :placeholder="form.source_kind === 'local'
+                     ? 'D:\\videos\\my.mp4'
+                     : '支持 YouTube / Bilibili / Twitter 等数千个站点 (由 yt-dlp 支持)'" />
         </n-form-item>
         <n-form-item label="标题 (可选)">
-          <n-input v-model:value="form.title" placeholder="留空自动使用视频标题/文件名" />
+          <n-input v-model:value="form.title"
+                   placeholder="留空自动获取: 优先用视频标题, 其次 文件名/站点+ID" />
         </n-form-item>
       </n-form>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showNew = false">取消</n-button>
           <n-button type="primary" :loading="creating" @click="create">创建</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-modal :show="!!renaming" preset="card" title="重命名项目" style="width: 460px">
+      <n-input v-model:value="renameTitle" maxlength="200" show-count
+               placeholder="输入新的标题" @keyup.enter="applyRename" />
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="renaming = null">取消</n-button>
+          <n-button type="primary" :loading="renameSaving" @click="applyRename">应用</n-button>
         </n-space>
       </template>
     </n-modal>
