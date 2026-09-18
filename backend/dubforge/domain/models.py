@@ -24,9 +24,10 @@ def _now() -> datetime.datetime:
 
 class Project(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
-    uid: str = Field(index=True, unique=True)          # 目录名: 短随机 id
+    uid: str = Field(index=True, unique=True)          # 稳定标识 (API/URL 用, 永不变)
+    dir_name: str = ""                                 # 项目目录名: 日期_标题 (空=旧项目沿用 uid)
     title: str = ""                                    # 展示名 (视频标题/文件名)
-    source_url: str = ""                               # YouTube 链接等 (本地导入为空)
+    source_url: str = ""                               # YouTube 链接等 (本地导入为路径)
     source_kind: str = "youtube"                       # youtube | local
     status: str = "created"                            # created | processing | done | failed
     created_at: datetime.datetime = Field(default_factory=_now)

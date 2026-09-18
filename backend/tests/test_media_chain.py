@@ -19,7 +19,7 @@ def test_srt_roundtrip(isolated_env):
     assert parsed[1].text == "Hello world"
 
 
-def test_segment_from_words(isolated_env):
+def test_segment_from_wordsisolated_env():
     from dubforge.pipeline.step_transcribe import _segment_from_words
     # 词序列: 停顿 1.2s 切句 + 句末标点切句
     words = [
@@ -34,7 +34,7 @@ def test_segment_from_words(isolated_env):
     assert segs[1][2] == "很好啊。"
 
 
-def test_download_local_import_and_idempotent(make_project, isolated_env):
+def test_download_local_import_and_idempotent(make_project, isolated_env, pdir):
     """本地导入: 零拷贝 —— 原文件就地引用, 项目里不落副本; 重跑不碰原文件"""
     import subprocess
     from pathlib import Path
@@ -53,7 +53,7 @@ def test_download_local_import_and_idempotent(make_project, isolated_env):
     runner.start_step(uid, "download")
     wait_status(uid, "download", {"done"})
 
-    pdir = isolated_env / "data" / "projects" / uid
+    pdir = pdir(uid)
     assert not list((pdir / "media").glob("video.*"))       # 零拷贝: media/ 无副本
     mtime = src.stat().st_mtime
     arts = crud.latest_artifacts(p.id, ["download"])
@@ -71,7 +71,7 @@ def test_download_local_import_and_idempotent(make_project, isolated_env):
     assert not list((pdir / "media").glob("video.*"))
 
 
-def test_preprocess_and_transcribe_local(make_project, isolated_env):
+def test_preprocess_and_transcribe_local(make_project, isolated_env, pdir):
     """本地样片全链: download → preprocess → transcribe (demucs+whisper 真跑, 1s 样片)"""
     import subprocess
     # 2.5s 语音样片: 440Hz 正弦 (whisper 会输出空/噪声句, 断言的是链路与产物形态)
@@ -91,16 +91,16 @@ def test_preprocess_and_transcribe_local(make_project, isolated_env):
         runner.start_step(uid, key)
         wait_status(uid, key, {"done"}, timeout=300)
 
-    audio = isolated_env / "data" / "projects" / uid / "audio"
+    audio = pdir(uid) / "audio"
     assert (audio / "raw.wav").exists()
     assert (audio / "vocal.wav").exists()
     assert (audio / "background.wav").exists()
 
     runner.start_step(uid, "transcribe")
     wait_status(uid, "transcribe", {"done"}, timeout=600)
-    src_srt = isolated_env / "data" / "projects" / uid / "srt" / "src.srt"
+    src_srt = pdir(uid) / "srt" / "src.srt"
     assert src_srt.exists()
-    tr = json.loads((isolated_env / "data" / "projects" / uid / "artifacts"
+    tr = json.loads((pdir(uid) / "artifacts"
                      / "transcribe" / "transcribe.json").read_text(encoding="utf-8"))
     assert tr["model"]
     assert tr["duration"] >= 2.0

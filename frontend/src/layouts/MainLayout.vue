@@ -21,6 +21,10 @@ const menuOptions = [
     key: 'settings',
   },
   {
+    label: () => h(RouterLink, { to: '/help' }, { default: () => '📖 帮助' }),
+    key: 'help',
+  },
+  {
     label: () => h(RouterLink, { to: '/about' }, { default: () => 'ℹ️ 关于' }),
     key: 'about',
   },

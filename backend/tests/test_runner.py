@@ -15,7 +15,7 @@ from conftest import wait_status
 from dubforge.domain import crud
 
 
-def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps):
+def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps, pdir):
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
@@ -29,23 +29,23 @@ def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps):
                                              for a in arts.values()}
     # 产物文件在盘上, 日志非空
     art = next(iter(arts.values()))
-    assert (isolated_env / "data" / "projects" / uid / art.rel_path).exists()
-    log = (isolated_env / "data" / "projects" / uid / "logs" / "assemble.log")
+    assert (pdir(uid) / art.rel_path).exists()
+    log = (pdir(uid) / "logs" / "assemble.log")
     assert "开始步骤" in log.read_text(encoding="utf-8")
     # manifest 已刷新为 done
-    m = json.loads((isolated_env / "data" / "projects" / uid / "manifest.json")
+    m = json.loads((pdir(uid) / "manifest.json")
                    .read_text(encoding="utf-8"))
     assert m["steps"][8]["status"] == "done"   # assemble 是第 9 步
 
 
-def test_skip_when_fresh(make_project, isolated_env, stub_heavy_steps):
+def test_skip_when_fresh(make_project, isolated_env, stub_heavy_steps, pdir):
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
     runner.start_step(uid, "assemble")
     wait_status(uid, "assemble", {"done"})
 
-    art_path = (isolated_env / "data" / "projects" / uid / "artifacts" / "assemble"
+    art_path = (pdir(uid) / "artifacts" / "assemble"
                 / "assemble_result.json")
     mtime1 = art_path.stat().st_mtime
 

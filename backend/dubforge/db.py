@@ -22,6 +22,17 @@ def get_engine():
 
 def init_db() -> None:
     sqlmodel.SQLModel.metadata.create_all(get_engine())
+    _ensure_columns()
+
+
+def _ensure_columns() -> None:
+    """轻量列迁移: create_all 不会给已有表加新列 (Project.dir_name 为语义化目录名加)"""
+    with get_engine().connect() as conn:
+        cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(project)")}
+        if "dir_name" not in cols:
+            conn.exec_driver_sql(
+                "ALTER TABLE project ADD COLUMN dir_name VARCHAR DEFAULT '' NOT NULL")
+            conn.commit()
 
 
 def reset_engine() -> None:

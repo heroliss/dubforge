@@ -88,3 +88,12 @@ def make_project(isolated_env):
         return p.uid
 
     return _make
+
+
+@pytest.fixture(name="pdir")
+def pdir_fixture(isolated_env):
+    """项目目录解析 (语义化目录名感知); 用法: pdir(uid) / "audio" / ..."""
+    def _get(uid: str):
+        from dubforge.domain import crud
+        return crud.project_dir(uid)
+    return _get

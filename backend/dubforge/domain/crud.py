@@ -8,6 +8,7 @@
 """
 import datetime
 import json
+import re
 import shutil
 import secrets
 from pathlib import Path
@@ -20,24 +21,48 @@ from dubforge.pipeline.registry import STEPS
 
 
 def new_uid() -> str:
-    """短目录 id: 6 位十六进制 (同秒并发碰撞概率 ~1/1600万, 单机足够)"""
+    """短随机 id: 6 位十六进制, 只作稳定标识 (API/URL), 不再当目录名"""
     return secrets.token_hex(3)
 
 
+def _sanitize_dir_title(t: str) -> str:
+    """标题 → 可作目录名的安全片段 (去 Windows 非法字符, 保中文)"""
+    t = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", t)
+    t = re.sub(r"\s+", " ", t).strip(" .")
+    return t[:40] or "未命名"
+
+
+def _new_dir_name(title: str) -> str:
+    """语义化项目目录名: 日期_时间_标题 (天然按时间排序), 重名追加 _2/_3…"""
+    base = f"{datetime.datetime.now():%Y%m%d_%H%M}_{_sanitize_dir_title(title)}"
+    taken = {p.dir_name for p in list_projects() if p.dir_name}
+    name, i = base, 2
+    while name in taken or (config.projects_dir() / name).exists():
+        name = f"{base}_{i}"
+        i += 1
+    return name
+
+
+def _dir_name_of(project: Project | None, uid: str) -> str:
+    return project.dir_name if (project and project.dir_name) else uid
+
+
 def project_dir(uid: str) -> Path:
-    return config.projects_dir() / uid
+    """项目目录: 语义化名 (新项目) / uid (旧项目回退)"""
+    return config.projects_dir() / _dir_name_of(get_project(uid), uid)
 
 
 def create_project(title: str, source_url: str = "", source_kind: str = "youtube",
                    params: dict | None = None) -> Project:
     uid = new_uid()
-    pdir = project_dir(uid)
+    dir_name = _new_dir_name(title or "未命名")
+    pdir = config.projects_dir() / dir_name
     # 目录骨架 (M2 各步骤往对应子目录写产物)
     for sub in ("media", "audio", "srt", "logs", *[f"artifacts/{s.key}" for s in STEPS]):
         (pdir / sub).mkdir(parents=True, exist_ok=True)
 
-    project = Project(uid=uid, title=title or uid, source_url=source_url,
-                      source_kind=source_kind,
+    project = Project(uid=uid, dir_name=dir_name, title=title or uid,
+                      source_url=source_url, source_kind=source_kind,
                       params=json.dumps(params or {}, ensure_ascii=False))
     with session() as s:
         s.add(project)
@@ -66,13 +91,14 @@ def delete_project(uid: str) -> bool:
         return False
     pid = project.id
     kind, source_url = project.source_kind, project.source_url or ""
+    pdir = project_dir(uid)     # 行删除前解析 (语义化目录名要从行里查)
     with session() as s:
         for model in (Artifact, Job, StepRun):
             for row in s.exec(sqlmodel.select(model).where(model.project_id == pid)).all():
                 s.delete(row)
         s.delete(s.get(Project, pid))
         s.commit()
-    shutil.rmtree(project_dir(uid), ignore_errors=True)
+    shutil.rmtree(pdir, ignore_errors=True)
     # 拖入上传的文件 (data/uploads/ 内) 是程序自己收下的, 跟着项目一起删;
     # 仅当没有其他项目还引用它。项目目录外的用户文件绝不动 —— 引用随 DB 行一起消失。
     if kind == "local" and source_url:
@@ -164,7 +190,8 @@ def delete_step_artifacts(project_id: int, step_key: str) -> None:
 
 def project_dir_by_id(s, project_id: int) -> Path:
     project = s.get(Project, project_id)
-    return project_dir(project.uid)
+    # 复用调用方会话 (不再走 get_project 开新会话); 语义化目录名/uid 回退
+    return config.projects_dir() / _dir_name_of(project, project.uid)
 
 
 def add_job(project_id: int, step_key: str, log_path: str) -> Job:
@@ -194,18 +221,34 @@ def save_project(project: Project) -> None:
 
 
 def write_manifest(uid: str) -> None:
-    """manifest.json 双写: 人类可读的项目状态快照 (DB 为准, 便于排查)"""
+    """manifest.json 双写: 人类可读的项目自描述快照 (DB 为准, 便于排查/搬移)"""
     project = get_project(uid)
     if not project:
         return
     steps = get_steps(project.id)
+    arts = latest_artifacts(project.id, None)
+    by_step: dict[str, list] = {}
+    for a in sorted(arts.values(), key=lambda x: (x.step_key, x.name)):
+        by_step.setdefault(a.step_key, []).append(
+            {"name": a.name, "file": a.rel_path, "size": a.size})
     data = {
         "uid": project.uid, "title": project.title,
-        "source_url": project.source_url, "source_kind": project.source_kind,
+        "dir_name": project.dir_name or uid,
+        "source": {
+            "kind": project.source_kind, "url": project.source_url,
+            # 本地导入 = 引用原文件零拷贝; 原文件不在项目目录里, 删项目也不会动它
+            "note": ("引用外部原文件 (零拷贝, 删项目不删原文件)"
+                     if project.source_kind == "local"
+                     and not Path(project.source_url or "").is_relative_to(
+                         config.data_root() / "uploads")
+                     else ""),
+        },
         "status": project.status, "params": json.loads(project.params or "{}"),
         "updated_at": project.updated_at.isoformat(),
         "steps": [{"key": s.step_key, "status": s.status,
                    "error": s.error_message or None} for s in steps],
+        # 每步骤产物清单: file 为相对项目目录路径; 绝对路径 = 外部引用文件
+        "artifacts": by_step,
     }
     p = project_dir(uid) / "manifest.json"
     tmp = p.with_suffix(".json.tmp")

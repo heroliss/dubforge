@@ -54,7 +54,8 @@ function isTesting(i: number): boolean {
 }
 
 const profiles = ref<any[]>([])
-const form = ref({ max_workers: 1 as number, timeout: 300 as number })
+const form = ref({ max_workers: 1 as number, timeout: 300 as number,
+                   data_root: '' as string })
 
 // —— 未应用修改的追踪 —— 表单是草稿, 「应用」写入 config.yaml 才生效 ——
 const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
@@ -68,14 +69,16 @@ const cardDirty = computed(() => profiles.value.map((p, i) => {
 const formDirty = computed(() =>
   dirtyOn.value && savedForm.value !== '' &&
   JSON.stringify({ max_workers: form.value.max_workers,
-                   timeout: form.value.timeout }) !== savedForm.value)
+                   timeout: form.value.timeout,
+                   data_root: form.value.data_root }) !== savedForm.value)
 const isDirty = computed(() =>
   dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean) ||
                     profiles.value.length !== savedProfiles.value.length))
 function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
   savedForm.value = JSON.stringify({ max_workers: form.value.max_workers,
-                                     timeout: form.value.timeout })
+                                     timeout: form.value.timeout,
+                                     data_root: form.value.data_root })
   dirtyOn.value = true
 }
 // 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
@@ -121,6 +124,7 @@ onMounted(async () => {
     }))
     form.value.max_workers = Number(llm.max_workers)
     form.value.timeout = Number(llm.timeout ?? 300)
+    form.value.data_root = String(cfg.value.server?.data_root ?? '')
     markApplied()                     // 以载入状态为"已应用"基线
     window.addEventListener('beforeunload', warnUnload)
   } catch (e: any) {
@@ -150,6 +154,7 @@ async function applySettings() {
         }),
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
+        'server.data_root': form.value.data_root.trim(),
       } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -319,6 +324,21 @@ function extraParamsStr(r: any): string {
               ✓ 无未应用的修改；测试只探测表单内容，不写入
             </n-text>
           </div>
+        </n-card>
+
+        <!-- ============ 存储 ============ -->
+        <n-card title="存储" size="small">
+          <div class="g-item">
+            <n-tooltip trigger="hover" placement="top">
+              <template #trigger><span class="g-lb">总工作目录 ⓘ</span></template>
+              所有项目数据 (项目目录 / 数据库 / 上传收件箱) 的根目录
+            </n-tooltip>
+            <n-input v-model:value="form.data_root" size="small" style="width: 420px"
+                     placeholder="留空 = 默认 程序目录\data" />
+          </div>
+          <n-text depth="3" style="font-size:12px; display:block; margin-top:6px">
+            修改并「应用设置」后需重启程序才生效；已有数据不会自动搬家，需手动移动后重启。详见「❓ 帮助」页。
+          </n-text>
         </n-card>
 
         <!-- ============ 其余配置 (只读概览, 后续版本开放编辑) ============ -->

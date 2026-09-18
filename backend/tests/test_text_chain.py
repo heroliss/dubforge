@@ -62,13 +62,13 @@ def _runner():
     return runner
 
 
-def test_split_long_line_with_word_timestamps(make_project, isolated_env):
+def test_split_long_line_with_word_timestamps(make_project, isolated_env, pdir):
     uid = make_project()
     long_text = " ".join(["word"] * 40)          # 40 词 > 默认 max_split_length=22
     _seed_transcribe(uid, [(0.0, 10.0, long_text)])
     assert _run_until(uid, "split") == "done"
 
-    data = json.loads((isolated_env / "data" / "projects" / uid
+    data = json.loads((pdir(uid)
                        / "artifacts" / "split" / "split.json").read_text(encoding="utf-8"))
     assert data["count"] > 1
     # 时间轴: 单调递增且覆盖原行区间
@@ -84,7 +84,7 @@ def test_split_long_line_with_word_timestamps(make_project, isolated_env):
     assert "wordword" not in "".join(l["text"] for l in data["lines"])
 
 
-def test_translate_whole_doc_tier(make_project, isolated_env, monkeypatch):
+def test_translate_whole_doc_tier(make_project, isolated_env, monkeypatch, pdir):
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 2.0, "Hello world"), (2.0, 4.0, "Second line")])
 
@@ -104,7 +104,7 @@ def test_translate_whole_doc_tier(make_project, isolated_env, monkeypatch):
         return st
     assert _rr("split") == "done"
     assert _rr("translate") == "done"
-    data = json.loads((isolated_env / "data" / "projects" / uid
+    data = json.loads((pdir(uid)
                        / "artifacts" / "translate" / "translate.json").read_text(encoding="utf-8"))
     assert data["lines"][0]["dst"] == "你好世界"
     assert data["lines"][1]["src"] == "Second line"
@@ -148,7 +148,7 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
     assert len(calls) == calls_after_1             # 缓存命中, 零新增调用
 
 
-def test_translate_id_alignment_robust(make_project, isolated_env, monkeypatch):
+def test_translate_id_alignment_robust(make_project, isolated_env, monkeypatch, pdir):
     """LLM 返回乱序 id → 仍按 id 正确对齐 (不按数组顺序)"""
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 2.0, "alpha"), (2.0, 4.0, "beta")])
@@ -168,13 +168,13 @@ def test_translate_id_alignment_robust(make_project, isolated_env, monkeypatch):
         return st
     assert _rr("split") == "done"
     assert _rr("translate") == "done"
-    data = json.loads((isolated_env / "data" / "projects" / uid
+    data = json.loads((pdir(uid)
                        / "artifacts" / "translate" / "translate.json").read_text(encoding="utf-8"))
     m = {l["id"]: l["dst"] for l in data["lines"]}
     assert m[1] == "阿尔法" and m[2] == "贝塔"
 
 
-def test_split_llm_garbage_falls_back(make_project, isolated_env, monkeypatch):
+def test_split_llm_garbage_falls_back(make_project, isolated_env, monkeypatch, pdir):
     """LLM 拆分返回垃圾 → 校验失败 → 回退规则切 (鲁棒)"""
     uid = make_project()
     long_text = " ".join(["hello"] * 30)
@@ -185,12 +185,12 @@ def test_split_llm_garbage_falls_back(make_project, isolated_env, monkeypatch):
     _mock_llm(monkeypatch, responder)
 
     assert _run_until(uid, "split") == "done"
-    data = json.loads((isolated_env / "data" / "projects" / uid
+    data = json.loads((pdir(uid)
                        / "artifacts" / "split" / "split.json").read_text(encoding="utf-8"))
     assert data["count"] > 1
 
 
-def test_subtitles_outputs(make_project, isolated_env, monkeypatch):
+def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 2.0, "Hello world"), (2.0, 4.0, "Second line")])
     def responder(prompt, s=None):
@@ -202,7 +202,7 @@ def test_subtitles_outputs(make_project, isolated_env, monkeypatch):
     for key in ("split", "translate", "subtitles"):
         assert _run_until(uid, key) == "done"
 
-    srt_dir = isolated_env / "data" / "projects" / uid / "srt"
+    srt_dir = pdir(uid) / "srt"
     assert (srt_dir / "trans.srt").exists()
     bi = (srt_dir / "bilingual.srt").read_text(encoding="utf-8")
     assert "你好" in bi and "Hello world" in bi       # 译文上/原文下

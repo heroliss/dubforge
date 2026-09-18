@@ -42,7 +42,7 @@ def _runner():
     return runner
 
 
-def test_estimate_and_speed_flag(isolated_env):
+def test_estimate_and_speed_flagisolated_env():
     # 10 个 CJK 字 ≈ 2.13s; 10 个英文词 ≈ 3.33s
     assert 2.0 < estimate_seconds("一二三四五六七八九十") < 2.3
     assert 3.0 < estimate_seconds("one two three four five six seven eight nine ten") < 3.6
@@ -85,7 +85,7 @@ def _mock_backend(monkeypatch, fail_ids=()):
 import os  # noqa: E402
 
 
-def test_dubtask_and_tts_chain(make_project, isolated_env, monkeypatch):
+def test_dubtask_and_tts_chain(make_project, isolated_env, monkeypatch, pdir):
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 3.0, "Hello world this is a test"),
                            (3.5, 6.0, "Second line for dubbing")])
@@ -93,7 +93,7 @@ def test_dubtask_and_tts_chain(make_project, isolated_env, monkeypatch):
     for key in ("split", "dubtask", "tts"):
         assert _run_until(uid, key) == "done"
 
-    pdir = isolated_env / "data" / "projects" / uid
+    pdir = pdir(uid)
     task = json.loads((pdir / "artifacts" / "dubtask" / "dubtask.json")
                       .read_text(encoding="utf-8"))
     assert task["lines"][0]["est_dur"] > 0

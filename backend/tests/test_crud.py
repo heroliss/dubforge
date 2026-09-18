@@ -3,12 +3,12 @@
 import json
 
 
-def test_create_project_scaffolding(make_project, isolated_env):
+def test_create_project_scaffolding(make_project, isolated_env, pdir):
     from dubforge.domain import crud
     from dubforge.pipeline.registry import STEP_KEYS
 
     uid = make_project(params={"fail_step": "translate"})
-    pdir = isolated_env / "data" / "projects" / uid
+    pdir = pdir(uid)
 
     # 目录骨架
     for sub in ("media", "audio", "srt", "logs", "artifacts/download"):
@@ -23,11 +23,11 @@ def test_create_project_scaffolding(make_project, isolated_env):
     assert len(manifest["steps"]) == 9
 
 
-def test_delete_project_cascades(make_project, isolated_env):
+def test_delete_project_cascades(make_project, isolated_env, pdir):
     from dubforge.domain import crud
     uid = make_project()
     assert crud.delete_project(uid) is True
     assert crud.get_project(uid) is None
-    assert not (isolated_env / "data" / "projects" / uid).exists()
+    assert not (pdir(uid)).exists()
     # 重复删除 → False (不抛错)
     assert crud.delete_project(uid) is False

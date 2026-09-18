@@ -25,8 +25,16 @@ def config_path() -> Path:
 
 
 def data_root() -> Path:
-    """数据根目录 (惰性取环境变量, 同上; 测试隔离依赖此语义)"""
-    return Path(os.environ.get("DUBFORGE_DATA_ROOT", REPO_ROOT / "data"))
+    """数据根目录: 环境变量 DUBFORGE_DATA_ROOT (测试/部署) >
+    config.yaml server.data_root (设置页可改, 重启生效) > 默认 <程序目录>/data"""
+    env = os.environ.get("DUBFORGE_DATA_ROOT")
+    if env:
+        return Path(env)
+    custom = str(get("server.data_root") or "").strip()
+    if custom:
+        p = Path(custom)
+        return p if p.is_absolute() else REPO_ROOT / p
+    return REPO_ROOT / "data"
 
 PROJECTS_DIR_NAME = "projects"
 DB_FILE_NAME = "dubforge.db"
@@ -99,6 +107,10 @@ DEFAULTS: dict[str, Any] = {
     },
     "server": {
         "port": 8600,
+        # 总工作目录: 所有项目数据 (项目目录/数据库/上传收件箱) 的根。
+        # 空 = 默认 <程序目录>/data; 修改后需重启程序生效 (数据库连接启动时建立)。
+        # 相对路径相对程序目录。
+        "data_root": "",
     },
     "paths": {
         # HuggingFace 模型缓存; 空=自动复用 VideoLingo-Workspace 的 vl_cache (省数GB下载)
