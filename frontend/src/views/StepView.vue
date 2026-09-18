@@ -114,23 +114,28 @@ const cfgRows = computed(() => {
   return rows
 })
 
-// ---- 本步骤参数 (可编辑; schema 全局缓存, 值来自 config 实时快照) ----
+// ---- 本步骤参数 (本项目覆盖 ?? 全局默认兜底; 逐键标识是否偏离全局) ----
 const _paramSchema = ref<Record<string, any> | null>(null)
+const overriddenMap = ref<Record<string, boolean>>({})
+const defaultsMap = ref<Record<string, any>>({})
 const paramFields = computed<any[]>(() => _paramSchema.value?.[key]?.fields ?? [])
 const draft = ref<Record<string, any>>({})
 const savedDraft = ref('')
 const savingParams = ref(false)
 const paramsDirty = computed(() => savedDraft.value !== '' &&
   JSON.stringify(draft.value) !== savedDraft.value)
+const anyOverridden = computed(() => Object.values(overriddenMap.value).some(Boolean))
 const extraCfgRows = computed(() =>
   cfgRows.value.filter((r) => !paramFields.value.some((f) => f.path === r.k)))
 
 async function loadParamSchema() {
-  if (_paramSchema.value) { initDraft(); return }
   try {
-    const r = await fetch('/api/settings/step_params')
+    const r = await fetch(`/api/projects/${uid}/step_params`)
     if (!r.ok) return
-    _paramSchema.value = (await r.json()).steps
+    const j = await r.json()
+    _paramSchema.value = j.steps
+    overriddenMap.value = j.overridden || {}
+    defaultsMap.value = j.defaults || {}
     initDraft()
   } catch { /* 拿不到 schema 时退回只读展示 */ }
 }
@@ -148,20 +153,43 @@ function initDraft() {
 }
 onMounted(loadParamSchema)
 
+async function putParams(updates: Record<string, any>, reset: string[]) {
+  const r = await fetch(`/api/projects/${uid}/step_params`, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ updates, reset }),
+  })
+  if (!r.ok) { message.error('参数保存失败'); return false }
+  await loadParamSchema()
+  await nav.poll()
+  return true
+}
+
 async function saveParams() {
   savingParams.value = true
   try {
+    // 与全局默认相同的键不落覆盖 (改回原值 = 自动回到跟随全局, 过期标识随之撤销)
     const updates: Record<string, any> = {}
-    for (const f of paramFields.value) updates[f.path] = draft.value[f.path]
-    const r = await fetch('/api/settings', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates }),
-    })
-    if (!r.ok) { message.error('参数保存失败'); return }
-    savedDraft.value = JSON.stringify(draft.value)
-    message.success('已写入 config.yaml —— 本步骤下次运行按新参数执行')
-    await nav.poll()
+    const reset: string[] = []
+    for (const f of paramFields.value) {
+      if (JSON.stringify(draft.value[f.path]) === JSON.stringify(defaultsMap.value[f.path])) {
+        if (overriddenMap.value[f.path]) reset.push(f.path)
+      } else {
+        updates[f.path] = draft.value[f.path]
+      }
+    }
+    if (await putParams(updates, reset)) {
+      message.success('已保存到本项目 (全局默认不变) —— 本步骤下次运行按新参数执行')
+    }
   } finally { savingParams.value = false }
+}
+
+async function resetOne(path: string) {
+  if (await putParams({}, [path])) message.info(`已恢复跟随全局默认: ${path}`)
+}
+async function resetAll() {
+  const paths = Object.keys(overriddenMap.value).filter((k) => overriddenMap.value[k])
+  if (!paths.length) return
+  if (await putParams({}, paths)) message.success('已全部恢复跟随全局默认')
 }
 
 function fmtSize(n: number): string {
@@ -339,37 +367,53 @@ async function loadText(name: string | null) {
             <pre ref="logBox" class="logbox">{{ logLines.join('\n') || '(暂无日志)' }}</pre>
           </n-card>
         </n-gi>
-        <!-- 本步骤参数: schema 驱动的可编辑表单 + schema 外关联配置的只读展示 -->
+        <!-- 本步骤参数: 项目级覆盖 ?? 全局默认; 标识偏离项, 可单键/整体恢复 -->
         <n-gi v-if="cfgRows.length">
-          <n-card size="small" title="本步骤参数 (写入 config.yaml)">
+          <n-card size="small" title="本步骤参数 (本项目 · 全局默认兜底)">
             <n-form v-if="paramFields.length" label-placement="left" label-width="170"
                     size="small" style="margin-bottom: 10px">
-              <n-form-item v-for="f in paramFields" :key="f.path" :label="f.label">
-                <n-tooltip trigger="hover" placement="top" :delay="200">
-                  <template #trigger>
-                    <span class="ctl">
-                      <n-switch v-if="f.type === 'bool'" v-model:value="draft[f.path]" />
-                      <n-select v-else-if="f.type === 'select'" v-model:value="draft[f.path]"
-                                :options="f.options" />
-                      <n-input-number v-else-if="f.type === 'int' || f.type === 'float'"
-                                      v-model:value="draft[f.path]" :min="f.min" :max="f.max"
-                                      :step="f.step ?? (f.type === 'int' ? 1 : 0.1)"
-                                      style="width: 150px" />
-                      <n-input v-else-if="f.type === 'text'" v-model:value="draft[f.path]"
-                               type="textarea" :rows="2" />
-                      <n-input v-else-if="f.type === 'password'" v-model:value="draft[f.path]"
-                               type="password" show-password-on="click" />
-                      <n-input v-else v-model:value="draft[f.path]" />
-                    </span>
-                  </template>
-                  {{ f.help || f.path }}
-                </n-tooltip>
+              <n-form-item v-for="f in paramFields" :key="f.path">
+                <template #label>
+                  <span class="plabel">
+                    {{ f.label }}
+                    <n-tag v-if="overriddenMap[f.path]" size="tiny" type="warning"
+                           :bordered="false">项目已改</n-tag>
+                    <n-tag v-else size="tiny" :bordered="false" class="gtag">跟随全局</n-tag>
+                  </span>
+                </template>
+                <div class="frow">
+                  <n-tooltip trigger="hover" placement="top" :delay="200">
+                    <template #trigger>
+                      <span class="ctl">
+                        <n-switch v-if="f.type === 'bool'" v-model:value="draft[f.path]" />
+                        <n-select v-else-if="f.type === 'select'" v-model:value="draft[f.path]"
+                                  :options="f.options" />
+                        <n-input-number v-else-if="f.type === 'int' || f.type === 'float'"
+                                        v-model:value="draft[f.path]" :min="f.min" :max="f.max"
+                                        :step="f.step ?? (f.type === 'int' ? 1 : 0.1)"
+                                        style="width: 150px" />
+                        <n-input v-else-if="f.type === 'text'" v-model:value="draft[f.path]"
+                                 type="textarea" :rows="2" />
+                        <n-input v-else-if="f.type === 'password'" v-model:value="draft[f.path]"
+                                 type="password" show-password-on="click" />
+                        <n-input v-else v-model:value="draft[f.path]" />
+                      </span>
+                    </template>
+                    {{ f.help || f.path }}<template v-if="overriddenMap[f.path]">
+                      <br />全局默认: {{ defaultsMap[f.path] ?? '(空)' }}
+                    </template>
+                  </n-tooltip>
+                  <n-button v-if="overriddenMap[f.path]" size="tiny" quaternary
+                            title="恢复跟随全局默认" @click="resetOne(f.path)">↺</n-button>
+                </div>
               </n-form-item>
-              <div>
+              <div class="frow">
                 <n-button size="small" type="primary" :loading="savingParams"
                           :disabled="!paramsDirty" @click="saveParams">💾 应用本步参数</n-button>
-                <n-text v-if="paramsDirty" type="warning" style="font-size: 12px; margin-left: 8px">
-                  ● 有未应用的修改 —— 不应用不生效
+                <n-button v-if="anyOverridden" size="small" quaternary
+                          :disabled="savingParams" @click="resetAll">↺ 全部恢复全局默认</n-button>
+                <n-text v-if="paramsDirty" type="warning" style="font-size: 12px">
+                  ● 有未应用的修改
                 </n-text>
               </div>
             </n-form>
@@ -380,7 +424,8 @@ async function loadText(name: string | null) {
               </n-descriptions-item>
             </n-descriptions>
             <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 8px">
-              悬停参数可看说明; 参数一改输入指纹就变, 已完成的本步/下游会标记「已过期」, 重跑即按新参数执行。
+              新项目跟随全局默认; 这里改动只影响本项目 (与全局相同的值不落覆盖, 改回原值即自动回到跟随全局)。
+              参数一改输入指纹就变, 已完成的本步/下游会失去「已是最新」, 重跑即按新参数执行。
               其余关联配置 (如 LLM 密钥) 在「⚙️ 设置」页修改。
             </n-text>
           </n-card>
@@ -428,6 +473,9 @@ async function loadText(name: string | null) {
 .arts { list-style: none; margin: 0; padding: 0; }
 .arts li { padding: 3px 0; }
 .ctl { display: block; width: 100%; }
+.frow { display: flex; align-items: center; gap: 4px; width: 100%; }
+.plabel { display: inline-flex; align-items: center; gap: 4px; }
+.gtag { opacity: 0.55; }
 .audio-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
 .textprev {
   background: #0d1117;

@@ -333,3 +333,12 @@ def rebuild_from_dirs() -> dict:
 def session():
     """统一会话工厂: expire_on_commit=False —— 对象出会话后仍可读属性 (本项目风格)"""
     return sqlmodel.Session(get_engine(), expire_on_commit=False)
+
+
+def project_step_params(project) -> dict:
+    """项目级步骤参数覆盖 (params JSON 的 step_params 段, 点分路径 → 值)。
+    无覆盖的键跟随全局 config —— 全局默认是兜底, 项目改过才生效。"""
+    try:
+        return (json.loads(project.params or "{}").get("step_params") or {})
+    except Exception:
+        return {}

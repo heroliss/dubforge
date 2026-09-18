@@ -197,3 +197,43 @@ def test_auto_steps_and_run_many(isolated_env, stub_heavy_steps, make_project):
         r = client.post("/api/projects/run_many", json={"uids": [uid]})
         res = r.json()["results"][0]
         assert res.get("skipped") or "跳过" in res.get("started", "")
+
+
+def test_project_step_params_layering(isolated_env):
+    """项目级参数: 覆盖生效并标记 overridden; 与全局同值或 reset 后指纹恢复 ——
+    「改参数→过期, 改回原值→过期自动撤销」语义 (指纹实时重算, 非固定事件)"""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from dubforge.domain import crud
+    from dubforge.runner import compute_fingerprint
+    p = crud.create_project(title="参数项目")
+    fp0 = compute_fingerprint(p, "preprocess")
+    with TestClient(app) as client:
+        j = client.get(f"/api/projects/{p.uid}/step_params").json()
+        assert j["overridden"]["separate.model"] is False
+        assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs"
+        assert j["defaults"]["separate.model"] == "htdemucs"
+
+        # 项目覆盖 → 生效值变化 + overridden 标记
+        r = client.put(f"/api/projects/{p.uid}/step_params", json={
+            "updates": {"separate.model": "htdemucs_ft"}, "reset": []})
+        assert r.status_code == 200
+        j = client.get(f"/api/projects/{p.uid}/step_params").json()
+        assert j["overridden"]["separate.model"] is True
+        assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs_ft"
+    assert compute_fingerprint(crud.get_project(p.uid), "preprocess") != fp0
+
+    # 覆盖值改回与全局相同 → 指纹立即恢复 (即使覆盖条目还在)
+    with TestClient(app) as client:
+        client.put(f"/api/projects/{p.uid}/step_params", json={
+            "updates": {"separate.model": "htdemucs"}, "reset": []})
+    assert compute_fingerprint(crud.get_project(p.uid), "preprocess") == fp0
+
+    # 显式 reset 清掉覆盖条目 → 标记回到「跟随全局」, 指纹不变
+    with TestClient(app) as client:
+        client.put(f"/api/projects/{p.uid}/step_params", json={
+            "updates": {}, "reset": ["separate.model"]})
+        j = client.get(f"/api/projects/{p.uid}/step_params").json()
+        assert j["overridden"]["separate.model"] is False
+        assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs"
+    assert compute_fingerprint(crud.get_project(p.uid), "preprocess") == fp0

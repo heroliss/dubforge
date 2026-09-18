@@ -246,6 +246,57 @@ def run_chain(uid: str, body: RunChain):
     return {"ok": True, "started": body.steps[0], "stopped": None}
 
 
+@router.get("/{uid}/step_params")
+def get_project_step_params(uid: str):
+    """本项目的步骤参数: 生效值 = 项目覆盖 ?? 全局默认, 逐键带 overridden 标记;
+    defaults 为全局默认值 (前端对比展示与恢复用)"""
+    from dubforge import config as cfg
+    from dubforge.pipeline.step_params import STEP_PARAM_SCHEMA, schema_view
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    ov = crud.project_step_params(project)
+    values, overridden, defaults = {}, {}, {}
+    for fields in STEP_PARAM_SCHEMA.values():
+        for f in fields:
+            defaults[f.path] = cfg.get(f.path)
+            if f.path in ov:
+                values[f.path] = ov[f.path]
+                overridden[f.path] = True
+            else:
+                values[f.path] = defaults[f.path]
+                overridden[f.path] = False
+    return {"ok": True, "steps": schema_view(values),
+            "overridden": overridden, "defaults": defaults}
+
+
+class StepParamsUpdate(BaseModel):
+    updates: dict = {}        # 点分路径 → 值 (写为本项目覆盖)
+    reset: list[str] = []     # 恢复跟随全局默认的路径
+
+
+@router.put("/{uid}/step_params")
+def update_project_step_params(uid: str, body: StepParamsUpdate):
+    """保存本项目的步骤参数覆盖 (全局默认不动)。清空的键恢复跟随全局。"""
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    params = json.loads(project.params or "{}")
+    sp = params.get("step_params") or {}
+    for k, v in body.updates.items():
+        sp[k] = v
+    for k in body.reset:
+        sp.pop(k, None)
+    if sp:
+        params["step_params"] = sp
+    else:
+        params.pop("step_params", None)
+    project.params = json.dumps(params, ensure_ascii=False)
+    crud.save_project(project)
+    crud.write_manifest(uid)          # params 已入 manifest, 重建索引时一并恢复
+    return {"ok": True, "overridden": sorted(sp.keys())}
+
+
 @router.post("/{uid}/reveal")
 def reveal_project(uid: str):
     """在系统文件资源管理器中显示项目目录 (服务端即本机)"""

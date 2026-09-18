@@ -92,9 +92,10 @@ class StepContext:
                           path, rel)
         return path
 
-    # ---- 配置读取 (每步实时读, 改配置立即生效) ----
+    # ---- 配置读取 (项目级覆盖优先, 全局 config 兜底; 每步实时读) ----
     def cfg(self, key: str, default=None):
-        return config.get(key, default)
+        ov = crud.project_step_params(self.project).get(key)
+        return config.get(key, default) if ov is None else ov
 
     # ---- 进度上报 (0-99; 整数变化才落盘, 完成时执行器置 100) ----
     def report_progress(self, pct: float) -> None:
@@ -122,8 +123,10 @@ class StepContext:
             f"缺少上游产物 {step_key}/{name} (项目 {self.project.uid})")
 
 
-def _cfg_snapshot(cfg_keys: tuple[str, ...]) -> dict:
-    """按注册表的 cfg_keys 提取配置子集 (前缀语义: 'llm' 匹配整段)"""
+def _cfg_snapshot(cfg_keys: tuple[str, ...], overrides: dict | None = None) -> dict:
+    """按注册表的 cfg_keys 提取配置子集 (前缀语义: 'llm' 匹配整段)。
+    overrides = 项目级覆盖 {点分路径: 值}, 只注入命中本步骤 cfg_keys 的键
+    (精确命中或前缀段内); 无关覆盖忽略 —— 无覆盖时快照与旧版完全一致。"""
     cfg = config.load_config()
     snap: dict = {}
     for key in cfg_keys:
@@ -137,17 +140,38 @@ def _cfg_snapshot(cfg_keys: tuple[str, ...]) -> dict:
             node = node[p]
         if ok:
             snap[key] = node
+    if overrides:
+        key_set = set(cfg_keys)
+        for path, value in overrides.items():
+            if path in key_set:
+                snap[path] = value
+                continue
+            hit = next((k for k in key_set if path.startswith(k + ".")), None)
+            if hit is None:
+                continue
+            node = snap.get(hit)
+            if not isinstance(node, dict):
+                snap[hit] = {path[len(hit) + 1:]: value}
+                continue
+            parts = path[len(hit) + 1:].split(".")
+            cur = node
+            for p in parts[:-1]:
+                if not isinstance(cur.get(p), dict):
+                    cur[p] = {}
+                cur = cur[p]
+            cur[parts[-1]] = value
     return snap
 
 
 def compute_fingerprint(project: Project, step_key: str) -> str:
-    """输入指纹 = sha256( 配置子集 + 上游全部产物[name,sha256] )"""
+    """输入指纹 = sha256( 配置子集 (含项目级覆盖) + 上游全部产物[name,sha256] )"""
     idx = STEP_KEYS.index(step_key)
     upstream = STEP_KEYS[:idx]
     arts = crud.latest_artifacts(project.id, upstream)
     payload = {
         "step": step_key,
-        "cfg": _cfg_snapshot(STEP_MAP[step_key].cfg_keys),
+        "cfg": _cfg_snapshot(STEP_MAP[step_key].cfg_keys,
+                             crud.project_step_params(project)),
         "upstream": sorted([f"{a.step_key}/{a.name}:{a.sha256}"
                             for a in arts.values()]),
     }
