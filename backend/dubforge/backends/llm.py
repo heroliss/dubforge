@@ -121,12 +121,13 @@ def test_provider(provider: dict) -> dict:
 
     request: 实际发送了什么 (url/model/temperature/专属参数/prompt);
     logs:    测试过程中的事件 (如专属参数被拒自动剥离重试); reply/detail: 收到了什么。
+    temperature 传 None → 与真实翻译完全一致 (全局默认 + 专属参数覆盖)。
     """
     import time as _time
     t0 = _time.time()
     logs: list[str] = []
     prompt = "请只回复两个字母: OK"
-    body = _payload(provider, [{"role": "user", "content": prompt}], 0.0, json_mode=False)
+    body = _payload(provider, [{"role": "user", "content": prompt}], None, json_mode=False)
     req_info = {"url": provider.get("base_url", "").rstrip("/") + "/chat/completions",
                 "model": body.get("model"), "temperature": body.get("temperature"),
                 "extra_params": provider.get("params") or {}, "prompt": prompt}

@@ -56,6 +56,12 @@ const form = ref({
   timeout: 300 as number, thinking: 'auto',
 })
 
+const THINKING_OPTIONS = [
+  { label: 'auto — 不传参数（跟随服务端默认）', value: 'auto' },
+  { label: 'disabled — 关闭思考（若服务端支持）', value: 'disabled' },
+  { label: 'enabled — 开启思考', value: 'enabled' },
+]
+
 // 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
 function parseParams(p: any): any {
   try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
@@ -240,6 +246,46 @@ function extraParamsStr(r: any): string {
               先保存表单值，再同时测试所有「启用」的配置；与单组测试互不影响
             </n-text>
           </div>
+          <!-- 通用参数: 全局默认值, 组内"专属参数"可覆盖同名项 -->
+          <n-text depth="3" style="font-size:12px; display:block; margin-top:14px">
+            通用参数（所有配置组共用；组内「专属参数」可覆盖 Temperature 等同名项）：
+          </n-text>
+          <div class="globals">
+            <div class="g-item">
+              <n-tooltip trigger="hover" placement="top">
+                <template #trigger><span class="g-lb">Temperature ⓘ</span></template>
+                随机性: 越高越发散。翻译建议 0.1~0.3; 思考型模型可按官方推荐值
+                (如 GLM-5.3-flash 推荐 1)。只在某组生效的话, 写进该组「专属参数」
+              </n-tooltip>
+              <n-input-number v-model:value="form.temperature" size="small"
+                              :step="0.1" :min="0" :max="2" style="width:110px" />
+            </div>
+            <div class="g-item">
+              <n-tooltip trigger="hover" placement="top">
+                <template #trigger><span class="g-lb">并发数 ⓘ</span></template>
+                翻译分块时同时发出的请求数; 太大容易触发服务商限流 (429)
+              </n-tooltip>
+              <n-input-number v-model:value="form.max_workers" size="small"
+                              :min="1" :max="8" style="width:90px" />
+            </div>
+            <div class="g-item">
+              <n-tooltip trigger="hover" placement="top">
+                <template #trigger><span class="g-lb">读超时(秒) ⓘ</span></template>
+                单次请求最长等待秒数; 思考型模型输出慢, 建议 ≥300
+              </n-tooltip>
+              <n-input-number v-model:value="form.timeout" size="small"
+                              :min="10" :max="3600" style="width:100px" />
+            </div>
+            <div class="g-item">
+              <n-tooltip trigger="hover" placement="top">
+                <template #trigger><span class="g-lb">思考模式 ⓘ</span></template>
+                auto: 不传参数, 跟随服务端默认; disabled/enabled:
+                发送 thinking.type 开关思考 (GLM 等部分服务商支持)
+              </n-tooltip>
+              <n-select v-model:value="form.thinking" size="small"
+                        :options="THINKING_OPTIONS" style="width:230px" />
+            </div>
+          </div>
         </n-card>
 
         <!-- ============ 其余配置 (只读概览, 后续版本开放编辑) ============ -->
@@ -252,11 +298,6 @@ function extraParamsStr(r: any): string {
             <n-descriptions-item label="IndexTTS">{{ cfg.tts.indextts25.url }}</n-descriptions-item>
             <n-descriptions-item label="成片 Ducking">{{ cfg.assemble.ducking ? '开' : '关' }}</n-descriptions-item>
           </n-descriptions>
-          <n-text depth="3" style="font-size:12px">
-            通用 LLM 参数（对所有配置生效，各组的专属参数优先）：
-            Temperature 随机性（翻译建议 0.1~0.3，思考型模型可按官方推荐放宽）、
-            并发数（翻译分块的并行请求数）、读超时（秒，思考型模型建议 ≥300）。
-          </n-text>
         </n-card>
       </div>
     </n-spin>
@@ -291,4 +332,7 @@ function extraParamsStr(r: any): string {
 .tl.warn { color: #d29922; }
 .tl.dim { color: #8b949e; }
 .actions { display: flex; align-items: center; gap: 10px; margin-top: 14px; }
+.globals { display: flex; gap: 18px; flex-wrap: wrap; margin-top: 8px; }
+.g-item { display: flex; flex-direction: column; gap: 4px; }
+.g-lb { font-size: 12px; cursor: help; width: fit-content; }
 </style>
