@@ -135,7 +135,8 @@ def check_online() -> bool:
 
 
 def chat(prompt: str, system: str | None = None,
-         temperature: float | None = None) -> str:
+         temperature: float | None = None,
+         log=lambda m: None) -> str:
     """单轮文本补全: 按启用的配置池顺序尝试, 单个失败自动切换下一个"""
     messages = ([{"role": "system", "content": system}] if system else []) + [
         {"role": "user", "content": prompt}]
@@ -184,7 +185,8 @@ def chat_json(prompt: str, validator=None, system: str | None = None,
         if last_err is not None:
             retry_hint = (f"\n\n【重试提示】上一次输出解析或校验失败: {last_err}\n"
                           f"请严格按要求的 JSON 结构重新输出, 不要输出任何解释文字。")
-        raw = chat(prompt + retry_hint, system=system, temperature=temperature)
+        raw = chat(prompt + retry_hint, system=system, temperature=temperature,
+                   log=log)
         last_raw = raw
         try:
             obj = _extract_json(raw)
