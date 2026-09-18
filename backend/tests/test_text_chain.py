@@ -139,8 +139,8 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
     assert _rr("split") == "done"
     assert _rr("translate") == "done"
     calls_after_1 = len(calls)
-    # 摘要 1 + 2 块×(直译+润色) 2×2 + 全局审校 2 = 7
-    assert calls_after_1 == 7
+    # 单步默认: 摘要 1 + 2 块×1 + 全局审校 2 = 5
+    assert calls_after_1 == 5
     runner = _runner()
     r = runner.start_step(uid, "translate", force=False)
     # 全部块已缓存 → 但 fresh 指纹包含产物哈希(变了) → 会重跑, 但 LLM 调用应为 0
@@ -211,3 +211,32 @@ def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
     tr = (srt_dir / "trans.srt").read_text(encoding="utf-8")
     assert "\n" in tr.split("\n")[2] or len(tr) > 0
 
+
+
+def test_translate_parallel_chunks(make_project, isolated_env, monkeypatch, pdir):
+    """llm.max_workers=2 并行分块: 请求总数不变, 输出按 id 正确归位"""
+    uid = make_project()
+    lines = [(float(i) * 2, float(i) * 2 + 1.5, f"sentence number {i} about topic")
+             for i in range(12)]
+    _seed_transcribe(uid, lines)
+
+    calls = []
+    def responder(prompt, system):
+        calls.append(1)
+        import re as _re
+        ids = _re.findall(r"^(\d+)\. ", prompt, flags=_re.M)
+        return json.dumps([{"id": int(i), "dst": f"译{i}"} for i in ids])
+    _mock_llm(monkeypatch, responder)
+
+    import dubforge.config as cfgmod
+    cfgmod.set_key("translate.whole_doc_max_lines", 5)
+    cfgmod.set_key("llm.max_workers", 2)          # 并行分块
+
+    from dubforge.domain import crud as _crud
+    assert _run_until(uid, "split") == "done"
+    assert _run_until(uid, "translate") == "done"
+    assert len(calls) == 5                        # 摘要 1 + 分块 2 + 审校 2
+    data = json.loads((pdir(uid) / "artifacts" / "translate" / "translate.json")
+                      .read_text(encoding="utf-8"))
+    dsts = {l["id"]: l["dst"] for l in data["lines"]}
+    assert dsts[3] == "译3" and dsts[11] == "译11"   # 并发下按 id 归位, 无错位

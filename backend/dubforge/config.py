@@ -74,6 +74,7 @@ DEFAULTS: dict[str, Any] = {
     "translate": {
         "target_language": "简体中文",
         "style_prompt": "",          # 自定义风格提示词 (翻译人设/语气)
+        "two_step": False,           # 两步直译 (先忠实再润色, 2×请求); 关=单步直出 (强模型推荐)
         "whole_doc_max_lines": 60,   # ≤该行数走整篇直译 (ADR-0002 三档策略)
         "global_polish": True,       # 分块模式启用全局审校第三步
         "summary_length": 8000,      # 摘要取样字符数

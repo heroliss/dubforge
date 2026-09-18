@@ -76,6 +76,8 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
                             ("Русский", "Русский"), ("Português", "Português"))),
         ParamField("translate.style_prompt", "风格提示词", "text",
                    help="翻译人设/语气要求, 例: 口语化, 忌翻译腔"),
+        ParamField("translate.two_step", "两步直译 (先忠实再润色)", "bool",
+                   help="开启 = 每块 2 次请求, 弱模型更稳; 默认单步一次成稿 (强模型推荐, 省 1/2 请求)"),
         ParamField("translate.whole_doc_max_lines", "整篇直译行数上限", "int", min=20, max=200, step=5,
                    help="≤该行数整篇直译 (上下文最全); 超过走分块+审校"),
         ParamField("translate.global_polish", "全局审校", "bool",

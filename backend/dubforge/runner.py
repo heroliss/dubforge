@@ -48,12 +48,13 @@ class StepContext:
         self.pdir = pdir
         self._log_file = log_file
         self._cancel = cancel_event
+        self._log_lock = threading.Lock()   # 分块并行时多线程写同一日志
         self.project_params: dict = json.loads(project.params or "{}")
 
     # ---- 日志 (带时间戳追加; 立即落盘, 崩溃后可读到最后状态) ----
     def log(self, msg: str) -> None:
         ts = datetime.datetime.now().strftime("%H:%M:%S")
-        with open(self._log_file, "a", encoding="utf-8") as f:
+        with self._log_lock, open(self._log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}] {msg}\n")
 
     # ---- 取消 (协作式: 步骤在循环/分块间主动调用) ----
