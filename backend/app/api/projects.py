@@ -221,7 +221,8 @@ def reveal_project(uid: str):
     pdir = crud.project_dir(uid)
     if not pdir.exists():
         raise DubForgeError("项目目录不存在", code="PROJECT_DIR_MISSING")
-    subprocess.Popen(["explorer", f"/select,{pdir}"])
+    import os
+    os.startfile(str(pdir))     # 直接在资源管理器打开文件夹 (比 /select 更可靠)
     return {"ok": True, "dir": str(pdir)}
 
 

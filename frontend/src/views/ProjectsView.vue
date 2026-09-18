@@ -1,6 +1,6 @@
 <script setup lang="ts">
 // 项目列表: 真实 CRUD + 新建 (yt-dlp 支持的任意站点链接 / 本地导入) + 改名
-import { onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
 import { useNavStore, STATUS_TEXT } from '../stores/nav'
@@ -67,6 +67,24 @@ async function reveal(p: any) {
 const STATUS_TAG: Record<string, string> = {
   done: 'success', failed: 'error', processing: 'info', created: 'default',
 }
+// —— 项目排序 ——
+const sortBy = ref<'created' | 'title' | 'progress'>('created')
+const sortDesc = ref(true)
+const SORT_OPTS = [
+  { label: '按创建时间', value: 'created' },
+  { label: '按标题', value: 'title' },
+  { label: '按完成进度', value: 'progress' },
+]
+const sortedProjects = computed(() => {
+  const dir = sortDesc.value ? -1 : 1
+  const arr = [...projects.value]
+  arr.sort((a: any, b: any) => {
+    if (sortBy.value === 'title') return dir * a.title.localeCompare(b.title, 'zh')
+    if (sortBy.value === 'progress') return dir * (doneCount(a) - doneCount(b))
+    return dir * ((a.created_at || '').localeCompare(b.created_at || ''))
+  })
+  return arr
+})
 const doneCount = (p: any) =>
   (p.steps ?? []).filter((x: any) => x.status === 'done').length
 
@@ -214,6 +232,11 @@ const STATUS_TEXT: Record<string, string> = {
     <n-space justify="space-between" align="center" style="margin-bottom: 16px">
       <n-h1 style="margin: 0">项目</n-h1>
       <n-space>
+        <n-select v-model:value="sortBy" :options="SORT_OPTS" size="small"
+                  style="width: 130px" />
+        <n-button size="small" @click="sortDesc = !sortDesc">
+          {{ sortDesc ? '↓ 降序' : '↑ 升序' }}
+        </n-button>
         <n-button v-if="sel.size" type="primary" @click="runSelected">
           ▶▶ 运行选中 ({{ sel.size }})
         </n-button>
@@ -225,7 +248,7 @@ const STATUS_TEXT: Record<string, string> = {
       <n-empty v-if="!loading && !projects.length"
                description="还没有项目 —— 点击右上角新建，粘贴视频链接 (YouTube / B站 等网站) 或导入本地视频" />
       <div v-else style="display:flex;flex-direction:column;gap:16px">
-        <n-card v-for="p in projects" :key="p.uid" size="small">
+        <n-card v-for="p in sortedProjects" :key="p.uid" size="small">
           <n-space justify="space-between" align="center">
             <div style="display:flex;align-items:center;gap:12px">
               <n-checkbox size="small" :checked="sel.has(p.uid)"
@@ -256,13 +279,20 @@ const STATUS_TEXT: Record<string, string> = {
           <!-- 分段进度条: 每段 = 一个步骤, 悬停看详情, 点击进步骤页 -->
           <div class="segwrap" v-if="(p.steps || []).length">
             <div class="segbar">
-              <div v-for="st in p.steps" :key="st.key" class="seg"
-                   :class="'seg-' + st.status"
-                   :title="`${st.label} · ${STATUS_TEXT[st.status] || st.status}${st.status === 'running' ? ' ' + Math.round(st.progress || 0) + '%' : ''}${st.error ? ' — ' + st.error : ''}`"
-                   @click.stop="router.push(`/projects/${p.uid}/steps/${st.key}`)">
-                <div class="fill" v-if="st.status === 'running'"
-                     :style="{ width: (st.progress || 0) + '%' }" />
-              </div>
+              <n-tooltip v-for="st in p.steps" :key="st.key" trigger="hover"
+                         :delay="0" :duration="0" placement="top">
+                <template #trigger>
+                  <div class="seg" :class="'seg-' + st.status"
+                       @click.stop="router.push(`/projects/${p.uid}/steps/${st.key}`)">
+                    <div class="fill" v-if="st.status === 'running'"
+                         :style="{ width: (st.progress || 0) + '%' }" />
+                  </div>
+                </template>
+                {{ st.label }} · {{ STATUS_TEXT[st.status] || st.status
+                }}{{ st.status === 'running' ? ` ${Math.round(st.progress || 0)}%` : ''
+                }}{{ st.error ? ` — ${st.error}` : '' }}
+                <n-text depth="3" style="font-size: 11px">(点击进入步骤页)</n-text>
+              </n-tooltip>
             </div>
             <n-text depth="3" style="font-size: 11px">
               已完成 {{ doneCount(p) }}/{{ (p.steps || []).length }}

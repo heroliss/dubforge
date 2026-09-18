@@ -113,6 +113,22 @@ def delete_project(uid: str) -> bool:
     return True
 
 
+def backfill_steps() -> int:
+    """为老项目补齐缺失的步骤行 (步骤注册表随版本增长, 旧项目创建时还没有后面的步骤)"""
+    with session() as s:
+        added = 0
+        for project in s.exec(sqlmodel.select(Project)).all():
+            existing = {st.step_key for st in s.exec(sqlmodel.select(StepRun).where(
+                StepRun.project_id == project.id)).all()}
+            for step in STEPS:
+                if step.key not in existing:
+                    s.add(StepRun(project_id=project.id,
+                                  step_key=step.key, status="pending"))
+                    added += 1
+        s.commit()
+    return added
+
+
 def get_steps(project_id: int) -> list[StepRun]:
     with session() as s:
         rows = list(s.exec(sqlmodel.select(StepRun).where(

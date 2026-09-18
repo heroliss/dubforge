@@ -203,13 +203,11 @@ const headerStatus = computed(() => {
             :title="`步骤进度 (${nav.doneCount}/${nav.steps.length})`">
       <template #header-extra>
         <n-text depth="3" style="font-size: 11.5px">
-          ☑ = 完成后允许自动续跑该步；「运行本步及后续」沿勾选链自动推进，遇未勾选即停
+          ☑ (在按钮旁) = 勾选自动续跑；「▶▶ 本步及后续」沿连续勾选推进，遇未勾选即停
         </n-text>
       </template>
       <div class="rows">
         <div v-for="s in nav.steps" :key="s.key" class="row">
-          <n-checkbox size="small" :checked="isAuto(s.key)"
-                      @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
           <span class="emoji">{{ STATUS_EMOJI[s.status] ?? '⚪' }}</span>
           <span class="lbl">{{ s.label }}</span>
           <n-tag size="small" :type="STATUS_TAG[s.status] || 'default'"
@@ -233,21 +231,26 @@ const headerStatus = computed(() => {
           <span class="ops">
             <n-button v-if="s.status === 'running' || s.status === 'queued'"
                       size="tiny" type="warning" :disabled="s.cancelling"
-                      @click="cancel(s)">{{ s.cancelling ? '取消中…' : '取消' }}</n-button>
-            <template v-else>
-              <n-button size="tiny" type="primary"
-                        :disabled="blockersOf(s.key).length > 0"
-                        :loading="busyKey === s.key"
-                        :title="blockersOf(s.key).length
-                          ? `上游未就绪: ${blockersOf(s.key).map(b => b.label).join('、')}` : ''"
-                        @click="run(s)">运行该步骤</n-button>
-              <n-button size="tiny" :disabled="blockersOf(s.key).length > 0"
-                        :title="chainFrom(s.key).length > 1
-                          ? `将自动执行: ${chainFrom(s.key).map(k => nav.stepMap[k]?.label ?? k).join(' → ')}` : ''"
-                        @click="runChain(s)">▶▶ 本步及后续</n-button>
-              <n-button v-if="['done', 'stale', 'failed'].includes(s.status)"
-                        size="tiny" quaternary @click="rerunDialog(s)">强制重跑</n-button>
-            </template>
+                      @click="cancel(s)">{{ s.cancelling ? '⏹ 取消中…' : '⏹ 取消' }}</n-button>
+            <n-button v-else size="tiny" type="primary"
+                      :disabled="blockersOf(s.key).length > 0"
+                      :loading="busyKey === s.key"
+                      :title="blockersOf(s.key).length
+                        ? `上游未就绪: ${blockersOf(s.key).map(b => b.label).join('、')}` : ''"
+                      @click="run(s)">▶ 运行该步骤</n-button>
+            <n-tooltip trigger="hover" :delay="0" placement="top">
+              <template #trigger>
+                <n-checkbox size="small" class="chainbox" :checked="isAuto(s.key)"
+                            @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
+              </template>
+              勾选 = 允许自动续跑；「▶▶ 本步及后续」沿连续勾选的步骤推进，遇未勾选即停
+            </n-tooltip>
+            <n-button size="tiny" :disabled="s.status === 'running' || s.status === 'queued'
+                        || blockersOf(s.key).length > 0"
+                      @click="runChain(s)">▶▶ 本步及后续</n-button>
+            <n-button size="tiny" :disabled="s.status === 'running' || s.status === 'queued'
+                        || !['done', 'stale', 'failed'].includes(s.status)"
+                      @click="rerunDialog(s)">强制重跑</n-button>
           </span>
         </div>
       </div>

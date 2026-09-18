@@ -31,3 +31,21 @@ def test_delete_project_cascades(make_project, isolated_env, pdir):
     assert not (pdir(uid)).exists()
     # 重复删除 → False (不抛错)
     assert crud.delete_project(uid) is False
+
+
+def test_backfill_steps(isolated_env):
+    """老项目缺失的步骤行在启动时自动补齐 (注册表随版本增长)"""
+    import sqlmodel
+    from dubforge.domain import crud
+    from dubforge.domain.models import StepRun
+    p = crud.create_project(title="老项目")
+    with crud.session() as s:
+        rows = s.exec(sqlmodel.select(StepRun).where(
+            StepRun.project_id == p.id)).all()
+        for r in rows[3:]:
+            s.delete(r)
+        s.commit()
+    assert len(crud.get_steps(p.id)) == 3
+    added = crud.backfill_steps()
+    assert added >= 6
+    assert len(crud.get_steps(p.id)) == 9

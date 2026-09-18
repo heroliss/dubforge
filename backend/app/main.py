@@ -20,6 +20,11 @@ FRONTEND_DIST = config.REPO_ROOT / "frontend" / "dist"
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    from dubforge.domain import crud
+    added = crud.backfill_steps()
+    if added:
+        import logging
+        logging.warning("为老项目补齐了 %d 个缺失的步骤行", added)
     # 崩溃恢复: 上次运行残留的 running 状态判中断 (原子写保证无半成品)
     from dubforge.runner import runner
     runner.recover()
