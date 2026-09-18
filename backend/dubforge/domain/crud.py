@@ -27,8 +27,11 @@ def new_uid() -> str:
 def _sanitize_dir_title(t: str) -> str:
     """标题 → 可作目录名的安全片段 (去 Windows 非法字符, 保中文)"""
     t = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "", t)
-    t = re.sub(r"\s+", " ", t).strip(" .")
-    return t[:40] or "未命名"
+    t = re.sub(r"\s+", " ", t).strip()
+    t = t[:40]
+    # 截断后再次剥掉首尾空白 (含 NBSP/全角空格) —— Windows 会剥离路径组件的
+    # 尾部空格, 留着它会让后续子目录 mkdir 报"找不到路径"
+    return t.strip().strip(" .") or "未命名"
 
 
 def _new_dir_name(title: str) -> str:
@@ -56,22 +59,28 @@ def create_project(title: str, source_url: str = "", source_kind: str = "youtube
     uid = new_uid()
     dir_name = _new_dir_name(title or "未命名")
     pdir = config.projects_dir() / dir_name
-    # 目录骨架 (M2 各步骤往对应子目录写产物)
-    for sub in ("media", "audio", "srt", "logs", *[f"artifacts/{s.key}" for s in STEPS]):
-        (pdir / sub).mkdir(parents=True, exist_ok=True)
+    # 目录骨架 + 登记: 任一步失败 → 清掉半成品目录并抛错,
+    # 绝不留"有目录没登记"的空壳 (列表上显示不出来)
+    import shutil
+    try:
+        for sub in ("media", "audio", "srt", "logs", *[f"artifacts/{s.key}" for s in STEPS]):
+            (pdir / sub).mkdir(parents=True, exist_ok=True)
 
-    project = Project(uid=uid, dir_name=dir_name, title=title or uid,
-                      source_url=source_url, source_kind=source_kind,
-                      params=json.dumps(params or {}, ensure_ascii=False))
-    with session() as s:
-        s.add(project)
-        s.commit()
-        s.refresh(project)
-        for step in STEPS:
-            s.add(StepRun(project_id=project.id, step_key=step.key, status="pending"))
-        s.commit()
-    write_manifest(uid)
-    return project
+        project = Project(uid=uid, dir_name=dir_name, title=title or uid,
+                          source_url=source_url, source_kind=source_kind,
+                          params=json.dumps(params or {}, ensure_ascii=False))
+        with session() as s:
+            s.add(project)
+            s.commit()
+            s.refresh(project)
+            for step in STEPS:
+                s.add(StepRun(project_id=project.id, step_key=step.key, status="pending"))
+            s.commit()
+        write_manifest(uid)
+        return project
+    except Exception:
+        shutil.rmtree(pdir, ignore_errors=True)
+        raise
 
 
 def get_project(uid: str) -> Project | None:

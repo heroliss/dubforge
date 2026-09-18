@@ -50,8 +50,13 @@ def _auto_title(body: ProjectCreate) -> str:
 @router.post("")
 def create_project(body: ProjectCreate):
     title = body.title.strip() or _auto_title(body)
-    project = crud.create_project(title=title, source_url=body.source_url,
-                                  source_kind=body.source_kind, params=body.params)
+    try:
+        project = crud.create_project(title=title, source_url=body.source_url,
+                                      source_kind=body.source_kind, params=body.params)
+    except DubForgeError:
+        raise
+    except Exception as e:
+        raise DubForgeError(f"创建项目失败: {e}", code="PROJECT_CREATE_FAIL")
     return _project_view(project)
 
 
@@ -309,8 +314,10 @@ def reveal_project(uid: str):
     pdir = crud.project_dir(uid)
     if not pdir.exists():
         raise DubForgeError("项目目录不存在", code="PROJECT_DIR_MISSING")
-    import os
-    os.startfile(str(pdir))     # 直接在资源管理器打开文件夹 (比 /select 更可靠)
+    import subprocess
+    # /select 变体: 打开父目录并选中项目文件夹 —— 新窗口会推到前台
+    # (os.startfile 打开的窗口在 Win11 下常落在后台)
+    subprocess.Popen(f'explorer /select,"{pdir}"')
     return {"ok": True, "dir": str(pdir)}
 
 

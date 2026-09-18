@@ -346,7 +346,7 @@ function resetNewForm() {
               </div>
             </div>
             <n-space>
-              <n-button size="small" type="primary" @click.stop="router.push(`/projects/${p.uid}`)">打开项目</n-button>
+              <n-button size="small" type="primary" @click.stop="router.push(`/projects/${p.uid}`)">步骤总览</n-button>
               <n-button size="small" @click.stop="runProject(p)">▶ 运行项目</n-button>
               <n-button size="small" quaternary @click.stop="reveal(p)">📁</n-button>
               <n-button size="small" quaternary @click.stop="openRename(p)">✏️ 改名</n-button>

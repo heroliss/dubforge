@@ -264,3 +264,16 @@ def test_ghost_project_cannot_run(isolated_env):
         assert r.status_code == 400
         assert r.json()["code"] == "PROJECT_DIR_MISSING"
     assert not crud.project_dir(p.uid).exists()      # 没有补回目录
+
+
+def test_dir_name_trailing_space_regression(isolated_env):
+    """回归: 40 字截断后残留尾部空格 → Windows mkdir 报"找不到路径", 项目创建 500。
+    目录名必须剥掉首尾空白 (含全角), 且创建成功落登记。"""
+    from dubforge.domain import crud
+    title = "I'm Finally Playing Black Myth Wukong ｜ Black Myth Wukong 上手体验"
+    p = crud.create_project(title=title)
+    name = crud.project_dir(p.uid).name
+    assert name == name.strip() and not name.endswith(" ")
+    assert len(name.split("_", 2)[2]) <= 40         # 标题片段不超 40 且无尾部空白
+    steps = crud.get_steps(p.id)
+    assert len(steps) == 9                          # 登记完整 (骨架+步骤行都在)
