@@ -265,6 +265,20 @@ async function loadStepParams() {
   } catch { /* 加载失败时该卡留空 */ }
 }
 
+// 逐项改动标识: 草稿值 vs 已应用基线
+const stepBaseline = computed<Record<string, any>>(() => {
+  try { return JSON.parse(savedSteps.value || '{}') } catch { return {} }
+})
+function stepChanged(path: string) {
+  return dirtyOn.value && savedSteps.value !== '' &&
+    JSON.stringify(stepDraft.value[path]) !== JSON.stringify(stepBaseline.value[path])
+}
+function concChanged(k: string) {
+  if (!dirtyOn.value || savedConc.value === '') return false
+  const base = JSON.parse(savedConc.value)
+  return JSON.stringify(form.value.conc[k]) !== JSON.stringify(base[k])
+}
+
 async function applySteps() {
   savingSteps.value = true
   try {
@@ -446,7 +460,10 @@ function extraParamsStr(r: any): string {
                 style="margin-top: 14px">
           <div class="conc">
             <div v-for="c in CONC_ITEMS" :key="c.k" class="c-item">
-              <n-text depth="3" style="font-size: 12px">{{ c.t }}</n-text>
+              <n-text depth="3" style="font-size: 12px">{{ c.t }}
+                <n-tag v-if="concChanged(c.k)" size="tiny" type="warning"
+                       :bordered="false">已改</n-tag>
+              </n-text>
               <n-input-number v-model:value="form.conc[c.k]" size="small"
                               :min="1" :max="4" style="width: 76px" />
             </div>
@@ -514,7 +531,10 @@ function extraParamsStr(r: any): string {
               <div v-for="f in stepSchema[sk]?.fields ?? []" :key="f.path" class="sp-row">
                 <n-tooltip trigger="hover" placement="top">
                   <template #trigger>
-                    <span class="sp-lb">{{ f.label }} <n-text depth="3">ⓘ</n-text></span>
+                    <span class="sp-lb">{{ f.label }} <n-text depth="3">ⓘ</n-text>
+                      <n-tag v-if="stepChanged(f.path)" size="tiny" type="warning"
+                             :bordered="false">已改</n-tag>
+                    </span>
                   </template>
                   {{ f.help || f.path }}
                 </n-tooltip>
@@ -579,5 +599,6 @@ function extraParamsStr(r: any): string {
   align-items: center;
   padding: 3px 0;
 }
-.sp-lb { font-size: 12.5px; white-space: nowrap; }
+.sp-lb { font-size: 12.5px; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
+.sp-row > .n-switch { justify-self: start; }
 </style>

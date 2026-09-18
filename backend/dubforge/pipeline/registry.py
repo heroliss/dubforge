@@ -19,36 +19,37 @@ class StepDef:
     label: str
     description: str
     cfg_keys: tuple[str, ...] = field(default=())
+    dir: str = ""                  # 本步骤的主产物目录 (相对项目目录; 「在文件浏览器中打开」用)
 
 
 STEPS: list[StepDef] = [
     StepDef("download", "获取视频",
             "粘贴 YouTube 等链接下载, 或导入本地视频; 全局去重归档",
-            ("download",)),
+            ("download",), "media"),
     StepDef("preprocess", "音轨分离",
             "提取音轨; demucs 分离人声/背景音; 可选说话人分离",
-            ("separate",)),
+            ("separate",), "audio"),
     StepDef("transcribe", "语音转文字",
             "faster-whisper 词级时间戳转录 (源语言 SRT)",
-            ("asr",)),
+            ("asr",), "artifacts/transcribe"),
     StepDef("split", "拆分句子",
             "NLP 粗切 + LLM 语义切句",
-            ("split", "llm.model", "llm.base_url")),
+            ("split", "llm.model", "llm.base_url"), "artifacts/split"),
     StepDef("translate", "翻译",
             "三档策略 (整篇直译/分块+全局审校/滚动摘要), 术语表+风格提示词",
-            ("translate", "llm")),
+            ("translate", "llm"), "artifacts/translate"),
     StepDef("subtitles", "生成字幕",
             "生成 源/译/双语 SRT, 行宽控制",
-            ("translate.target_language", "tts.subtitles")),
+            ("translate.target_language", "tts.subtitles"), "srt"),
     StepDef("dubtask", "配音计划",
             "时长估算与语速分析, 逐句配音任务表",
-            ("tts",)),
+            ("tts",), "artifacts/dubtask"),
     StepDef("tts", "逐句配音",
             "IndexTTS2.5 / GPT-SoVITS 逐句合成 + 精修工作台",
-            ("tts",)),
+            ("tts",), "artifacts/tts"),
     StepDef("assemble", "合成成片",
             "响度归一 + 背景混音(ducking) + 可选字幕烧录",
-            ("assemble",)),
+            ("assemble",), "output"),
 ]
 
 STEP_KEYS = [s.key for s in STEPS]

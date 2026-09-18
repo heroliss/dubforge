@@ -93,6 +93,21 @@ def _artifact_file(uid: str, key: str, name: str) -> Path:
     return p
 
 
+@router.post("/{key}/reveal")
+def reveal_step(uid: str, key: str):
+    """在系统资源管理器中打开本步骤的主产物目录 (不存在则先创建)"""
+    import os
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
+    if key not in STEP_MAP:
+        raise DubForgeError(f"未知步骤: {key}", code="STEP_UNKNOWN")
+    d = crud.project_dir(uid) / STEP_MAP[key].dir
+    d.mkdir(parents=True, exist_ok=True)
+    os.startfile(str(d))
+    return {"ok": True, "dir": str(d)}
+
+
 @router.get("/{key}/artifacts/{name}/raw")
 def artifact_raw(uid: str, key: str, name: str):
     """按登记产物提供原文/原文件 (预览用); 只允许本步骤已登记的名字, 不接受路径"""

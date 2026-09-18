@@ -70,6 +70,11 @@ async function cancel() {
   message.info('取消信号已发送, 等待步骤在检查点退出')
 }
 
+async function revealStep() {
+  const r = await fetch(`/api/projects/${uid}/steps/${key}/reveal`, { method: 'POST' })
+  if (!r.ok) message.error('打开目录失败')
+}
+
 // ---- 日志: 运行态 1.5s 轮询并自动滚底 ----
 const logLines = ref<string[]>([])
 const logBox = ref<HTMLElement | null>(null)
@@ -295,6 +300,8 @@ async function loadText(name: string | null) {
                  :bordered="false">需重跑</n-tag>
         </n-space>
         <n-space>
+          <n-button size="small" quaternary title="在文件浏览器中打开本步骤目录"
+                    @click="revealStep">📁</n-button>
           <n-button v-if="running" type="warning" :disabled="step.cancelling"
                     @click="cancel">⏹ {{ step.cancelling ? '取消中…' : '取消' }}</n-button>
           <n-button v-else type="primary" :loading="busy" :disabled="!canRun"
