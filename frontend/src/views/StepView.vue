@@ -6,6 +6,7 @@ import { useRoute, useRouter } from 'vue-router'
 import { useDialog, useMessage } from 'naive-ui'
 import MediaInfo from '../components/MediaInfo.vue'
 import AudioTracksPlayer from '../components/AudioTracksPlayer.vue'
+import ParamControl from '../components/ParamControl.vue'
 import { useNavStore, STEP_ORDER, STATUS_TEXT } from '../stores/nav'
 
 const route = useRoute()
@@ -290,6 +291,8 @@ async function loadText(name: string | null) {
           </n-tag>
           <n-tag v-if="step.status === 'done' && step.fresh" size="small" type="success"
                  :bordered="false">已是最新</n-tag>
+          <n-tag v-else-if="step.status === 'done'" size="small" type="warning"
+                 :bordered="false">需重跑</n-tag>
         </n-space>
         <n-space>
           <n-button v-if="running" type="warning" :disabled="step.cancelling"
@@ -385,18 +388,7 @@ async function loadText(name: string | null) {
                   <n-tooltip trigger="hover" placement="top" :delay="200">
                     <template #trigger>
                       <span class="ctl">
-                        <n-switch v-if="f.type === 'bool'" v-model:value="draft[f.path]" />
-                        <n-select v-else-if="f.type === 'select'" v-model:value="draft[f.path]"
-                                  :options="f.options" />
-                        <n-input-number v-else-if="f.type === 'int' || f.type === 'float'"
-                                        v-model:value="draft[f.path]" :min="f.min" :max="f.max"
-                                        :step="f.step ?? (f.type === 'int' ? 1 : 0.1)"
-                                        style="width: 150px" />
-                        <n-input v-else-if="f.type === 'text'" v-model:value="draft[f.path]"
-                                 type="textarea" :rows="2" />
-                        <n-input v-else-if="f.type === 'password'" v-model:value="draft[f.path]"
-                                 type="password" show-password-on="click" />
-                        <n-input v-else v-model:value="draft[f.path]" />
+                        <ParamControl :field="f" v-model="draft[f.path]" />
                       </span>
                     </template>
                     {{ f.help || f.path }}<template v-if="overriddenMap[f.path]">

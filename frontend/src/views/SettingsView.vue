@@ -5,6 +5,7 @@
 import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { onBeforeRouteLeave } from 'vue-router'
 import { useMessage } from 'naive-ui'
+import ParamControl from '../components/ParamControl.vue'
 
 const message = useMessage()
 const cfg = ref<any>(null)
@@ -67,10 +68,20 @@ const CONC_ITEMS = [
   { k: 'assemble', t: '合成成片' },
 ]
 
-// —— 未应用修改的追踪 —— 表单是草稿, 「应用」写入 config.yaml 才生效 ——
+// 全局步骤参数卡的分组顺序与标题 (与后端 step_params schema 的 key 对应)
+const STEP_LABELS: Record<string, string> = {
+  download: '获取视频', preprocess: '音轨分离', transcribe: '语音转文字',
+  split: '拆分句子', translate: '翻译', subtitles: '生成字幕',
+  dubtask: '配音计划', tts: '逐句配音', assemble: '合成成片',
+}
+
+// —— 未应用修改的追踪: 每张卡独立 —— 表单是草稿, 各卡的「应用」才是唯一写入口 ——
 const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
 const savedProfiles = ref<string[]>([])   // 已应用状态: 每组配置的序列化值 (按下标)
-const savedForm = ref('')                 // 已应用状态: 翻译任务设置的序列化值
+const savedForm = ref('')                 // 已应用状态: LLM 通用参数 (并发/超时)
+const savedConc = ref('')                 // 已应用状态: 运行并行度
+const savedRoot = ref('')                 // 已应用状态: 总工作目录
+const savedSteps = ref('')                // 已应用状态: 全局步骤参数
 const cardDirty = computed(() => profiles.value.map((p, i) => {
   if (!dirtyOn.value) return false
   return i >= savedProfiles.value.length ||
@@ -79,27 +90,32 @@ const cardDirty = computed(() => profiles.value.map((p, i) => {
 const formDirty = computed(() =>
   dirtyOn.value && savedForm.value !== '' &&
   JSON.stringify({ max_workers: form.value.max_workers,
-                   timeout: form.value.timeout,
-                   data_root: form.value.data_root,
-                   conc: form.value.conc }) !== savedForm.value)
+                   timeout: form.value.timeout }) !== savedForm.value)
+const concDirty = computed(() =>
+  dirtyOn.value && savedConc.value !== '' &&
+  JSON.stringify(form.value.conc) !== savedConc.value)
+const rootDirty = computed(() =>
+  dirtyOn.value && savedRoot.value !== '' && form.value.data_root !== savedRoot.value)
 const isDirty = computed(() =>
-  dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean) ||
-                    profiles.value.length !== savedProfiles.value.length))
+  dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean)))
+const anyDirty = computed(() =>
+  isDirty.value || concDirty.value || rootDirty.value || stepsDirty.value)
 function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
   savedForm.value = JSON.stringify({ max_workers: form.value.max_workers,
-                                     timeout: form.value.timeout,
-                                     data_root: form.value.data_root,
-                                     conc: form.value.conc })
+                                     timeout: form.value.timeout })
+  savedConc.value = JSON.stringify(form.value.conc)
+  savedRoot.value = form.value.data_root
+  savedSteps.value = JSON.stringify(stepDraft.value)
   dirtyOn.value = true
 }
 // 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
 onBeforeRouteLeave(() => {
-  if (isDirty.value &&
+  if (anyDirty.value &&
       !window.confirm('有未应用的修改，离开将丢失。仍要离开吗？')) return false
 })
 function warnUnload(e: BeforeUnloadEvent) {
-  if (isDirty.value) { e.preventDefault(); e.returnValue = '' }
+  if (anyDirty.value) { e.preventDefault(); e.returnValue = '' }
 }
 onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 
@@ -151,13 +167,14 @@ onMounted(async () => {
     form.value.data_root = String(cfg.value.server?.data_root ?? '')
     form.value.conc = { ...(cfg.value.runner?.step_concurrency ?? {}) }
     markApplied()                     // 以载入状态为"已应用"基线
+    void loadStepParams()             // 全局步骤参数 (独立基线)
     window.addEventListener('beforeunload', warnUnload)
   } catch (e: any) {
     loadError.value = `加载失败 (${e.message}) —— 请确认后端窗口正在运行 (8600)`
   }
 })
 
-// 「应用」是唯一写入口: 把整张卡片的草稿 (配置组 + 通用参数) 写入 config.yaml
+// 「应用」是唯一写入口: 只保存本卡内容 (LLM 配置组 + 通用参数)
 async function applySettings() {
   saving.value = true
   try {
@@ -179,8 +196,6 @@ async function applySettings() {
         }),
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
-        'server.data_root': form.value.data_root.trim(),
-        'runner.step_concurrency': { ...form.value.conc },
       } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -189,6 +204,78 @@ async function applySettings() {
   } catch (e: any) {
     message.error(`应用失败: ${e.message}`)
   } finally { saving.value = false }
+}
+
+// —— 各卡独立的应用入口 (就近保存, 互不牵连) ——
+const savingConc = ref(false)
+async function applyConc() {
+  savingConc.value = true
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates: { 'runner.step_concurrency': { ...form.value.conc } } }),
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    savedConc.value = JSON.stringify(form.value.conc)
+    message.success('并行度已写入 config.yaml —— 之后新启动的步骤即时生效')
+  } catch (e: any) {
+    message.error(`应用失败: ${e.message}`)
+  } finally { savingConc.value = false }
+}
+
+const savingRoot = ref(false)
+async function applyRoot() {
+  savingRoot.value = true
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates: { 'server.data_root': form.value.data_root.trim() } }),
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    savedRoot.value = form.value.data_root
+    message.success('已写入 config.yaml —— 需重启程序生效')
+  } catch (e: any) {
+    message.error(`应用失败: ${e.message}`)
+  } finally { savingRoot.value = false }
+}
+
+// —— 全局步骤参数 (各项目未单独覆盖时的默认值) ——
+const stepSchema = ref<Record<string, any>>({})
+const stepDraft = ref<Record<string, any>>({})
+const savingSteps = ref(false)
+const stepsDirty = computed(() =>
+  savedSteps.value !== '' && JSON.stringify(stepDraft.value) !== savedSteps.value)
+
+async function loadStepParams() {
+  try {
+    const r = await fetch('/api/settings/step_params')
+    if (!r.ok) return
+    const j = await r.json()
+    stepSchema.value = j.steps || {}
+    const d: Record<string, any> = {}
+    for (const node of Object.values<any>(j.steps || {})) {
+      for (const f of node.fields as any[]) {
+        d[f.path] = node.values?.[f.path]
+      }
+    }
+    stepDraft.value = d
+    savedSteps.value = JSON.stringify(d)
+  } catch { /* 加载失败时该卡留空 */ }
+}
+
+async function applySteps() {
+  savingSteps.value = true
+  try {
+    const r = await fetch('/api/settings', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates: { ...stepDraft.value } }),
+    })
+    if (!r.ok) throw new Error('HTTP ' + r.status)
+    savedSteps.value = JSON.stringify(stepDraft.value)
+    message.success('全局步骤参数已写入 config.yaml —— 新启动的步骤生效; 项目级覆盖不受影响')
+  } catch (e: any) {
+    message.error(`应用失败: ${e.message}`)
+  } finally { savingSteps.value = false }
 }
 
 async function testConnection() {
@@ -365,8 +452,15 @@ function extraParamsStr(r: any): string {
           <n-text depth="3" style="font-size:12px; display:block; margin-top: 8px">
             勾选多个项目点「运行选中」时：下载/LLM 类可并行推进，GPU 类
             (音轨分离/语音转文字/逐句配音/合成成片) 保持 1 排队保护显存。
-            修改并「应用设置」后，对之后新启动的步骤即时生效。
+            应用后对之后新启动的步骤即时生效。
           </n-text>
+          <div class="actions" style="margin-top: 8px">
+            <n-button type="primary" size="small" :loading="savingConc"
+                      :disabled="!concDirty" @click="applyConc">💾 应用并行度</n-button>
+            <n-text v-if="concDirty" type="warning" style="font-size:12px">
+              ● 有未应用的修改
+            </n-text>
+          </div>
         </n-card>
 
         <!-- ============ 存储 ============ -->
@@ -380,8 +474,15 @@ function extraParamsStr(r: any): string {
                      placeholder="留空 = 默认 程序目录\data" />
           </div>
           <n-text depth="3" style="font-size:12px; display:block; margin-top:6px">
-            修改并「应用设置」后需重启程序才生效；已有数据不会自动搬家，需手动移动后重启。详见「❓ 帮助」页。
+            应用后需重启程序才生效；已有数据不会自动搬家，需手动移动后重启。详见「❓ 帮助」页。
           </n-text>
+          <div class="actions" style="margin-top: 8px">
+            <n-button type="primary" size="small" :loading="savingRoot"
+                      :disabled="!rootDirty" @click="applyRoot">💾 应用存储位置</n-button>
+            <n-text v-if="rootDirty" type="warning" style="font-size:12px">
+              ● 有未应用的修改
+            </n-text>
+          </div>
           <div style="margin-top: 10px">
             <n-button size="small" :loading="rebuilding" @click="rebuildDb">🔄 从项目目录重建索引</n-button>
             <n-text depth="3" style="font-size:12px; margin-left:8px">
@@ -390,16 +491,36 @@ function extraParamsStr(r: any): string {
           </div>
         </n-card>
 
-        <!-- ============ 其余配置 (只读概览, 后续版本开放编辑) ============ -->
-        <n-card title="下载 / 分离 / 转录 / 配音 / 成片" size="small">
-          <n-descriptions :column="3" label-placement="left" bordered size="small">
-            <n-descriptions-item label="最高分辨率">{{ cfg.download.resolution }}p</n-descriptions-item>
-            <n-descriptions-item label="代理">{{ cfg.download.proxy || '(环境变量)' }}</n-descriptions-item>
-            <n-descriptions-item label="ASR 模型">{{ cfg.asr.model }}</n-descriptions-item>
-            <n-descriptions-item label="TTS 后端">{{ cfg.tts.backend }}</n-descriptions-item>
-            <n-descriptions-item label="IndexTTS">{{ cfg.tts.indextts25.url }}</n-descriptions-item>
-            <n-descriptions-item label="成片 Ducking">{{ cfg.assemble.ducking ? '开' : '关' }}</n-descriptions-item>
-          </n-descriptions>
+        <!-- ============ 全局步骤参数 (schema 驱动, 项目未覆盖时使用) ============ -->
+        <n-card title="全局步骤参数 (各项目未单独覆盖时的默认值)" size="small">
+          <n-text depth="3" style="font-size:12px; display:block; margin-bottom: 8px">
+            每个项目的步骤页可以单独覆盖这些默认值 (覆盖项会标「项目已改」)；
+            修改全局默认不影响已单独覆盖的项目。
+          </n-text>
+          <n-collapse size="small">
+            <n-collapse-item v-for="(label, sk) in STEP_LABELS" :key="sk" :name="sk"
+                             :title="`${label} — ${(stepSchema[sk]?.fields ?? []).length} 项`">
+              <div v-for="f in stepSchema[sk]?.fields ?? []" :key="f.path" class="sp-row">
+                <n-tooltip trigger="hover" placement="top">
+                  <template #trigger>
+                    <span class="sp-lb">{{ f.label }} <n-text depth="3">ⓘ</n-text></span>
+                  </template>
+                  {{ f.help || f.path }}
+                </n-tooltip>
+                <ParamControl :field="f" v-model="stepDraft[f.path]" />
+              </div>
+            </n-collapse-item>
+          </n-collapse>
+          <div class="actions" style="margin-top: 10px">
+            <n-button type="primary" size="small" :loading="savingSteps"
+                      :disabled="!stepsDirty" @click="applySteps">💾 应用全局步骤参数</n-button>
+            <n-text v-if="stepsDirty" type="warning" style="font-size:12px">
+              ● 有未应用的修改 —— 不应用不生效
+            </n-text>
+            <n-text v-else depth="3" style="font-size:12px">
+              新启动的步骤按此执行; 改动会改变步骤指纹, 已完成步骤失去「已是最新」需重跑
+            </n-text>
+          </div>
         </n-card>
       </div>
     </n-spin>
@@ -440,4 +561,12 @@ function extraParamsStr(r: any): string {
 .g-lb { font-size: 12px; cursor: help; width: fit-content; }
 .conc { display: flex; flex-wrap: wrap; gap: 10px 18px; }
 .c-item { display: flex; align-items: center; gap: 6px; }
+.sp-row {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 8px 12px;
+  align-items: center;
+  padding: 3px 0;
+}
+.sp-lb { font-size: 12.5px; white-space: nowrap; }
 </style>

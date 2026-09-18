@@ -223,6 +223,8 @@ const headerStatus = computed(() => {
                  :bordered="false">⛓ 将自动执行</n-tag>
           <n-tag v-if="s.status === 'done' && s.fresh" size="small" type="success"
                  :bordered="false">已是最新</n-tag>
+          <n-tag v-else-if="s.status === 'done'" size="small" type="warning"
+                 :bordered="false">需重跑</n-tag>
           <span class="info">
             {{ (s.artifacts?.length ?? 0)
               ? `产物 ${s.artifacts.length} 个 · ${fmtSize(artsSize(s))}` : '—' }}
