@@ -13,7 +13,7 @@ import threading
 import httpx
 
 from dubforge import config
-from dubforge.errors import ServiceOfflineError, StepFailedError
+from dubforge.errors import DubForgeError, ServiceOfflineError, StepFailedError
 
 _offline_cache: dict = {}
 _offline_lock = threading.Lock()
@@ -53,6 +53,9 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
         body["thinking"] = {"type": "disabled"}
     elif thinking == "enabled":
         body["thinking"] = {"type": "enabled"}
+    # 专属参数最后合并: 同名键覆盖上面的通用默认 (如该模型官方推荐 temperature:1);
+    # 留空 {} 则不多发任何字段, 完全跟随服务商默认
+    body.update(provider.get("params") or {})
     return body
 
 

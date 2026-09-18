@@ -29,9 +29,20 @@ async function testOne(i: number) {
   await save(false)
   delete testResults.value[i]
   testingMap.value[i] = true
-  try { await runTest({ index: i }) }
-  catch (e: any) { message.error(e.message) }
-  finally { testingMap.value[i] = false }
+  try {
+    await runTest({ index: i })
+  } catch (e: any) {
+    // 测试请求本身失败 (后端不可达/接口报错) 也归一成结果, 与成功信息显示在同一个详情框
+    const p = profiles.value[i] ?? {}
+    testResults.value[i] = {
+      ok: false, error: e.message || String(e),
+      request: {
+        url: (p.base_url || '').replace(/\/+$/, '') + '/chat/completions',
+        model: p.model, temperature: form.value.temperature,
+        extra_params: parseParams(p), prompt: '请只回复两个字母: OK',
+      },
+    }
+  } finally { testingMap.value[i] = false }
 }
 // 该组是否正在测试 (单独点测试, 或处于「并行测试全部」中且还没出结果)
 function isTesting(i: number): boolean {
@@ -50,16 +61,23 @@ const PARAM_TPLS: Record<string, { label: string, params: any }> = {
   glm53: { label: 'GLM-5.3-flash 官方推荐 (思考型)',
            params: { temperature: 1, top_p: 0.95, reasoning_effort: 'max' } },
   low_random: { label: '翻译通用 (低随机, 更稳定)', params: { temperature: 0.2 } },
-  clear: { label: '清空', params: {} },
+  clear: { label: '清空 (留空 = 用服务商默认)', params: {} },
 }
 function applyTpl(p: any, key: string) {
-  if (key && PARAM_TPLS[key]) p.paramsJson = JSON.stringify(PARAM_TPLS[key].params, null, 1)
+  if (!key || !PARAM_TPLS[key]) return
+  const params = PARAM_TPLS[key].params
+  p.paramsJson = Object.keys(params).length ? JSON.stringify(params, null, 1) : ''
+}
+
+// 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
+function parseParams(p: any): any {
+  try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
 }
 
 function addProfile() {
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
                         base_url: '', api_key: '', model: '', enabled: true,
-                        params: {}, paramsJson: '{}' })
+                        params: {}, paramsJson: '' }) // 专属参数默认留空
 }
 function delProfile(i: number) { profiles.value.splice(i, 1) }
 function move(i: number, d: number) {
@@ -77,7 +95,10 @@ onMounted(async () => {
     profiles.value = (llm.profiles?.length ? llm.profiles :
       [{ name: '默认', base_url: llm.base_url, api_key: llm.api_key,
          model: llm.model, enabled: true }]).map((p: any) => ({
-      ...p, params: p.params ?? {}, paramsJson: JSON.stringify(p.params ?? {}, null, 1),
+      ...p, params: p.params ?? {},
+      // 专属参数留空不显示 "{}" —— 空即不发送任何额外字段
+      paramsJson: (p.params && Object.keys(p.params).length)
+        ? JSON.stringify(p.params, null, 1) : '',
     }))
     form.value.temperature = Number(llm.temperature)
     form.value.max_workers = Number(llm.max_workers)
@@ -92,10 +113,8 @@ async function save(showTip = true) {
   saving.value = true
   try {
     const list = profiles.value.map((p: any) => {
-      let params: any = {}
-      try { params = JSON.parse(p.paramsJson || '{}') } catch { /* 保持空 */ }
       const { paramsJson, ...rest } = p
-      return { ...rest, params }
+      return { ...rest, params: parseParams(p) }
     })
     await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -191,7 +210,7 @@ function extraParamsStr(r: any): string {
                             placeholder="参数模板 (官方推荐值)…"
                             @update:value="(v: string) => applyTpl(p, v)" />
                   <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
-                           placeholder='JSON, 如 {"temperature":1,"top_p":0.95,"reasoning_effort":"max"}' />
+                           placeholder="可选, 留空 = 使用服务商默认值; JSON 如 {&quot;temperature&quot;:1,&quot;top_p&quot;:0.95}" />
                 </div>
               </div>
               <!-- 测试过程/结果: 发送了什么 / 过程事件 / 收到了什么 -->
