@@ -38,24 +38,19 @@ def _profiles() -> list[dict]:
 
 
 def _payload(provider: dict, messages: list[dict], temperature: float | None,
-             json_mode: bool, thinking: str | None = None) -> dict:
+             json_mode: bool) -> dict:
+    """构造请求体。temperature=None 时不发送该字段 (用服务商默认);
+    每组配置想固定随机性, 在其专属参数里写 {"temperature": ..} (最后合并, 优先级最高)"""
     body = {
         "model": provider.get("model", ""),
         "messages": messages,
-        "temperature": temperature if temperature is not None
-        else float(config.get("llm.temperature", 0.1)),
     }
+    if temperature is not None:
+        body["temperature"] = temperature
     if json_mode:
         body["response_format"] = {"type": "json_object"}
-    # 思考模式: GLM-4.5+ 支持请求级开关; 字幕翻译不需要长思考, 关闭可大幅提速
-    # thinking 参数优先 (测试连接传表单值), 否则读全局配置
-    think = thinking if thinking is not None else str(config.get("llm.thinking", "auto"))
-    if think == "disabled":
-        body["thinking"] = {"type": "disabled"}
-    elif think == "enabled":
-        body["thinking"] = {"type": "enabled"}
-    # 专属参数最后合并: 同名键覆盖上面的通用默认 (如该模型官方推荐 temperature:1);
-    # 留空 {} 则不多发任何字段, 完全跟随服务商默认
+    # 专属参数最后合并: 同名键覆盖上面的通用默认, 也可补充厂家私有参数
+    # (如 GLM 的 {"thinking": {"type": "enabled"}, "reasoning_effort": "max"})
     body.update(provider.get("params") or {})
     return body
 
@@ -153,20 +148,17 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     return data["choices"][0]["message"]["content"]
 
 
-def test_provider(provider: dict, *, temperature: float | None = None,
-                  thinking: str | None = None) -> dict:
+def test_provider(provider: dict) -> dict:
     """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果 + 请求/响应详情
 
     request: 实际发送了什么 (url/model/temperature/专属参数/prompt);
     logs:    测试过程中的事件 (如专属参数被拒自动剥离重试); reply/detail: 收到了什么。
-    temperature/thinking 传调用方的表单值 (None → 读全局配置), 保证"测的就是所填的"。
     """
     import time as _time
     t0 = _time.time()
     logs: list[str] = []
     prompt = "请只回复两个字母: OK"
-    body = _payload(provider, [{"role": "user", "content": prompt}], temperature,
-                    json_mode=False, thinking=thinking)
+    body = _payload(provider, [{"role": "user", "content": prompt}], None, json_mode=False)
     req_info = {"url": provider.get("base_url", "").rstrip("/") + "/chat/completions",
                 "model": body.get("model"), "temperature": body.get("temperature"),
                 "extra_params": provider.get("params") or {}, "prompt": prompt}

@@ -35,9 +35,9 @@ def update_settings(body: SettingsUpdate):
 
 @router.post("/test_llm")
 def test_llm(body: dict | None = None):
-    """LLM 连通性测试 —— 只探测传入的表单值, 不读写 config.yaml (保存是唯一写入口)。
+    """LLM 连通性测试 —— 只探测传入的表单值, 不读写 config.yaml (应用是唯一写入口)。
 
-    body: {"profiles": [配置...], "globals": {"temperature": .., "thinking": ".."}}
+    body: {"profiles": [配置...]}
       - profiles: 前端当前表单里的配置 (一组=单测, 多组=并行测)
       - 不传 profiles 时兼容旧行为: 测 config 中所有启用组
     返回 {"results": [{index(传入数组中的位置), name, ok, ...}], "ok": 任一组可用}
@@ -46,21 +46,17 @@ def test_llm(body: dict | None = None):
 
     from dubforge.backends import llm
 
-    body = body or {}
-    profiles = body.get("profiles")
+    profiles = (body or {}).get("profiles")
     if not profiles:  # 兼容: 未传则测 config 启用组
         profiles = [p for p in (config.load_config().get("llm", {})
                                 .get("profiles") or []) if p.get("enabled", True)]
         if not profiles:
             raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
                                 suggestion="在设置页勾选至少一组配置的「启用」开关。")
-    globals_ = body.get("globals") or {}
 
     def probe(item):
         i, p = item
-        return {**llm.test_provider(p, temperature=globals_.get("temperature"),
-                                    thinking=globals_.get("thinking")),
-                "index": i, "name": p.get("name")}
+        return {**llm.test_provider(p), "index": i, "name": p.get("name")}
 
     with ThreadPoolExecutor(max_workers=min(len(profiles), 8)) as pool:
         results = list(pool.map(probe, enumerate(profiles)))

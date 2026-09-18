@@ -38,9 +38,9 @@ DEFAULTS: dict[str, Any] = {
         # 多组 API 配置池: 按顺序降级 (旧版单 base_url/api_key 自动兼容)
         "profiles": [],
         "max_workers": 1,          # LLM 并发请求数 (本地/弱限流设 1)
-        "temperature": 0.1,
         "timeout": 300,            # 读超时秒数 (思考型模型单次可能 >120s)
-        "thinking": "auto",      # auto=不传(官方默认) / disabled=关闭思考(翻译任务推荐, 大幅提速) / enabled
+        # temperature / thinking 属于请求参数, 不做全局配置 ——
+        # 在各组 profiles 的专属参数里按模型填写 (留空 = 不发送, 用服务商默认)
     },
     "download": {
         "resolution": 1080,         # 最高分辨率

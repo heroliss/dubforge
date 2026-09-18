@@ -19,13 +19,10 @@ function toWire(p: any) {
   const { paramsJson, ...rest } = p
   return { ...rest, params: parseParams(p) }
 }
-function toGlobals() {
-  return { temperature: form.value.temperature, thinking: form.value.thinking }
-}
 async function postTest(profileList: any[]) {
   const r = await fetch('/api/settings/test_llm', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ profiles: profileList, globals: toGlobals() }),
+    body: JSON.stringify({ profiles: profileList }),
   })
   const j = await r.json()
   if (!r.ok) throw new Error(j.message || j.detail || '测试请求失败')
@@ -44,7 +41,7 @@ async function testOne(i: number) {
       ok: false, error: e.message || String(e),
       request: {
         url: (p.base_url || '').replace(/\/+$/, '') + '/chat/completions',
-        model: p.model, temperature: form.value.temperature,
+        model: p.model,
         extra_params: parseParams(p), prompt: '请只回复两个字母: OK',
       },
     }
@@ -57,29 +54,28 @@ function isTesting(i: number): boolean {
 }
 
 const profiles = ref<any[]>([])
-const form = ref({
-  temperature: 0.1 as number, max_workers: 1 as number,
-  timeout: 300 as number, thinking: 'auto',
-})
+const form = ref({ max_workers: 1 as number, timeout: 300 as number })
 
 // —— 未应用修改的追踪 —— 表单是草稿, 「应用」写入 config.yaml 才生效 ——
 const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
 const savedProfiles = ref<string[]>([])   // 已应用状态: 每组配置的序列化值 (按下标)
-const savedGlobals = ref('')              // 已应用状态: 通用参数的序列化值
+const savedForm = ref('')                 // 已应用状态: 翻译任务设置的序列化值
 const cardDirty = computed(() => profiles.value.map((p, i) => {
   if (!dirtyOn.value) return false
   return i >= savedProfiles.value.length ||
          JSON.stringify(toWire(p)) !== savedProfiles.value[i]
 }))
-const globalsDirty = computed(() =>
-  dirtyOn.value && savedGlobals.value !== '' &&
-  JSON.stringify(toGlobals()) !== savedGlobals.value)
+const formDirty = computed(() =>
+  dirtyOn.value && savedForm.value !== '' &&
+  JSON.stringify({ max_workers: form.value.max_workers,
+                   timeout: form.value.timeout }) !== savedForm.value)
 const isDirty = computed(() =>
-  dirtyOn.value && (globalsDirty.value || cardDirty.value.some(Boolean) ||
+  dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean) ||
                     profiles.value.length !== savedProfiles.value.length))
 function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
-  savedGlobals.value = JSON.stringify(toGlobals())
+  savedForm.value = JSON.stringify({ max_workers: form.value.max_workers,
+                                     timeout: form.value.timeout })
   dirtyOn.value = true
 }
 // 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
@@ -91,12 +87,6 @@ function warnUnload(e: BeforeUnloadEvent) {
   if (isDirty.value) { e.preventDefault(); e.returnValue = '' }
 }
 onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
-
-const THINKING_OPTIONS = [
-  { label: 'auto — 不传参数（跟随服务端默认）', value: 'auto' },
-  { label: 'disabled — 关闭思考（若服务端支持）', value: 'disabled' },
-  { label: 'enabled — 开启思考', value: 'enabled' },
-]
 
 // 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
 function parseParams(p: any): any {
@@ -129,10 +119,8 @@ onMounted(async () => {
       paramsJson: (p.params && Object.keys(p.params).length)
         ? JSON.stringify(p.params, null, 1) : '',
     }))
-    form.value.temperature = Number(llm.temperature)
     form.value.max_workers = Number(llm.max_workers)
     form.value.timeout = Number(llm.timeout ?? 300)
-    form.value.thinking = llm.thinking ?? 'auto'
     markApplied()                     // 以载入状态为"已应用"基线
     window.addEventListener('beforeunload', warnUnload)
   } catch (e: any) {
@@ -151,10 +139,8 @@ async function applySettings() {
           const { paramsJson, ...rest } = p
           return { ...rest, params: parseParams(p) }
         }),
-        'llm.temperature': form.value.temperature,
         'llm.max_workers': form.value.max_workers,
         'llm.timeout': form.value.timeout,
-        'llm.thinking': form.value.thinking,
       } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
@@ -270,7 +256,8 @@ function extraParamsStr(r: any): string {
                   <div class="tl">→ 发送  POST {{ testResults[i].request?.url }}</div>
                   <div class="tl">
                     &nbsp;&nbsp;model={{ testResults[i].request?.model }}
-                    · temperature={{ testResults[i].request?.temperature }}<template
+                    · temperature={{ testResults[i].request?.temperature ??
+                      '未发送 (用服务商默认)' }}<template
                       v-if="extraParamsStr(testResults[i])"> · 专属参数={{ extraParamsStr(testResults[i]) }}</template>
                   </div>
                   <div class="tl">&nbsp;&nbsp;prompt: "{{ testResults[i].request?.prompt }}"</div>
@@ -289,24 +276,15 @@ function extraParamsStr(r: any): string {
             </div>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
           </div>
-          <!-- 通用参数: 全局默认值, 组内"专属参数"可覆盖同名项 -->
+          <!-- 翻译任务设置: DubForge 自身运行参数 (非模型请求参数), 对所有配置组生效 -->
           <div class="globals-cap">
             <n-text depth="3" style="font-size:12px">
-              通用参数（所有配置组共用；组内「专属参数」可覆盖 Temperature 等同名项）：
+              翻译任务设置（DubForge 自身参数，非模型参数，对所有配置组生效）：
             </n-text>
-            <n-tag v-if="globalsDirty" size="small" type="warning"
+            <n-tag v-if="formDirty" size="small" type="warning"
                    :bordered="false">未应用</n-tag>
           </div>
           <div class="globals">
-            <div class="g-item">
-              <n-tooltip trigger="hover" placement="top">
-                <template #trigger><span class="g-lb">Temperature ⓘ</span></template>
-                随机性: 越高越发散。翻译建议 0.1~0.3; 思考型模型可按官方推荐值
-                (如 GLM-5.3-flash 推荐 1)。只在某组生效的话, 写进该组「专属参数」
-              </n-tooltip>
-              <n-input-number v-model:value="form.temperature" size="small"
-                              :step="0.1" :min="0" :max="2" style="width:110px" />
-            </div>
             <div class="g-item">
               <n-tooltip trigger="hover" placement="top">
                 <template #trigger><span class="g-lb">并发数 ⓘ</span></template>
@@ -322,15 +300,6 @@ function extraParamsStr(r: any): string {
               </n-tooltip>
               <n-input-number v-model:value="form.timeout" size="small"
                               :min="10" :max="3600" style="width:100px" />
-            </div>
-            <div class="g-item">
-              <n-tooltip trigger="hover" placement="top">
-                <template #trigger><span class="g-lb">思考模式 ⓘ</span></template>
-                auto: 不传参数, 跟随服务端默认; disabled/enabled:
-                发送 thinking.type 开关思考 (GLM 等部分服务商支持)
-              </n-tooltip>
-              <n-select v-model:value="form.thinking" size="small"
-                        :options="THINKING_OPTIONS" style="width:230px" />
             </div>
           </div>
           <!-- 「应用」是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->

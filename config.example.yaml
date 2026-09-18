@@ -14,9 +14,10 @@ llm:
     model: "deepseek-chat"
     enabled: true
   max_workers: 1
-  temperature: 0.1
   timeout: 300          # 读超时秒数 (思考型模型建议 >=300)
-  thinking: auto        # auto / disabled / enabled
+  # temperature / thinking 属于请求参数, 不做全局配置:
+  # 在各组 profiles 的 params 里按模型填写, 留空 = 不发送 (用服务商默认)
+  # 例: params: {"temperature": 1, "top_p": 0.95, "reasoning_effort": "max"}
 
 download:
   resolution: 1080
