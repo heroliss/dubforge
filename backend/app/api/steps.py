@@ -109,8 +109,8 @@ def reveal_step(uid: str, key: str):
                             suggestion="从回收站还原目录后重试。")
     d = pdir / STEP_MAP[key].dir
     d.mkdir(parents=True, exist_ok=True)
-    import subprocess
-    subprocess.Popen(f'explorer /select,"{d}"')   # 选中本步骤目录, 新窗口置前
+    from dubforge.utils.reveal import reveal_in_explorer
+    reveal_in_explorer(str(d))
     return {"ok": True, "dir": str(d)}
 
 

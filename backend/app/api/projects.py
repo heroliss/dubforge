@@ -314,10 +314,8 @@ def reveal_project(uid: str):
     pdir = crud.project_dir(uid)
     if not pdir.exists():
         raise DubForgeError("项目目录不存在", code="PROJECT_DIR_MISSING")
-    import subprocess
-    # /select 变体: 打开父目录并选中项目文件夹 —— 新窗口会推到前台
-    # (os.startfile 打开的窗口在 Win11 下常落在后台)
-    subprocess.Popen(f'explorer /select,"{pdir}"')
+    from dubforge.utils.reveal import reveal_in_explorer
+    reveal_in_explorer(str(pdir))
     return {"ok": True, "dir": str(pdir)}
 
 
