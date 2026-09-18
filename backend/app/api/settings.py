@@ -18,6 +18,14 @@ class SettingsUpdate(BaseModel):
     updates: dict  # 点分路径 → 值, 例 {"llm.model": "glm-5.3-flash"}
 
 
+@router.post("/rebuild_db")
+def rebuild_db():
+    """从项目目录的 manifest.json 重建索引 (只补缺不覆盖, 幂等)。
+    DB 丢失/损坏后的手动恢复入口; 拷进来的项目文件夹也会被收编。"""
+    from dubforge.domain import crud
+    return {"ok": True, **crud.rebuild_from_dirs()}
+
+
 @router.get("")
 def get_settings():
     # 本机单用户应用: api_key 明文回传 (前端密码框直接显示, 可切换明文)

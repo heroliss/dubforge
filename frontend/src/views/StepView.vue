@@ -93,10 +93,6 @@ function syncLogPolling() {
   }
 }
 watch(running, syncLogPolling, { immediate: true })
-watch(() => route.params.key, () => {
-  logLines.value = []
-  if (running.value) syncLogPolling()
-})
 onUnmounted(() => logTimer && clearInterval(logTimer))
 
 // ---- 本步配置快照 (展平一层) ----

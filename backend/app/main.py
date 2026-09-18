@@ -21,6 +21,13 @@ FRONTEND_DIST = config.REPO_ROOT / "frontend" / "dist"
 async def lifespan(app: FastAPI):
     init_db()
     from dubforge.domain import crud
+    # 目录+manifest 是事实, DB 是可重建索引: 只补缺 (DB 正常时零操作),
+    # 同时把手动拷进 projects/ 的项目文件夹收编进索引 (拷文件夹 = 搬项目)
+    rebuilt = crud.rebuild_from_dirs()
+    if rebuilt["projects"]:
+        import logging
+        logging.warning("从项目目录收编了 %d 个未登记的项目 (步骤 %d 行 / 产物 %d 条)",
+                        rebuilt["projects"], rebuilt["steps"], rebuilt["artifacts"])
     added = crud.backfill_steps()
     if added:
         import logging

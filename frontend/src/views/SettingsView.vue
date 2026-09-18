@@ -108,6 +108,18 @@ function parseParams(p: any): any {
   try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
 }
 
+// —— 从项目目录重建索引 (数据库只是可重建索引; 只补缺不覆盖) ——
+const rebuilding = ref(false)
+async function rebuildDb() {
+  rebuilding.value = true
+  try {
+    const r = await fetch('/api/settings/rebuild_db', { method: 'POST' })
+    const j = await r.json()
+    if (!r.ok) { message.error('重建失败'); return }
+    message.success(`已扫描项目目录: 新收编项目 ${j.projects} 个 (步骤 ${j.steps} 行 / 产物 ${j.artifacts} 条)`)
+  } finally { rebuilding.value = false }
+}
+
 function addProfile() {
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
                         base_url: '', api_key: '', model: '', enabled: true,
@@ -370,6 +382,12 @@ function extraParamsStr(r: any): string {
           <n-text depth="3" style="font-size:12px; display:block; margin-top:6px">
             修改并「应用设置」后需重启程序才生效；已有数据不会自动搬家，需手动移动后重启。详见「❓ 帮助」页。
           </n-text>
+          <div style="margin-top: 10px">
+            <n-button size="small" :loading="rebuilding" @click="rebuildDb">🔄 从项目目录重建索引</n-button>
+            <n-text depth="3" style="font-size:12px; margin-left:8px">
+              只补缺不覆盖；手动拷进 projects\ 的项目文件夹也会被收编 (拷文件夹 = 搬项目)
+            </n-text>
+          </div>
         </n-card>
 
         <!-- ============ 其余配置 (只读概览, 后续版本开放编辑) ============ -->

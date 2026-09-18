@@ -249,6 +249,8 @@ def write_manifest(uid: str) -> None:
         "status": project.status, "params": json.loads(project.params or "{}"),
         "updated_at": project.updated_at.isoformat(),
         "steps": [{"key": s.step_key, "status": s.status,
+                   # 指纹 = "已最新可跳过"的判断依据, 一并入 manifest (重建索引时恢复)
+                   "fingerprint": s.input_fingerprint or None,
                    "error": s.error_message or None} for s in steps],
         # 每步骤产物清单: file 为相对项目目录路径; 绝对路径 = 外部引用文件
         "artifacts": by_step,
@@ -263,6 +265,69 @@ def write_manifest(uid: str) -> None:
 def get_engine():
     from dubforge.db import get_engine
     return get_engine()
+
+
+def rebuild_from_dirs() -> dict:
+    """扫 projects/*/manifest.json 重建索引 —— 只补缺, 不覆盖已有行 (幂等, 可反复调)。
+
+    目录 + manifest 是事实, DB 是可重建的索引: DB 丢失/损坏后用它恢复;
+    手动拷进来的项目文件夹也会在启动/重建时被收编 (拷文件夹 = 搬项目)。
+    重建不恢复: 进度百分比 (归零, 无碍) 与 Job 运行历史; running 一律判 interrupted。"""
+    counts = {"projects": 0, "steps": 0, "artifacts": 0}
+    root = config.projects_dir()
+    if not root.is_dir():
+        return counts
+    with session() as s:
+        known = set(s.exec(sqlmodel.select(Project.uid)).all())
+    for m in sorted(root.glob("*/manifest.json")):
+        try:
+            data = json.loads(m.read_text(encoding="utf-8"))
+        except Exception:
+            continue                    # 损坏的 manifest 跳过, 不挡其余项目
+        uid = data.get("uid")
+        if not uid or uid in known:
+            continue
+        known.add(uid)
+        source = data.get("source") or {}
+        with session() as s:
+            proj = Project(uid=uid, dir_name=data.get("dir_name") or m.parent.name,
+                           title=data.get("title") or uid,
+                           source_url=source.get("url") or "",
+                           source_kind=source.get("kind") or "link",
+                           status=data.get("status") or "created",
+                           params=json.dumps(data.get("params") or {}, ensure_ascii=False))
+            s.add(proj)
+            s.commit()
+            s.refresh(proj)
+            counts["projects"] += 1
+            # 步骤行: manifest 记载的状态/错误/指纹; 缺的按注册表补 pending
+            have: set[str] = set()
+            for st in data.get("steps") or []:
+                key = st.get("key")
+                if not key or key in have:
+                    continue
+                have.add(key)
+                status = st.get("status") or "pending"
+                if status == "running":     # 崩溃残留, 与 recover() 同语义
+                    status = "interrupted"
+                s.add(StepRun(project_id=proj.id, step_key=key, status=status,
+                              input_fingerprint=st.get("fingerprint") or "",
+                              error_message=st.get("error") or ""))
+                counts["steps"] += 1
+            for step_def in STEPS:
+                if step_def.key not in have:
+                    s.add(StepRun(project_id=proj.id, step_key=step_def.key))
+                    counts["steps"] += 1
+            # 产物行: manifest 的 by_step 清单 (file 为相对路径; 绝对路径 = 外部引用)
+            for step_key, arts in (data.get("artifacts") or {}).items():
+                for a in arts:
+                    s.add(Artifact(project_id=proj.id, step_key=step_key,
+                                   name=a.get("name") or "",
+                                   rel_path=a.get("file") or "",
+                                   size=int(a.get("size") or 0)))
+                    counts["artifacts"] += 1
+            s.commit()
+    return counts
 
 
 def session():

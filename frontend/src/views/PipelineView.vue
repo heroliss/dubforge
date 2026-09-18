@@ -230,25 +230,30 @@ const headerStatus = computed(() => {
           <span class="err" v-if="s.error" :title="s.error.message">⚠ {{ s.error.message }}</span>
           <span class="ops">
             <n-button v-if="s.status === 'running' || s.status === 'queued'"
-                      size="tiny" type="warning" :disabled="s.cancelling"
+                      size="small" type="warning" secondary :disabled="s.cancelling"
                       @click="cancel(s)">{{ s.cancelling ? '⏹ 取消中…' : '⏹ 取消' }}</n-button>
-            <n-button v-else size="tiny" type="primary"
+            <n-button v-else size="small" type="primary" secondary
                       :disabled="blockersOf(s.key).length > 0"
                       :loading="busyKey === s.key"
                       :title="blockersOf(s.key).length
                         ? `上游未就绪: ${blockersOf(s.key).map(b => b.label).join('、')}` : ''"
                       @click="run(s)">▶ 运行该步骤</n-button>
-            <n-tooltip trigger="hover" :delay="0" placement="top">
-              <template #trigger>
-                <n-checkbox size="small" class="chainbox" :checked="isAuto(s.key)"
-                            @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
-              </template>
-              勾选 = 允许自动续跑；「▶▶ 本步及后续」沿连续勾选的步骤推进，遇未勾选即停
-            </n-tooltip>
-            <n-button size="tiny" :disabled="s.status === 'running' || s.status === 'queued'
-                        || blockersOf(s.key).length > 0"
-                      @click="runChain(s)">▶▶ 本步及后续</n-button>
-            <n-button size="tiny" :disabled="s.status === 'running' || s.status === 'queued'
+            <!-- 链组: 勾选框(自动续跑开关)与「本步及后续」是相关的一对, 包成同一个胶囊 -->
+            <span class="chain-group">
+              <n-tooltip trigger="hover" :delay="0" placement="top">
+                <template #trigger>
+                  <n-checkbox size="small" :checked="isAuto(s.key)"
+                              @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
+                </template>
+                勾选 = 允许自动续跑；「▶▶ 本步及后续」沿连续勾选的步骤推进，遇未勾选即停
+              </n-tooltip>
+              <n-button size="small" quaternary type="info"
+                        :disabled="s.status === 'running' || s.status === 'queued'
+                          || blockersOf(s.key).length > 0"
+                        @click="runChain(s)">▶▶ 本步及后续</n-button>
+            </span>
+            <n-button size="small" type="error" secondary
+                      :disabled="s.status === 'running' || s.status === 'queued'
                         || !['done', 'stale', 'failed'].includes(s.status)"
                       @click="rerunDialog(s)">强制重跑</n-button>
           </span>
@@ -307,6 +312,14 @@ const headerStatus = computed(() => {
   font-size: 11.5px; color: #e88080; max-width: 220px;
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
-.ops { display: flex; gap: 6px; }
+.ops { display: flex; align-items: center; gap: 12px; }
+/* 勾选框 + 本步及后续: 同一胶囊内的整体控件 (蓝=链式自动) */
+.chain-group {
+  display: inline-flex; align-items: center; gap: 2px;
+  padding: 2px 5px 2px 10px;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  border-radius: 7px;
+  background: rgba(96, 165, 250, 0.08);
+}
 .pbar { display: flex; align-items: center; gap: 6px; }
 </style>
