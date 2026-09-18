@@ -32,6 +32,15 @@ def test_test_provider_failure_returns_error_dict(isolated_env):
     assert r["request"]["url"].endswith("/chat/completions")
 
 
+def test_status_title_carries_brief_meaning():
+    # 标题只带错误码的简短含义, 不含修复建议
+    from dubforge.backends.llm import _status_title
+    assert _status_title(404) == "LLM 请求失败 HTTP 404 —— 接口路径不存在"
+    assert "限流" in _status_title(429)
+    assert "服务器错误" in _status_title(502)
+    assert _status_title(418).endswith("HTTP 418")   # 无含义的码只显示数字
+
+
 def test_explicit_empty_suggestion_clears_default():
     # 服务器已响应的错误不再自造建议: 传 "" 显式清除类默认
     # (回归: 曾把 StepFailedError 的管线页默认建议泄漏到设置页)

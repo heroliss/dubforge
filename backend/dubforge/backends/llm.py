@@ -59,6 +59,24 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
+def _status_title(status: int) -> str:
+    """非 200 状态码的标题: 状态码 + 简短含义 (只解释码义, 不含修复建议)"""
+    meaning = {
+        400: "请求格式或参数有误",
+        401: "身份验证未通过",
+        403: "已认证但无权访问",
+        404: "接口路径不存在",
+        405: "请求方法不被允许",
+        408: "请求超时",
+        413: "请求体过大",
+        422: "参数校验失败",
+        429: "请求过于频繁 (限流)",
+    }.get(status)
+    if status >= 500:
+        meaning = "服务商服务器错误"
+    return f"LLM 请求失败 HTTP {status}" + (f" —— {meaning}" if meaning else "")
+
+
 def _post(provider: dict, body: dict, log=lambda m: None) -> str:
     """向单个 profile 发请求; 429/5xx/读超时 → 指数退避重试"""
     key = provider.get("api_key", "")
@@ -98,8 +116,8 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
             suggestion="思考型模型响应慢时可调大 llm.timeout, 或换更快模型。")
     if r.status_code == 401:
         # 服务器已响应 → 认证信息以服务端返回为准, 不再自造建议
-        raise ServiceOfflineError("LLM 认证失败 (401)", code="LLM_AUTH",
-                                  suggestion="")
+        raise ServiceOfflineError("LLM 认证失败 (401) —— 身份验证未通过",
+                                  code="LLM_AUTH", suggestion="")
     if r.status_code == 400 and provider.get("params"):
         # 该服务商不认某个专属参数 → 自适应降级: 剥离专属参数重发一次
         log(f"⚠ 「{name}」拒绝了专属参数, 已自动剥离重试 ({r.text[:120]})")
@@ -108,9 +126,9 @@ def _post(provider: dict, body: dict, log=lambda m: None) -> str:
         with _client(provider.get("base_url", "")) as c:
             r = c.post("/chat/completions", json=core, headers=headers)
     if r.status_code != 200:
-        # 服务器有响应 → 错误码与原因以服务端返回为准 (detail), 本地只给状态码标题;
-        # 显式清空 suggestion, 避免泄漏 StepFailedError 的管线页默认建议
-        raise StepFailedError(f"LLM 请求失败 HTTP {r.status_code}",
+        # 服务器有响应 → 错误码与原因以服务端返回为准 (detail), 本地只给
+        # 状态码标题 + 码义; 显式清空 suggestion, 避免泄漏管线页默认建议
+        raise StepFailedError(_status_title(r.status_code),
                               detail=r.text[:800], suggestion="")
     data = r.json()
     return data["choices"][0]["message"]["content"]
