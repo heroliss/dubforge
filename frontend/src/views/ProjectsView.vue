@@ -87,6 +87,72 @@ function remove(p: any) {
   })
 }
 
+// —— 本地文件: 文件夹浏览 + 拖入上传 (服务端即本机, 路径即真实路径) ——
+const showBrowse = ref(false)
+const browsePath = ref('')
+const browseParent = ref<string | null>(null)
+const browseEntries = ref<any[]>([])
+const browseSel = ref<any>(null)
+const uploading = ref('')
+
+async function browseTo(path: string) {
+  const r = await fetch(`/api/files/list?path=${encodeURIComponent(path)}`)
+  const j = await r.json()
+  if (!r.ok) { message.error(j.message || '打开文件夹失败'); return }
+  browsePath.value = j.path
+  browseParent.value = j.parent
+  browseEntries.value = j.entries
+  browseSel.value = null
+  localStorage.setItem('dubforge.browse', j.path)     // 记住浏览位置
+}
+function openBrowse() {
+  showBrowse.value = true
+  void browseTo(localStorage.getItem('dubforge.browse') || '')
+}
+function browseConfirm() {
+  if (!browseSel.value) return
+  form.value.source_kind = 'local'
+  form.value.source_url = browseSel.value.path
+  if (!form.value.title.trim()) {
+    form.value.title = browseSel.value.name.replace(/\.[^.]+$/, '')
+  }
+  showBrowse.value = false
+}
+function fmtSize(n: number) {
+  if (!n) return ''
+  const u = ['B', 'KB', 'MB', 'GB', 'TB']
+  let i = 0
+  let v = n
+  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++ }
+  return `${v.toFixed(v >= 100 || i === 0 ? 0 : 1)} ${u[i]}`
+}
+function onDrop(e: DragEvent) {
+  const files = e.dataTransfer?.files
+  if (!files?.length) { message.warning('未识别到文件'); return }
+  const f = files[0]
+  if (f.size === 0 && f.type === '') {
+    message.warning('似乎拖入的是文件夹 —— 请拖入视频文件')
+    return
+  }
+  form.value.source_kind = 'local'
+  void uploadDropped(f)
+}
+async function uploadDropped(f: File) {
+  uploading.value = f.name
+  try {
+    const fd = new FormData()
+    fd.append('file', f)
+    const r = await fetch('/api/files/upload', { method: 'POST', body: fd })
+    const j = await r.json()
+    if (!r.ok) throw new Error(j.message || '上传失败')
+    form.value.source_url = j.path
+    if (!form.value.title.trim()) form.value.title = j.name.replace(/\.[^.]+$/, '')
+    message.success(`已导入到服务器收件箱: ${j.path}`)
+  } catch (e: any) {
+    message.error(e.message || '上传失败')
+  } finally { uploading.value = '' }
+}
+
 const STATUS_TEXT: Record<string, string> = {
   created: '待处理', processing: '进行中', done: '已完成', failed: '有失败步骤',
 }
@@ -128,28 +194,76 @@ const STATUS_TEXT: Record<string, string> = {
     </n-spin>
 
     <n-modal v-model:show="showNew" preset="card" title="新建项目" style="width: 560px">
-      <n-form label-placement="left" label-width="90">
-        <n-form-item label="来源类型">
-          <n-radio-group v-model:value="form.source_kind">
-            <n-radio value="link">视频链接 (YouTube / B站 等网站)</n-radio>
-            <n-radio value="local">本地视频导入</n-radio>
-          </n-radio-group>
-        </n-form-item>
-        <n-form-item :label="form.source_kind === 'local' ? '本地路径' : '视频链接'">
-          <n-input v-model:value="form.source_url"
-                   :placeholder="form.source_kind === 'local'
-                     ? 'D:\\videos\\my.mp4'
-                     : '支持 YouTube / Bilibili / Twitter 等数千个站点 (由 yt-dlp 支持)'" />
-        </n-form-item>
-        <n-form-item label="标题 (可选)">
-          <n-input v-model:value="form.title"
-                   placeholder="留空自动获取: 优先用视频标题, 其次 文件名/站点+ID" />
-        </n-form-item>
-      </n-form>
+      <div @dragover.prevent @drop.prevent="onDrop">
+        <n-form label-placement="left" label-width="90">
+          <n-form-item label="来源类型">
+            <n-radio-group v-model:value="form.source_kind">
+              <n-radio value="link">视频链接 (YouTube / B站 等网站)</n-radio>
+              <n-radio value="local">本地视频导入</n-radio>
+            </n-radio-group>
+          </n-form-item>
+          <n-form-item :label="form.source_kind === 'local' ? '本地路径' : '视频链接'">
+            <n-input-group>
+              <n-input v-model:value="form.source_url"
+                       :placeholder="form.source_kind === 'local'
+                         ? 'D:\\videos\\my.mp4 · 点「选择文件」或直接拖入视频'
+                         : '支持 YouTube / Bilibili / Twitter 等数千个站点 (由 yt-dlp 支持)'" />
+              <n-button v-if="form.source_kind === 'local'" @click="openBrowse">
+                📂 选择文件
+              </n-button>
+            </n-input-group>
+          </n-form-item>
+          <n-form-item label="标题 (可选)">
+            <n-input v-model:value="form.title"
+                     placeholder="留空自动获取: 优先用视频标题, 其次 文件名/站点+ID" />
+          </n-form-item>
+        </n-form>
+        <n-text v-if="form.source_kind === 'local' || uploading" depth="3"
+                style="font-size:12px; display:block">
+          {{ uploading ? `⬆️ 正在导入 ${uploading} …` : '提示: 也可以把视频文件直接拖进本窗口' }}
+        </n-text>
+      </div>
       <template #footer>
         <n-space justify="end">
           <n-button @click="showNew = false">取消</n-button>
           <n-button type="primary" :loading="creating" @click="create">创建</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-modal :show="showBrowse" preset="card" title="选择视频文件" style="width: 680px">
+      <div style="display:flex;gap:8px;margin-bottom:8px">
+        <n-input v-model:value="browsePath" size="small" placeholder="输入文件夹路径后回车"
+                 @keyup.enter="browseTo(browsePath)" />
+        <n-button size="small" @click="browseTo(browsePath)">跳转</n-button>
+        <n-button size="small" :disabled="!browseParent" @click="browseTo(browseParent || '')">
+          上级
+        </n-button>
+      </div>
+      <div class="browse-list">
+        <div v-for="e in browseEntries" :key="e.path" class="browse-item"
+             :class="{ sel: browseSel?.path === e.path }"
+             @click="e.is_dir ? browseTo(e.path) : (browseSel = e)"
+             @dblclick="!e.is_dir && browseConfirm()">
+          <span>{{ e.is_dir ? '📁' : (e.video ? '🎬' : '📄') }}</span>
+          <span style="flex:1;margin-left:8px;overflow:hidden;text-overflow:ellipsis">
+            {{ e.name }}
+          </span>
+          <n-text v-if="!e.is_dir" depth="3" style="font-size:11px">
+            {{ fmtSize(e.size) }}
+          </n-text>
+        </div>
+        <n-empty v-if="!browseEntries.length" size="small" description="(空文件夹)" />
+      </div>
+      <template #footer>
+        <n-space justify="space-between" align="center">
+          <n-text depth="3" style="font-size:12px">
+            {{ browseSel ? `已选: ${browseSel.name}` : '单击进入文件夹 / 选中文件, 双击文件直接确定' }}
+          </n-text>
+          <n-space>
+            <n-button @click="showBrowse = false">取消</n-button>
+            <n-button type="primary" :disabled="!browseSel" @click="browseConfirm">确定</n-button>
+          </n-space>
         </n-space>
       </template>
     </n-modal>
@@ -166,3 +280,25 @@ const STATUS_TEXT: Record<string, string> = {
     </n-modal>
   </n-layout-content>
 </template>
+
+<style scoped>
+.browse-list {
+  height: 340px;
+  overflow-y: auto;
+  border: 1px solid #2a343f;
+  border-radius: 6px;
+}
+.browse-item {
+  display: flex;
+  align-items: center;
+  padding: 6px 10px;
+  cursor: pointer;
+  gap: 4px;
+}
+.browse-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+.browse-item.sel {
+  background: rgba(24, 160, 88, 0.25);
+}
+</style>
