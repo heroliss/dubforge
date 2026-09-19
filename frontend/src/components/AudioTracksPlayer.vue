@@ -106,10 +106,22 @@ function setAudio(name: string, el: HTMLAudioElement | null) {
   else audioEls.delete(name)
 }
 
-// —— 选中变化 → 视频静音联动 (选原始且视频在 = 解除静音, 其余静音) ——
+// —— 选中变化 → 视频静音联动 + 立即换声源 ——
+// (换台不能只等下次 play 事件: 视频正在播时切单选, 旧轨要停、新轨要从视频
+//  当前时间对齐接着响, 否则叠音/无声)
 watch(selected, (s) => {
   const v = videoEl.value
   if (v) v.muted = !(hasVideo.value && s === rawName.value)
+  for (const a of audioEls.values()) a.pause()
+  const act = audiosFor(s)
+  if (v) {
+    for (const a of act) {
+      a.playbackRate = v.playbackRate
+      a.currentTime = Math.min(v.currentTime, a.duration || v.currentTime)
+    }
+    if (!v.paused) for (const a of act) void a.play().catch(() => {})
+  }
+  draw()
 })
 // 原生控件的小喇叭 → 同步回单选 (双向一致, 防止叠加两层声音)
 function onVideoVolumeChange() {
