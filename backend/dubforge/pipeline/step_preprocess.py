@@ -34,6 +34,27 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     os.replace(tmp, out_wav)
 
 
+def _demucs_callback(ctx, total_sec: float, shifts: int):
+    """demucs 分段回调 → 进度上报 + 段间暂停/取消检查点。
+
+    demucs (4.1.0) 的 apply_model 在 GPU 下用 DummyPoolExecutor 同步逐段执行,
+    每段计算前后各回调一次 ({state: start|end, segment_offset, shift_idx, ...});
+    回调在我们自己的线程里运行 —— 在回调里阻塞即暂停, 抛异常即取消
+    (apply_model 捕获后 cancel_futures 终止剩余分段并向上传播)。
+    单段是一次前向推理, 原子不可分 —— 检查点粒度 = 分段长度 (htdemucs 每段数秒)。"""
+    def cb(d: dict) -> None:
+        if d.get("state") != "end":
+            return
+        ctx.check_pause()          # 暂停: 段间阻塞 (显存保持占用, 不再计算)
+        ctx.check_cancel()         # 取消: 抛出后 demucs 终止剩余分段
+        passes = max(1, shifts + 1)
+        offset = float(d.get("segment_offset") or 0)
+        shift_idx = int(d.get("shift_idx") or 0)
+        frac = (shift_idx + min(1.0, offset / max(total_sec, 1e-6))) / passes
+        ctx.report_progress(30 + frac * 55)     # 30 → 85 区间
+    return cb
+
+
 def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
     """htdemucs 分离人声/伴奏; 输入须为 44.1kHz 立体声 (模型训练规格)"""
     from dubforge import config
@@ -60,6 +81,13 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
     model.eval()
 
     data, sr = sf.read(str(src_wav), dtype="float32", always_2d=True)
+    total_sec = len(data) / sr
+    seg = float(getattr(model, "segment", 0) or 0)
+    if seg > 0:
+        import math
+        n_seg = math.ceil(total_sec / (seg * (1 - overlap)))
+        ctx.log(f"整轨 {total_sec:.0f}s ≈ {n_seg} 段 × {seg:.0f}s, "
+                f"共 {n_seg * (shifts + 1)} 次前向 (暂停/取消在段间生效)")
     wav = torch.from_numpy(data.T)          # [channels, samples]
     if wav.shape[0] == 1:
         wav = wav.repeat(2, 1)              # htdemucs 要求立体声输入, 单声道复制
@@ -69,10 +97,16 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
     ref = wav.mean(0)
     wav = (wav - ref.mean()) / (ref.std() + 1e-8)
 
-    with th.no_grad():
-        sources = apply_model(model, wav[None], device=device,
-                              split=True, overlap=overlap, shifts=shifts,
-                              progress=False)[0]
+    try:
+        with th.no_grad():
+            sources = apply_model(model, wav[None], device=device,
+                                  split=True, overlap=overlap, shifts=shifts,
+                                  progress=False,
+                                  callback=_demucs_callback(ctx, total_sec, shifts))[0]
+    except BaseException:
+        # 取消/暂停异常: 终止剩余分段后清掉本曲工作目录再向上传播
+        shutil.rmtree(tmp_out, ignore_errors=True)
+        raise
     # htdemucs stems 顺序: drums, bass, other, vocals
     vocals = sources[-1]
     background = sources[:-1].sum(0)
@@ -128,8 +162,7 @@ def run(ctx) -> None:
                                 detail=err[-1500:])
         try:
             ctx.check_cancel()
-            ctx.log("分离引擎在进程内计算, 取消/暂停将在本曲结束后生效"
-                    " (强制结束可立即标记, 后台结果自动丢弃)")
+            ctx.log("分段分离中 —— 进度逐段上报; 暂停/取消在段间检查点生效 (数秒粒度)")
             vocal, bg = _run_demucs(ctx, src441, audio_dir)
         finally:
             src441.unlink(missing_ok=True)

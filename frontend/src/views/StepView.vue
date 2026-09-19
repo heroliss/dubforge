@@ -385,7 +385,7 @@ async function loadText(name: string | null) {
           <n-button size="small" quaternary title="在文件浏览器中打开本步骤目录"
                     @click="revealStep">📁</n-button>
           <n-button v-if="running" size="small" secondary :disabled="step.cancelling"
-                    :title="pausing ? '继续执行' : '在当前单元结束后暂停 (如 demucs 单曲计算中会等它算完)'"
+                    :title="pausing ? '继续执行' : '在下一个检查点暂停 (循环步骤在句/块间, 分离在分段间)'"
                     @click="setPause(!pausing)">{{ pausing ? '▶ 继续' : '⏸ 暂停' }}</n-button>
           <n-button v-if="running" type="warning" :disabled="step.cancelling"
                     @click="stopDialog">⏹ {{ step.cancelling ? '取消中…' : '停止' }}</n-button>
