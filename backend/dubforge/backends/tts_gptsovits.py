@@ -11,6 +11,7 @@ from pathlib import Path
 import httpx
 
 from dubforge import config
+from dubforge.utils.fs import atomic_replace
 from dubforge.errors import ServiceOfflineError
 
 
@@ -56,6 +57,6 @@ def synth(url: str, text: str, out_path: Path, lang: str = "zh",
                     "-f", "wav", str(out_path.with_suffix(".norm"))],
                    check=True, capture_output=True)
     import os
-    os.replace(out_path.with_suffix(".norm"), out_path)
+    atomic_replace(out_path.with_suffix(".norm"), out_path)
     Path(tmp).unlink(missing_ok=True)
     return out_path

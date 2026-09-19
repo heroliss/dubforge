@@ -143,24 +143,26 @@ def test_sweep_temp_files(make_project, isolated_env, pdir):
     keep = d / "artifacts" / "assemble" / "assemble_result.json"
     keep.parent.mkdir(parents=True, exist_ok=True)
     keep.write_text("{}", encoding="utf-8")
-    temps = [d / "media" / "video.mp4.part",
-             d / "audio" / ".tmp_src44100.wav",
-             d / "artifacts" / "assemble" / "peaks_x.json.tmp",
-             d / "media" / "video.webm.ytdl"]
-    tmpdir = d / "audio" / ".demucs_tmp"
+    temps = [d / "output" / "final.mp4.part",
+             d / "output" / ".tmp_final.mp4",
+             d / "artifacts" / "assemble" / "peaks_x.json.tmp"]
+    tmpdir = d / "artifacts" / "assemble" / ".demucs_tmp"
     tmpdir.mkdir(parents=True)
-    for t in temps:
+    (tmpdir / "t.wav").write_bytes(b"x")
+    others = [d / "media" / "video.mp4.part",        # download 的地盘: 不扫
+              d / "audio" / ".tmp_src44100.wav"]     # preprocess 的地盘: 不扫
+    for t in temps + others:
         t.parent.mkdir(parents=True, exist_ok=True)
         t.write_bytes(b"x")
 
-    removed = _sweep_temp_files(d)
-    names = set(removed)
+    removed = _sweep_temp_files(d, "assemble")
     for t in temps:
         assert not t.exists(), f"未清理: {t.name}"
-        assert str(t.relative_to(d)) in names
     assert not tmpdir.exists()
+    for o in others:
+        assert o.exists(), f"不该扫别人的地盘: {o}"
     assert keep.exists(), "正式产物不应被清扫"
-    assert _sweep_temp_files(d) == []                  # 幂等
+    assert _sweep_temp_files(d, "assemble") == []      # 幂等
 
 
 def test_sweep_runs_after_cancel(make_project, isolated_env, monkeypatch, pdir):

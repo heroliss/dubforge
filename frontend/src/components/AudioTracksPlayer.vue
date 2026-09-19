@@ -204,6 +204,15 @@ function onAudioError(name: string) {
   trackErr.value = new Set([...trackErr.value, name])
 }
 
+// 元数据到达: 用真实宽高比替换 16/9 兜底, 元素盒不再信箱式留黑边
+function onMeta(e: Event) {
+  const v = e.target as HTMLVideoElement
+  if (v.videoWidth && v.videoHeight) {
+    v.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`
+  }
+  draw()
+}
+
 // 布局/尺寸变化 (视频元数据加载后高度变化、窗口缩放) → 波形重绘,
 // 否则初次绘制可能停留在布局未定的小尺寸上
 function onWinResize() { draw() }
@@ -297,14 +306,13 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <n-grid :cols="5" :x-gap="16">
-    <n-gi :span="3">
-      <video v-if="hasVideo" ref="videoEl" :src="videoUrl || undefined" muted controls
-             preload="metadata"
-             style="width: 100%; max-height: 340px; border-radius: 8px; background: #000"
+  <n-grid cols="1 m:5" :x-gap="16" responsive="screen">
+    <n-gi span="1 m:3">
+      <video v-if="hasVideo" ref="videoEl" class="vid" :src="videoUrl || undefined"
+             muted controls preload="metadata"
              @play="onVideoPlay" @pause="onVideoPause" @ended="onVideoEnded"
              @seeked="onVideoSeeked" @ratechange="onVideoRate"
-             @loadedmetadata="draw"
+             @loadedmetadata="onMeta"
              @volumechange="onVideoVolumeChange" @error="videoErr = true" />
       <template v-else>
         <n-empty v-if="videoUrl && videoErr" size="small"
@@ -314,7 +322,7 @@ onBeforeUnmount(() => {
         </n-button>
       </template>
     </n-gi>
-    <n-gi :span="2">
+    <n-gi span="1 m:2">
       <div ref="rightEl" class="right">
         <n-radio-group :value="selected" size="small"
                        @update:value="(v: string) => (selected = v)">
@@ -350,6 +358,19 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 视频始终按自身宽高比呈现, 由最大高度/最大宽度封顶 (绝不信箱式拉伸出黑边);
+   窄屏 (竖排模式) 下同样适用 */
+.vid {
+  display: block;
+  margin: 0 auto;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 340px;
+  aspect-ratio: 16 / 9;              /* 元数据到达后替换为真实比例 */
+  border-radius: 8px;
+  background: #000;
+}
 /* 右列纵向撑满: 行高由视频 (宽高比+最大高度) 决定, 音轨行均分剩余高度。
    canvas 固有尺寸 300x150 会污染 flex 基准 —— 用 basis 0 + height 0 消掉 */
 .right { display: flex; flex-direction: column; height: 100%; min-height: 0; }

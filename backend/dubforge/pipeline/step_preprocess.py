@@ -18,6 +18,7 @@ import shutil
 from pathlib import Path
 
 from dubforge.errors import DubForgeError
+from dubforge.utils.fs import atomic_replace
 
 
 def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
@@ -31,7 +32,7 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     if rc != 0:
         raise DubForgeError("音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
                             detail=err[-1500:])
-    os.replace(tmp, out_wav)
+    atomic_replace(tmp, out_wav)
 
 
 def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int):
@@ -128,8 +129,8 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
 
     final_v = out_dir / "vocal.wav"
     final_b = out_dir / "background.wav"
-    os.replace(vocal_path, final_v)
-    os.replace(bg_path, final_b)
+    atomic_replace(vocal_path, final_v)
+    atomic_replace(bg_path, final_b)
     shutil.rmtree(tmp_out, ignore_errors=True)
     return final_v, final_b
 

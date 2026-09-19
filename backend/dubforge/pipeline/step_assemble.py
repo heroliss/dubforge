@@ -17,6 +17,7 @@ import subprocess
 from pathlib import Path
 
 from dubforge.errors import DubForgeError
+from dubforge.utils.fs import atomic_replace
 from dubforge.utils import audio as au
 
 
@@ -58,7 +59,7 @@ def _mix_timeline(ctx, pdir: Path, total: float) -> Path:
     tmp = out.with_suffix(".wav.tmp")
     # .tmp 后缀无法推断格式, 显式指定 WAV (与 ffmpeg 原子写同理)
     sf.write(str(tmp), mixed, au.SR, subtype="PCM_16", format="WAV")
-    os.replace(tmp, out)
+    atomic_replace(tmp, out)
 
     # EBU R128 响度归一 (单遍, 足够配音场景)
     if ctx.cfg("assemble.loudnorm", True):
@@ -70,7 +71,7 @@ def _mix_timeline(ctx, pdir: Path, total: float) -> Path:
         if rc != 0:
             raise DubForgeError("响度归一失败 (ffmpeg)", code="FFMPEG_FAIL",
                                 detail=err[-1500:])
-        os.replace(norm, out)
+        atomic_replace(norm, out)
         ctx.log("响度归一 (EBU R128, I=-16) 完成")
     ctx.register_file("dub_full.wav", out, "audio")
     return out
@@ -133,7 +134,7 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path) -> None:
         tmp_out.unlink(missing_ok=True)
         raise DubForgeError("成片封装失败 (ffmpeg)", code="FFMPEG_FAIL",
                             detail=err[-1500:])
-    os.replace((cwd / tmp_out.name) if cwd else tmp_out, out)
+    atomic_replace((cwd / tmp_out.name) if cwd else tmp_out, out)
 
 
 def run(ctx) -> None:

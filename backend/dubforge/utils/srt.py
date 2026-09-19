@@ -2,6 +2,7 @@
 """SRT 读写工具 (无第三方依赖; 手写 30 行, 少一个依赖)"""
 import re
 from dataclasses import dataclass
+from dubforge.utils.fs import atomic_replace
 from pathlib import Path
 
 
@@ -33,7 +34,7 @@ def write_srt(lines: list[SubLine], path: Path) -> None:
               for i, l in enumerate(lines, 1)]
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(blocks), encoding="utf-8")
-    Path(tmp).replace(path)
+    atomic_replace(tmp, path)
 
 
 def parse_srt(path: Path) -> list[SubLine]:
@@ -62,4 +63,4 @@ def write_bilingual(src_lines: list[SubLine], dst_lines: list[SubLine],
         blocks.append(f"{i}\n{_fmt_ts(a.start)} --> {_fmt_ts(a.end)}\n{top}\n{bottom}\n")
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text("\n".join(blocks), encoding="utf-8")
-    Path(tmp).replace(path)
+    atomic_replace(tmp, path)

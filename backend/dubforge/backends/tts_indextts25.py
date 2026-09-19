@@ -15,6 +15,7 @@ from pathlib import Path
 import httpx
 
 from dubforge import config
+from dubforge.utils.fs import atomic_replace
 from dubforge.errors import ServiceOfflineError
 
 # WebUI 枚举 (中英双语界面兼容)
@@ -108,5 +109,5 @@ def synth(url: str, text: str, out_path: Path, lang: str,
     subprocess.run(["ffmpeg", "-y", "-i", str(out), "-ar", "32000", "-ac", "1",
                     "-f", "wav", str(tmp)], check=True, capture_output=True)
     import os
-    os.replace(tmp, out_path)
+    atomic_replace(tmp, out_path)
     return out_path

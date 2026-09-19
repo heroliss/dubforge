@@ -95,6 +95,13 @@ function fmtT(ts?: number): string {
   const p = (n: number) => n.toString().padStart(2, '0')
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
 }
+// 元数据到达: 用真实宽高比替换 16/9 兜底 —— 视频盒与内容比例一致, 不出黑边
+function onMeta(e: Event) {
+  const v = e.target as HTMLVideoElement
+  if (v.videoWidth && v.videoHeight) {
+    v.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`
+  }
+}
 async function reveal() {
   const r = await fetch(`/api/projects/${uid}/reveal`, { method: 'POST' })
   if (!r.ok) message.error('打开文件管理器失败')
@@ -261,8 +268,8 @@ const headerStatus = computed(() => {
       </template>
       <n-grid :cols="5" :x-gap="16" v-if="media.found">
         <n-gi :span="3">
-          <video v-if="videoSrc" :src="videoSrc" controls preload="metadata"
-                 style="width: 100%; max-height: 440px; border-radius: 8px; background: #000" />
+          <video v-if="videoSrc" class="vid" :src="videoSrc" controls preload="metadata"
+                 @loadedmetadata="onMeta" />
         </n-gi>
         <n-gi :span="2">
           <MediaInfo :media="media" />
@@ -382,6 +389,18 @@ const headerStatus = computed(() => {
 </template>
 
 <style scoped>
+/* 视频按自身宽高比呈现, 最大高度封顶 (绝不信箱式拉伸出黑边) */
+.vid {
+  display: block;
+  margin: 0 auto;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 440px;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  background: #000;
+}
 .rows { display: flex; flex-direction: column; }
 .row {
   display: flex; align-items: center; gap: 8px;

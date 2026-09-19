@@ -27,6 +27,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from dubforge import config
+from dubforge.utils.fs import atomic_replace
 from dubforge.domain import crud
 from dubforge.domain.models import Artifact, Job, Project, StepRun
 from dubforge.errors import DubForgeError
@@ -46,24 +47,36 @@ _TEMP_FILE_PATTERNS = ("*.tmp", "*.part", "*.ytdl", ".tmp_*")
 _TEMP_DIR_NAMES = (".demucs_tmp",)
 
 
-def _sweep_temp_files(pdir: Path, log=None) -> list[str]:
-    """删除项目目录下的过程临时文件, 返回清理清单 (不存在则静默通过)"""
+def _sweep_temp_files(pdir: Path, step_key: str, log=None) -> list[str]:
+    """清扫本步骤目录下的过程临时文件, 返回清理清单 (不存在则静默通过)。
+
+    只扫本步骤自己的地盘 (主产物目录 + artifacts/<key>) —— 项目级清扫会与
+    自动续跑中的下游步骤赛跑: 对方刚写入的 .tmp 会被误删, os.replace 直接
+    FileNotFoundError (真实事故)。其他步骤的残留由其自己下次运行的收尾清扫处理。"""
     removed: list[str] = []
     if not pdir.exists():
         return removed
-    for pat in _TEMP_FILE_PATTERNS:
-        for f in pdir.rglob(pat):
-            if f.is_file():
-                try:
-                    f.unlink()
-                    removed.append(str(f.relative_to(pdir)))
-                except OSError:
-                    pass
-    for name in _TEMP_DIR_NAMES:
-        for d in pdir.rglob(name):
-            if d.is_dir():
-                shutil.rmtree(d, ignore_errors=True)
-                removed.append(str(d.relative_to(pdir)) + "/")
+    step_def = STEP_MAP.get(step_key)
+    roots = []
+    if step_def and step_def.dir:
+        roots.append(pdir / step_def.dir)
+    roots.append(pdir / "artifacts" / step_key)
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for pat in _TEMP_FILE_PATTERNS:
+            for f in root.rglob(pat):
+                if f.is_file():
+                    try:
+                        f.unlink()
+                        removed.append(str(f.relative_to(pdir)))
+                    except OSError:
+                        pass
+        for name in _TEMP_DIR_NAMES:
+            for d in root.rglob(name):
+                if d.is_dir():
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed.append(str(d.relative_to(pdir)) + "/")
     if removed and log:
         head = ", ".join(removed[:8])
         log(f"🧹 已清理临时文件 {len(removed)} 个: {head}{'…' if len(removed) > 8 else ''}")
@@ -189,7 +202,7 @@ class StepContext:
         final = self.artifact_dir() / name
         tmp = final.with_suffix(final.suffix + ".tmp")
         tmp.write_bytes(data)
-        os.replace(tmp, final)
+        atomic_replace(tmp, final)
         crud.add_artifact(self.project.id, self.step_key, kind, name,
                           final, str(final.relative_to(self.pdir)))
         return final
@@ -516,9 +529,9 @@ class Runner:
         finally:
             # 收尾兜底: 暂停标志必须清掉, 否则后续运行会在第一个暂停点卡死
             pause.clear()
-            # 半成品清扫: 原子写保证正式产物完整, 这里清的是过程临时文件
+            # 半成品清扫: 只扫本步骤目录 (项目级会误删续跑中下游的 .tmp)
             try:
-                _sweep_temp_files(pdir, log=ctx.log)
+                _sweep_temp_files(pdir, step_key, log=ctx.log)
             except Exception:
                 logging.exception("临时文件清扫失败: %s", pdir)
             job.finished_at = datetime.datetime.now(datetime.timezone.utc)

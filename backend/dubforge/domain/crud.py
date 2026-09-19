@@ -17,6 +17,7 @@ import sqlmodel
 from dubforge import config
 from dubforge.domain.models import Artifact, Job, Project, StepRun
 from dubforge.pipeline.registry import STEPS
+from dubforge.utils.fs import atomic_replace
 
 
 def new_uid() -> str:
@@ -274,7 +275,7 @@ def write_manifest(uid: str) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
     import os
-    os.replace(tmp, p)
+    atomic_replace(tmp, p)
 
 
 def get_engine():

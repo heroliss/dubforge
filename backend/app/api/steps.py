@@ -9,6 +9,7 @@ from fastapi.responses import FileResponse, Response
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.registry import STEP_MAP
+from dubforge.utils.fs import atomic_replace
 from dubforge.runner import _cfg_snapshot, compute_fingerprint, runner
 
 router = APIRouter(prefix="/api/projects/{uid}/steps", tags=["steps"])
@@ -199,12 +200,13 @@ def artifact_peaks(uid: str, key: str, name: str, buckets: int = 900):
     if p.suffix.lower() != ".wav":
         raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
     cache = crud.project_dir(uid) / "artifacts" / key / f"peaks_{name}.json"
-    if _cache_valid(cache, [p]):
+    if _cache_valid(cache, [p], buckets):
         data = _json.loads(cache.read_text(encoding="utf-8"))
         data.pop("src_sizes", None)
+        data.pop("buckets", None)
         return data
     data = _bucketize(_decode_4k(p), buckets)
-    _write_cache(cache, [p], data)
+    _write_cache(cache, [p], data, buckets)
     return data
 
 
@@ -221,40 +223,46 @@ def artifact_peaks_mixed(uid: str, key: str, name: str, other: str,
         raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
     cache = (crud.project_dir(uid) / "artifacts" / key
              / f"peaks_mixed_{name}_{other}.json")
-    if _cache_valid(cache, [p1, p2]):
+    if _cache_valid(cache, [p1, p2], buckets):
         data = _json.loads(cache.read_text(encoding="utf-8"))
         data.pop("src_sizes", None)
+        data.pop("buckets", None)
         return data
     import numpy as np
-    a, b = _decode_4k(p1), _decode_4k(p2)
+    # 两轨解码相互独立, 并行跑 (输出与串行逐字节一致, 纯提速)
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        fa, fb = ex.submit(_decode_4k, p1), ex.submit(_decode_4k, p2)
+        a, b = fa.result(), fb.result()
     n = min(len(a), len(b))
     mixed = np.clip(a[:n].astype(np.int32) + b[:n].astype(np.int32),
                     -32768, 32767).astype(np.int16)
     data = _bucketize(mixed, buckets)
-    _write_cache(cache, [p1, p2], data)
+    _write_cache(cache, [p1, p2], data, buckets)
     return data
 
 
-def _cache_valid(cache: Path, files: list) -> bool:
+def _cache_valid(cache: Path, files: list, buckets: int) -> bool:
     if not cache.exists():
         return False
     try:
         import json as _json
         data = _json.loads(cache.read_text(encoding="utf-8"))
-        sizes = data.get("src_sizes")
-        return sizes == [f.stat().st_size for f in files]
+        return (data.get("src_sizes") == [f.stat().st_size for f in files]
+                and data.get("buckets") == buckets)
     except Exception:
         return False
 
 
-def _write_cache(cache: Path, files: list, data: dict) -> None:
+def _write_cache(cache: Path, files: list, data: dict, buckets: int) -> None:
     import json as _json
     import os
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
-        payload = {**data, "src_sizes": [f.stat().st_size for f in files]}
+        payload = {**data, "src_sizes": [f.stat().st_size for f in files],
+                   "buckets": buckets}
         tmp = cache.with_suffix(".json.tmp")
         tmp.write_text(_json.dumps(payload), encoding="utf-8")
-        os.replace(tmp, cache)
+        atomic_replace(tmp, cache)
     except Exception:
         pass                          # 缓存写失败不影响返回

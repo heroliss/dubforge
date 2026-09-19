@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from dubforge.utils.fs import atomic_replace
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
@@ -179,7 +180,7 @@ def set_key(key: str, value: Any) -> None:
     tmp = cp.with_suffix(".yaml.tmp")
     with open(tmp, "w", encoding="utf-8") as f:
         yaml.safe_dump(user, f, allow_unicode=True, sort_keys=False)
-    os.replace(tmp, cp)          # 原子替换, 避免写一半损坏
+    atomic_replace(tmp, cp)       # 原子替换, 避免写一半损坏
 
 
 def projects_dir() -> Path:

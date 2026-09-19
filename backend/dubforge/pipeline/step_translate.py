@@ -23,6 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import pandas as pd
 
 from dubforge.backends import llm
+from dubforge.utils.fs import atomic_replace
 from dubforge.errors import StepFailedError
 
 CHUNK_CHARS = 600
@@ -158,7 +159,7 @@ def _store(ctx, key: str, data) -> None:
     tmp = p.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
     import os
-    os.replace(tmp, p)
+    atomic_replace(tmp, p)
 
 
 # ==================== 提示词 ====================

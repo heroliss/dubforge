@@ -135,6 +135,14 @@ async function revealStep() {
   if (!r.ok) message.error('打开目录失败')
 }
 
+// 元数据到达: 用真实宽高比替换 16/9 兜底 —— 视频盒与内容比例一致, 不出黑边
+function onMeta(e: Event) {
+  const v = e.target as HTMLVideoElement
+  if (v.videoWidth && v.videoHeight) {
+    v.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`
+  }
+}
+
 async function revealArt(stepKey: string, name: string) {
   const r = await fetch(
     `/api/projects/${uid}/steps/${stepKey}/artifacts/${encodeURIComponent(name)}/reveal`,
@@ -436,8 +444,8 @@ async function loadText(name: string | null) {
         <template v-if="key === 'download' && media.found">
           <n-grid :cols="2" :x-gap="16">
             <n-gi>
-              <video v-if="preview.url" :src="preview.url" controls preload="metadata"
-                     style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
+              <video v-if="preview.url" class="vid" :src="preview.url" controls
+                     preload="metadata" @loadedmetadata="onMeta" />
             </n-gi>
             <n-gi>
               <MediaInfo :media="media" />
@@ -446,9 +454,9 @@ async function loadText(name: string | null) {
         </template>
         <AudioTracksPlayer v-else-if="preview.kind === 'tracks'"
                            :tracks="preview.audios" :video-url="preview.videoUrl" />
-        <video v-else-if="preview.kind === 'video' && preview.url" :src="preview.url"
-               controls preload="metadata"
-               style="width: 100%; max-height: 340px; border-radius: 8px; background: #000" />
+        <video v-else-if="preview.kind === 'video' && preview.url" class="vid"
+               :src="preview.url" controls preload="metadata"
+               @loadedmetadata="onMeta" />
         <template v-if="preview.kind === 'audio'">
           <div v-for="a in preview.audios ?? []" :key="a.name" class="audio-row">
             <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
@@ -580,6 +588,18 @@ async function loadText(name: string | null) {
 </template>
 
 <style scoped>
+/* 视频按自身宽高比呈现, 最大高度封顶 (绝不信箱式拉伸出黑边) */
+.vid {
+  display: block;
+  margin: 0 auto;
+  width: auto;
+  height: auto;
+  max-width: 100%;
+  max-height: 340px;
+  aspect-ratio: 16 / 9;
+  border-radius: 8px;
+  background: #000;
+}
 .logbox {
   background: #0d1117;
   border: 1px solid #2a343f;
