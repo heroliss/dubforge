@@ -75,13 +75,15 @@ class StepContext:
 
     def __init__(self, project: Project, step_key: str, pdir: Path,
                  log_file: Path, cancel_event: threading.Event,
-                 pause_event: threading.Event | None = None):
+                 pause_event: threading.Event | None = None,
+                 force: bool = False):
         self.project = project
         self.step_key = step_key
         self.pdir = pdir
         self._log_file = log_file
         self._cancel = cancel_event
         self._pause = pause_event or threading.Event()
+        self.force = bool(force)             # 本次是否强制重跑 (步骤实现可据此决定真重做)
         self._log_lock = threading.Lock()   # 分块并行时多线程写同一日志
         self._subprocs: set = set()          # 本步骤启动的子进程 (取消/强制结束时终止)
         self._subproc_lock = threading.Lock()
@@ -415,7 +417,7 @@ class Runner:
 
         job = crud.add_job(project.id, step_key, str(log_file))
         fut = self._pool.submit(self._execute, project, step_key, step_def, job,
-                                log_file, cancel, pause, fp)
+                                log_file, cancel, pause, fp, force)
         # future 异常必须被观测, 否则线程池静默吞错 (排查问题时是盲区)
         fut.add_done_callback(
             lambda f: f.exception() and logging.error(
@@ -426,10 +428,12 @@ class Runner:
 
     def _execute(self, project: Project, step_key: str, step_def, job: Job,
                  log_file: Path, cancel: threading.Event,
-                 pause: threading.Event, fingerprint: str) -> None:
+                 pause: threading.Event, fingerprint: str,
+                 force: bool = False) -> None:
         from dubforge.pipeline.steps import get_runner
         pdir = crud.project_dir(project.uid)
-        ctx = StepContext(project, step_key, pdir, log_file, cancel, pause)
+        ctx = StepContext(project, step_key, pdir, log_file, cancel, pause,
+                          force=force)
         k = (project.id, step_key)
 
         # 取 DB 里的最新 step 行 (start_step 读到的可能是旧快照);

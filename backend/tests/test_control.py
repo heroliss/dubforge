@@ -260,3 +260,34 @@ def test_cancelling_flag_only_after_cancel(make_project, isolated_env, monkeypat
         release.set()
     wait_status(uid, "assemble", {"failed"}, timeout=8)
     assert runner.is_cancelling(crud.get_project(uid).id, "assemble") is False
+
+
+def test_force_download_really_redownloads(make_project, isolated_env, monkeypatch, pdir):
+    """回归: 强制重跑获取视频必须真重下 —— 清掉旧视频文件 + 重新调用 yt-dlp
+    (旧行为: media/ 有文件就跳过, 改分辨率重跑等于没跑)"""
+    from dubforge.pipeline import step_download
+    uid = make_project()                       # source_kind 默认 youtube
+    media = pdir(uid) / "media"
+    media.mkdir(parents=True, exist_ok=True)
+    (media / "video.mp4").write_bytes(b"old-video")
+
+    calls = []
+
+    def fake_ytdlp(ctx, url, out_template):
+        calls.append((url, getattr(ctx, "force", False)))
+        (media / "video.mp4").write_bytes(b"new-video")
+        return {"title": "t", "filepath": str(media / "video.mp4")}
+
+    monkeypatch.setattr(step_download, "_run_ytdlp", fake_ytdlp)
+    runner = _runner()
+    runner.start_step(uid, "download", force=True)
+    wait_status(uid, "download", {"done"})
+    assert calls, "强制重跑应重新调用 yt-dlp"
+    assert calls[0][1] is True                 # ctx.force 传递到位 (绕过归档)
+    assert (media / "video.mp4").read_bytes() == b"new-video"
+
+    # 非强制仍复用: 不再调 yt-dlp
+    calls.clear()
+    runner.start_step(uid, "download", force=True)   # force 但已无 _RUNNERS patch? 仍在
+    wait_status(uid, "download", {"done"})
+    assert len(calls) == 1                     # force 依旧重下 (语义一致)

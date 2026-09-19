@@ -29,24 +29,26 @@ def _ydl_format(resolution: int) -> str:
             f"best[height<={resolution}]/best")
 
 
-def _ytdlp_cmd(ctx, url: str, out_template: str) -> list[str]:
+def _ytdlp_cmd(ctx, url: str, out_template: str, force: bool = False) -> list[str]:
     """yt-dlp 子进程命令行 (与库方式同参: 归档/cookies/代理/格式)。
-    子进程化是为了可即时终止 —— 下载是最长的步骤, 取消必须马上停。"""
+    子进程化是为了可即时终止 —— 下载是最长的步骤, 取消必须马上停。
+    force=True 时不带 --download-archive: 归档里有该视频 ID 也会照样重下。"""
     import sys
     dcfg = ctx.cfg("download") or {}
-    archive = config.data_root() / "download_archive.txt"
-    archive.touch(exist_ok=True)
     cmd = [
         sys.executable, "-m", "yt_dlp",
         "-f", _ydl_format(int(dcfg.get("resolution", 1080))),
         "-o", out_template,
         "--merge-output-format", "mp4",
         "--no-playlist", "--newline", "--progress", "--retries", "3",
-        "--download-archive", str(archive),   # 全局去重: 同 ID 不重下
         "--print", "after_move:%(filepath)s",
         "--print", "after_move:%(title)s",
         url,
     ]
+    if not force:
+        archive = config.data_root() / "download_archive.txt"
+        archive.touch(exist_ok=True)
+        cmd[9:9] = ["--download-archive", str(archive)]   # 全局去重: 同 ID 不重下
     cookies = dcfg.get("cookies_path")
     if cookies and Path(cookies).exists():
         cmd += ["--cookies", str(cookies)]
@@ -61,7 +63,7 @@ _VIDEO_EXT = {".mp4", ".mkv", ".webm", ".mov", ".avi", ".flv", ".ts", ".m4v"}
 
 def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
     """子进程方式调 yt-dlp; 取消即终止进程树; 返回 {title, filepath}"""
-    cmd = _ytdlp_cmd(ctx, url, out_template)
+    cmd = _ytdlp_cmd(ctx, url, out_template, force=getattr(ctx, "force", False))
     ctx.log(f"yt-dlp: {url}")
     last_pct = -1
 
@@ -99,11 +101,20 @@ def _find_downloaded(media_dir: Path) -> Path | None:
 def run(ctx) -> None:
     media = ctx.pdir / "media"
     media.mkdir(exist_ok=True)
+    kind = ctx.project.source_kind
 
-    # 幂等: 已有产物且文件在 → 跳过获取。
-    # 注意 force 语义: 执行器会先删"已登记产物行", 但获取本身没有过期概念
-    # (本地文件还在/链接已在归档), 文件只要在 media/ 就直接复用。
-    existing = _find_downloaded(media)
+    # 幂等: 已有产物且文件在 → 跳过获取。强制重跑是唯一例外 ——
+    # 参数 (如分辨率) 改了就该真重下: 清掉旧视频文件 + 绕过全局下载归档。
+    # (本地导入不受影响, 用户的原文件任何情况下都不删)
+    existing = None
+    if getattr(ctx, "force", False) and kind in ("youtube", "link"):
+        old = [f for f in media.glob("video.*")]
+        for f in old:
+            f.unlink(missing_ok=True)
+        ctx.log(f"强制重跑: 清掉旧视频 {len(old)} 个文件, 按当前参数重新下载")
+    else:
+        existing = _find_downloaded(media)
+
     if existing:
         ctx.log(f"已存在视频: {existing.name}, 跳过获取")
         ctx.register_file("video.mp4", existing, "video")
@@ -116,7 +127,6 @@ def run(ctx) -> None:
                 pass
         return
 
-    kind = ctx.project.source_kind
     if kind == "local":
         src = resolve_source(ctx.project, ctx.pdir)
         if not src:

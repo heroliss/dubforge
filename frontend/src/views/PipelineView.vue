@@ -196,11 +196,13 @@ async function setPause(step: any, p: boolean) {
 function rerunDialog(step: any) {
   const downstream = nav.steps.slice(nav.steps.findIndex(s => s.key === step.key) + 1)
     .filter((s: any) => s.status === 'done' || s.status === 'stale')
+  const extra = step.key === 'download'
+    ? '将删除已下载的视频并按当前参数真正重新下载（绕过下载去重归档）。' : ''
   dialog.warning({
     title: `强制重跑「${step.label}」`,
-    content: downstream.length
-      ? `将删除本步产物并重新执行；下游 ${downstream.length} 个步骤将被标记为「已过期」（需要重跑）。`
-      : '将删除本步产物并重新执行。',
+    content: extra + (downstream.length
+      ? `下游 ${downstream.length} 个步骤将被标记为「已过期」（需要重跑）。`
+      : ''),
     positiveText: '强制重跑',
     negativeText: '取消',
     onPositiveClick: () => run(step, true),
