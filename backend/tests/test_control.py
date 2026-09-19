@@ -231,3 +231,32 @@ def test_reveal_artifact_endpoint(isolated_env, monkeypatch):
         r = client.post(f"/api/projects/{uid}/steps/download/artifacts/nope/reveal")
         assert r.status_code == 400
         assert r.json()["code"] == "ARTIFACT_NOT_FOUND"
+
+
+def test_cancelling_flag_only_after_cancel(make_project, isolated_env, monkeypatch):
+    """回归: 运行中 cancelling 必须为 False, 点了停止才为 True
+    (曾把「取消事件已注册」误当「已置位」, 导致一运行就显示取消中)"""
+    uid = make_project()
+    mark_upstream_done(uid, "assemble")
+    started = threading.Event()
+    release = threading.Event()
+
+    def worker(ctx):
+        started.set()
+        release.wait(10)
+        ctx.check_cancel()                   # 唤醒后响应停止 → failed
+
+    _patch_step(monkeypatch, "assemble", worker)
+    runner = _runner()
+    try:
+        runner.start_step(uid, "assemble")
+        assert started.wait(5)
+        pid = crud.get_project(uid).id
+        assert runner.is_cancelling(pid, "assemble") is False    # 运行中 ≠ 取消中
+        assert runner.is_paused(pid, "assemble") is False
+        runner.cancel_step(uid, "assemble")
+        assert runner.is_cancelling(pid, "assemble") is True     # 置位后才是
+    finally:
+        release.set()
+    wait_status(uid, "assemble", {"failed"}, timeout=8)
+    assert runner.is_cancelling(crud.get_project(uid).id, "assemble") is False

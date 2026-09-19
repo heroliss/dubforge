@@ -622,9 +622,12 @@ class Runner:
         return {"status": "force_stopped", "message": "已强制结束 (后台残余计算将自动丢弃结果)"}
 
     def is_cancelling(self, project_id: int, step_key: str) -> bool:
-        """该步骤是否已发出取消信号且尚未退出 (前端显示「取消中…」)"""
+        """该步骤是否已发出停止信号且尚未退出 (前端显示「取消中…」)。
+        注意判 is_set 而非"键存在": 取消事件在步骤启动时就注册进表了,
+        按"存在"判断会把整个运行期都当成取消中。"""
         with self._lock:
-            return (project_id, step_key) in self._cancels
+            ev = self._cancels.get((project_id, step_key))
+        return bool(ev and ev.is_set())
 
     def is_paused(self, project_id: int, step_key: str) -> bool:
         with self._lock:
