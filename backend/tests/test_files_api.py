@@ -180,3 +180,53 @@ def test_spa_blocks_path_traversal(isolated_env):
         # 正常静态资源仍可达
         r = client.get("/index.html")
         assert r.status_code == 200
+
+
+def test_peaks_mixed_true_sample_sum(isolated_env):
+    """合成波形 = 逐样本真混音: 反相双轨相加应抵消到 0.1
+    (峰值包络直接相加会得 0.7 —— 那是最坏情形上界, 不是混音)"""
+    import json
+    import struct
+    import wave
+
+    from dubforge.domain import crud
+    from fastapi.testclient import TestClient
+    from app.main import app
+
+    client = TestClient(app)
+    r = client.post("/api/projects", json={"title": "混音波形"})
+    uid = r.json()["uid"]
+    project = crud.get_project(uid)
+    pdir = crud.project_dir(uid)
+
+    def const_wav(name: str, amp: float):
+        f = pdir / "audio" / name
+        f.parent.mkdir(parents=True, exist_ok=True)
+        v = int(amp * 32767)
+        with wave.open(str(f), "wb") as w:
+            w.setnchannels(1)
+            w.setsampwidth(2)
+            w.setframerate(4000)
+            w.writeframes(struct.pack("<200h", *([v] * 200)))
+        crud.add_artifact(project.id, "preprocess", "audio", name,
+                          f, str(f.relative_to(pdir)))
+        return f
+
+    const_wav("vocal.wav", 0.3)
+    const_wav("background.wav", -0.4)
+
+    url = (f"/api/projects/{uid}/steps/preprocess/artifacts/vocal.wav/"
+           "peaks_mixed?other=background.wav")
+    j = client.get(url).json()
+    assert j["points"], j
+    assert max(j["points"]) < 0.15, f"反相应抵消: {max(j['points'])}"
+    assert max(j["points"]) > 0.05, f"和不应为 0: {max(j['points'])}"
+    assert j["duration"] == 0.05
+
+    # 缓存: 二次请求一致
+    assert client.get(url).json() == j
+
+    # 单轨峰值仍是自己的包络 (0.3), 不受混音影响
+    j1 = client.get(f"/api/projects/{uid}/steps/preprocess/artifacts/vocal.wav/peaks").json()
+    assert abs(max(j1["points"]) - 0.3) < 0.02
+    assert json.dumps(j1)

@@ -165,24 +165,8 @@ def artifact_raw(uid: str, key: str, name: str):
                         headers={"Cache-Control": "no-store"})
 
 
-@router.get("/{key}/artifacts/{name}/peaks")
-def artifact_peaks(uid: str, key: str, name: str, buckets: int = 900):
-    """音频波形峰值序列 (前端画波形): ffmpeg 降采样为 4kHz 单声道后按桶取最大幅值。
-    结果缓存在 artifacts/<key>/peaks_<name>.json (重跑清产物时一并失效)。"""
-    import json as _json
-    p = _artifact_file(uid, key, name)
-    if p.suffix.lower() != ".wav":
-        raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
-    cache = crud.project_dir(uid) / "artifacts" / key / f"peaks_{name}.json"
-    if cache.exists():
-        try:
-            data = _json.loads(cache.read_text(encoding="utf-8"))
-            if data.get("src_size") == p.stat().st_size:
-                data.pop("src_size", None)
-                return data
-        except Exception:
-            pass
-
+def _decode_4k(p: Path):
+    """ffmpeg 解码为 4kHz 单声道 s16 原始样本 (波形计算的公共输入)"""
     import subprocess
     r = subprocess.run(["ffmpeg", "-i", str(p), "-vn", "-ac", "1", "-ar", "4000",
                         "-f", "s16le", "-"], capture_output=True)
@@ -190,21 +174,87 @@ def artifact_peaks(uid: str, key: str, name: str, buckets: int = 900):
         raise DubForgeError("波形计算失败 (ffmpeg)", code="PEAKS_FAIL",
                             detail=r.stderr[-500:])
     import numpy as np
-    amp = np.frombuffer(r.stdout, dtype=np.int16).astype(np.float32) / 32768.0
-    duration = round(len(amp) / 4000.0, 3)
-    n = max(1, min(buckets, len(amp)))
-    pad = (-len(amp)) % n
+    return np.frombuffer(r.stdout, dtype=np.int16)
+
+
+def _bucketize(amp: "np.ndarray", buckets: int) -> dict:
+    """s16 样本 → 桶峰值序列 (先求和后取绝对值, 混音语义正确) + 时长"""
+    import numpy as np
+    f = amp.astype(np.float32) / 32768.0
+    duration = round(len(f) / 4000.0, 3)
+    n = max(1, min(buckets, len(f)))
+    pad = (-len(f)) % n
     if pad:
-        amp = np.concatenate([amp, np.zeros(pad, dtype=np.float32)])
-    peaks = np.abs(amp).reshape(n, -1).max(axis=1).round(3).tolist()
-    data = {"points": peaks, "duration": duration}
+        f = np.concatenate([f, np.zeros(pad, dtype=np.float32)])
+    peaks = np.abs(f).reshape(n, -1).max(axis=1).round(3).tolist()
+    return {"points": peaks, "duration": duration}
+
+
+@router.get("/{key}/artifacts/{name}/peaks")
+def artifact_peaks(uid: str, key: str, name: str, buckets: int = 900):
+    """音频波形峰值序列 (前端画波形)。结果缓存在 artifacts/<key>/peaks_<name>.json
+    (重跑清产物时一并失效)。"""
+    import json as _json
+    p = _artifact_file(uid, key, name)
+    if p.suffix.lower() != ".wav":
+        raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
+    cache = crud.project_dir(uid) / "artifacts" / key / f"peaks_{name}.json"
+    if _cache_valid(cache, [p]):
+        data = _json.loads(cache.read_text(encoding="utf-8"))
+        data.pop("src_sizes", None)
+        return data
+    data = _bucketize(_decode_4k(p), buckets)
+    _write_cache(cache, [p], data)
+    return data
+
+
+@router.get("/{key}/artifacts/{name}/peaks_mixed")
+def artifact_peaks_mixed(uid: str, key: str, name: str, other: str,
+                         buckets: int = 900):
+    """两轨真实混音 (逐样本相加) 的波形峰值。
+    峰值包络直接相加是"两轨峰值恰好同瞬同号"的最坏情形上界 —— 实际错开时
+    会高估、反相时该抵消, 混音预览必须先求和再取峰值。结果按双方文件大小缓存。"""
+    import json as _json
+    p1 = _artifact_file(uid, key, name)
+    p2 = _artifact_file(uid, key, other)
+    if p1.suffix.lower() != ".wav" or p2.suffix.lower() != ".wav":
+        raise DubForgeError("只支持 wav 音频生成波形", code="PEAKS_UNSUPPORTED")
+    cache = (crud.project_dir(uid) / "artifacts" / key
+             / f"peaks_mixed_{name}_{other}.json")
+    if _cache_valid(cache, [p1, p2]):
+        data = _json.loads(cache.read_text(encoding="utf-8"))
+        data.pop("src_sizes", None)
+        return data
+    import numpy as np
+    a, b = _decode_4k(p1), _decode_4k(p2)
+    n = min(len(a), len(b))
+    mixed = np.clip(a[:n].astype(np.int32) + b[:n].astype(np.int32),
+                    -32768, 32767).astype(np.int16)
+    data = _bucketize(mixed, buckets)
+    _write_cache(cache, [p1, p2], data)
+    return data
+
+
+def _cache_valid(cache: Path, files: list) -> bool:
+    if not cache.exists():
+        return False
+    try:
+        import json as _json
+        data = _json.loads(cache.read_text(encoding="utf-8"))
+        sizes = data.get("src_sizes")
+        return sizes == [f.stat().st_size for f in files]
+    except Exception:
+        return False
+
+
+def _write_cache(cache: Path, files: list, data: dict) -> None:
+    import json as _json
+    import os
     try:
         cache.parent.mkdir(parents=True, exist_ok=True)
+        payload = {**data, "src_sizes": [f.stat().st_size for f in files]}
         tmp = cache.with_suffix(".json.tmp")
-        tmp.write_text(_json.dumps({"src_size": p.stat().st_size, **data}),
-                       encoding="utf-8")
-        import os
+        tmp.write_text(_json.dumps(payload), encoding="utf-8")
         os.replace(tmp, cache)
     except Exception:
         pass                          # 缓存写失败不影响返回
-    return data
