@@ -1,13 +1,13 @@
 <script setup lang="ts">
-// 音轨同步播放器 v3: 视频为主控 (静音), 右侧三条波形各带启用勾选 ——
-// 多轨同时启用即叠加混音 (每个音轨一个隐藏 audio 元素, 浏览器原生混音);
-// 全部按头部对齐跟随视频 (拖动/倍速/暂停同步, 漂移>0.3s 校正);
-// 每条波形画出播放位置竖线, 点击波形跳转
-// v3 修复: 此前模板里漏渲染了 <audio> 元素 (勾选任何轨都不会发声),
-// 且播放循环未按勾选过滤 (应只播启用的轨)
+// 音轨同步播放器 v4: 视频为主控, 右侧四个单选音轨 —— 原始 / 分离人声 / 背景音 /
+// 合成(人声+背景)。单选 = 一次听一路; 选「合成」时人声+背景两路同时播放。
+// 原始音轨优先用视频自带的声音 (原始音质, 16k 的 raw.wav 仅作无视频时兜底):
+// 勾选「原始」= 解除视频静音; 在原生控件里点小喇叭 = 同步选中「原始」, 双向一致。
+// 全部按头部对齐跟随视频 (拖动/倍速/暂停同步, 漂移>0.3s 校正); 波形画播放位置竖线
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import { fmtDur } from '../utils/format'
 
+const MIXED = '__mixed__'
 const props = defineProps<{
   tracks: { name: string, label: string, url: string, peaks: string, size?: number }[]
   videoUrl: string | null
@@ -16,24 +16,33 @@ const props = defineProps<{
 const videoEl = ref<HTMLVideoElement | null>(null)
 const canvasEls = new Map<string, HTMLCanvasElement>()
 const audioEls = new Map<string, HTMLAudioElement>()
-const enabled = ref<Set<string>>(new Set())
+const selected = ref<string>('')
 const peaksMap = ref<Record<string, number[]>>({})
 const durs = ref<Record<string, number>>({})
 const videoErr = ref(false)
-const trackErr = ref<Set<string>>(new Set())   // 加载失败的音轨 (勾选也没声音, 明示)
+const trackErr = ref<Set<string>>(new Set())   // 加载失败的音轨 (选中也没声音, 明示)
 const hasVideo = computed(() => !!props.videoUrl && !videoErr.value)
 let raf = 0
 
+const rawName = computed(() => props.tracks[0]?.name ?? '')
+const hasVocalBg = computed(() =>
+  ['vocal.wav', 'background.wav'].every(n => props.tracks.some(t => t.name === n)))
+// 单选项: 已生成的三轨 + 合成 (人声/背景齐备时)
+const options = computed(() => {
+  const opts = props.tracks.map(t => ({ name: t.name, label: t.label }))
+  if (hasVocalBg.value) opts.push({ name: MIXED, label: '合成 (人声+背景)' })
+  return opts
+})
+
 // 轮询会不断重建 tracks 数组 (内容不变) —— 按名字签名去重,
-// 只有音轨集合真正变化时才重置勾选/重载波形
+// 只有音轨集合真正变化时才重置选择/重载波形
 const trackSig = computed(() => props.tracks.map(t => t.name).join('|'))
 let lastSig = ''
 watch(trackSig, (sig) => {
   if (sig === lastSig) return
   lastSig = sig
   trackErr.value = new Set()
-  // 默认启用第一条 (原始音轨); 其余由用户勾选叠加
-  enabled.value = new Set([props.tracks[0]?.name].filter(Boolean) as string[])
+  selected.value = rawName.value || props.tracks[0]?.name || ''
   void loadAllPeaks()
 }, { immediate: true })
 
@@ -59,29 +68,33 @@ async function loadAllPeaks() {
   draw()
 }
 
-function enabledAudios(): HTMLAudioElement[] {
-  return props.tracks
-    .filter(t => enabled.value.has(t.name))
-    .map(t => audioEls.get(t.name))
-    .filter((a): a is HTMLAudioElement => !!a)
-}
+// 合成波形 = 人声 + 背景逐桶相加 (削顶到 1) —— 预览用的近似, 试听才是真叠加
+const mixedPeaks = computed<number[]>(() => {
+  const v = peaksMap.value['vocal.wav'] ?? []
+  const b = peaksMap.value['background.wav'] ?? []
+  if (!v.length || !b.length) return []
+  const n = Math.min(v.length, b.length)
+  const out = new Array<number>(n)
+  for (let i = 0; i < n; i++) out[i] = Math.min(1, v[i] + b[i])
+  return out
+})
 
-function toggle(name: string, v: boolean) {
-  const s = new Set(enabled.value)
-  if (v) s.add(name)
-  else s.delete(name)
-  enabled.value = s
-  // 播放中切换: 新勾选的轨立即跟上, 取消勾选的轨立即停
-  const a = audioEls.get(name)
-  const vid = videoEl.value
-  if (!a) return
-  if (!v) {
-    a.pause()
-  } else if (vid && !vid.paused) {
-    a.playbackRate = vid.playbackRate
-    a.currentTime = Math.min(vid.currentTime, a.duration || vid.currentTime)
-    void a.play().catch(() => {})
+function peaksFor(name: string): number[] {
+  return name === MIXED ? mixedPeaks.value : (peaksMap.value[name] ?? [])
+}
+function durFor(name: string): number {
+  if (name !== MIXED) return durs.value[name] ?? 0
+  return Math.max(durs.value['vocal.wav'] ?? 0, durs.value['background.wav'] ?? 0)
+}
+// 选中项对应的发声元素; 原始音轨在视频存在时用视频本身的声音 (不叠加 raw.wav)
+function audiosFor(name: string): HTMLAudioElement[] {
+  if (name === MIXED) {
+    return ['vocal.wav', 'background.wav']
+      .map(n => audioEls.get(n)).filter((a): a is HTMLAudioElement => !!a)
   }
+  if (name === rawName.value && hasVideo.value) return []   // 声音走视频
+  const a = audioEls.get(name)
+  return a ? [a] : []
 }
 
 function setCanvas(name: string, el: HTMLCanvasElement | null) {
@@ -93,7 +106,21 @@ function setAudio(name: string, el: HTMLAudioElement | null) {
   else audioEls.delete(name)
 }
 
-// —— 同步: 视频时间轴为基准, 各启用音轨头部对齐 ——
+// —— 选中变化 → 视频静音联动 (选原始且视频在 = 解除静音, 其余静音) ——
+watch(selected, (s) => {
+  const v = videoEl.value
+  if (v) v.muted = !(hasVideo.value && s === rawName.value)
+})
+// 原生控件的小喇叭 → 同步回单选 (双向一致, 防止叠加两层声音)
+function onVideoVolumeChange() {
+  const v = videoEl.value
+  if (!v) return
+  const wantRaw = hasVideo.value && selected.value === rawName.value
+  if (!v.muted && !wantRaw) selected.value = rawName.value
+  else if (v.muted && wantRaw) selected.value = ''
+}
+
+// —— 同步: 视频时间轴为基准, 各发声元素头部对齐 ——
 function resync(hard = false) {
   const v = videoEl.value
   if (!v) return
@@ -107,7 +134,7 @@ function resync(hard = false) {
 function onVideoPlay() {
   resync()
   startLoop()
-  for (const a of enabledAudios()) void a.play().catch(() => {})
+  for (const a of audiosFor(selected.value)) void a.play().catch(() => {})
 }
 function onVideoPause() {
   for (const a of audioEls.values()) a.pause()
@@ -130,17 +157,18 @@ function onAudioLoaded(name: string) {
   if (!a || !v) return
   a.playbackRate = v.playbackRate
   a.currentTime = Math.min(v.currentTime, a.duration || v.currentTime)
-  if (!v.paused && enabled.value.has(name)) void a.play().catch(() => {})
+  if (!v.paused && audiosFor(selected.value).includes(a)) void a.play().catch(() => {})
 }
 function onAudioError(name: string) {
   trackErr.value = new Set([...trackErr.value, name])
 }
 
-// —— 波形: 启用轨亮色 / 未启用暗色; 竖线 = 播放位置 ——
+// —— 波形: 选中轨亮色 / 其余暗色; 竖线 = 播放位置 ——
 function draw() {
   const v = videoEl.value
-  const maxDur = Math.max(0.001, ...Object.values(durs.value))
-  const total = (hasVideo.value && v?.duration) ? v.duration : maxDur
+  const total = (hasVideo.value && v?.duration) ? v.duration
+    : Math.max(0.001, ...props.tracks.map(t => durFor(t.name)),
+               props.tracks.length ? 0.001 : 0.001)
   const now = v?.currentTime ?? 0
   const pos = total ? Math.min(1, now / total) : 0
   for (const [name, c] of canvasEls.entries()) {
@@ -153,8 +181,8 @@ function draw() {
     }
     const ctx = c.getContext('2d')!
     ctx.clearRect(0, 0, c.width, c.height)
-    const on = enabled.value.has(name)
-    const pts = peaksMap.value[name] ?? []
+    const on = selected.value === name
+    const pts = peaksFor(name)
     const n = pts.length
     const bw = n ? c.width / n : 0
     for (let i = 0; i < n; i++) {
@@ -183,7 +211,8 @@ function stopLoop() {
 }
 function onCanvasClick(e: MouseEvent) {
   const total = (hasVideo.value && videoEl.value?.duration)
-    ? videoEl.value!.duration : Math.max(0.001, ...Object.values(durs.value))
+    ? videoEl.value!.duration
+    : Math.max(0.001, ...props.tracks.map(t => durFor(t.name)), 0.001)
   const target = e.currentTarget as HTMLCanvasElement
   const rect = target.getBoundingClientRect()
   const t = (e.clientX - rect.left) / rect.width * total
@@ -197,12 +226,13 @@ function onCanvasClick(e: MouseEvent) {
 }
 // 无视频时的简易走带 (波形单击跳转已够用, 这里补播放/暂停)
 function fallbackToggle() {
-  const any = [...audioEls.values()].some(a => !a.paused)
+  const act = audiosFor(selected.value)
+  const any = act.some(a => !a.paused)
   if (any) {
     for (const a of audioEls.values()) a.pause()
     stopLoop()
   } else {
-    for (const a of enabledAudios()) void a.play().catch(() => {})
+    for (const a of act) void a.play().catch(() => {})
     startLoop()
   }
 }
@@ -217,44 +247,47 @@ onBeforeUnmount(() => stopLoop())
              preload="metadata"
              style="width: 100%; max-height: 340px; border-radius: 8px; background: #000"
              @play="onVideoPlay" @pause="onVideoPause" @ended="onVideoEnded"
-             @seeked="onVideoSeeked" @ratechange="onVideoRate" @error="videoErr = true" />
+             @seeked="onVideoSeeked" @ratechange="onVideoRate"
+             @volumechange="onVideoVolumeChange" @error="videoErr = true" />
       <template v-else>
         <n-empty v-if="videoUrl && videoErr" size="small"
                  description="视频无法加载 (源文件可能被移动)" style="padding: 30px 0" />
-        <n-button v-if="enabled.size" size="small" @click="fallbackToggle">
-          ▶/⏸ 播放启用的音轨
+        <n-button v-if="selected" size="small" @click="fallbackToggle">
+          ▶/⏸ 播放选中的音轨
         </n-button>
       </template>
     </n-gi>
     <n-gi :span="2">
-      <div v-for="t in tracks" :key="t.name" class="trk">
-        <div class="trk-head">
-          <n-checkbox size="small" :checked="enabled.has(t.name)"
-                      @update:checked="(v: boolean) => toggle(t.name, v)">
-            {{ t.label }}
-          </n-checkbox>
-          <n-text depth="3" style="font-size: 11px; margin-left: auto">{{ fmtDur(durs[t.name]) }}</n-text>
+      <n-radio-group :value="selected" size="small"
+                     @update:value="(v: string) => (selected = v)">
+        <div v-for="o in options" :key="o.name" class="trk">
+          <div class="trk-head">
+            <n-radio :value="o.name">{{ o.label }}</n-radio>
+            <n-text depth="3" style="font-size: 11px; margin-left: auto">
+              {{ fmtDur(durFor(o.name)) }}
+            </n-text>
+          </div>
+          <canvas :ref="(el) => setCanvas(o.name, el as HTMLCanvasElement | null)"
+                  class="wave" @click="onCanvasClick" />
         </div>
-        <canvas :ref="(el) => setCanvas(t.name, el as HTMLCanvasElement | null)"
-                class="wave" @click="onCanvasClick" />
-      </div>
+      </n-radio-group>
       <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 6px">
-        勾选启用; 多轨同时启用 = 叠加混音 · 竖线为播放位置 · 点波形跳转
+        单选试听一路; 「合成」= 人声+背景同时播放 · 选「原始」时用视频自带声音
+        (原生小喇叭与本单选联动) · 竖线为播放位置 · 点波形跳转
+      </n-text>
+      <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block">
+        ⚠ 音轨加载失败: {{ [...trackErr].map(n => options.find(o => o.name === n)?.label ?? n).join('、') }}
       </n-text>
     </n-gi>
   </n-grid>
-  <!-- 隐藏音轨元素: 实际发声者 (浏览器原生混音); 必须留在 DOM 里 -->
+  <!-- 隐藏音轨元素: 实际发声者 (原始轨在无视频时兜底); 必须留在 DOM 里 -->
   <div style="display: none">
-    <audio v-for="t in tracks" :key="t.name"
+    <audio v-for="t in (hasVideo ? tracks.filter(t => t.name !== rawName) : tracks)"
+           :key="t.name"
            :ref="(el) => setAudio(t.name, el as HTMLAudioElement | null)"
            :src="t.url" preload="auto"
-           @loadedmetadata="onAudioLoaded(t.name)"
-           @error="onAudioError(t.name)" />
+           @loadedmetadata="onAudioLoaded(t.name)" @error="onAudioError(t.name)" />
   </div>
-  <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block; margin-top: 6px">
-    ⚠ 音轨加载失败: {{ [...trackErr].map(n => tracks.find(t => t.name === n)?.label ?? n).join('、') }}
-    (文件可能尚未生成或已损坏)
-  </n-text>
 </template>
 
 <style scoped>
