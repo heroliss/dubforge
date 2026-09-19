@@ -266,15 +266,15 @@ const headerStatus = computed(() => {
           <n-button size="tiny" @click="reveal">📁 在资源管理器中显示</n-button>
         </n-space>
       </template>
-      <n-grid :cols="5" :x-gap="16" v-if="media.found">
-        <n-gi :span="3">
+      <div class="prev-row" v-if="media.found">
+        <div class="vid-col">
           <video v-if="videoSrc" class="vid" :src="videoSrc" controls preload="metadata"
                  @loadedmetadata="onMeta" />
-        </n-gi>
-        <n-gi :span="2">
+        </div>
+        <div class="info">
           <MediaInfo :media="media" />
-        </n-gi>
-      </n-grid>
+        </div>
+      </div>
       <n-empty v-else description="还没有视频 —— 运行「获取视频」后这里会显示信息与预览"
                size="small" style="margin: 8px 0" />
     </n-card>
@@ -389,10 +389,16 @@ const headerStatus = computed(() => {
 </template>
 
 <style scoped>
+/* 预览行: 视频列贴内容宽, 信息列吃掉剩余; 窄屏上下堆叠 */
+.prev-row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.vid-col { flex: 0 1 auto; min-width: 0; }
+.info { flex: 1 1 320px; min-width: 0; }
+@media (max-width: 900px) {
+  .prev-row { flex-direction: column; flex-wrap: nowrap; }
+}
 /* 视频按自身宽高比呈现, 最大高度封顶 (绝不信箱式拉伸出黑边) */
 .vid {
   display: block;
-  margin: 0 auto;
   width: auto;
   height: auto;
   max-width: 100%;

@@ -306,8 +306,8 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <n-grid cols="1 m:5" :x-gap="16" responsive="screen">
-    <n-gi span="1 m:3">
+  <div class="prev-row">
+    <div class="vid-col">
       <video v-if="hasVideo" ref="videoEl" class="vid" :src="videoUrl || undefined"
              muted controls preload="metadata"
              @play="onVideoPlay" @pause="onVideoPause" @ended="onVideoEnded"
@@ -321,32 +321,30 @@ onBeforeUnmount(() => {
           ▶/⏸ 播放选中的音轨
         </n-button>
       </template>
-    </n-gi>
-    <n-gi span="1 m:2">
-      <div ref="rightEl" class="right">
-        <n-radio-group :value="selected" size="small"
-                       @update:value="(v: string) => (selected = v)">
-          <div v-for="o in options" :key="o.name" class="trk">
-            <div class="trk-head">
-              <n-radio :value="o.name">{{ o.label }}</n-radio>
-              <n-text depth="3" style="font-size: 11px; margin-left: auto">
-                {{ fmtDur(durFor(o.name)) }}
-              </n-text>
-            </div>
-            <canvas :ref="(el) => setCanvas(o.name, el as HTMLCanvasElement | null)"
-                    class="wave" @click="onCanvasClick" />
+    </div>
+    <div ref="rightEl" class="right">
+      <n-radio-group :value="selected" size="small"
+                     @update:value="(v: string) => (selected = v)">
+        <div v-for="o in options" :key="o.name" class="trk">
+          <div class="trk-head">
+            <n-radio :value="o.name">{{ o.label }}</n-radio>
+            <n-text depth="3" style="font-size: 11px; margin-left: auto">
+              {{ fmtDur(durFor(o.name)) }}
+            </n-text>
           </div>
-        </n-radio-group>
-        <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 6px">
-          单选试听一路; 「合成」= 人声+背景逐样本混音 · 选「原始」时用视频自带声音
-          (原生小喇叭与本单选联动) · 竖线为播放位置 · 点波形跳转
-        </n-text>
-        <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block">
-          ⚠ 音轨加载失败: {{ [...trackErr].map(n => options.find(o => o.name === n)?.label ?? n).join('、') }}
-        </n-text>
-      </div>
-    </n-gi>
-  </n-grid>
+          <canvas :ref="(el) => setCanvas(o.name, el as HTMLCanvasElement | null)"
+                  class="wave" @click="onCanvasClick" />
+        </div>
+      </n-radio-group>
+      <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 6px">
+        单选试听一路; 「合成」= 人声+背景逐样本混音 · 选「原始」时用视频自带声音
+        (原生小喇叭与本单选联动) · 竖线为播放位置 · 点波形跳转
+      </n-text>
+      <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block">
+        ⚠ 音轨加载失败: {{ [...trackErr].map(n => options.find(o => o.name === n)?.label ?? n).join('、') }}
+      </n-text>
+    </div>
+  </div>
   <!-- 隐藏音轨元素: 实际发声者 (原始轨在无视频时兜底); 必须留在 DOM 里 -->
   <div style="display: none">
     <audio v-for="t in (hasVideo ? tracks.filter(t => t.name !== rawName) : tracks)"
@@ -358,11 +356,18 @@ onBeforeUnmount(() => {
 </template>
 
 <style scoped>
+/* 预览行: 视频列贴内容宽 (由高度封顶决定), 音轨列吃掉全部剩余宽度;
+   窄屏 (<900px) 自动改上下堆叠 —— 不留大块空白 */
+.prev-row { display: flex; gap: 16px; align-items: stretch; flex-wrap: wrap; }
+.vid-col { flex: 0 1 auto; min-width: 0; }
+.right { flex: 1 1 340px; min-width: 260px; display: flex; flex-direction: column; min-height: 0; }
+@media (max-width: 900px) {
+  .prev-row { flex-direction: column; flex-wrap: nowrap; }
+}
 /* 视频始终按自身宽高比呈现, 由最大高度/最大宽度封顶 (绝不信箱式拉伸出黑边);
-   窄屏 (竖排模式) 下同样适用 */
+   贴左排布 (列已贴合内容宽, 不再居中留白) */
 .vid {
   display: block;
-  margin: 0 auto;
   width: auto;
   height: auto;
   max-width: 100%;
@@ -371,9 +376,8 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   background: #000;
 }
-/* 右列纵向撑满: 行高由视频 (宽高比+最大高度) 决定, 音轨行均分剩余高度。
-   canvas 固有尺寸 300x150 会污染 flex 基准 —— 用 basis 0 + height 0 消掉 */
-.right { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+/* 音轨行均分右列高度。canvas 固有尺寸 300x150 会污染 flex 基准 ——
+   用 basis 0 + height 0 消掉 */
 .right :deep(.n-radio-group) { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 .trk {
   flex: 1;

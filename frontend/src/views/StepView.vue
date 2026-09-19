@@ -442,15 +442,15 @@ async function loadText(name: string | null) {
       <!-- 产出预览: 有对应产物时直接展示 -->
       <n-card v-if="preview" size="small" title="产出预览" style="margin-top: 14px">
         <template v-if="key === 'download' && media.found">
-          <n-grid :cols="2" :x-gap="16">
-            <n-gi>
+          <div class="prev-row">
+            <div class="vid-col">
               <video v-if="preview.url" class="vid" :src="preview.url" controls
                      preload="metadata" @loadedmetadata="onMeta" />
-            </n-gi>
-            <n-gi>
+            </div>
+            <div class="info">
               <MediaInfo :media="media" />
-            </n-gi>
-          </n-grid>
+            </div>
+          </div>
         </template>
         <AudioTracksPlayer v-else-if="preview.kind === 'tracks'"
                            :tracks="preview.audios" :video-url="preview.videoUrl" />
@@ -588,10 +588,16 @@ async function loadText(name: string | null) {
 </template>
 
 <style scoped>
+/* 预览行: 视频列贴内容宽, 信息列吃掉剩余; 窄屏上下堆叠 */
+.prev-row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
+.vid-col { flex: 0 1 auto; min-width: 0; }
+.info { flex: 1 1 320px; min-width: 0; }
+@media (max-width: 900px) {
+  .prev-row { flex-direction: column; flex-wrap: nowrap; }
+}
 /* 视频按自身宽高比呈现, 最大高度封顶 (绝不信箱式拉伸出黑边) */
 .vid {
   display: block;
-  margin: 0 auto;
   width: auto;
   height: auto;
   max-width: 100%;
