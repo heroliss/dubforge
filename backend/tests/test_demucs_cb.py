@@ -52,21 +52,42 @@ class _Ctx:
             raise StepCancelled("取消")
 
 
+SR = 44100
+
+
 def test_callback_reports_monotonic_progress():
     ctx = _Ctx(pdir=None)
-    cb = _demucs_callback(ctx, total_sec=100.0, shifts=0)
+    cb = _demucs_callback(ctx, total_sec=100.0, shifts=0, sr=SR)
     cb({"state": "start", "segment_offset": 0})          # start 不计进度
     assert ctx.prog == []
-    cb({"state": "end", "segment_offset": 0})
-    cb({"state": "end", "segment_offset": 50})
-    cb({"state": "end", "segment_offset": 99})
+    for sec in (0, 50, 99):                              # offset 单位 = 采样点
+        cb({"state": "end", "segment_offset": sec * SR})
     assert ctx.prog == sorted(ctx.prog)                  # 单调递增
     assert 30 <= ctx.prog[0] < ctx.prog[-1] <= 85        # 映射在 30→85 区间
+    assert ctx.prog[-1] > 80                             # 尾段应接近区间上沿
+
+
+def test_callback_offset_is_in_samples_not_seconds():
+    """回归: segment_offset 单位是采样点 —— 曾误当秒数, 进度从第一段起就卡死 57.5%"""
+    ctx = _Ctx(pdir=None)
+    cb = _demucs_callback(ctx, total_sec=600.0, shifts=0, sr=SR)
+    for sec in range(0, 600, 10):
+        cb({"state": "end", "segment_offset": sec * SR})
+    assert max(ctx.prog) > 80                            # 修前: 恒为 57.5
+
+
+def test_callback_shifts_single_pass_reaches_end():
+    """shifts=1 时 demucs 只跑一遍位移平均 (range(shifts)), 分母不得按 shifts+1 折算"""
+    ctx = _Ctx(pdir=None)
+    cb = _demucs_callback(ctx, total_sec=100.0, shifts=1, sr=SR)
+    for sec in (0, 50, 99):
+        cb({"state": "end", "segment_offset": sec * SR, "shift_idx": 0})
+    assert ctx.prog[-1] > 80                             # 修前: 封顶 57.5
 
 
 def test_callback_pause_blocks_and_cancel_aborts():
     ctx = _Ctx(pdir=None)
-    cb = _demucs_callback(ctx, total_sec=100.0, shifts=0)
+    cb = _demucs_callback(ctx, total_sec=100.0, shifts=0, sr=SR)
     # 暂停: 回调阻塞, 直到清除暂停或取消
     ctx._pause.set()
     done = threading.Event()
@@ -80,7 +101,7 @@ def test_callback_pause_blocks_and_cancel_aborts():
     # 取消: 回调抛 StepCancelled (apply_model 会终止剩余分段并向上传播)
     ctx._cancel.set()
     with pytest.raises(DubForgeError):
-        cb({"state": "end", "segment_offset": 50})
+        cb({"state": "end", "segment_offset": 50 * SR})
 
 
 def test_run_demucs_cancel_mid_segments(monkeypatch, tmp_path):

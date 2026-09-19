@@ -34,23 +34,28 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     os.replace(tmp, out_wav)
 
 
-def _demucs_callback(ctx, total_sec: float, shifts: int):
+def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int):
     """demucs 分段回调 → 进度上报 + 段间暂停/取消检查点。
 
     demucs (4.1.0) 的 apply_model 在 GPU 下用 DummyPoolExecutor 同步逐段执行,
     每段计算前后各回调一次 ({state: start|end, segment_offset, shift_idx, ...});
     回调在我们自己的线程里运行 —— 在回调里阻塞即暂停, 抛异常即取消
     (apply_model 捕获后 cancel_futures 终止剩余分段并向上传播)。
-    单段是一次前向推理, 原子不可分 —— 检查点粒度 = 分段长度 (htdemucs 每段数秒)。"""
+    单段是一次前向推理, 原子不可分 —— 检查点粒度 = 分段长度 (htdemucs 每段数秒)。
+
+    注意: segment_offset 单位是采样点 (shifts>0 时是相对位移后分块的),
+    须除以 sr 换算成秒; shifts>0 时 demucs 只跑 shifts 遍位移平均 (没有额外
+    的干净遍), 遍数分母 = max(1, shifts)。"""
+    passes = max(1, shifts)
+
     def cb(d: dict) -> None:
         if d.get("state") != "end":
             return
         ctx.check_pause()          # 暂停: 段间阻塞 (显存保持占用, 不再计算)
         ctx.check_cancel()         # 取消: 抛出后 demucs 终止剩余分段
-        passes = max(1, shifts + 1)
-        offset = float(d.get("segment_offset") or 0)
+        offset_sec = float(d.get("segment_offset") or 0) / max(sr, 1)
         shift_idx = int(d.get("shift_idx") or 0)
-        frac = (shift_idx + min(1.0, offset / max(total_sec, 1e-6))) / passes
+        frac = (shift_idx + min(1.0, offset_sec / max(total_sec, 1e-6))) / passes
         ctx.report_progress(30 + frac * 55)     # 30 → 85 区间
     return cb
 
@@ -83,11 +88,15 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
     data, sr = sf.read(str(src_wav), dtype="float32", always_2d=True)
     total_sec = len(data) / sr
     seg = float(getattr(model, "segment", 0) or 0)
+    passes = max(1, shifts)
     if seg > 0:
         import math
         n_seg = math.ceil(total_sec / (seg * (1 - overlap)))
         ctx.log(f"整轨 {total_sec:.0f}s ≈ {n_seg} 段 × {seg:.0f}s, "
-                f"共 {n_seg * (shifts + 1)} 次前向 (暂停/取消在段间生效)")
+                f"共 {n_seg * passes} 次前向 (暂停/取消在段间生效)")
+    if model_name.endswith("_ft") and shifts > 0:
+        ctx.log("⚠ htdemucs_ft + shifts>0 计算量约为标准版 3 倍; 显存接近满载时 "
+                "Windows 会溢出到共享内存, 速度可能骤降 —— 小显存建议 htdemucs + shifts=0")
     wav = torch.from_numpy(data.T)          # [channels, samples]
     if wav.shape[0] == 1:
         wav = wav.repeat(2, 1)              # htdemucs 要求立体声输入, 单声道复制
@@ -102,7 +111,8 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
             sources = apply_model(model, wav[None], device=device,
                                   split=True, overlap=overlap, shifts=shifts,
                                   progress=False,
-                                  callback=_demucs_callback(ctx, total_sec, shifts))[0]
+                                  callback=_demucs_callback(ctx, total_sec,
+                                                            shifts, sr))[0]
     except BaseException:
         # 取消/暂停异常: 终止剩余分段后清掉本曲工作目录再向上传播
         shutil.rmtree(tmp_out, ignore_errors=True)
