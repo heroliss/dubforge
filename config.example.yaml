@@ -26,8 +26,6 @@ download:
 
 separate:
   enabled: true
-  speaker_diarization: false  # 说话人分离 (需 hf_token)
-  hf_token: ""
 
 asr:
   backend: "faster_whisper"

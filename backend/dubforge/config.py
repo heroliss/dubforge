@@ -60,8 +60,8 @@ DEFAULTS: dict[str, Any] = {
         "model": "htdemucs",        # htdemucs | htdemucs_ft (精调: 更优, 约慢一倍)
         "shifts": 0,                # 位移平均次数 (0=快; 1~2 更好, 按倍变慢)
         "overlap": 0.25,            # 长音频分块处理的重叠比例
-        "speaker_diarization": False,  # pyannote 说话人分离 (需 hf_token)
-        "hf_token": "",
+        # 说话人分离 (pyannote, 需 hf_token) 为规划中的可选项, 尚未实现 ——
+        # 不预置死配置, 实现时随功能一并加入
     },
     "asr": {
         "backend": "faster_whisper",

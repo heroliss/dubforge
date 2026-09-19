@@ -2,7 +2,7 @@
 // 总览: 项目信息 + 原视频 (预览+信息) + 项目文件 + 步骤清单
 // 勾选步骤 = 允许自动续跑; 「运行该步骤」只跑一步, 「运行本步及后续」按勾选链自动推进
 import { computed, onMounted, ref, watch } from 'vue'
-import { useRoute } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { useMessage, useDialog } from 'naive-ui'
 import {
   useNavStore, STEP_ORDER, STATUS_TAG, STATUS_TEXT, STATUS_EMOJI,
@@ -11,6 +11,7 @@ import MediaInfo from '../components/MediaInfo.vue'
 import { fmtSize } from '../utils/format'
 
 const route = useRoute()
+const router = useRouter()
 const message = useMessage()
 const dialog = useDialog()
 const nav = useNavStore()
@@ -209,19 +210,23 @@ function rerunDialog(step: any) {
   })
 }
 
-// 项目动态状态
+// 项目动态状态 (running/queued 时附带步骤 key, 头部胶囊可点击直达该步骤页)
 const headerStatus = computed(() => {
   const run = nav.steps.find((s: any) => s.status === 'running')
   const que = nav.steps.find((s: any) => s.status === 'queued')
-  if (run) return { text: run.cancelling ? `正在取消「${run.label}」…`
-                                         : `正在「${run.label}」…`, type: 'info' }
-  if (que) return { text: `「${que.label}」排队中…`, type: 'warning' }
+  const active = run || que
+  if (active) {
+    return { text: run ? (run.cancelling ? `正在取消「${run.label}」…`
+                                               : `正在「${run.label}」…`)
+                        : `「${que.label}」排队中…`,
+             type: run ? 'info' : 'warning', key: active.key as string | null }
+  }
   const map: Record<string, [string, string]> = {
     done: ['已完成', 'success'], failed: ['有失败步骤', 'error'],
     processing: ['部分完成', 'default'], created: ['待开始', 'default'],
   }
   const [text, type] = map[nav.status] ?? [nav.status, 'default']
-  return { text, type }
+  return { text, type, key: null }
 })
 </script>
 
@@ -229,7 +234,13 @@ const headerStatus = computed(() => {
   <n-layout-content content-style="padding: 24px;">
     <n-space justify="space-between" align="center">
       <n-h1 style="margin: 0; font-size: 20px">{{ nav.title || '…' }}</n-h1>
-      <n-tag size="small" :type="headerStatus.type as any">{{ headerStatus.text }}</n-tag>
+      <!-- 运行/排队中: 变成可点按钮, 直达该步骤页; 其余状态仍是纯标签 -->
+      <n-button v-if="headerStatus.key" size="small"
+                :type="headerStatus.type as any" secondary
+                @click="router.push(`/projects/${uid}/steps/${headerStatus.key}`)">
+        {{ headerStatus.text }} →
+      </n-button>
+      <n-tag v-else size="small" :type="headerStatus.type as any">{{ headerStatus.text }}</n-tag>
       <n-tooltip v-if="dirMissing" trigger="hover" :delay="0" placement="top">
         <template #trigger>
           <n-tag size="small" type="error" :bordered="false">⚠ 项目目录缺失</n-tag>
@@ -272,7 +283,8 @@ const headerStatus = computed(() => {
       <div class="rows">
         <div v-for="s in nav.steps" :key="s.key" class="row">
           <span class="emoji">{{ STATUS_EMOJI[s.status] ?? '⚪' }}</span>
-          <span class="lbl">{{ s.label }}</span>
+          <span class="lbl steplink" title="进入该步骤页"
+                @click="router.push(`/projects/${uid}/steps/${s.key}`)">{{ s.label }}</span>
           <n-tag size="small" :type="STATUS_TAG[s.status] || 'default'"
                  :bordered="s.status !== 'pending'">
             {{ STATUS_TEXT[s.status] || s.status }}
@@ -378,6 +390,8 @@ const headerStatus = computed(() => {
 .row:last-child { border-bottom: none; }
 .emoji { width: 20px; text-align: center; }
 .lbl { font-size: 13px; font-weight: 600; width: 76px; }
+.steplink { cursor: pointer; }
+.steplink:hover { color: #4da3ff; text-decoration: underline; }
 .info { font-size: 11.5px; opacity: 0.65; flex: 1; }
 .err {
   font-size: 11.5px; color: #e88080; max-width: 220px;

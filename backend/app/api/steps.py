@@ -13,6 +13,22 @@ from dubforge.runner import _cfg_snapshot, compute_fingerprint, runner
 
 router = APIRouter(prefix="/api/projects/{uid}/steps", tags=["steps"])
 
+# 规划中尚未实现的配置键 (如 pyannote 说话人分离) 不在步骤页展示, 免得看着像可调参数;
+# 用户 config.yaml 里残留的同名键同样被过滤。快照按段嵌套 ("separate": {...}), 段内外都要滤
+_CFG_DISPLAY_HIDE = {"separate.speaker_diarization", "separate.hf_token"}
+
+
+def _display_cfg(snapshot: dict) -> dict:
+    out = {}
+    for k, v in snapshot.items():
+        if k in _CFG_DISPLAY_HIDE:
+            continue
+        if isinstance(v, dict):
+            v = {sk: sv for sk, sv in v.items()
+                 if f"{k}.{sk}" not in _CFG_DISPLAY_HIDE}
+        out[k] = v
+    return out
+
 
 @router.get("")
 def list_steps(uid: str):
@@ -36,7 +52,7 @@ def list_steps(uid: str):
                       compute_fingerprint(project, s.step_key)),
         "retry_count": s.retry_count,
         "artifacts": arts_by_step.get(s.step_key, []),
-        "cfg": _cfg_snapshot(STEP_MAP[s.step_key].cfg_keys),
+        "cfg": _display_cfg(_cfg_snapshot(STEP_MAP[s.step_key].cfg_keys)),
         "progress": round(s.progress or 0, 1),
         "cancelling": runner.is_cancelling(project.id, s.step_key),
         "pausing": runner.is_paused(project.id, s.step_key),

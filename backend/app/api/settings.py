@@ -11,7 +11,7 @@ from dubforge.errors import DubForgeError
 router = APIRouter(prefix="/api/settings", tags=["settings"])
 
 # 前端"留空 = 保持不变"的敏感键
-_KEEP_IF_EMPTY = {"llm.api_key", "separate.hf_token"}
+_KEEP_IF_EMPTY = {"llm.api_key"}
 
 
 class SettingsUpdate(BaseModel):
