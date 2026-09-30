@@ -5,11 +5,14 @@
 // 勾选「原始」= 解除视频静音; 在原生控件里点小喇叭 = 同步选中「原始」, 双向一致。
 // 全部按头部对齐跟随视频 (拖动/倍速/暂停同步, 漂移>0.3s 校正); 波形画播放位置竖线
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { NButton, NEmpty, NRadio, NRadioGroup, NText } from 'naive-ui'
 import { fmtDur } from '../utils/format'
+import { vReleaseMedia } from '../utils/preview'
 
 const MIXED = '__mixed__'
 const props = defineProps<{
-  tracks: { name: string, label: string, url: string, peaks: string, size?: number }[]
+  tracks: { name: string, label: string, url: string, peaks: string,
+    size?: number, sha256?: string }[]
   videoUrl: string | null
 }>()
 
@@ -38,13 +41,21 @@ const options = computed(() => {
   return [...head, ...mixed, ...rest]
 })
 
-// 轮询会不断重建 tracks 数组 (内容不变) —— 按名字签名去重,
-// 只有音轨集合真正变化时才重置选择/重载波形
-const trackSig = computed(() => props.tracks.map(t => t.name).join('|'))
+// 轮询会不断重建 tracks 数组。签名必须包含内容版本；同名 wav 被重跑替换后
+// 也要重新加载波形和 audio 元素，不能只按文件名去重。
+const trackSig = computed(() => props.tracks
+  .map(t => `${t.name}:${t.sha256 || ''}:${t.size ?? ''}`).join('|'))
 let lastSig = ''
+watch(() => props.videoUrl, () => {
+  videoErr.value = false
+  for (const audio of audioEls.values()) audio.pause()
+  stopLoop()
+})
 watch(trackSig, (sig) => {
   if (sig === lastSig) return
   lastSig = sig
+  videoEl.value?.pause()
+  for (const audio of audioEls.values()) audio.pause()
   trackErr.value = new Set()
   selected.value = rawName.value || props.tracks[0]?.name || ''
   void loadAllPeaks()
@@ -60,7 +71,7 @@ async function loadAllPeaks() {
   const gotMax: Record<string, number> = {}
   const jobs = props.tracks.map(async (t) => {
     try {
-      const r = await fetch(t.peaks)
+      const r = await fetch(t.peaks, { cache: 'no-store' })
       if (r.ok) {
         const j = await r.json()
         got[t.name] = j.points ?? []
@@ -75,7 +86,7 @@ async function loadAllPeaks() {
     jobs.push((async () => {
       try {
         const url = `${vT.peaks}_mixed?other=${encodeURIComponent('background.wav')}`
-        const r = await fetch(url)
+        const r = await fetch(url, { cache: 'no-store' })
         if (r.ok) {
           const j = await r.json()
           got[MIXED] = j.points ?? []
@@ -308,7 +319,7 @@ onBeforeUnmount(() => {
 <template>
   <div class="prev-row">
     <div class="vid-col">
-      <video v-if="hasVideo" ref="videoEl" class="vid" :src="videoUrl || undefined"
+      <video v-if="hasVideo" v-release-media :key="videoUrl || ''" ref="videoEl" class="vid" :src="videoUrl || undefined"
              muted controls preload="metadata"
              @play="onVideoPlay" @pause="onVideoPause" @ended="onVideoEnded"
              @seeked="onVideoSeeked" @ratechange="onVideoRate"
@@ -347,8 +358,8 @@ onBeforeUnmount(() => {
   </div>
   <!-- 隐藏音轨元素: 实际发声者 (原始轨在无视频时兜底); 必须留在 DOM 里 -->
   <div style="display: none">
-    <audio v-for="t in (hasVideo ? tracks.filter(t => t.name !== rawName) : tracks)"
-           :key="t.name"
+    <audio v-for="t in (hasVideo ? tracks.filter(t => t.name !== rawName) : tracks)" v-release-media
+           :key="`${t.name}:${t.sha256 || ''}:${t.size ?? ''}`"
            :ref="(el) => setAudio(t.name, el as HTMLAudioElement | null)"
            :src="t.url" preload="auto"
            @loadedmetadata="onAudioLoaded(t.name)" @error="onAudioError(t.name)" />

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """本地文件 API: 目录浏览 + 拖入导入 (ingest)"""
 from fastapi.testclient import TestClient
 
@@ -100,7 +99,6 @@ def test_ingest_guards(isolated_env, tmp_path):
 
 def test_external_file_survives_project_delete(isolated_env, tmp_path):
     """引用的外部视频 (项目目录外) 删项目时绝不受伤"""
-    from dubforge import config
     src = tmp_path / "movie.mp4"
     src.write_bytes(b"original")
     with _client() as client:
@@ -131,6 +129,7 @@ def test_artifact_peaks(isolated_env):
     import math
     import struct
     import wave as wavmod
+
     from dubforge.domain import crud
     from dubforge.domain.models import Artifact
     p = crud.create_project(title="波形项目")
@@ -150,8 +149,8 @@ def test_artifact_peaks(isolated_env):
                        rel_path="audio/tone.wav", size=path.stat().st_size))
         s.commit()
 
-    from fastapi.testclient import TestClient
     from app.main import app
+    from fastapi.testclient import TestClient
     with TestClient(app) as client:
         url = f"/api/projects/{p.uid}/steps/preprocess/artifacts/tone.wav/peaks"
         r = client.get(url)
@@ -165,8 +164,8 @@ def test_artifact_peaks(isolated_env):
 
 def test_spa_blocks_path_traversal(isolated_env):
     """SPA 静态托管: 编码穿越 (..%2F) 不允许读到 dist 外的文件 (如仓库 config.yaml)"""
-    from fastapi.testclient import TestClient
     from app.main import FRONTEND_DIST, app
+    from fastapi.testclient import TestClient
     if not FRONTEND_DIST.is_dir():
         return                        # 前端未构建的环境跳过 (CI 只跑后端时)
     with TestClient(app) as client:
@@ -189,9 +188,9 @@ def test_peaks_mixed_true_sample_sum(isolated_env):
     import struct
     import wave
 
+    from app.main import app
     from dubforge.domain import crud
     from fastapi.testclient import TestClient
-    from app.main import app
 
     client = TestClient(app)
     r = client.post("/api/projects", json={"title": "混音波形"})

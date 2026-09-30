@@ -1,0 +1,16 @@
+<script setup lang="ts">
+import { ref, watch, onUnmounted } from 'vue'
+import { RouterLink } from 'vue-router'
+import { NButton, NSelect, NAlert, useDialog } from 'naive-ui'
+import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
+const props=defineProps<{uids:string[]}>(),emit=defineEmits<{'changed':[]}>()
+const dialog=useDialog(),rows=ref<any[]>([]),current=ref<string|null>(null),busy=ref(false),error=ref(''),overrides=ref(0)
+let generation=0,disposed=false
+async function api(path:string,body?:any){const r=await fetch('/api/configuration'+path,{method:body?'POST':'GET',headers:body?{'Content-Type':'application/json'}:undefined,body:body?JSON.stringify(body):undefined});const d=await r.json();if(!r.ok)throw new Error(d.message||'模板操作失败');return d}
+async function load(){const n=++generation;try{const list=await api('/templates');if(n!==generation)return;rows.value=list;current.value=null;overrides.value=0;if(props.uids.length===1){const d=await api('/project:'+encodeURIComponent(props.uids[0]));if(n!==generation)return;current.value=d.parent?.slice(7)||null;overrides.value=Object.keys(d.overrides).length}}catch(e:any){error.value=e.message}}
+async function bind(value:string|null){if(busy.value||!props.uids.length)return;busy.value=true;error.value='';const uids=[...props.uids],ticket=generation;let sent=false;const close=()=>{busy.value=false};try{const plan=await api('/binding-plan',{uids,template_id:value||''});if(disposed||ticket!==generation){close();return}dialog.warning({title:`绑定${plan.name}？`,content:plan.projects.map((p:any)=>`${p.uid}：${p.changes.length}项生效值变化，保留${p.preserved}项项目设置`).join('；'),positiveText:'确认绑定',negativeText:'取消',onPositiveClick:async()=>{if(sent||disposed||ticket!==generation){close();return false}sent=true;try{await api('/bind',{uids,template_id:value||'',fingerprint:plan.fingerprint,confirmed:true});if(!disposed){await load();emit('changed')}}catch(e:any){if(!disposed)error.value=e.message}finally{close()}},onNegativeClick:close,onClose:close,onMaskClick:close})}catch(e:any){if(!disposed)error.value=e.message;close()}}
+watch(()=>props.uids.join(','),load,{immediate:true})
+onUnmounted(()=>{disposed=true;generation++})
+</script>
+<template><div class="binding"><span>{{ uids.length>1?'批量绑定模板':'系列模板' }}</span><n-select :value="current" :options="[{label:'不绑定模板（跟随全局默认）',value:''},...rows.filter(r=>!r.archived||r.id===current).map(r=>({label:r.name+(r.archived?' · 已归档':''),value:r.id,disabled:r.archived}))]" :disabled="busy||!uids.length" :clearable="uids.length===1" :placeholder="uids.length>1?'选择要绑定的模板…':'跟随全局默认'" @update:value="bind"/><span v-if="uids.length===1" class="binding-overrides"><ConfigurationSourceBadge :source="{kind:'project'}"/><small>{{ overrides }} 项覆盖</small></span><RouterLink :to="{path:'/settings',query:{section:'production',...(uids.length===1&&current?{template:current}:{})}}">{{ uids.length===1 ? (current?'编辑当前模板':'编辑全局默认') : '管理模板' }}</RouterLink></div><n-alert v-if="error" type="error">{{ error }}</n-alert></template>
+<style scoped>.binding{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0;font-size:12px}.binding :deep(.n-select){width:230px}.binding-overrides{display:inline-flex;align-items:center;gap:6px}.binding small{color:var(--df-muted)}.binding a{margin-left:auto}</style>

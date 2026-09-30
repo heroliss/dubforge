@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """ASR 后端: faster-whisper
 ==========================
 LANGUAGES = 本后端支持的语言表 (code, 中文名), 供步骤页/设置页的下拉与

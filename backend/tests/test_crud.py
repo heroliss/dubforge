@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """M1 领域 CRUD 测试: 目录骨架 / 9 步骤行 / 删除联动 / manifest 双写"""
 import json
 
@@ -49,6 +48,41 @@ def test_backfill_steps(isolated_env):
     added = crud.backfill_steps()
     assert added >= 6
     assert len(crud.get_steps(p.id)) == 9
+
+
+def test_repair_only_stale_steps_without_execution_or_artifact_evidence(make_project, pdir):
+    """兼容修复只还原从未运行的旧错误状态，不能把真实过期结果说成首次运行。"""
+    import datetime
+
+    from dubforge.domain import crud
+    from dubforge.domain.models import Artifact, Job
+
+    uid = make_project()
+    project = crud.get_project(uid)
+    keys = ("split", "translate", "subtitles", "dubtask", "tts", "assemble")
+    for key in keys:
+        step = crud.get_step(project.id, key)
+        step.status = "stale"
+        step.error_message = "上游步骤 [download] 已重跑, 本步结果过期"
+        if key == "translate":
+            step.input_fingerprint = "old-input"
+        elif key == "subtitles":
+            step.started_at = datetime.datetime.now(datetime.timezone.utc)
+        elif key == "assemble":
+            step.progress = 10
+        crud.save_step(step)
+    with crud.session() as s:
+        s.add(Artifact(project_id=project.id, step_key="dubtask", name="tasks.json", rel_path="tasks.json"))
+        s.add(Job(project_id=project.id, step_key="tts", status="failed"))
+        s.commit()
+    assert crud.repair_unstarted_stale_steps() == 1
+    steps = {s.step_key: s for s in crud.get_steps(project.id)}
+    assert steps["split"].status == "pending"
+    assert not steps["split"].error_message
+    assert all(steps[key].status == "stale" for key in keys if key != "split")
+    manifest = json.loads((pdir(uid) / "manifest.json").read_text(encoding="utf-8"))
+    assert next(s for s in manifest["steps"] if s["key"] == "split")["status"] == "pending"
+    assert crud.repair_unstarted_stale_steps() == 0
 
 
 def test_rebuild_from_dirs(isolated_env):
@@ -147,3 +181,46 @@ def test_step_param_change_alters_fingerprint(isolated_env):
         assert compute_fingerprint(p, "preprocess") != fp1
     finally:
         config.set_key("separate.model", "htdemucs")
+
+
+def test_segmentation_mode_alters_split_fingerprint(isolated_env):
+    """词级/短语级只让语义整理失效，不触发 Whisper 重新识别。"""
+    import dubforge.config as cfgmod
+    from dubforge.domain import crud
+    from dubforge.runner import compute_fingerprint
+
+    p = crud.create_project(title="mode-fingerprint")
+    cfgmod.set_key("asr.segmentation_mode", "phrase")
+    transcribe_fp = compute_fingerprint(p, "transcribe")
+    phrase_fp = compute_fingerprint(p, "split")
+    cfgmod.set_key("asr.segmentation_mode", "word")
+    assert compute_fingerprint(crud.get_project(p.uid), "transcribe") == transcribe_fp
+    assert compute_fingerprint(crud.get_project(p.uid), "split") != phrase_fp
+def test_download_source_change_alters_fingerprint(isolated_env, tmp_path):
+    from dubforge.domain import crud
+    from dubforge.runner import compute_fingerprint
+
+    source = tmp_path / "a.mp4"
+    source.write_bytes(b"a")
+    p = crud.create_project(title="源指纹", source_kind="local",
+                            source_url=str(source))
+    fp1 = compute_fingerprint(p, "download")
+    p.source_url = str(tmp_path / "b.mp4")
+    crud.save_project(p)
+    assert compute_fingerprint(crud.get_project(p.uid), "download") != fp1
+
+
+def test_force_assemble_keeps_history_files(make_project, isolated_env, pdir):
+    """重跑保留成片及索引，失败后用户仍可预览、定位和发布原成品。"""
+    from dubforge.domain import crud
+
+    uid = make_project()
+    project = crud.get_project(uid)
+    out = pdir(uid) / "output" / "final_old.mp4"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_bytes(b"old")
+    crud.add_artifact(project.id, "assemble", "video", out.name, out,
+                      str(out.relative_to(pdir(uid))))
+    crud.delete_step_artifacts(project.id, "assemble")
+    assert out.exists()
+    assert f'assemble/{out.name}' in crud.latest_artifacts(project.id, ["assemble"])

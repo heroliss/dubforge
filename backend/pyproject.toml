@@ -14,18 +14,20 @@ dependencies = [
     "python-multipart>=0.0.9",
     # ---- M2 媒体处理链 ----
     "yt-dlp>=2025.9.26",
-    "faster-whisper>=1.1.0",
-    "demucs>=4.0.1",
-    # 显式声明 torch 以使下方 CUDA index 生效 (传递依赖不受 sources 控制)
-    "torch>=2.6",
-    "torchaudio>=2.6",
     "soundfile>=0.13",
     "pandas>=2.2",
     "openpyxl>=3.1",
     # ---- M3 配音链 ----
     "gradio-client>=1.8",
     "send2trash>=2.1.0",
+    "pywin32>=305; sys_platform == 'win32'",
+    "psutil>=7.0",
 ]
+
+[project.optional-dependencies]
+# 按使用能力安装；TTS 服务仍使用各自独立环境。
+asr = ["faster-whisper>=1.1.0", "torch>=2.6"]
+separation = ["demucs>=4.0.1", "torch>=2.6", "torchaudio>=2.6"]
 
 # torch 走 CUDA wheel (默认 PyPI 在 Windows 只发 CPU 版); 8G 显存 GPU 加速
 [tool.uv.sources]

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 GPT-SoVITS 后端 (v2 API /tts)
 =============================
@@ -10,15 +9,18 @@ from pathlib import Path
 
 import httpx
 
-from dubforge import config
-from dubforge.utils.fs import atomic_replace
 from dubforge.errors import ServiceOfflineError
+from dubforge.utils.fs import atomic_replace
 
 
 def is_online(url: str) -> bool:
     try:
         with httpx.Client(timeout=3, trust_env=False) as c:
-            return c.get(url.rstrip("/") + "/tts").status_code in (200, 405)
+            response = c.get(url.rstrip("/") + "/tts")
+            # api_v2 的 GET /tts 缺少参考音频时返回 400，此时模型已加载、服务可用。
+            return response.status_code in (200, 405) or (
+                response.status_code == 400
+                and response.json().get("message") in {"ref_audio_path is required", "text is required"})
     except Exception:
         return False
 
@@ -43,20 +45,32 @@ def synth(url: str, text: str, out_path: Path, lang: str = "zh",
         "prompt_lang": "zh",
         "speed_factor": 1.0,
     }
-    with httpx.Client(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10),
-                      trust_env=False) as c:
-        with c.stream("POST", url.rstrip("/") + "/tts", json=body) as r:
-            if r.status_code != 200:
-                raise RuntimeError(f"GPT-SoVITS HTTP {r.status_code}")
-            tmp = out_path.with_suffix(".wav.tmp")
-            with open(tmp, "wb") as f:
-                for chunk in r.iter_bytes():
-                    f.write(chunk)
-    # GPT-SoVITS 返回 wav; 统一 32k mono (显式 -f wav: .norm 后缀无法推断格式)
-    subprocess.run(["ffmpeg", "-y", "-i", str(tmp), "-ar", "32000", "-ac", "1",
-                    "-f", "wav", str(out_path.with_suffix(".norm"))],
-                   check=True, capture_output=True)
-    import os
-    atomic_replace(out_path.with_suffix(".norm"), out_path)
+    tmp = out_path.with_suffix(".wav.tmp")
+    try:
+        with (httpx.Client(timeout=httpx.Timeout(connect=10, read=300, write=60, pool=10),
+                           trust_env=False) as c,
+              c.stream("POST", url.rstrip("/") + "/tts", json=body) as r):
+                if r.status_code != 200:
+                    raise RuntimeError(f"GPT-SoVITS HTTP {r.status_code}")
+                with open(tmp, "wb") as f:
+                    f.writelines(r.iter_bytes())
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    # GPT-SoVITS 返回 wav; 统一 32k mono (临时名显式 -f wav)
+    norm = out_path.with_suffix(".tmp_norm.wav")
+    try:
+        subprocess.run(["ffmpeg", "-y", "-i", str(tmp), "-ar", "32000", "-ac", "1",
+                        "-f", "wav", str(norm)], check=True, capture_output=True)
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        norm.unlink(missing_ok=True)
+        raise
+    try:
+        atomic_replace(norm, out_path)
+    except Exception:
+        norm.unlink(missing_ok=True)
+        tmp.unlink(missing_ok=True)
+        raise
     Path(tmp).unlink(missing_ok=True)
     return out_path

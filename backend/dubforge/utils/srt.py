@@ -1,9 +1,9 @@
-# -*- coding: utf-8 -*-
 """SRT 读写工具 (无第三方依赖; 手写 30 行, 少一个依赖)"""
 import re
 from dataclasses import dataclass
-from dubforge.utils.fs import atomic_replace
 from pathlib import Path
+
+from dubforge.utils.fs import atomic_replace
 
 
 @dataclass
@@ -12,10 +12,12 @@ class SubLine:
     start: float          # 秒
     end: float
     text: str
+    # 仅供烧录样式使用，SRT 导出仍只写 text；不能通过换行猜测语言边界。
+    parts: tuple[tuple[str, str], ...] | None = None
 
 
 def _fmt_ts(seconds: float) -> str:
-    ms = int(round(seconds * 1000))
+    ms = round(seconds * 1000)
     h, rem = divmod(ms, 3600_000)
     m, rem = divmod(rem, 60_000)
     s, ms = divmod(rem, 1000)
@@ -32,9 +34,13 @@ def write_srt(lines: list[SubLine], path: Path) -> None:
     """原子写 SRT (UTF-8)"""
     blocks = [f"{i}\n{_fmt_ts(l.start)} --> {_fmt_ts(l.end)}\n{l.text}\n"
               for i, l in enumerate(lines, 1)]
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("\n".join(blocks), encoding="utf-8")
-    atomic_replace(tmp, path)
+    try:
+        tmp.write_text("\n".join(blocks), encoding="utf-8")
+        atomic_replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
 def parse_srt(path: Path) -> list[SubLine]:
@@ -45,7 +51,7 @@ def parse_srt(path: Path) -> list[SubLine]:
         if len(lines) < 2 or "-->" not in lines[1]:
             continue
         t1, t2 = [x.strip() for x in lines[1].split("-->")]
-        text = " ".join(lines[2:]) if len(lines) > 2 else ""
+        text = "\n".join(lines[2:]) if len(lines) > 2 else ""
         try:
             idx = int(lines[0])
         except ValueError:
@@ -61,6 +67,10 @@ def write_bilingual(src_lines: list[SubLine], dst_lines: list[SubLine],
     for i, (a, b) in enumerate(zip(src_lines, dst_lines), 1):
         top, bottom = (b.text, a.text) if dst_top else (a.text, b.text)
         blocks.append(f"{i}\n{_fmt_ts(a.start)} --> {_fmt_ts(a.end)}\n{top}\n{bottom}\n")
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text("\n".join(blocks), encoding="utf-8")
-    atomic_replace(tmp, path)
+    try:
+        tmp.write_text("\n".join(blocks), encoding="utf-8")
+        atomic_replace(tmp, path)
+    finally:
+        tmp.unlink(missing_ok=True)

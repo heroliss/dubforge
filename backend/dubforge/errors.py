@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 DubForge 统一错误体系
 =====================
@@ -43,10 +42,30 @@ class ServiceOfflineError(DubForgeError):
     suggestion = "请先启动对应外部服务并确认地址端口, 再重试本步骤。"
 
 
+class ServiceStartError(DubForgeError):
+    code = "SERVICE_START_FAILED"
+    suggestion = "请检查配音参数中的服务地址、安装目录及启动日志。"
+
+
+class ServiceStopError(DubForgeError):
+    code = "SERVICE_STOP_FAILED"
+    suggestion = "请结束正在使用该服务的配音任务后重试，或在服务所在机器关闭。"
+
+
+class PresetError(DubForgeError):
+    code = "PRESET_INVALID"
+    suggestion = "请检查预设文件、参考音频及保存目录。"
+
+
 class ArtifactMissingError(DubForgeError):
     """前置产物缺失 (不该发生: 执行器会先校验上游步骤完成)"""
     code = "ARTIFACT_MISSING"
     suggestion = "请重跑产生该产物的上游步骤。"
+
+
+class DubbingIncompleteError(DubForgeError):
+    code = 'DUBBING_INCOMPLETE'
+    suggestion = '请继续配音或重试完整流程；有效的已有配音会复用。'
 
 
 class StepFailedError(DubForgeError):

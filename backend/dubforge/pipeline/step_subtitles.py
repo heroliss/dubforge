@@ -1,75 +1,69 @@
-# -*- coding: utf-8 -*-
-"""
-步骤 6: subtitles —— 字幕生成
-=============================
-输入: split/split.json (时间轴) + translate/translate.json (译文)
-产物:
-  srt/trans.srt      目标语言字幕 (split 后的时间轴)
-  srt/bilingual.srt  双语字幕 (译文上/原文下, 幂等约定与 VideoLingo 工具箱一致)
-  srt/src.srt        源语言字幕 (transcribe 原句, 不在本步重写)
-行宽: 译文超 max_length 时按标点/字数插入换行 (SRT 内 \n)
-"""
-import json
-import re
-
+"""从统一校对稿导出字幕；手动设置的时间优先于最短显示时长。"""
+from dubforge.pipeline.subtitle_document import read
 from dubforge.utils.srt import SubLine, write_srt
 
 
-def _wrap(text: str, max_chars: int) -> str:
-    """按 max_chars 硬换行: CJK 按字数, 拉丁按词; 优先在标点后断"""
-    if len(text) <= max_chars:
-        return text
-    # 优先标点断点
-    best = None
-    for m in re.finditer(r"[,，。.!?!?；;、：:]", text):
-        if m.end() <= max_chars:
-            best = m.end()
-    if best and best >= max_chars * 0.5:
-        return text[:best].rstrip() + "\n" + text[best:].lstrip()
-    # 通用: 找最近空格 (拉丁) 或硬切 (CJK)
-    out, cur, width = [], "", 0
-    for word in re.findall(r"[\u4e00-\u9fff]|[^\s\u4e00-\u9fff]+|\s+", text):
-        w = len(word)
-        if width + w > max_chars and cur:
-            out.append(cur.rstrip())
-            cur, width = "", 0
-        cur += word
-        width += w
-    if cur:
-        out.append(cur.rstrip())
-    return "\n".join(out)
+def _extend_short_cues(lines, min_duration, total=None, fixed_ids=()):
+    """只利用空隙延长，不引入重叠，也不越过已知内容终点。"""
+    threshold = max(0.0, float(min_duration or 0))
+    total = total if total is not None else max((l.end for l in lines), default=0)
+    changed = 0
+    for i, line in enumerate(lines):
+        if line.index in fixed_ids:
+            continue
+        limit = lines[i + 1].start if i + 1 < len(lines) else total
+        end = max(line.end, min(line.start + threshold, limit))
+        if end > line.end:
+            line.end = end
+            changed += 1
+    return changed
 
 
-def run(ctx) -> None:
-    split_data = json.loads(ctx.upstream("split", "split.json").read_text(encoding="utf-8"))
-    trans_data = json.loads(ctx.upstream("translate", "translate.json").read_text(encoding="utf-8"))
-    dst_map = {l["id"]: l["dst"] for l in trans_data["lines"]}
+def build_tracks(ctx, mode=None):
+    """预览与导出共用文字、双语顺序和最短显示时长。"""
+    mode = mode or ctx.cfg("subtitles.mode", "all")
+    if mode not in {"all", "source", "target", "bilingual"}:
+        from dubforge.errors import DubForgeError
+        raise DubForgeError("请选择有效的字幕导出类型", code="CONFIG_INVALID")
+    document = read(ctx, translation=mode != 'source')
+    source = [{**l, 'text': l['source_text']} for l in document]
+    target = document if mode != 'source' else []
+    source_first = bool(ctx.cfg("subtitles.source_first", False))
+    minimum = float(ctx.cfg("subtitles.min_duration", 1.5) or 0)
+    tracks = {}
+    if mode in {"all", "source"}:
+        tracks["source.srt"] = source
+    if mode in {"all", "target"}:
+        tracks["trans.srt"] = target
+    if mode in {"all", "bilingual"}:
+        tracks["bilingual.srt"] = [
+            {**a, "text": "\n".join((a["text"], b["text"]) if source_first
+                                    else (b["text"], a["text"]))}
+            for a, b in zip(source, target, strict=True)]
+    for name, rows in tracks.items():
+        lines = [SubLine(l["id"], l["start"], l["end"], l["text"]) for l in rows]
+        for line, original in zip(lines, document, strict=True):
+            source_part = ('source', original['source_text'])
+            target_part = ('trans', original['text'])
+            line.parts = (source_part,) if name == 'source.srt' else (target_part,) if name == 'trans.srt' else (
+                (source_part, target_part) if source_first else (target_part, source_part))
+        _extend_short_cues(lines, minimum, fixed_ids={l['id'] for l in rows if 'voice_timing' in l})
+        tracks[name] = lines
+    return tracks, document
 
-    max_chars = int(ctx.cfg("tts.subtitles.max_length", 75))
-    srt_dir = ctx.pdir / "srt"
-    srt_dir.mkdir(exist_ok=True)
 
-    src_lines, dst_lines = [], []
-    for l in split_data["lines"]:
-        start, end = l["start"], l["end"]
-        text_src = l["text"]
-        text_dst = dst_map.get(l["id"], "")
-        src_lines.append(SubLine(l["id"], start, end, text_src))
-        dst_lines.append(SubLine(l["id"], start, end, _wrap(text_dst, max_chars)))
-
-    write_srt(dst_lines, srt_dir / "trans.srt")
-    ctx.register_file("trans.srt", srt_dir / "trans.srt", "srt")
-
-    # 双语: 译文上 / 原文下 (B 站字幕上传用; 时间轴来自 split)
-    write_srt([SubLine(l["id"], l["start"], l["end"],
-                       f"{dst_map.get(l['id'], '')}\n{l['text']}")
-               for l in split_data["lines"]],
-              srt_dir / "bilingual.srt")
-    ctx.register_file("bilingual.srt", srt_dir / "bilingual.srt", "srt")
-
-    ctx.write_json("subtitles.json", {
-        "lines": len(dst_lines),
-        "max_chars": max_chars,
-        "target_language": trans_data["target_language"],
-    })
-    ctx.log(f"✅ 字幕生成: {len(dst_lines)} 句 (trans.srt / bilingual.srt)")
+def run(ctx):
+    tracks, document = build_tracks(ctx)
+    if getattr(ctx, "rebuild", False):
+        from dubforge.domain import crud
+        crud.delete_step_artifacts(ctx.project.id, "subtitles")
+    for name, lines in tracks.items():
+        ctx.check_cancel()
+        path = ctx.pdir / "srt" / name
+        write_srt(lines, path)
+        ctx.register_file(name, path, "srt")
+    ctx.write_json("subtitles.json", {"lines": len(document), "tracks": list(tracks),
+        "source": "edited" if any(l['edited'] for l in document) else "split",
+        "source_first": bool(ctx.cfg("subtitles.source_first", False)),
+        "min_duration": float(ctx.cfg("subtitles.min_duration", 1.5) or 0)})
+    ctx.log(f"✅ 字幕导出：{len(document)} 句，{' / '.join(tracks)}；已应用保存的文字与时间")

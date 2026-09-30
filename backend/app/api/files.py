@@ -1,14 +1,23 @@
-# -*- coding: utf-8 -*-
 """本地文件 API: 目录浏览 (服务端即本机, 浏览服务端目录即浏览用户磁盘)"""
 import string
 from pathlib import Path
 
-from fastapi import APIRouter
-
-from dubforge import config
 from dubforge.errors import DubForgeError
+from fastapi import APIRouter, Request, Response
 
 router = APIRouter(prefix="/api/files", tags=["files"])
+
+
+@router.post('/reveal')
+def reveal_file(body: dict, request: Request, response: Response):
+    from urllib.parse import urlparse
+    from dubforge.utils.reveal import reveal_path
+    origin = request.headers.get('origin')
+    if (request.headers.get('sec-fetch-site') == 'cross-site'
+            or origin and urlparse(origin).hostname not in {request.url.hostname, 'localhost', '127.0.0.1', '::1'}):
+        raise DubForgeError('请在 DubForge 页面内定位文件', code='FILE_ORIGIN')
+    response.headers['Cache-Control'] = 'no-store'
+    return reveal_path(body.get('path'))
 
 VIDEO_EXTS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".flv",
               ".wmv", ".ts", ".m4v", ".mpg", ".mpeg"}

@@ -1,6 +1,3 @@
-import time
-# -*- coding: utf-8 -*-
-import time
 """M2a 媒体链测试: SRT 读写 / 断句纯函数 / download 幂等与去重档案"""
 import json
 
@@ -32,6 +29,35 @@ def test_segment_from_wordsisolated_env():
     assert len(segs) == 2
     assert segs[0][2] == "今天天气"
     assert segs[1][2] == "很好啊。"
+
+
+def test_segment_from_words_marks_soft_punctuation_anchor():
+    """软标点先形成短语锚点，后续语义整理仍可根据上下文合并。"""
+    from dubforge.pipeline.step_transcribe import _segment_from_words
+
+    words = [
+        {"start": 0.0, "end": 0.4, "word": "今天"},
+        {"start": 0.4, "end": 0.8, "word": "天气，"},
+        {"start": 0.8, "end": 1.2, "word": "很好。"},
+    ]
+    segs = _segment_from_words(words)
+    assert len(segs) == 2
+    assert segs[0][2] == "今天天气，"
+    assert segs[1][2] == "很好。"
+
+
+def test_segment_from_words_honors_fine_duration_anchor():
+    """无标点连续语音也按粗句时长上限保留更细的时间锚点。"""
+    from dubforge.pipeline.step_transcribe import _segment_from_words
+
+    words = [
+        {"start": float(i), "end": float(i + 0.8), "word": f"词{i}"}
+        for i in range(6)
+    ]
+    segs = _segment_from_words(words, max_line=4.0)
+    assert len(segs) == 2
+    assert segs[0][2] == "词0词1词2词3"
+    assert segs[1][2] == "词4词5"
 
 
 def test_download_local_import_and_idempotent(make_project, isolated_env, pdir):
@@ -109,3 +135,63 @@ def test_preprocess_and_transcribe_local(make_project, isolated_env, pdir):
 def _runner():
     from dubforge.runner import runner
     return runner
+
+
+def test_transcribe_phases_and_eta_exclude_model_preparation(make_project, pdir, monkeypatch):
+    """可控模型逐批返回，覆盖加载、首批等待、真实进度和尾部静音的收尾。"""
+    import sys
+    import threading
+    from types import SimpleNamespace
+
+    from dubforge.domain import crud
+    from dubforge.pipeline import step_transcribe
+    from dubforge.runner import StepContext, runner
+
+    uid = make_project()
+    project = crud.get_project(uid)
+    step = crud.get_step(project.id, "transcribe")
+    step.status = "running"
+    crud.save_step(step)
+    ctx = StepContext(project, "transcribe", pdir(uid), pdir(uid) / "logs" / "transcribe.log", threading.Event())
+    clock = [0.0]
+    ctx.active_seconds = lambda: clock[0]
+    ctx.upstream = lambda *args: pdir(uid) / "audio" / "raw.wav"
+    monkeypatch.setitem(runner._ctxs, (project.id, "transcribe"), ctx)
+
+    def visible():
+        return runner.progress_eta(project.id, "transcribe")
+
+    def segments():
+        assert visible()["progress_phase"] == "识别首批语音，等待结果"
+        assert visible()["progress_indeterminate"] is True
+        assert ctx.eta_seconds() == 0
+        clock[0] = 90
+        yield SimpleNamespace(start=0, end=30, words=[SimpleNamespace(start=0, end=2, word="Hello.")])
+        assert visible()["progress_indeterminate"] is False
+        assert crud.get_step(project.id, "transcribe").progress == 24.8
+        assert ctx.eta_seconds() == 30  # 仅识别耗时10秒，前80秒准备不计入速度。
+        clock[0] = 95
+        assert ctx.eta_seconds() == 25
+        clock[0] = 100
+        yield SimpleNamespace(start=30, end=60, words=[SimpleNamespace(start=30, end=32, word="World.")])
+        assert ctx.eta_seconds() == 20
+
+    class FakeWhisper:
+        def __init__(self, *args, **kwargs):
+            assert visible()["progress_phase"] == "加载语音识别模型"
+            assert visible()["progress_indeterminate"] is True
+            clock[0] = 60
+            assert visible()["elapsed_seconds"] == 60
+
+        def transcribe(self, *args, **kwargs):
+            assert visible()["progress_phase"] == "准备音频并检测人声与语言"
+            clock[0] = 80
+            return segments(), SimpleNamespace(duration=120, language="en")
+
+    monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
+    monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisper))
+    step_transcribe.run(ctx)
+    assert visible()["progress_phase"] == "整理并保存字幕"
+    assert crud.get_step(project.id, "transcribe").progress == 99
+    assert ctx.eta_seconds() == 0
+    assert [line.text for line in parse_srt(pdir(uid) / "srt" / "src.srt")] == ["Hello.", "World."]

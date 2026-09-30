@@ -1,0 +1,18 @@
+{
+  "schema": "dubforge.batch.v1",
+  "projects": [
+    {
+      "source": "https://www.youtube.com/watch?v=BaW_jenozKc",
+      "title": "旅行视频 01"
+    },
+    {
+      "source": "https://www.youtube.com/watch?v=aqz-KE-bpKQ",
+      "title": "旅行视频 02",
+      "settings": {
+        "comments.mode": "auto",
+        "comments.limit": 50,
+        "comments.count": 10
+      }
+    }
+  ]
+}

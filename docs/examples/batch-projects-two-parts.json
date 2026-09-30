@@ -1,0 +1,43 @@
+{
+  "schema": "dubforge.batch.v1",
+  "defaults": {
+    "settings": {
+      "comments.mode": "auto",
+      "comments.limit": 50,
+      "comments.count": 10,
+      "assembly.versions": [
+        {
+          "id": "dub",
+          "name": "中文配音版",
+          "dubbing": true,
+          "burn_subtitles": true,
+          "include_comments": true,
+          "overrides": {
+            "assemble.subtitle_track": "trans",
+            "comments.language_mode": "translated"
+          }
+        },
+        {
+          "id": "src",
+          "name": "原声双语版",
+          "dubbing": false,
+          "burn_subtitles": true,
+          "include_comments": true,
+          "overrides": {
+            "assemble.subtitle_track": "bilingual",
+            "comments.language_mode": "bilingual"
+          }
+        }
+      ],
+      "publish.version_ids": ["dub", "src"],
+      "publish.part_titles": {
+        "dub": "中文配音版",
+        "src": "原声双语版"
+      }
+    }
+  },
+  "projects": [
+    {"source": "https://www.youtube.com/watch?v=BaW_jenozKc", "title": "旅行视频 01"},
+    {"source": "https://www.youtube.com/watch?v=aqz-KE-bpKQ", "title": "旅行视频 02"}
+  ]
+}

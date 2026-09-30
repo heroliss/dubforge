@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 步骤 2: preprocess —— 预处理
 ============================
@@ -13,11 +12,11 @@
 - 显存不足自动降级; ctx.check_cancel 取消粒度=整曲 (demucs 无细粒度回调)
 - "取消不产生半成品" 由临时目录保证: 输出写 artifacts/preprocess/.tmp_* 完成后改名
 """
-import os
 import shutil
 from pathlib import Path
 
 from dubforge.errors import DubForgeError
+from dubforge.progress import RateProgress, _bind
 from dubforge.utils.fs import atomic_replace
 
 
@@ -28,14 +27,17 @@ def _extract_audio(ctx, video: Path, out_wav: Path) -> None:
     cmd = ["ffmpeg", "-y", "-i", str(video), "-vn",
            "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le",
            "-f", "wav", str(tmp)]
-    rc, _, err = ctx.run_subprocess(cmd)
-    if rc != 0:
-        raise DubForgeError("音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
-                            detail=err[-1500:])
-    atomic_replace(tmp, out_wav)
+    try:
+        rc, _, err = ctx.run_subprocess(cmd)
+        if rc != 0:
+            raise DubForgeError("音轨提取失败 (ffmpeg)", code="FFMPEG_FAIL",
+                                detail=err[-1500:])
+        atomic_replace(tmp, out_wav)
+    finally:
+        tmp.unlink(missing_ok=True)
 
 
-def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int):
+def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int, stride_sec=0.0):
     """demucs 分段回调 → 进度上报 + 段间暂停/取消检查点。
 
     demucs (4.1.0) 的 apply_model 在 GPU 下用 DummyPoolExecutor 同步逐段执行,
@@ -48,6 +50,7 @@ def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int):
     须除以 sr 换算成秒; shifts>0 时 demucs 只跑 shifts 遍位移平均 (没有额外
     的干净遍), 遍数分母 = max(1, shifts)。"""
     passes = max(1, shifts)
+    progress = RateProgress(ctx, 1.0, start=30, end=85, scope="phase")
 
     def cb(d: dict) -> None:
         if d.get("state") != "end":
@@ -56,14 +59,19 @@ def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int):
         ctx.check_cancel()         # 取消: 抛出后 demucs 终止剩余分段
         offset_sec = float(d.get("segment_offset") or 0) / max(sr, 1)
         shift_idx = int(d.get("shift_idx") or 0)
-        frac = (shift_idx + min(1.0, offset_sec / max(total_sec, 1e-6))) / passes
-        ctx.report_progress(30 + frac * 55)     # 30 → 85 区间
+        models = max(1, int(d.get("models") or 1))
+        model_idx = int(d.get("model_idx_in_bag") or 0)
+        frac = (model_idx * passes + shift_idx
+                + min(1.0, (offset_sec + stride_sec) / max(total_sec, 1e-6))) / (passes * models)
+        progress.update(frac)
     return cb
 
 
 def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
     """htdemucs 分离人声/伴奏; 输入须为 44.1kHz 立体声 (模型训练规格)"""
     from dubforge import config
+    from dubforge.environment import require_component
+    require_component("separation")
     config.ensure_hf_env()
     import torch
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -77,10 +85,10 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
         shutil.rmtree(tmp_out)
     tmp_out.mkdir(parents=True)
 
-    from demucs import pretrained
-    from demucs.apply import apply_model
     import soundfile as sf
     import torch as th
+    from demucs import pretrained
+    from demucs.apply import apply_model
 
     model = pretrained.get_model(model_name)
     model.to(device)
@@ -113,26 +121,25 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
                                   split=True, overlap=overlap, shifts=shifts,
                                   progress=False,
                                   callback=_demucs_callback(ctx, total_sec,
-                                                            shifts, sr))[0]
-    except BaseException:
-        # 取消/暂停异常: 终止剩余分段后清掉本曲工作目录再向上传播
+                                                            shifts, sr, seg * (1 - overlap)))[0]
+        _bind(ctx, None)
+        # htdemucs stems 顺序: drums, bass, other, vocals
+        vocals = sources[-1]
+        background = sources[:-1].sum(0)
+
+        vocal_path = tmp_out / "vocal.wav"
+        bg_path = tmp_out / "background.wav"
+        sf.write(vocal_path, (vocals * ref.std() + ref.mean()).cpu().numpy().T, sr)
+        sf.write(bg_path, (background * ref.std() + ref.mean()).cpu().numpy().T, sr)
+
+        final_v = out_dir / "vocal.wav"
+        final_b = out_dir / "background.wav"
+        atomic_replace(vocal_path, final_v)
+        atomic_replace(bg_path, final_b)
+        return final_v, final_b
+    finally:
+        # 取消、写盘失败或原子替换失败都不能留下可被下次误认的临时目录。
         shutil.rmtree(tmp_out, ignore_errors=True)
-        raise
-    # htdemucs stems 顺序: drums, bass, other, vocals
-    vocals = sources[-1]
-    background = sources[:-1].sum(0)
-
-    vocal_path = tmp_out / "vocal.wav"
-    bg_path = tmp_out / "background.wav"
-    sf.write(vocal_path, (vocals * ref.std() + ref.mean()).cpu().numpy().T, sr)
-    sf.write(bg_path, (background * ref.std() + ref.mean()).cpu().numpy().T, sr)
-
-    final_v = out_dir / "vocal.wav"
-    final_b = out_dir / "background.wav"
-    atomic_replace(vocal_path, final_v)
-    atomic_replace(bg_path, final_b)
-    shutil.rmtree(tmp_out, ignore_errors=True)
-    return final_v, final_b
 
 
 def run(ctx) -> None:
@@ -141,7 +148,12 @@ def run(ctx) -> None:
     video = ctx.upstream("download", "video.mp4")
     raw_wav = audio_dir / "raw.wav"
 
-    if raw_wav.exists():
+    if getattr(ctx, "rebuild", False):
+        # 配置/上游变化时不能把旧音轨当成幂等缓存继续使用。
+        for old in (raw_wav, audio_dir / "vocal.wav", audio_dir / "background.wav"):
+            old.unlink(missing_ok=True)
+
+    if raw_wav.exists() and not getattr(ctx, "rebuild", False):
         ctx.log("raw.wav 已存在, 跳过音轨提取")
     else:
         ctx.log("提取 16kHz 单声道音轨...")
@@ -156,7 +168,7 @@ def run(ctx) -> None:
 
     vocal = audio_dir / "vocal.wav"
     bg = audio_dir / "background.wav"
-    if vocal.exists() and bg.exists():
+    if vocal.exists() and bg.exists() and not getattr(ctx, "rebuild", False):
         ctx.log("vocal/background 已存在, 跳过分离")
     else:
         ctx.report_progress(30)

@@ -1,20 +1,19 @@
-# -*- coding: utf-8 -*-
 """FastAPI 应用入口 (壳层; 领域逻辑全部在 dubforge 包内)
 - 启动: init_db + 崩溃恢复扫描 (M1 实现)
 - 生产: 托管 frontend/dist 静态文件 (存在时), SPA fallback 到 index.html
 """
+import logging
 from contextlib import asynccontextmanager
-from pathlib import Path
-
-from fastapi import FastAPI, Request
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
 
 from dubforge import config
 from dubforge.db import init_db
 from dubforge.errors import DubForgeError
+from fastapi import FastAPI, Request
+from fastapi.responses import FileResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 FRONTEND_DIST = config.REPO_ROOT / "frontend" / "dist"
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -25,17 +24,27 @@ async def lifespan(app: FastAPI):
     # 同时把手动拷进 projects/ 的项目文件夹收编进索引 (拷文件夹 = 搬项目)
     rebuilt = crud.rebuild_from_dirs()
     if rebuilt["projects"]:
-        import logging
-        logging.warning("从项目目录收编了 %d 个未登记的项目 (步骤 %d 行 / 产物 %d 条)",
-                        rebuilt["projects"], rebuilt["steps"], rebuilt["artifacts"])
+        logger.warning("从项目目录收编了 %d 个未登记的项目 (步骤 %d 行 / 产物 %d 条)",
+                       rebuilt["projects"], rebuilt["steps"], rebuilt["artifacts"])
     added = crud.backfill_steps()
     if added:
-        import logging
-        logging.warning("为老项目补齐了 %d 个缺失的步骤行", added)
+        logger.warning("为老项目补齐了 %d 个缺失的步骤行", added)
+    repaired = crud.repair_unstarted_stale_steps()
+    if repaired:
+        logger.info("已将 %d 个从未运行却被标记过期的步骤恢复为待运行", repaired)
     # 崩溃恢复: 上次运行残留的 running 状态判中断 (原子写保证无半成品)
     from dubforge.runner import runner
     runner.recover()
-    yield
+    from dubforge.publishing import service as publishing
+    publishing.recover()
+    from dubforge import workflows
+    workflows.recover()
+    workflows.start_monitor()
+    try:
+        yield
+    finally:
+        workflows.shutdown()
+        publishing.interrupt_all()
 
 
 app = FastAPI(title="DubForge", version="0.1.0", lifespan=lifespan)
@@ -53,12 +62,19 @@ def health():
 
 
 # ---- API 路由 ----
+from app.api import files as api_files
+from app.api import services as api_services
+from app.api import presets as api_presets
 from app.api import projects as api_projects
 from app.api import settings as api_settings
 from app.api import steps as api_steps
-from app.api import presets as api_presets
 from app.api import workbench as api_workbench
-from app.api import files as api_files
+from app.api import comments as api_comments
+from app.api import publishing as api_publishing
+from app.api import workflows as api_workflows
+from app.api import assembly_versions as api_assembly_versions
+from app.api import configuration as api_configuration
+from app.api import project_import as api_project_import
 
 app.include_router(api_settings.router)
 app.include_router(api_projects.router)
@@ -66,6 +82,13 @@ app.include_router(api_steps.router)
 app.include_router(api_workbench.router)
 app.include_router(api_presets.router)
 app.include_router(api_files.router)
+app.include_router(api_services.router)
+app.include_router(api_comments.router)
+app.include_router(api_publishing.router)
+app.include_router(api_workflows.router)
+app.include_router(api_assembly_versions.router)
+app.include_router(api_configuration.router)
+app.include_router(api_project_import.router)
 
 
 # ---- 前端静态托管 (frontend/dist 存在时; 开发期走 vite dev server) ----

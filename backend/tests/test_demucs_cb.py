@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 demucs 分段回调测试
 ==================
@@ -15,7 +14,6 @@ import numpy as np
 import pytest
 import soundfile as sf
 import torch as th
-
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.step_preprocess import _demucs_callback, _run_demucs
 
@@ -106,7 +104,6 @@ def test_callback_pause_blocks_and_cancel_aborts():
 
 def test_run_demucs_cancel_mid_segments(monkeypatch, tmp_path):
     """整链: 分段回调里取消 → _run_demucs 中止且清掉临时目录 (不留半成品)"""
-    import dubforge.pipeline.step_preprocess as sp
     from dubforge.runner import StepCancelled
 
     src = tmp_path / "src.wav"

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 步骤实现注册表
 ==============
@@ -9,7 +8,7 @@ ctx.write_* 原子产出。
 测试可用 stub_heavy_steps 夹具临时替换 _RUNNERS[key] (状态机测试与真实现解耦)。
 """
 import time
-from typing import Callable
+from collections.abc import Callable
 
 from dubforge.pipeline.registry import STEP_KEYS
 
@@ -36,17 +35,15 @@ def _stub(step_key: str):
 
 
 # 真实实现 (M2a 媒体链 + M2b 文本链)
-from dubforge.pipeline.step_download import run as _download_run
-from dubforge.pipeline.step_preprocess import run as _preprocess_run
-from dubforge.pipeline.step_transcribe import run as _transcribe_run
-from dubforge.pipeline.step_split import run as _split_run
-from dubforge.pipeline.step_translate import run as _translate_run
-from dubforge.pipeline.step_subtitles import run as _subtitles_run
-
-from dubforge.pipeline.step_dubtask import run as _dubtask_run
-from dubforge.pipeline.step_tts import run as _tts_run
-
 from dubforge.pipeline.step_assemble import run as _assemble_run
+from dubforge.pipeline.step_download import run as _download_run
+from dubforge.pipeline.step_dubtask import run as _dubtask_run
+from dubforge.pipeline.step_preprocess import run as _preprocess_run
+from dubforge.pipeline.step_split import run as _split_run
+from dubforge.pipeline.step_subtitles import run as _subtitles_run
+from dubforge.pipeline.step_transcribe import run as _transcribe_run
+from dubforge.pipeline.step_translate import run as _translate_run
+from dubforge.pipeline.step_tts import run as _tts_run
 
 _REAL = {
     "download": _download_run,

@@ -1,17 +1,37 @@
 <script setup lang="ts">
-// 设置页: LLM 多组配置池 (任意 OpenAI 兼容服务商, 按顺序降级) + 其余组只读概览
+import FilePathLink from '../components/FilePathLink.vue'
+// 设置入口：制作规则复用统一配置编辑器，本机连接与运行偏好分别保存。
 // 注意: v-for 容器一律用原生 flex div —— naive-ui 2.45 的 n-space 在嵌套 n-card
 // 场景会把组件子项渲染成空注释 (已踩坑, 见 git 历史)
-import { computed, onMounted, onUnmounted, ref } from 'vue'
-import { onBeforeRouteLeave } from 'vue-router'
-import { useMessage } from 'naive-ui'
-import ParamControl from '../components/ParamControl.vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
+import { onBeforeRouteLeave, onBeforeRouteUpdate, useRoute, useRouter } from 'vue-router'
+import {
+  NAlert, NButton, NCard, NH1, NInput,
+  NInputNumber, NSpin, NSwitch, NTag, NText, NTooltip, useDialog, useMessage,
+} from 'naive-ui'
+import EnvironmentPanel from '../components/EnvironmentPanel.vue'
+import ConfigurationWorkspace from '../components/ConfigurationWorkspace.vue'
 
 const message = useMessage()
 const cfg = ref<any>(null)
 const saving = ref(false)
 const testing = ref(false) // 「并行测试全部」的全局转圈 (与单组测试互不影响)
 const loadError = ref('')
+// 分类只改变可见区域，已打开区域的草稿持续保留；模板范围变化才需确认。
+const route = useRoute(), router = useRouter(), dialog = useDialog()
+const section = computed(() => ['models', 'runtime'].includes(String(route.query.section)) ? String(route.query.section) : 'production')
+const scopeFromQuery = (query: typeof route.query) => typeof query.template === 'string' && query.template ? 'series:' + query.template : 'global'
+const selectedScope = computed(() => scopeFromQuery(route.query))
+const visited = ref(new Set<string>())
+watch(section, key => visited.value.add(key), { immediate: true })
+const productionDirty = ref(false), productionBusy = ref(false)
+const sections = computed(() => [
+  { key: 'production', label: '制作与发布', dirty: productionDirty.value },
+  { key: 'models', label: '模型与服务', dirty: isDirty.value },
+  { key: 'runtime', label: '运行与存储', dirty: concDirty.value || rootDirty.value || displayDirty.value },
+])
+function selectSection(key: string) { void router.push({ path: '/settings', query: { ...route.query, section: key } }) }
+function selectScope(scope: string) { void router.push({ path: '/settings', query: { section: 'production', ...(scope === 'global' ? {} : { template: scope.slice(7) }) } }) }
 const testResults = ref<Record<number, any>>({})
 const testingMap = ref<Record<number, boolean>>({}) // 每组独立的测试中状态 → 各组可并行测试
 
@@ -55,33 +75,45 @@ function isTesting(i: number): boolean {
 }
 
 const profiles = ref<any[]>([])
-const form = ref({ max_workers: 1 as number, timeout: 300 as number,
+const form = ref({ timeout: 300 as number,
+                   stream_reference_distance: 500 as number,
                    data_root: '' as string,
                    conc: {} as Record<string, number> })
+
+// 进度算法固定，设置页只展示真实耗时记录。
+const progressTiming = ref<any>(null)
+function fmtSeconds(value: any): string {
+  const n = Number(value)
+  return Number.isFinite(n) ? `${n.toFixed(1)} 秒` : '—'
+}
+function fmtSampleTime(value: any): string {
+  const n = Number(value)
+  if (!Number.isFinite(n) || n <= 0) return '—'
+  return new Date(n * 1000).toLocaleString()
+}
+async function loadProgressTiming() {
+  try {
+    const r = await fetch('/api/settings/progress_timing', { cache: 'no-store' })
+    if (r.ok) progressTiming.value = await r.json()
+  } catch { /* 暂时保留上次显示的记录 */ }
+}
 
 // 每步骤并行上限 (GPU 类保持 1; 修改应用后对新启动的步骤即时生效)
 const CONC_ITEMS = [
   { k: 'download', t: '获取视频' }, { k: 'preprocess', t: '音轨分离' },
-  { k: 'transcribe', t: '语音转文字' }, { k: 'split', t: '拆分句子' },
+  { k: 'transcribe', t: '语音转文字' }, { k: 'split', t: '语义整理' },
   { k: 'translate', t: '翻译' }, { k: 'subtitles', t: '生成字幕' },
-  { k: 'dubtask', t: '配音计划' }, { k: 'tts', t: '逐句配音' },
+  { k: 'tts', t: '配音' },
   { k: 'assemble', t: '合成成片' },
 ]
-
-// 全局步骤参数卡的分组顺序与标题 (与后端 step_params schema 的 key 对应)
-const STEP_LABELS: Record<string, string> = {
-  download: '获取视频', preprocess: '音轨分离', transcribe: '语音转文字',
-  split: '拆分句子', translate: '翻译', subtitles: '生成字幕',
-  dubtask: '配音计划', tts: '逐句配音', assemble: '合成成片',
-}
 
 // —— 未应用修改的追踪: 每张卡独立 —— 表单是草稿, 各卡的「应用」才是唯一写入口 ——
 const dirtyOn = ref(false)          // 载入完成/应用成功后开启追踪
 const savedProfiles = ref<string[]>([])   // 已应用状态: 每组配置的序列化值 (按下标)
-const savedForm = ref('')                 // 已应用状态: LLM 通用参数 (并发/超时)
+const savedForm = ref('')                 // 已应用状态: LLM 请求参数
 const savedConc = ref('')                 // 已应用状态: 运行并行度
 const savedRoot = ref('')                 // 已应用状态: 总工作目录
-const savedSteps = ref('')                // 已应用状态: 全局步骤参数
+const savedDisplay = ref(500)
 const cardDirty = computed(() => profiles.value.map((p, i) => {
   if (!dirtyOn.value) return false
   // JSON 非法也算"未保存" —— 否则 toWire 归一成 {} 后可能恰好等于基线,
@@ -91,34 +123,44 @@ const cardDirty = computed(() => profiles.value.map((p, i) => {
 }))
 const formDirty = computed(() =>
   dirtyOn.value && savedForm.value !== '' &&
-  JSON.stringify({ max_workers: form.value.max_workers,
-                   timeout: form.value.timeout }) !== savedForm.value)
+  JSON.stringify({ timeout: form.value.timeout }) !== savedForm.value)
+const displayDirty = computed(() => dirtyOn.value && form.value.stream_reference_distance !== savedDisplay.value)
 const concDirty = computed(() =>
   dirtyOn.value && savedConc.value !== '' &&
   JSON.stringify(form.value.conc) !== savedConc.value)
 const rootDirty = computed(() =>
-  dirtyOn.value && savedRoot.value !== '' && form.value.data_root !== savedRoot.value)
+  dirtyOn.value && form.value.data_root.trim() !== savedRoot.value)
 const isDirty = computed(() =>
-  dirtyOn.value && (formDirty.value || cardDirty.value.some(Boolean)))
+  dirtyOn.value && (formDirty.value || profiles.value.length !== savedProfiles.value.length || cardDirty.value.some(Boolean)))
 const anyDirty = computed(() =>
-  isDirty.value || concDirty.value || rootDirty.value || stepsDirty.value)
+  isDirty.value || concDirty.value || rootDirty.value || displayDirty.value || productionDirty.value)
+const anySaving = computed(() => saving.value || savingConc.value || savingRoot.value || savingDisplay.value || productionBusy.value)
 function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
-  savedForm.value = JSON.stringify({ max_workers: form.value.max_workers,
-                                     timeout: form.value.timeout })
+  savedForm.value = JSON.stringify({ timeout: form.value.timeout })
+  savedDisplay.value = form.value.stream_reference_distance
   savedConc.value = JSON.stringify(form.value.conc)
-  savedRoot.value = form.value.data_root
-  savedSteps.value = JSON.stringify(stepDraft.value)
+  savedRoot.value = form.value.data_root.trim()
   dirtyOn.value = true
 }
-// 未应用就离开: 拦截 SPA 路由跳转与窗口关闭, 避免草稿无感丢失
-onBeforeRouteLeave(() => {
-  if (anyDirty.value &&
-      !window.confirm('有未应用的修改，离开将丢失。仍要离开吗？')) return false
+function confirmDiscard() {
+  return new Promise<boolean>(resolve => dialog.warning({
+    title: '放弃未保存的修改？', content: '离开后这些修改不会保留。', positiveText: '放弃并离开', negativeText: '继续编辑',
+    onPositiveClick: () => resolve(true), onNegativeClick: () => resolve(false),
+    onClose: () => resolve(false), onMaskClick: () => resolve(false),
+  }))
+}
+function waitForSave() { message.info('正在保存，请完成后再切换'); return false }
+onBeforeRouteLeave(() => anySaving.value ? waitForSave() : !anyDirty.value || confirmDiscard())
+onBeforeRouteUpdate(to => {
+  if (scopeFromQuery(to.query) === selectedScope.value) return true
+  if (productionBusy.value) return waitForSave()
+  return !productionDirty.value || confirmDiscard()
 })
 function warnUnload(e: BeforeUnloadEvent) {
-  if (anyDirty.value) { e.preventDefault(); e.returnValue = '' }
+  if (anyDirty.value || anySaving.value) { e.preventDefault(); e.returnValue = '' }
 }
+onMounted(() => window.addEventListener('beforeunload', warnUnload))
 onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 
 // 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
@@ -143,9 +185,13 @@ function move(i: number, d: number) {
   ;[profiles.value[i], profiles.value[j]] = [profiles.value[j], profiles.value[i]]
 }
 
-onMounted(async () => {
+const loadingConfig = ref(false)
+async function loadSettings() {
+  if (loadingConfig.value) return
+  loadingConfig.value = true
+  loadError.value = ''
   try {
-    const _r = await fetch('/api/settings')
+    const _r = await fetch('/api/settings', { cache: 'no-store' })
     if (!_r.ok) throw new Error('HTTP ' + _r.status)
     cfg.value = await _r.json()
     const llm = cfg.value.llm
@@ -157,41 +203,39 @@ onMounted(async () => {
       paramsJson: (p.params && Object.keys(p.params).length)
         ? JSON.stringify(p.params, null, 1) : '',
     }))
-    form.value.max_workers = Number(llm.max_workers) || 1
     form.value.timeout = Number(llm.timeout ?? 300)
+    form.value.stream_reference_distance = Number(
+      cfg.value.ui?.llm_stream?.reference_distance_chars ?? 500) || 500
     form.value.data_root = String(cfg.value.server?.data_root ?? '')
     form.value.conc = { ...(cfg.value.runner?.step_concurrency ?? {}) }
     markApplied()                     // 以载入状态为"已应用"基线
-    void loadStepParams()             // 全局步骤参数 (独立基线)
-    window.addEventListener('beforeunload', warnUnload)
+    void loadProgressTiming()
   } catch (e: any) {
-    loadError.value = `加载失败 (${e.message}) —— 请确认后端窗口正在运行 (8600)`
-  }
-})
+    loadError.value = `加载失败 (${e.message}) —— 请确认后端服务正在运行，并使用启动脚本打开的地址`
+  } finally { loadingConfig.value = false }
+}
+watch(section, key => { if (key !== 'production' && !cfg.value && !loadError.value) void loadSettings() }, { immediate: true })
 
 // 「应用」是唯一写入口: 只保存本卡内容 (LLM 配置组 + 通用参数)
 async function applySettings() {
+  if (saving.value) return
+  const bad = profiles.value.filter(paramsJsonBad).map(p => p.name?.trim() || '未命名配置')
+  if (bad.length) { message.warning(`请先修正专属参数的 JSON 格式：${bad.join('、')}`); return }
   saving.value = true
+  // 仅记录本次请求提交的快照，不吞掉其他分区或请求期间的新修改。
+  const submittedProfiles = profiles.value.map(p => toWire(p))
+  const submittedForm = { timeout: form.value.timeout }
   try {
-    // 专属参数 JSON 写错时后端按空处理, 这里提示一声避免无感
-    const bad = profiles.value.filter(paramsJsonBad)
-      .map(p => p.name?.trim() || `#${profiles.value.indexOf(p) + 1}`)
-    if (bad.length) {
-      message.warning(`这些组的专属参数 JSON 格式有误，已按空处理：${bad.join('、')}`)
-    }
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {
-        'llm.profiles': profiles.value.map(p => {
-          const { paramsJson, ...rest } = p
-          return { ...rest, params: parseParams(p) }
-        }),
-        'llm.max_workers': form.value.max_workers,
-        'llm.timeout': form.value.timeout,
+        'llm.profiles': submittedProfiles,
+        'llm.timeout': submittedForm.timeout,
       } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
-    markApplied()
+    savedProfiles.value = submittedProfiles.map(p => JSON.stringify(p))
+    savedForm.value = JSON.stringify(submittedForm)
     message.success('已应用并写入 config.yaml')
   } catch (e: any) {
     message.error(`应用失败: ${e.message}`)
@@ -201,14 +245,16 @@ async function applySettings() {
 // —— 各卡独立的应用入口 (就近保存, 互不牵连) ——
 const savingConc = ref(false)
 async function applyConc() {
+  if (savingConc.value) return
   savingConc.value = true
+  const submitted = { ...form.value.conc }
   try {
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates: { 'runner.step_concurrency': { ...form.value.conc } } }),
+      body: JSON.stringify({ updates: { 'runner.step_concurrency': submitted } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
-    savedConc.value = JSON.stringify(form.value.conc)
+    savedConc.value = JSON.stringify(submitted)
     message.success('并行度已写入 config.yaml —— 之后新启动的步骤即时生效')
   } catch (e: any) {
     message.error(`应用失败: ${e.message}`)
@@ -217,73 +263,43 @@ async function applyConc() {
 
 const savingRoot = ref(false)
 async function applyRoot() {
+  if (savingRoot.value) return
   savingRoot.value = true
+  const submitted = form.value.data_root.trim()
   try {
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates: { 'server.data_root': form.value.data_root.trim() } }),
+      body: JSON.stringify({ updates: { 'server.data_root': submitted } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
-    savedRoot.value = form.value.data_root
+    savedRoot.value = submitted
     message.success('已写入 config.yaml —— 需重启程序生效')
   } catch (e: any) {
     message.error(`应用失败: ${e.message}`)
   } finally { savingRoot.value = false }
 }
 
-// —— 全局步骤参数 (各项目未单独覆盖时的默认值) ——
-const stepSchema = ref<Record<string, any>>({})
-const stepDraft = ref<Record<string, any>>({})
-const caps = ref<any>(null)
-const savingSteps = ref(false)
-const stepsDirty = computed(() =>
-  savedSteps.value !== '' && JSON.stringify(stepDraft.value) !== savedSteps.value)
-
-async function loadStepParams() {
-  try {
-    const r = await fetch('/api/settings/step_params')
-    if (!r.ok) return
-    const j = await r.json()
-    stepSchema.value = j.steps || {}
-    caps.value = j.caps || null
-    const d: Record<string, any> = {}
-    for (const node of Object.values<any>(j.steps || {})) {
-      for (const f of node.fields as any[]) {
-        d[f.path] = node.values?.[f.path]
-      }
-    }
-    stepDraft.value = d
-    savedSteps.value = JSON.stringify(d)
-  } catch { /* 加载失败时该卡留空 */ }
-}
-
-// 逐项改动标识: 草稿值 vs 已应用基线
-const stepBaseline = computed<Record<string, any>>(() => {
-  try { return JSON.parse(savedSteps.value || '{}') } catch { return {} }
-})
-function stepChanged(path: string) {
-  return dirtyOn.value && savedSteps.value !== '' &&
-    JSON.stringify(stepDraft.value[path]) !== JSON.stringify(stepBaseline.value[path])
-}
 function concChanged(k: string) {
   if (!dirtyOn.value || savedConc.value === '') return false
   const base = JSON.parse(savedConc.value)
   return JSON.stringify(form.value.conc[k]) !== JSON.stringify(base[k])
 }
 
-async function applySteps() {
-  savingSteps.value = true
+const savingDisplay = ref(false)
+async function applyDisplay() {
+  if (savingDisplay.value) return
+  savingDisplay.value = true
+  const submitted = form.value.stream_reference_distance
   try {
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates: { ...stepDraft.value } }),
+      body: JSON.stringify({ updates: { 'ui.llm_stream.reference_distance_chars': submitted } }),
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
-    savedSteps.value = JSON.stringify(stepDraft.value)
-    message.success('全局步骤参数已写入 config.yaml —— 新启动的步骤生效; 项目级覆盖不受影响')
-  } catch (e: any) {
-    message.error(`应用失败: ${e.message}`)
-  } finally { savingSteps.value = false }
+    savedDisplay.value = submitted
+    message.success('已保存显示偏好')
+  } catch (e: any) { message.error(`保存失败：${e.message}`) }
+  finally { savingDisplay.value = false }
 }
 
 async function testConnection() {
@@ -307,24 +323,22 @@ function extraParamsStr(r: any): string {
 </script>
 
 <template>
-  <n-layout-content content-style="padding: 24px;">
-    <n-h1>设置</n-h1>
-    <n-alert type="info" :show-icon="false" style="margin-bottom: 16px">
-      配置统一保存在仓库根 <n-code>config.yaml</n-code>（含密钥，不入库）。
-      LLM 采用 OpenAI 兼容协议 —— 修改 <n-code>base_url</n-code> + <n-code>api_key</n-code> + 模型名
-      即可接入任意服务商（智谱 / 火山方舟 / DeepSeek / OpenAI / 本地 vLLM 等）。
-      可保存多组配置并按顺序启用：前面的失败时自动切换到下一个。
+  <div class="workspace-page settings-page">
+    <header class="page-head"><span class="page-kicker">偏好与配置</span><n-h1>设置</n-h1><p class="page-description">制作规则统一管理，服务连接与本机偏好独立设置。</p></header>
+    <nav class="section-nav" aria-label="设置分类"><button v-for="item in sections" :key="item.key" :aria-pressed="section === item.key" @click="selectSection(item.key)">{{ item.label }}<span v-if="item.dirty" class="dirty-dot" aria-label="有未保存修改">●</span></button></nav>
+    <ConfigurationWorkspace v-if="visited.has('production')" v-show="section === 'production'" :scope="selectedScope" @select="selectScope" @dirty-change="productionDirty = $event" @busy-change="productionBusy = $event" />
+    <div v-show="section !== 'production'">
+    <n-alert v-if="section === 'models'" type="info" :show-icon="false" style="margin-bottom: 20px">
+      首次使用：填写接口地址、密钥和模型名 → 测试连接 → 保存模型设置。支持 OpenAI 兼容接口；多个配置按顺序自动切换。
     </n-alert>
 
-    <n-alert v-if="loadError" type="error">{{ loadError }}</n-alert>
-    <n-spin :show="!cfg && !loadError">
+    <n-alert v-if="loadError" type="error">{{ loadError }} <n-button text @click="loadSettings">重试</n-button></n-alert>
+    <n-spin :show="loadingConfig">
       <div v-if="cfg" style="display:flex;flex-direction:column;gap:16px">
         <!-- ============ LLM 配置池 (可编辑) ============ -->
-        <n-card title="🌐 大模型 (LLM) — 翻译与分句" size="small">
+        <n-card v-show="section === 'models'" title="大模型连接" size="small">
           <n-text depth="3" style="font-size:12px">
-            配置按列表顺序作为降级链：前面的失败时自动切换到下一个。
-            每组可用右侧「⚡ 测试」单独验证；各组测试互相独立、可同时进行，详情会显示发送与收到的内容。
-            测试只探测表单当前填写的内容，不会保存。
+            配置从上到下依次尝试，可用箭头调整优先级。测试不会保存修改；翻译和语义整理步骤可指定某一组。
           </n-text>
           <div class="profiles">
             <div v-for="(p, i) in profiles" :key="i" class="profile" :class="{ off: !p.enabled }">
@@ -345,9 +359,9 @@ function extraParamsStr(r: any): string {
                   测试
                 </n-button>
                 <n-button size="small" quaternary :disabled="i === 0"
-                          @click="move(i, -1)">↑</n-button>
+                          aria-label="提高配置优先级" @click="move(i, -1)">↑</n-button>
                 <n-button size="small" quaternary :disabled="i === profiles.length - 1"
-                          @click="move(i, 1)">↓</n-button>
+                          aria-label="降低配置优先级" @click="move(i, 1)">↓</n-button>
                 <n-button size="small" quaternary type="error"
                           @click="delProfile(i)">删除</n-button>
               </div>
@@ -366,10 +380,13 @@ function extraParamsStr(r: any): string {
                 <n-text depth="3" class="lb lb-top">专属参数</n-text>
                 <div class="c-span">
                   <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
-                           placeholder='可选, 留空 = 使用服务商默认值; JSON 原样合并进请求, 如 {"temperature":1,"top_p":0.95}' />
+                           placeholder='可选，留空=服务商默认；例如 {"temperature":1,"top_p":0.95} 或 {"reasoning_effort":"low"}' />
                   <div class="param-hint">
                     核心参数各家通用 (OpenAI 协议: temperature / top_p / max_tokens 等)；
-                    厂家私有参数 (如 GLM 的 reasoning_effort、thinking) 也写在这里原样发送
+                    厂家私有参数 (如 GLM 的 reasoning_effort、thinking) 也写在这里原样发送；
+                    GLM-5.3/5.3-Flash 通常不能关闭思考，建议用
+                    <code>{"reasoning_effort":"low"}</code> 降低思考量；其他支持开关的模型才使用
+                    <code>{"thinking":{"type":"disabled"}}</code>。具体字段以该接口文档为准，返回 400 时删除不支持的字段即可
                   </div>
                 </div>
               </div>
@@ -407,23 +424,15 @@ function extraParamsStr(r: any): string {
             </div>
             <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
           </div>
-          <!-- 翻译任务设置: DubForge 自身运行参数 (非模型请求参数), 对所有配置组生效 -->
+          <!-- LLM 运行设置: DubForge 自身参数 (非模型请求参数), 对所有配置组生效 -->
           <div class="globals-cap">
             <n-text depth="3" style="font-size:12px">
-              翻译任务设置（DubForge 自身参数，非模型参数，对所有配置组生效）：
+              请求超时对所有模型配置生效。
             </n-text>
             <n-tag v-if="formDirty" size="small" type="warning"
                    :bordered="false">未应用</n-tag>
           </div>
           <div class="globals">
-            <div class="g-item">
-              <n-tooltip trigger="hover" placement="top">
-                <template #trigger><span class="g-lb">并发数 ⓘ</span></template>
-                翻译分块时同时发出的请求数; 太大容易触发服务商限流 (429)
-              </n-tooltip>
-              <n-input-number v-model:value="form.max_workers" size="small"
-                              :min="1" :max="8" style="width:90px" />
-            </div>
             <div class="g-item">
               <n-tooltip trigger="hover" placement="top">
                 <template #trigger><span class="g-lb">读超时(秒) ⓘ</span></template>
@@ -436,7 +445,7 @@ function extraParamsStr(r: any): string {
           <!-- 「应用」是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
           <div class="actions">
             <n-button type="primary" :loading="saving" :disabled="!isDirty"
-                      @click="applySettings()">💾 应用设置</n-button>
+                      @click="applySettings()">保存模型设置</n-button>
             <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
             <n-text v-if="isDirty" type="warning" style="font-size: 12px">
               ● 有未应用的修改 —— 不应用不生效
@@ -447,8 +456,25 @@ function extraParamsStr(r: any): string {
           </div>
         </n-card>
 
+        <div v-if="visited.has('models')" v-show="section === 'models'"><EnvironmentPanel /></div>
+
+        <n-card v-show="section === 'runtime'" title="显示偏好" size="small">
+          <div class="globals">
+            <div class="g-item">
+              <n-tooltip trigger="hover" placement="top">
+                <template #trigger><span class="g-lb">流式追赶距离(字符) ⓘ</span></template>
+                显示文字落后最新模型文字多少字符时，追赶速度达到参考生成速度
+              </n-tooltip>
+              <n-input-number v-model:value="form.stream_reference_distance" size="small"
+                              :min="50" :max="5000" :step="50" style="width:130px" />
+            </div>
+          </div>
+          <n-text depth="3" class="display-note">默认 500。调大更平滑，调小更跟手；仅影响网页文字显示，不影响生成速度和产物。</n-text>
+          <div class="actions"><n-button type="primary" size="small" :loading="savingDisplay" :disabled="!displayDirty" @click="applyDisplay">保存显示偏好</n-button><n-text v-if="displayDirty" type="warning">有未保存的修改</n-text></div>
+        </n-card>
+
         <!-- ============ 运行并行度 ============ -->
-        <n-card title="运行并行度 (多项目同时跑时的每步骤并发上限)" size="small"
+        <n-card v-show="section === 'runtime'" title="运行并行度" size="small"
                 style="margin-top: 14px">
           <div class="conc">
             <div v-for="c in CONC_ITEMS" :key="c.k" class="c-item">
@@ -462,7 +488,7 @@ function extraParamsStr(r: any): string {
           </div>
           <n-text depth="3" style="font-size:12px; display:block; margin-top: 8px">
             勾选多个项目点「运行选中」时：下载/LLM 类可并行推进，GPU 类
-            (音轨分离/语音转文字/逐句配音/合成成片) 保持 1 排队保护显存。
+            (音轨分离/语音转文字/批量配音/合成成片) 保持 1 排队保护显存。
             应用后对之后新启动的步骤即时生效。
           </n-text>
           <div class="actions" style="margin-top: 8px">
@@ -475,14 +501,15 @@ function extraParamsStr(r: any): string {
         </n-card>
 
         <!-- ============ 存储 ============ -->
-        <n-card title="存储" size="small">
+        <n-card v-show="section === 'runtime'" title="存储位置" size="small">
           <div class="g-item">
             <n-tooltip trigger="hover" placement="top">
               <template #trigger><span class="g-lb">总工作目录 ⓘ</span></template>
               所有项目数据 (项目目录 / 数据库) 的根目录
             </n-tooltip>
-            <n-input v-model:value="form.data_root" size="small" style="width: 420px"
+            <n-input v-model:value="form.data_root" size="small" style="width: min(420px, 100%)"
                      placeholder="留空 = 默认 程序目录\data" />
+            <FilePathLink v-if="form.data_root" :path="form.data_root" label="定位目录" />
           </div>
           <n-text depth="3" style="font-size:12px; display:block; margin-top:6px">
             应用后需重启程序才生效；已有数据不会自动搬家，需手动移动后重启。详见「❓ 帮助」页。
@@ -499,56 +526,51 @@ function extraParamsStr(r: any): string {
           </n-text>
         </n-card>
 
-        <!-- ============ 全局步骤参数 (schema 驱动, 项目未覆盖时使用) ============ -->
-        <n-card title="全局步骤参数 (各项目未单独覆盖时的默认值)" size="small">
-          <n-text depth="3" style="font-size:12px; display:block; margin-bottom: 8px">
-            每个项目的步骤页可以单独覆盖这些默认值 (覆盖项会标「项目已改」)；
-            修改全局默认不影响已单独覆盖的项目。
+        <details v-show="section === 'runtime'" class="timing-details"><summary>耗时记录与进度估算</summary>
+        <n-card title="进度与剩余时间" size="small">
+          <details><summary>进度如何估算？</summary>
+          <n-text depth="3" style="font-size:12px; display:block">
+            下载显示实际字节进度，剩余时间 = 剩余字节 ÷ 本次累计平均速度；转录、分离和配音继续按实际处理量计进度。
+            语义整理和翻译显示“预计进度”：无相近记录时整步默认 10 分钟，准备 1%、思考 60%、输出 38%、收尾 1%；阶段按实际事件切换，成功后才到 100%。
+            同模型、同任务保留最近 20 条正常请求记录，相近输入长度按单位字符耗时比较；两端各去掉三分之一（向下取整），其余取平均，1～2 条时直接平均。
+            多窗口共享整步预算。超出预估或重试时显示状态和已用时间，撤下倒计时；进度不倒退，缓存、重试和失败不计入正常耗时记录。
+            标有“当前阶段”的时间只包含正在下载、分离或封装的阶段。
           </n-text>
-          <n-alert v-if="caps" type="default" :show-icon="false" :bordered="true"
-                   style="margin-bottom: 10px">
-            🔊 <n-text strong>语言能力</n-text>（随所用后端自动适应）：
-            语音转文字 ({{ caps.asr.backend }}) 支持
-            {{ caps.asr.langs.filter((l: any) => l[0] !== 'auto').length }} 种语言；
-            逐句配音 ({{ caps.tts.backend }}) 支持
-            {{ caps.tts.langs.map((l: any) => l[1]).join(' / ') }}。
-            这几个就是<b>可贯穿全流程</b>的配音目标语言（识别 → 翻译 → 配音），
-            翻译目标语言下拉里会分组标注；其他语言只能出字幕。
-          </n-alert>
-          <n-collapse size="small">
-            <n-collapse-item v-for="(label, sk) in STEP_LABELS" :key="sk" :name="sk"
-                             :title="`${label} — ${(stepSchema[sk]?.fields ?? []).length} 项`">
-              <div v-for="f in stepSchema[sk]?.fields ?? []" :key="f.path" class="sp-row">
-                <n-tooltip trigger="hover" placement="top">
-                  <template #trigger>
-                    <span class="sp-lb">{{ f.label }} <n-text depth="3">ⓘ</n-text>
-                      <n-tag v-if="stepChanged(f.path)" size="tiny" type="warning"
-                             :bordered="false">已改</n-tag>
-                    </span>
-                  </template>
-                  {{ f.help || f.path }}
-                </n-tooltip>
-                <ParamControl :field="f" v-model="stepDraft[f.path]" />
-              </div>
-            </n-collapse-item>
-          </n-collapse>
-          <div class="actions" style="margin-top: 10px">
-            <n-button type="primary" size="small" :loading="savingSteps"
-                      :disabled="!stepsDirty" @click="applySteps">💾 应用全局步骤参数</n-button>
-            <n-text v-if="stepsDirty" type="warning" style="font-size:12px">
-              ● 有未应用的修改 —— 不应用不生效
-            </n-text>
-            <n-text v-else depth="3" style="font-size:12px">
-              新启动的步骤按此执行; 改动会改变步骤指纹, 已完成步骤失去「已是最新」需重跑
-            </n-text>
+          </details>
+          <div class="timing-history-head">
+            <n-text strong>已记录的真实耗时</n-text>
+            <n-text depth="3" style="font-size:12px">共 {{ progressTiming?.sample_count ?? 0 }} 条，跨项目复用</n-text>
+            <n-button size="tiny" quaternary @click="loadProgressTiming">↻ 刷新记录</n-button>
+          </div>
+          <div v-if="!(progressTiming?.profiles?.length)" class="timing-empty">
+            暂无记录，完成正常模型请求后自动积累。
+          </div>
+          <div v-for="group in progressTiming?.profiles ?? []" :key="group.key" class="timing-group">
+            <div class="timing-group-title">{{ group.label }}</div>
+            <div class="timing-summary">样本耗时截尾平均 {{ fmtSeconds(group.trimmed_mean_seconds) }}（记录概览；实际估算按输入长度换算）</div>
+            <div v-for="(sample, si) in group.samples" :key="`${group.key}-${sample.ts}-${si}`" class="timing-sample">
+              <span>{{ fmtSampleTime(sample.ts) }}</span>
+              <span>原文 {{ sample.work }} 字符</span>
+              <span>耗时 {{ fmtSeconds(sample.seconds) }}</span>
+            </div>
           </div>
         </n-card>
+
+        </details>
       </div>
     </n-spin>
-  </n-layout-content>
+    </div>
+  </div>
 </template>
 
 <style scoped>
+.settings-page { max-width: 1240px; }
+.settings-page .profile { padding: 18px; border-color: var(--df-border); border-radius: 10px; background: #161c24; }
+.settings-page .profiles { gap: 16px; margin-top: 18px; }
+.settings-page .fields { gap: 14px; }
+.settings-page .conc { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; }
+.settings-page .c-item { justify-content: space-between; padding: 12px; border: 1px solid var(--df-border); border-radius: 8px; }
+.settings-page .actions { padding-top: 16px; border-top: 1px solid var(--df-border); flex-wrap: wrap; }
 .profiles { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
 .profile { border: 1px solid #2a343f; border-radius: 8px; padding: 10px 12px; }
 .profile.off { opacity: .55; }
@@ -582,13 +604,26 @@ function extraParamsStr(r: any): string {
 .g-lb { font-size: 12px; cursor: help; width: fit-content; }
 .conc { display: flex; flex-wrap: wrap; gap: 10px 18px; }
 .c-item { display: flex; align-items: center; gap: 6px; }
-.sp-row {
-  display: grid;
-  grid-template-columns: 150px 1fr;
-  gap: 8px 12px;
-  align-items: center;
-  padding: 3px 0;
+.timing-history-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-top: 14px; }
+.timing-history-head > :last-child { margin-left: auto; }
+.timing-empty { margin-top: 8px; padding: 10px; color: #8b949e; border: 1px dashed #2a343f; border-radius: 6px; font-size: 12px; }
+.timing-group { margin-top: 10px; border: 1px solid #2a343f; border-radius: 6px; overflow: hidden; }
+.timing-group-title { padding: 6px 9px; background: rgba(77,163,255,.07); font-size: 12px; word-break: break-word; }
+.timing-summary { padding: 5px 9px; color: #8b949e; font-size: 11px; }
+.timing-sample { display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 5px 9px; border-top: 1px solid #202832; color: #c9d1d9; font-size: 11px; }
+.timing-details > summary { cursor:pointer; color:var(--df-muted); padding:14px 0; font-size:13px; }
+.timing-details details { font-size:12px; color:var(--df-muted); margin-bottom:12px; }
+.display-note { display:block; font-size:12px; margin-top:10px; }
+@media (max-width: 720px) {
+  .p-head { flex-wrap: wrap; align-items: center; }
+  .p-head .flex-sp { display: none; }
+  .name-input { width: min(150px, 100%); }
+  .fields { grid-template-columns: 1fr; gap: 4px; }
+  .fields > .c-span { grid-column: auto; }
+  .fields > .lb { white-space: normal; margin-top: 4px; }
+  .actions { flex-wrap: wrap; align-items: flex-start; }
+  .globals-cap { align-items: flex-start; flex-wrap: wrap; }
+  .globals { gap: 12px; }
+  .timing-sample { display: grid; grid-template-columns: 1fr 1fr; }
 }
-.sp-lb { font-size: 12.5px; white-space: nowrap; display: inline-flex; align-items: center; gap: 4px; }
-.sp-row > .n-switch { justify-self: start; }
 </style>

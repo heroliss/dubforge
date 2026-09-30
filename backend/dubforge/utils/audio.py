@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """音频工具: 时间轴铺轨 / 峰值归一 (numpy + soundfile, 零 ffmpeg 依赖)
 约定: 配音句统一 32kHz 单声道 wav (tts 后端保证)"""
 import numpy as np
@@ -21,7 +20,7 @@ def load_mono_32k(path) -> np.ndarray:
 def mix_over_timeline(entries: list[tuple[float, "np.ndarray"]],
                       total_seconds: float) -> np.ndarray:
     """把 (开始秒, 单声道音频) 铺到 total_seconds 的静音轨上; 重叠段叠加"""
-    total = max(1, int(round(total_seconds * SR)))
+    total = max(1, round(total_seconds * SR))
     out = np.zeros(total, dtype=np.float32)
     for start, audio in entries:
         i0 = int(start * SR)
