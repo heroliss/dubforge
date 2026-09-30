@@ -76,6 +76,25 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
     return warnings, len(items)
 
 
+def confirmed_or_auto(uid, project=None):
+    """合成规划/启动共用的评论门禁: 返回 (上屏方案, 是否将自动准备)。
+
+    已有人工确认方案 → (方案, False); 无方案且评论准备=auto 且来源为
+    YouTube → (None, True), 由合成步骤自动采集 (ADR-0073); 其余情形
+    维持「请先确认」拦截。"""
+    from dubforge import comment_studio, configuration, video_info
+    try:
+        return comment_studio.confirmed(uid), False
+    except DubForgeError as exc:
+        if exc.code != 'COMMENTS_NOT_CONFIRMED':
+            raise
+        project = project or crud.get_project(uid)
+        if (project is not None and configuration.resolve(uid)['values'].get('comments.mode') == 'auto'
+                and video_info._youtube(project.source_url)):
+            return None, True
+        raise
+
+
 def current_overlay(uid):
     """当前已保存的上屏方案（无已保存方案时为 None）。"""
     from dubforge import comment_studio

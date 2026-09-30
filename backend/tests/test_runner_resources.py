@@ -151,3 +151,32 @@ def test_project_view_includes_workflow_status(isolated_env, make_project):
         assert client.get(f'/api/projects/{uid}').json()['workflow_status'] == 'failed'
         listing = client.get('/api/projects').json()
         assert next(p for p in listing if p['uid'] == uid)['workflow_status'] == 'failed'
+
+
+def test_download_concurrency_two_with_success_handoff(isolated_env, monkeypatch, make_project):
+    """download 并行上限=2: 第三项目的下载在槽位因「成功完成」交接后立即运行,
+    不需要等其他项目失败; 峰值并发恒为 2。"""
+    from dubforge.pipeline import steps as steps_mod
+    state = {'active': 0, 'max': 0}
+    lock = threading.Lock()
+
+    def run(ctx):
+        with lock:
+            state['active'] += 1
+            state['max'] = max(state['max'], state['active'])
+        time.sleep(0.3)
+        with lock:
+            state['active'] -= 1
+        ctx.write_json('download_result.json', {'step': 'download'})
+    monkeypatch.setitem(steps_mod._RUNNERS, 'download', run)
+    uids = [make_project() for _ in range(3)]
+    for uid in uids:
+        assert runner.start_step(uid, 'download')['status'] == 'started'
+    deadline = time.time() + 5
+    while time.time() < deadline and state['active'] < 2:
+        time.sleep(0.02)
+    assert state['active'] == 2                     # 两个并行, 第三个在等槽位
+    for uid in uids:
+        wait_status(uid, 'download', {'done'})
+    assert state['max'] == 2                        # 全程峰值不超过 2
+    assert all(crud.get_step(crud.get_project(u).id, 'download').status == 'done' for u in uids)

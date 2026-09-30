@@ -195,7 +195,7 @@ DEFAULTS: dict[str, Any] = {
     },
     "runner": {
         # 全局线程池大小 (应 ≥ 各步骤并行上限之和的预期峰值)
-        "pool_size": 8,
+        "pool_size": 12,
         # 每步骤并行上限: 下载/LLM 类可并行, GPU 类保持 1 保护显存。修改后重启生效。
         "step_concurrency": {
             "download": 2, "preprocess": 1, "transcribe": 1, "split": 2,

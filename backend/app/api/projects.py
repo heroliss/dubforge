@@ -249,11 +249,14 @@ def run_plan(uid: str, body: RunChain):
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     deps = Dependencies(project)
     versions = []
+    auto_comments = False
     if 'assemble' in body.steps:
         from dubforge.pipeline import assembly_versions
-        from dubforge import comment_studio
+        from dubforge import comments_auto
         definitions = assembly_versions.catalog(uid)['versions']
-        overlay = comment_studio.confirmed(uid) if any(v['include_comments'] for v in definitions) else None
+        # 评论准备=auto 且无已确认方案时不再拦截规划 (ADR-0073):
+        # 合成步骤会自动采集; saved 模式仍维持「请先确认」。
+        overlay, auto_comments = comments_auto.confirmed_or_auto(uid, project)             if any(v['include_comments'] for v in definitions) else (None, False)
         versions = [assembly_versions.resolve(deps, v, comment_plan=overlay) for v in definitions]
         deps = deps.with_versions(versions)
     plan = deps.plan(body.steps, body.include_dependencies)
@@ -262,6 +265,8 @@ def run_plan(uid: str, body: RunChain):
         effects.append("配音按全项目声源选择处理，复用仍有效的音频；不读取句子列表的临时勾选。")
     if "assemble" in plan["steps"]:
         effects.append('生成已保存版本：' + '、'.join(v['name'] for v in versions) + '；不读取成品卡片临时勾选。')
+        if auto_comments:
+            effects.append('评论准备为自动采集：合成时将自动抓取、评分并翻译上屏评论。')
     return {**plan, "labels": {k: STEP_MAP[k].label for k in plan["steps"]}, "effects": effects}
 
 

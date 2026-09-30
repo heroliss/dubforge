@@ -832,17 +832,8 @@ class Runner:
             base.with_versions(versions).require(step_key)
             overlay, auto_comments = None, False
             if any(v['include_comments'] for v in definitions):
-                try:
-                    overlay = comment_studio.confirmed(uid)
-                except DubForgeError as exc:
-                    # 评论准备=auto 时允许合成步骤内自动采集 (comments_auto);
-                    # 非自动模式或来源不支持采集时, 维持「先确认再合成」的拦截。
-                    from dubforge import configuration, video_info as _vi
-                    if (exc.code != 'COMMENTS_NOT_CONFIRMED'
-                            or configuration.resolve(uid)['values'].get('comments.mode') != 'auto'
-                            or not _vi._youtube(project.source_url)):
-                        raise
-                    auto_comments = True
+                from dubforge import comments_auto
+                overlay, auto_comments = comments_auto.confirmed_or_auto(uid, project)
             task_data = dict(scope='versions', version_specs=[assembly_versions.resolve(base,v,comment_plan=overlay) for v in definitions])
             if auto_comments:
                 task_data['comments_auto'] = True

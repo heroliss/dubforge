@@ -164,7 +164,7 @@ server:
   data_root: ""              # 空=仓库根 data; 相对路径相对仓库根
 
 runner:
-  pool_size: 8
+  pool_size: 12
   step_concurrency:
     download: 2
     preprocess: 1

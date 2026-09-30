@@ -99,3 +99,22 @@ def test_auto_mode_zero_usable_comments_fails_loudly(isolated_env, monkeypatch):
     runner.start_step(uid, 'assemble')
     wait_status(uid, 'assemble', {'failed'})
     assert not (comment_studio.view(uid)['overlay'] or {}).get('items')
+
+
+def test_auto_mode_run_plan_does_not_block_on_unconfirmed_comments(isolated_env, monkeypatch):
+    """核对运行步骤 (run_plan) 在 auto 模式且无已确认方案时不再拦截:
+    规划放行并在说明里告知合成时将自动采集; saved 模式维持拦截。"""
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    from fastapi.testclient import TestClient
+    with TestClient(__import__('app.main', fromlist=['app']).app) as client:
+        r = client.post(f'/api/projects/{uid}/run_plan',
+                        json={'steps': ['assemble'], 'include_dependencies': False})
+        assert r.status_code == 200, r.json()
+        assert not r.json()['blockers']
+        assert any('自动采集' in e for e in r.json()['effects'])
+
+    uid2, _ = _setup(isolated_env, monkeypatch, 'saved')
+    with TestClient(__import__('app.main', fromlist=['app']).app) as client:
+        r = client.post(f'/api/projects/{uid2}/run_plan',
+                        json={'steps': ['assemble'], 'include_dependencies': False})
+        assert r.status_code == 400 and '评论精选' in (r.json()['message'] or '')
