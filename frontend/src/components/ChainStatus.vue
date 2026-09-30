@@ -5,6 +5,7 @@ import { computed, ref } from 'vue'
 import { RouterLink } from 'vue-router'
 import { NButton } from 'naive-ui'
 import { useMessage } from 'naive-ui'
+import { friendlyError } from '../utils/http'
 import { STEP_LABELS, useNavStore } from '../stores/nav'
 import { chainKind, chainSequence, holdDescription, type ChainInfo } from '../utils/chainStatus'
 
@@ -31,7 +32,7 @@ async function call(path: string, okText: string) {
     message.success(okText)
     void nav.poll()
   } catch (e: any) {
-    message.error(e.message)
+    message.error(friendlyError(e))
   } finally {
     busy.value = false
   }

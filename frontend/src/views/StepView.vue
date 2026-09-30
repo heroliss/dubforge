@@ -154,7 +154,7 @@ async function run(force = false, resumeChain = false) {
     nav.stepStarted(uid, key, j)
     refreshInBackground(() => nav.poll())
     loadLog()
-  } catch { message.error('启动请求失败 (网络异常)') } finally {
+  } catch { message.error('无法连接后端服务（可能正在重启或更新），请稍候重试；恢复后可「重试并继续」') } finally {
     busy.value = false
     previewSuspended.value = false
   }
@@ -227,7 +227,7 @@ async function doCancel(expectedJobId: number | null = null) {
       message.info('该步骤已经在停止中，请等待它退出')
       return
     }
-  } catch { cancelPending.value = false; message.error('停止信号发送失败'); return }
+  } catch { cancelPending.value = false; message.error('停止信号发送失败（后端可能正在重启），请稍候重试'); return }
   message.info('停止信号已发送, 等待步骤退出；长时间无响应可用「强制结束」')
 }
 
@@ -268,7 +268,7 @@ async function doForce(expectedJobId: number | null = null) {
     }
     message.success('已强制结束')
     refreshInBackground(() => nav.poll())
-  } catch { message.error('强制结束失败'); return }
+  } catch { message.error('强制结束请求失败（后端可能正在重启），请稍候重试'); return }
   finally { forceBusy.value = false }
 }
 
@@ -287,7 +287,7 @@ async function setPause(p: boolean) {
       refreshInBackground(() => nav.poll())
       return
     }
-  } catch { message.error(p ? '暂停失败' : '继续失败'); return }
+  } catch { message.error(p ? '暂停请求失败（后端可能正在重启），请稍候重试' : '继续请求失败（后端可能正在重启），请稍候重试'); return }
   finally { pauseBusy.value = false }
   refreshInBackground(() => nav.poll())
 }

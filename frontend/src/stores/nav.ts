@@ -63,6 +63,7 @@ function getPollers(store: any) {
       return { uid, value }
     }, ({ uid, value }) => {
       if (uid !== store.uid) return
+      store.connectionLost = false
       if (kind === 'steps') {
         const previous = store.steps.filter((s: any) => s.status === 'running').map((s: any) => `${s.key}:${s.job_id}`).join(',')
         store.steps = value; store.stepsLoaded = true; store.stepsError = ''
@@ -87,6 +88,7 @@ function getPollers(store: any) {
       }
     }, error => {
       const detail = error instanceof Error && error.name === 'TimeoutError' ? '请求超时' : '连接失败'
+      if (detail === '连接失败') store.connectionLost = true
       store[kind === 'steps' ? 'stepsError' : kind === 'publication' ? 'publicationError' : kind === 'workflow' ? 'workflowError' : 'projectError'] = `${detail}，未能读取${kind === 'steps' ? '步骤状态' : kind === 'publication' ? '发布状态' : kind === 'workflow' ? '自动流程状态' : '项目信息'}，请重试`
     })
     const activity = createLatestRefresh(async signal => {
@@ -135,6 +137,7 @@ export const useNavStore = defineStore('nav', {
     projectError: '',
     publication: null as any,
     publicationError: '',
+    connectionLost: false,             // 后端连接中断 (重启/更新), 由轮询自动恢复
     workflow: null as any,
     workflowError: '',
     workflowPlan: null as any,
@@ -239,6 +242,7 @@ export const useNavStore = defineStore('nav', {
         this.workflowPlan = null; this.activities = {}
         this.status = ''; this.autoSteps = null; this.chain = null; this.dirMissing = false
       }
+      this.connectionLost = false
       this.poll()
       // 与进度插值窗口一致：每 1.5 秒取得一次后端目标值，视觉上连续追赶，
       // 不会等待 2.5 秒后突然跳一大段。
@@ -256,6 +260,7 @@ export const useNavStore = defineStore('nav', {
       this.workflow = null; this.workflowError = ''
       this.workflowPlan = null; this.activities = {}
       this.status = ''; this.autoSteps = null; this.chain = null; this.dirMissing = false
+      this.connectionLost = false
       if (this.timer) {
         clearInterval(this.timer)
         this.timer = 0

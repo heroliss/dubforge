@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import ProjectTemplateBinding from '../components/ProjectTemplateBinding.vue'
+import { friendlyError } from '../utils/http'
 import BatchWorkflow from '../components/BatchWorkflow.vue'
 import BatchWorkflowResume from '../components/BatchWorkflowResume.vue'
 import BatchProjectImport from '../components/BatchProjectImport.vue'
@@ -49,7 +50,7 @@ async function load(showSpin = false) {
       sel.value = new Set([...sel.value].filter(uid => next.some((p: any) => p.uid === uid)))
     }
   } catch (err: any) {
-    if (seq === loadSeq) loadError.value = err.message || '无法连接服务，请检查连接后重试'
+    if (seq === loadSeq) loadError.value = friendlyError(err, '无法连接服务，请检查连接后重试')
   } finally {
     if (seq === loadSeq) loading.value = false
   }
@@ -184,7 +185,7 @@ async function resumeChainQuiet(uid: string): Promise<boolean> {
     if (!r.ok) throw new Error(d.message || '继续失败')
     return true
   } catch (e: any) {
-    message.error(`「${title}」${e.message}`)
+    message.error(`「${title}」${friendlyError(e)}`)
     return false
   }
 }
@@ -462,7 +463,7 @@ async function runIngest() {
     message.success('项目已创建, 视频副本已存入项目目录')
     router.push(`/projects/${newUid.value}`)
   } catch (e: any) {
-    ingestErr.value = e.message || '导入失败'
+    ingestErr.value = friendlyError(e, '导入失败')
   } finally { ingesting.value = false }
 }
 

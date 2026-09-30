@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onUnmounted, ref } from 'vue'
+import { friendlyError } from '../utils/http'
 import { RouterLink } from 'vue-router'
 import { NAlert, NButton, NCard, NDrawer, NDrawerContent, NProgress, NSelect, NSpin, NTag } from 'naive-ui'
 import { versionSummary } from '../utils/assemblyVersions'
@@ -41,7 +42,7 @@ async function open(run=''){
     state.value=data
     mode.value=(run?data.runs.find((item:any)=>item.id===run)?.recipe.mode:null)||data.recipe.mode
     await requestPlan(ticket)
-  }catch(e:any){if(!disposed&&ticket===generation)error.value=e.message}
+  }catch(e:any){if(!disposed&&ticket===generation)error.value=friendlyError(e)}
   finally{if(ticket===generation){busy.value=false;checking.value=false}}
 }
 async function inspect(){
@@ -66,7 +67,7 @@ async function confirmStart(){
     if(disposed)return
     nav.workflowStarted(uid,result);show.value=false
     void nav.refreshWorkflow()
-  }catch(e:any){if(!disposed)error.value=e.message}
+  }catch(e:any){if(!disposed)error.value=friendlyError(e)}
   finally{busy.value=false}
 }
 async function stop(){

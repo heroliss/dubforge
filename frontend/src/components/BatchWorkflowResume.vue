@@ -2,6 +2,7 @@
 // 跨项目批量恢复失败的自动流程：逐项目读取状态 → 预检（resume_id）→ 一次确认后逐个恢复。
 // 复用现有单项目工作流端点，不新增后端面；预检未通过的项目显示原因，不会带病恢复。
 import { computed, ref } from 'vue'
+import { friendlyError } from '../utils/http'
 import { RouterLink } from 'vue-router'
 import { NAlert, NButton, NDrawer, NDrawerContent } from 'naive-ui'
 import { workflowRunStage } from '../utils/workflow'
@@ -42,7 +43,7 @@ async function inspect() {
         const plan = await api(project.uid, '/plan', { mode: run.mode, resume_id: run.id })
         items.value.push({ uid: project.uid, title: project.title, run, plan, blockers: plan.blockers })
       } catch (e: any) {
-        items.value.push({ uid: project.uid, title: project.title, run: null, plan: null, blockers: [e.message] })
+        items.value.push({ uid: project.uid, title: project.title, run: null, plan: null, blockers: [friendlyError(e)] })
       }
     }
   } finally { busy.value = false }
@@ -66,7 +67,7 @@ async function resumeAll() {
         })
         results.value.push({ uid: item.uid, title: item.title, error: '' })
       } catch (e: any) {
-        results.value.push({ uid: item.uid, title: item.title, error: e.message })
+        results.value.push({ uid: item.uid, title: item.title, error: friendlyError(e) })
       }
     }
     emit('resumed')

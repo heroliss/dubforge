@@ -124,6 +124,9 @@ const projActive = computed(() => {
       <div v-if="!nav.uid && (!collapsed || narrowScreen)" class="sidebar-hint">打开一个项目，<br />在这里切换制作步骤。</div>
     </n-layout-sider>
     <n-layout class="workspace-main" :native-scrollbar="false" :inert="narrowScreen && mobileOpen">
+    <n-alert v-if="nav.connectionLost" type="warning" style="margin: 12px 16px 0" data-testid="connection-lost">
+      无法连接后端服务（可能正在重启或更新）。运行中的步骤已被安全中断并保留计划；连接恢复后本提示会自动消失，可到项目里「重试并继续」。
+    </n-alert>
       <header class="workspace-topbar">
         <button v-if="narrowScreen" class="icon-button" aria-label="打开导航" :aria-expanded="mobileOpen" @click="mobileOpen = true"><AppIcon name="menu" /></button>
         <nav class="breadcrumbs" aria-label="当前位置">
