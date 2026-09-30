@@ -274,17 +274,35 @@ def _read_user_config(cp: Path) -> dict:
     return user
 
 
+_config_file_cache: dict = {}
+
+
 def load_config() -> dict:
-    """读取独立配置快照；下一次读取仍能看到外部编辑，不使用跨请求缓存。"""
+    """读取独立配置快照。以 (路径, mtime, size) 短路缓存「解析+合并」结果:
+    轮询路径每秒调用数十次, 命中缓存可免去文件 IO / YAML 解析 / 深合并;
+    外部编辑或 update_config 落盘都会改变 stat → 自动失效。返回深拷贝,
+    调用方对快照的改动不会污染缓存。"""
     with _CONFIG_LOCK:
-        user = _read_user_config(config_path())
-    settings = _deep_merge(DEFAULTS, user)
-    # 兼容旧字幕设置；显式的新设置始终优先。
-    legacy_subtitles = settings["tts"].get("subtitles") or {}
-    if (isinstance(legacy_subtitles, dict) and legacy_subtitles.get("min_duration") is not None
-            and "min_duration" not in (user.get("subtitles") or {})):
-        settings["subtitles"]["min_duration"] = legacy_subtitles["min_duration"]
-    return settings
+        cp = config_path()
+        try:
+            st = os.stat(cp)
+            stamp = (st.st_mtime_ns, st.st_size)
+        except OSError:
+            stamp = None
+        key = (str(cp), stamp)
+        cached = _config_file_cache.get("settings") if _config_file_cache.get("key") == key else None
+        if cached is None:
+            user = _read_user_config(cp)
+            settings = _deep_merge(DEFAULTS, user)
+            # 兼容旧字幕设置；显式的新设置始终优先。
+            legacy_subtitles = settings["tts"].get("subtitles") or {}
+            if (isinstance(legacy_subtitles, dict) and legacy_subtitles.get("min_duration") is not None
+                    and "min_duration" not in (user.get("subtitles") or {})):
+                settings["subtitles"]["min_duration"] = legacy_subtitles["min_duration"]
+            cached = settings
+            _config_file_cache["key"] = key
+            _config_file_cache["settings"] = cached
+        return copy.deepcopy(cached)
 
 
 def get(key: str, default: Any = None, *, settings: dict | None = None) -> Any:
