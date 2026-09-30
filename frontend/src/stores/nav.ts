@@ -16,12 +16,6 @@ export const STEP_LABELS: Record<string, string> = {
   translate: '翻译', subtitles: '字幕导出', tts: '字幕与配音', assemble: '合成成片',
 }
 
-export const STATUS_EMOJI: Record<string, string> = {
-  pending: '⚪', queued: '⏳', running: '🔄', done: '✅',
-  failed: '❌', stale: '🟠', interrupted: '❌', skipped: '⏭️',
-  stopped: '⏹️', pausing: '⏳', paused: '⏸️',
-}
-
 export const STATUS_TEXT: Record<string, string> = {
   pending: '待运行', queued: '⏳ 排队中', running: '运行中', done: '✓ 完成',
   failed: '✗ 失败', stale: '⟳ 已过期', interrupted: '已中断', skipped: '已跳过',
@@ -46,8 +40,6 @@ export const FRESHNESS_HINTS = {
   fresh: '产物存在，且输入、上游结果和设置自上次成功运行后没有变化。',
   stale: '产物来自旧输入或旧设置；重新运行后会按当前配置重新生成。',
 }
-
-export const AUTO_CHAIN_HINT = '勾选本项目需要执行的步骤；未勾选的可跳过，运行只检查实际需要的上游文件。'
 
 export const STATUS_TAG: Record<string, 'default' | 'success' | 'error' | 'warning' | 'info'> = {
   pending: 'default', queued: 'warning', running: 'info', done: 'success',

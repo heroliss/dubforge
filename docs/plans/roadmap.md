@@ -2,6 +2,13 @@
 
 > 每里程碑结束：可运行 + pytest 绿 + 已推送。完成即勾选并附实现笔记链接。
 
+> **2026-09-30 现状说明**：以下 M0~M6 为当时的规划快照，保留原文不改。
+> 与现状的主要差异：工作台已合并进总览与步骤页（WorkbenchView 移除，
+> ADR-0031/0060）；轮询为 1.5s/2.5s 而非 WebSocket；M6 的错误中心与引导
+> 中文化已由各 ADR 的错误码 + 中文文案体系覆盖。发布、全流程、评论、配置
+> 等后续里程碑见 docs/decisions/0041~0076，未勾选项按 ADR 体系演进，
+> 不再在本文件逐项勾选。
+
 ## M0 脚手架 ✅ 2026-09-17
 - [x] monorepo 结构（backend/ frontend/ scripts/ docs/ data/）
 - [x] uv + pyproject（Python 3.13）+ FastAPI 骨架 + SQLModel 表结构（Project/StepRun/Artifact/Job）
