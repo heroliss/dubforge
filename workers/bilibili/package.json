@@ -1,0 +1,8 @@
+{
+  "name": "dubforge-bilibili-worker",
+  "private": true,
+  "type": "module",
+  "scripts": { "test": "node --test *.test.mjs" },
+  "dependencies": { "@renmu/bili-api": "2.15.0" },
+  "overrides": { "fast-xml-parser": "5.7.0" }
+}
