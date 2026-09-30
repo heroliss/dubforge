@@ -364,11 +364,10 @@ def _coarse_resegment_prompt(lines: list[SubLine], max_len: int,
         "\n【输出示例】输入 3 行短语，第 1+2 句语义连续被合并，时间取跨度:\n"
         "1. 0.000-4.050: we tried the best food in hanoi\n"
         "2. 4.050-6.200: and it was amazing\n"
-        "【常见错误（任一都会让本窗口整体作废）】\n"
-        "- 原样复述输入、一行不合并（输出行数与输入完全相同通常意味着没有整理）\n"
-        "- 改写、翻译或增删原文内容；只允许调整边界与词语归属\n"
-        "- 输出 Markdown 代码块、解释或致歉等协议之外的文字\n"
-        "- 时间戳乱序、越界、缺秒或用逗号作小数点；序号不连续或重复\n",
+        "【错误输出示例（不要这样输出）】\n"
+        "1, 0.000-4.050: we tried the best food in hanoi\n"
+        "0.000-4.050: we tried the best food in hanoi\n"
+        "1. 0,000-4,050: we tried the best food in hanoi\n",
         f"{context}\n",
         "【本窗口时间轴输入】\n",
         timeline,
