@@ -13,11 +13,17 @@ llm:
     api_key: "YOUR_API_KEY_2"
     model: "deepseek-chat"
     enabled: true
-  max_workers: 1
   timeout: 300          # 读超时秒数 (思考型模型建议 >=300)
   # temperature / thinking 属于请求参数, 不做全局配置:
   # 在各组 profiles 的 params 里按模型填写, 留空 = 不发送 (用服务商默认)
   # 例: params: {"temperature": 1, "top_p": 0.95, "reasoning_effort": "max"}
+  # GLM-5.3/5.3-Flash 通常只能降低思考量: {"reasoning_effort": "low"}
+  # 其他支持开关的模型可按服务商使用: {"thinking": {"type": "disabled"}}
+
+ui:
+  llm_stream:
+    # 流式文字显示的参考追赶距离: 越大越平滑, 但显示延迟也会略增加
+    reference_distance_chars: 500
 
 download:
   resolution: 1080
@@ -26,25 +32,52 @@ download:
 
 separate:
   enabled: true
+  model: "htdemucs"
+  shifts: 0
+  overlap: 0.25
 
 asr:
+  input_mode: "speech" # platform_subtitle=使用已确认导入的平台字幕，不加载识别模型
   backend: "faster_whisper"
   model: "large-v3-turbo"
   language: "auto"
+  # phrase=发送约 2 秒短语时间轴 (推荐); word=发送每个词的时间轴和停顿提示 (更精确、更慢)
+  segmentation_mode: "phrase"
+  # Whisper 识别完成后先形成稳定的短语锚点；不会改变识别模型的上下文
+  pause_threshold_seconds: 0.6
+  # 识别结果先形成约 2 秒的短语锚点；最终字幕由语义整理合并/拆分，过低会增加 LLM 输入量
+  max_segment_seconds: 2.0
 
 split:
+  # 语义边界由 LLM 根据上下文自主判断；程序只保护长停顿的时间对齐
+  use_llm: true
+  # 留空=按设置页启用顺序自动降级；也可填写某个配置组名称固定模型
+  llm_profile: ""
+  # 单次语义整理请求的总上下文预算；只按 token 分窗，系统会预留提示词和输出空间
+  llm_context_tokens: 200000
+  # 长稿分窗时，每个窗口前后各带几句作为理解参考；只参考，不输出
+  context_lines: 2
+  # 给 LLM 的阅读节奏参考；本地只拆回明显过长的结果
   max_split_length: 22
+  # 给 LLM 的配音/字幕节奏参考；本地只拆回明显超长的结果
+  max_segment_seconds: 8.0
 
+subtitles:
+  mode: all                     # all/source/target/bilingual
+  source_first: false           # 默认译文在上、原文在下
+  min_duration: 1.5             # 利用空隙延长显示；0=原始时间
 translate:
   target_language: "简体中文"
   style_prompt: ""
-  whole_doc_max_lines: 60
-  global_polish: true
-  summary_length: 8000
+  # 留空=按设置页启用顺序自动降级；也可填写某个配置组名称固定模型
+  llm_profile: ""
+  # 单次翻译窗口的总上下文预算；包含提示词、交接摘要和预留输出，默认 200k，最高可调到 1M
+  max_context_tokens: 200000
   custom_terms_path: ""
 
 tts:
   backend: "indextts25"
+  tolerance: 0.4              # 兼容旧任务标记，当前 UI、超长判断和重试不使用
   indextts25:
     url: "http://127.0.0.1:7860/"
     project_dir: ""           # index-tts 项目根 (空=自动查找)
@@ -55,17 +88,117 @@ tts:
     emo_audio: ""             # 情感参考 wav 路径 (preset 模式)
     emo_weight: 1.0
     emo_vector: [0, 0, 0, 0, 0, 0, 0, 0]
+    emo_text: ""              # 文本情感描述，需服务端加载对应情感模型
+    emo_random: false         # 情感随机采样，可能降低音色稳定性
     duration_factor: 1.0
+    duration_retry_factors: "0.7, 0.5"  # 超长重试因子，逗号分隔；留空关闭，只尝试更小的值
+    request_timeout_seconds: 300  # 单次模型请求上限，含服务排队；0 关闭，独立于整个步骤的超时
+    do_sample: true
+    top_p: 0.8
+    top_k: 30
+    temperature: 0.8
+    length_penalty: 0.0
+    num_beams: 3
+    repetition_penalty: 10.0
+    max_mel_tokens: 1500
+    max_text_tokens_per_segment: 120
+    source_preset: ""
+    preset_baseline: {}
   gptsovits:
     url: "http://127.0.0.1:9880/"
+    project_dir: ""           # GPT-SoVITS 安装目录（空=自动查找）
     character: ""
 
 assemble:
-  bgm_volume: 0.3
+  subtitle_track: trans        # 烧录时使用 source/trans/bilingual
+  subtitle_font: "Microsoft YaHei" # 已安装字体的名称
+  subtitle_size: 48            # 字号、描边与边距按 1080 高画面等比例缩放
+  subtitle_source_style_enabled: false # 原文独立样式；关闭时跟随译文，底色与位置始终共用
+  subtitle_source_font: "Microsoft YaHei"
+  subtitle_source_size: 40
+  subtitle_source_color: "#FFFFFF"
+  subtitle_source_outline_color: "#000000"
+  subtitle_source_outline: 2
+  subtitle_color: "#FFFFFF"
+  subtitle_outline_color: "#000000"
+  subtitle_outline: 2
+  subtitle_margin: 50
+  subtitle_background_color: "#000000"
+  subtitle_background_opacity: 0 # 0 完全透明，100 实心底色；描边单独保留
+  bgm_volume: 1.0
+  voice_volume: 1.0
   ducking: true
   loudnorm: true
   burn_subtitles: false
   crf: 18
 
+comments:
+  failure_policy: skip  # skip：局部失败继续；stop：严格暂停
+  # 新评论方案的起点；不改变已确认方案或已保存的全流程配方
+  overlay:
+    start: 5.0
+    interval: 15.0
+    duration: 6.0
+    position: top_left
+    width_percent: 0           # 0 自动；1–100 为最大宽度占画面宽度的百分比，受边距限制
+    font_size: 36
+    margin: 60
+    show_author: false
+    language_mode: translated
+    source_first: false
+    color: "#FFFFFF"
+    outline_color: "#000000"
+    outline: 2
+    background_color: "#000000"
+    background_opacity: 50
+    font: "Microsoft YaHei"
+    source_style_enabled: false
+    source_font: "Microsoft YaHei"
+    source_font_size: 30
+    source_color: "#FFFFFF"
+    source_outline_color: "#000000"
+    source_outline: 2
+
 server:
   port: 8600
+  data_root: ""              # 空=仓库根 data; 相对路径相对仓库根
+
+runner:
+  pool_size: 8
+  step_concurrency:
+    download: 2
+    preprocess: 1
+    transcribe: 1
+    split: 2
+    translate: 2
+    subtitles: 2
+    dubtask: 2
+    tts: 1
+    assemble: 1
+  # 资源组互斥: 同组步骤 (即使分属不同项目) 同时只能执行一个, 防止 GPU/算力争用
+  step_resources:
+    preprocess: gpu
+    transcribe: gpu
+    tts: gpu
+  # 各资源组并行上限 (调大需确认显存余量)
+  resource_concurrency:
+    gpu: 1
+  # 自动运行链内步骤失败后的自动重试次数 (仅链内; 0=失败即挂起等人工处理)
+  step_retries:
+    download: 1
+  # 自动重试前的等待秒数
+  retry_delay: 15
+  # 每个步骤进入运行后的最大活动时间 (秒); 排队和用户暂停不计时; 0=关闭兜底
+  step_timeout_seconds:
+    download: 3600
+    preprocess: 1800
+    transcribe: 3600
+    split: 1800
+    translate: 3600
+    subtitles: 600
+    dubtask: 600
+    tts: 7200
+    assemble: 3600
+
+paths:
+  hf_home: ""                # 空=自动复用 VideoLingo-Workspace/vl_cache/hf

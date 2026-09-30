@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 DubForge 配置管理
 =================
@@ -11,13 +10,18 @@ DubForge 配置管理
 """
 import copy
 import os
+import threading
 from pathlib import Path
 from typing import Any
 
 import yaml
-from dubforge.utils.fs import atomic_replace
+
+from dubforge.errors import ConfigError
+from dubforge.utils.fs import atomic_write_bytes
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+_CONFIG_LOCK = threading.RLock()
+_runtime_data_root: Path | None = None
 
 
 def config_path() -> Path:
@@ -28,6 +32,9 @@ def config_path() -> Path:
 def data_root() -> Path:
     """数据根目录: 环境变量 DUBFORGE_DATA_ROOT (测试/部署) >
     config.yaml server.data_root (设置页可改, 重启生效) > 默认 <程序目录>/data"""
+    with _CONFIG_LOCK:
+        if _runtime_data_root is not None:
+            return _runtime_data_root
     env = os.environ.get("DUBFORGE_DATA_ROOT")
     if env:
         return Path(env)
@@ -36,6 +43,13 @@ def data_root() -> Path:
         p = Path(custom)
         return p if p.is_absolute() else REPO_ROOT / p
     return REPO_ROOT / "data"
+
+
+def _set_runtime_data_root(root: Path | None) -> None:
+    """由数据库生命周期绑定/释放目录，防止配置热更新把数据库与产物拆到两处。"""
+    global _runtime_data_root
+    with _CONFIG_LOCK:
+        _runtime_data_root = root.resolve() if root is not None else None
 
 PROJECTS_DIR_NAME = "projects"
 DB_FILE_NAME = "dubforge.db"
@@ -46,10 +60,17 @@ DEFAULTS: dict[str, Any] = {
         # OpenAI 兼容接口 (智谱/GLM 等); 翻译与分句语义切共用
         # 多组 API 配置池: 按顺序降级 (旧版单 base_url/api_key 自动兼容)
         "profiles": [],
-        "max_workers": 1,          # LLM 并发请求数 (本地/弱限流设 1)
         "timeout": 300,            # 读超时秒数 (思考型模型单次可能 >120s)
         # temperature / thinking 属于请求参数, 不做全局配置 ——
         # 在各组 profiles 的专属参数里按模型填写 (留空 = 不发送, 用服务商默认)
+        # GLM-5.3/5.3-Flash 通常只能用 reasoning_effort=low 降低思考量;
+        # 其他支持开关的模型再按服务商填写 thinking={type: disabled}
+    },
+    "ui": {
+        "llm_stream": {
+            # 流式文字显示的追赶距离: 距离越大越平滑, 但显示会多一点延迟
+            "reference_distance_chars": 500,
+        },
     },
     "download": {
         "resolution": 1080,         # 最高分辨率
@@ -65,24 +86,39 @@ DEFAULTS: dict[str, Any] = {
         # 不预置死配置, 实现时随功能一并加入
     },
     "asr": {
+        "input_mode": "speech",     # speech=识别音频；platform_subtitle=显式导入的平台字幕
         "backend": "faster_whisper",
         "model": "large-v3-turbo",
         "language": "auto",         # 源语言, auto=自动检测
+        "segmentation_mode": "phrase", # phrase=短语时间轴; word=词级时间轴发送给 LLM
+        "pause_threshold_seconds": 0.6,  # 词间静音超过此值, 形成转录短语锚点
+        "max_segment_seconds": 2.0,      # 仅整理识别结果的短语锚点; 不切 Whisper 识别上下文
     },
     "split": {
-        "max_split_length": 22,     # 粗切每块词数上限
+        "use_llm": True,             # 启用 LLM 语义整理
+        "llm_profile": "",           # 空=跟随全局降级链；填写配置组名称可固定该组
+        # 单次语义整理请求的上下文预算；只按 token 分窗，默认保守使用 0.2M。
+        # 界面允许按服务商能力调到最高 1M。
+        "llm_context_tokens": 200_000,
+        "context_lines": 2,          # 长稿分窗时，窗口前后各带几句作为理解参考
+        "max_split_length": 22,      # 目标单句显示长度；本地只兜底明显过长结果
+        "max_segment_seconds": 8.0,  # 目标单句语音时长；本地只兜底明显过长结果
+    },
+    "subtitles": {
+        "mode": "all",             # all/source/target/bilingual
+        "source_first": False,     # 默认译文在上，原文在下
+        "min_duration": 1.5,        # 仅利用句间空隙延长显示；0=原始时长
     },
     "translate": {
         "target_language": "简体中文",
         "style_prompt": "",          # 自定义风格提示词 (翻译人设/语气)
-        "two_step": False,           # 两步直译 (先忠实再润色, 2×请求); 关=单步直出 (强模型推荐)
-        "whole_doc_max_lines": 60,   # ≤该行数走整篇直译 (ADR-0002 三档策略)
-        "global_polish": True,       # 分块模式启用全局审校第三步
-        "summary_length": 8000,      # 摘要取样字符数
+        "llm_profile": "",            # 空=跟随全局降级链；填写配置组名称可固定该组
+        "max_context_tokens": 200000,  # 单次翻译总预算; 界面允许按服务商能力调到 1M
         "custom_terms_path": "",     # 术语表 xlsx (src/dst/备注 三列)
     },
     "tts": {
         "backend": "indextts25",
+        "tolerance": 0.4,          # 兼容旧任务标记；当前 UI、超长判断和重试不使用
         "indextts25": {
             "url": "http://127.0.0.1:7860/",
             "project_dir": "",       # index-tts 项目根 (空=自动查找)
@@ -95,20 +131,67 @@ DEFAULTS: dict[str, Any] = {
             "emo_audio": "",
             "emo_weight": 1.0,
             "emo_vector": [0, 0, 0, 0, 0, 0, 0, 0],  # 喜怒哀惧厌恶低落惊喜平静
+            "emo_text": "",         # 文本情感模式；留空按待合成文本理解
+            "emo_random": False,    # 向量/文本情感的随机采样
             "duration_factor": 1.0,
+            "duration_retry_factors": "0.7, 0.5",  # 配音超出可用时长时逐次缩短；留空关闭
+            "request_timeout_seconds": 300,  # 单次模型请求（含服务排队）上限；不改变已有音频指纹
+            # IndexTTS WebUI 高级推理参数 (预设应用与逐句合成共用)
+            "do_sample": True,
+            "top_p": 0.8,
+            "top_k": 30,
+            "temperature": 0.8,
+            "length_penalty": 0.0,
+            "num_beams": 3,
+            "repetition_penalty": 10.0,
+            "max_mel_tokens": 1500,
+            "max_text_tokens_per_segment": 120,
+            "source_preset": "",
+            "preset_baseline": {},
         },
         "gptsovits": {
             "url": "http://127.0.0.1:9880/",
+            "project_dir": "",       # GPT-SoVITS 安装目录（空=自动查找）
             "character": "",
         },
-        "subtitles": {"max_length": 75},
     },
     "assemble": {
-        "bgm_volume": 0.3,          # 背景音混入音量
+        "bgm_volume": 1.0,          # 背景音混入音量
+        "voice_volume": 1.0,        # 人声音量，与配音编辑页共用
         "ducking": True,            # 人声段自动压低背景音 (sidechaincompress)
         "loudnorm": True,           # EBU R128 响度归一
         "burn_subtitles": False,    # 烧录字幕 (默认外挂)
+        "subtitle_track": "trans",  # source/trans/bilingual，仅烧录时需要
+        "subtitle_font": "Microsoft YaHei",
+        "subtitle_size": 48,        # 字号、描边与边距按 1080 高画面等比例缩放
+        "subtitle_color": "#FFFFFF",
+        "subtitle_outline_color": "#000000",
+        "subtitle_outline": 2,
+        "subtitle_margin": 50,
+        "subtitle_source_style_enabled": False,  # 关闭时原文跟随译文样式。
+        "subtitle_source_font": "Microsoft YaHei",
+        "subtitle_source_size": 40,
+        "subtitle_source_color": "#FFFFFF",
+        "subtitle_source_outline_color": "#000000",
+        "subtitle_source_outline": 2,
+        "subtitle_background_color": "#000000",
+        "subtitle_background_opacity": 0,  # 0 完全透明；不改变旧字幕的无底色效果
         "crf": 18,
+    },
+    "comments": {
+        "failure_policy": "skip",  # 单条内容失败继续；鉴权、网络和存储错误仍暂停。
+        # 仅作为新评论方案的起点；已确认方案及已保存全流程配方使用自己的快照。
+        "overlay": {
+            "start": 5.0, "interval": 15.0, "duration": 6.0,
+            "position": "top_left", "font_size": 36, "margin": 60,
+            "width_percent": 0,  # 0 自动；其他值为评论最大宽度占画面宽度的百分比。
+            "show_author": False, "language_mode": "translated", "source_first": False,
+            "color": "#FFFFFF", "outline_color": "#000000", "outline": 2,
+            "background_color": "#000000", "background_opacity": 50,
+            "font": "Microsoft YaHei", "source_style_enabled": False,
+            "source_font": "Microsoft YaHei", "source_font_size": 30,
+            "source_color": "#FFFFFF", "source_outline_color": "#000000", "source_outline": 2,
+        },
     },
     "runner": {
         # 全局线程池大小 (应 ≥ 各步骤并行上限之和的预期峰值)
@@ -117,6 +200,29 @@ DEFAULTS: dict[str, Any] = {
         "step_concurrency": {
             "download": 2, "preprocess": 1, "transcribe": 1, "split": 2,
             "translate": 2, "subtitles": 2, "dubtask": 2, "tts": 1, "assemble": 1,
+        },
+        # 资源组互斥: 同组步骤 (即使分属不同项目) 同时只能执行一个, 防止争用
+        # 同类资源 (GPU 显存/算力) 导致性能骤降甚至超时。留空表示不参与分组。
+        "step_resources": {
+            "preprocess": "gpu", "transcribe": "gpu", "tts": "gpu",
+        },
+        # 各资源组的并行上限; 调大需自行确认显存与算力余量。
+        "resource_concurrency": {
+            "gpu": 1,
+        },
+        # 自动运行链内步骤失败后的自动重试次数 (仅链内; 0 = 失败即挂起等人工处理)。
+        # 网络/代理类瞬时失败 (如下载) 建议至少 1。
+        "step_retries": {
+            "download": 1,
+        },
+        # 自动重试前的等待秒数 (给网络/代理恢复留时间; 等待期间槽位让给其他项目)。
+        "retry_delay": 15,
+        # 每个步骤进入 running 后的最大活动运行时间 (秒); 排队和暂停不计时。
+        # 设为 0 可关闭该步骤的兜底, 一般只建议在排查问题时临时使用。
+        "step_timeout_seconds": {
+            "download": 3600, "preprocess": 1800, "transcribe": 3600,
+            "split": 1800, "translate": 3600, "subtitles": 600,
+            "dubtask": 600, "tts": 7200, "assemble": 3600,
         },
     },
     "server": {
@@ -133,30 +239,57 @@ DEFAULTS: dict[str, Any] = {
 }
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    """递归合并: override 覆盖 base, 嵌套 dict 深合并, 其余类型整体替换"""
+def _deep_merge(base: dict, override: dict, path: str = "") -> dict:
+    """递归合并；历史数值空值回退默认值，保留合法的 0。"""
     out = copy.deepcopy(base)
     for k, v in override.items():
-        if isinstance(v, dict) and isinstance(out.get(k), dict):
-            out[k] = _deep_merge(out[k], v)
+        if v is None and type(out.get(k)) in (int, float):
+            continue
+        if isinstance(out.get(k), dict):
+            if v is None:
+                continue
+            key = f"{path}.{k}" if path else str(k)
+            if not isinstance(v, dict):
+                raise ConfigError(f"配置项必须是对象: {key}")
+            out[k] = _deep_merge(out[k], v, key)
         else:
             out[k] = v
     return out
 
 
+def _read_user_config(cp: Path) -> dict:
+    try:
+        with cp.open("r", encoding="utf-8") as f:
+            user = yaml.safe_load(f)
+    except FileNotFoundError:
+        return {}
+    except (yaml.YAMLError, UnicodeError) as e:
+        raise ConfigError("config.yaml YAML 格式错误，请检查文件格式与编码") from e
+    except OSError as e:
+        raise ConfigError("无法读取 config.yaml，请检查文件权限") from e
+    if user is None:
+        return {}
+    if not isinstance(user, dict):
+        raise ConfigError("config.yaml 顶层必须是对象")
+    return user
+
+
 def load_config() -> dict:
-    """读取配置 (默认值 ∪ config.yaml); 每次调用重读, 改配置即时生效"""
-    cp = config_path()
-    if cp.exists():
-        with open(cp, "r", encoding="utf-8") as f:
-            user = yaml.safe_load(f) or {}
-        return _deep_merge(DEFAULTS, user)
-    return copy.deepcopy(DEFAULTS)
+    """读取独立配置快照；下一次读取仍能看到外部编辑，不使用跨请求缓存。"""
+    with _CONFIG_LOCK:
+        user = _read_user_config(config_path())
+    settings = _deep_merge(DEFAULTS, user)
+    # 兼容旧字幕设置；显式的新设置始终优先。
+    legacy_subtitles = settings["tts"].get("subtitles") or {}
+    if (isinstance(legacy_subtitles, dict) and legacy_subtitles.get("min_duration") is not None
+            and "min_duration" not in (user.get("subtitles") or {})):
+        settings["subtitles"]["min_duration"] = legacy_subtitles["min_duration"]
+    return settings
 
 
-def get(key: str, default: Any = None) -> Any:
+def get(key: str, default: Any = None, *, settings: dict | None = None) -> Any:
     """点分路径取配置值, 例: get('tts.indextts25.url')"""
-    node: Any = load_config()
+    node: Any = load_config() if settings is None else settings
     for part in key.split("."):
         if not isinstance(node, dict) or part not in node:
             return default
@@ -166,21 +299,41 @@ def get(key: str, default: Any = None) -> Any:
 
 def set_key(key: str, value: Any) -> None:
     """点分路径写配置值并落盘 (保留其他键; 原子写)"""
-    user: dict = {}
-    cp = config_path()
-    if cp.exists():
-        with open(cp, "r", encoding="utf-8") as f:
-            user = yaml.safe_load(f) or {}
-    node = user
-    parts = key.split(".")
-    for p in parts[:-1]:
-        node = node.setdefault(p, {})
-    node[parts[-1]] = value
-    cp.parent.mkdir(parents=True, exist_ok=True)
-    tmp = cp.with_suffix(".yaml.tmp")
-    with open(tmp, "w", encoding="utf-8") as f:
-        yaml.safe_dump(user, f, allow_unicode=True, sort_keys=False)
-    atomic_replace(tmp, cp)       # 原子替换, 避免写一半损坏
+    update_config({key: value})
+
+
+def update_config(updates: dict[str, Any]) -> None:
+    """整批更新：任一键无效则不落盘，并发保存从最新文件合并后一次替换。"""
+    if not updates:
+        return
+    with _CONFIG_LOCK:
+        cp = config_path()
+        user = _read_user_config(cp)
+        for key in updates:
+            if not isinstance(key, str) or not all(key.split(".")):
+                raise ConfigError("配置键不能为空，也不能包含空的路径段")
+            parts = key.split(".")
+            if any(".".join(parts[:i]) in updates for i in range(1, len(parts))):
+                raise ConfigError(f"不能同时更新配置项及其子项: {key}")
+        for key, value in updates.items():
+            node = user
+            parts = key.split(".")
+            for p in parts[:-1]:
+                existing = node.get(p)
+                if existing is None:
+                    node[p] = {}
+                elif not isinstance(existing, dict):
+                    raise ConfigError(f"配置路径不是对象: {p}")
+                node = node[p]
+            node[parts[-1]] = copy.deepcopy(value)
+        _deep_merge(DEFAULTS, user)  # 已知配置段必须保持对象结构，完整校验后才能写入。
+        try:
+            data = yaml.safe_dump(user, allow_unicode=True, sort_keys=False).encode("utf-8")
+            atomic_write_bytes(cp, data)
+        except yaml.YAMLError as e:
+            raise ConfigError("配置值无法保存为 YAML，请检查输入") from e
+        except OSError as e:
+            raise ConfigError("无法保存 config.yaml，请检查文件权限及剩余空间") from e
 
 
 def projects_dir() -> Path:
