@@ -1050,20 +1050,38 @@ class Runner:
                 job.status, job.error_detail = "failed", str(e.detail or e.message)
                 ctx.log(f"❌ 失败 [{e.code}]: {e.message}")
         except Exception as e:  # 未知异常兜底: 不让线程静默死亡
-            self._hold_chain(project, step_key, "UNEXPECTED_ERROR", f"未预期的错误: {type(e).__name__}")
             import traceback
             tb = traceback.format_exc()
-            step = crud.get_step(project.id, step_key)
-            if step is not None:
-                step.status = "failed"
-                step.error_code = "UNEXPECTED_ERROR"
-                step.error_message = f"未预期的错误: {type(e).__name__}: {e}"
-                step.error_suggestion = "请查看日志详情; 可直接重跑该步骤。"
-                step.finished_at = datetime.datetime.now(datetime.timezone.utc)
-                _sweep_temp_files(pdir, step_key, log=ctx.log)
-                crud.save_step(step)
-            job.status, job.error_detail = "failed", tb
-            ctx.log(f"❌ 未预期异常:\n{tb}")
+            # GPU 显存不足在多项目批量下常见 (配音服务驻留显存 + 分离/转写争用):
+            # 给出可操作的中文指引, 而不是一屏英文堆栈。
+            if "out of memory" in str(e).lower() or "cuda error" in str(e).lower():
+                self._hold_chain(project, step_key, "GPU_OOM", "显存不足 (CUDA OOM)")
+                step = crud.get_step(project.id, step_key)
+                if step is not None:
+                    step.status = "failed"
+                    step.error_code = "GPU_OOM"
+                    step.error_message = "显存不足 (CUDA OOM)，该步骤未能完成"
+                    step.error_suggestion = ("关闭其他占用显存的程序 (配音服务/浏览器硬件加速等) 后重跑; "
+                                             "分离步骤可在设置把模型换为 htdemucs、shifts 设为 0；"
+                                             "显存会随配音完成驻留，批量制作前可先暂停配音服务。")
+                    step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                    _sweep_temp_files(pdir, step_key, log=ctx.log)
+                    crud.save_step(step)
+                job.status, job.error_detail = "failed", tb
+                ctx.log(f"❌ 显存不足 (CUDA OOM): {e}")
+            else:
+                self._hold_chain(project, step_key, "UNEXPECTED_ERROR", f"未预期的错误: {type(e).__name__}")
+                step = crud.get_step(project.id, step_key)
+                if step is not None:
+                    step.status = "failed"
+                    step.error_code = "UNEXPECTED_ERROR"
+                    step.error_message = f"未预期的错误: {type(e).__name__}: {e}"
+                    step.error_suggestion = "请查看日志详情; 可直接重跑该步骤。"
+                    step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                    _sweep_temp_files(pdir, step_key, log=ctx.log)
+                    crud.save_step(step)
+                job.status, job.error_detail = "failed", tb
+                ctx.log(f"❌ 未预期异常:\n{tb}")
         finally:
             # 收尾兜底: 暂停标志必须清掉, 否则后续运行会在第一个暂停点卡死
             pause.clear()

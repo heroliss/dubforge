@@ -180,3 +180,81 @@ def test_download_concurrency_two_with_success_handoff(isolated_env, monkeypatch
         wait_status(uid, 'download', {'done'})
     assert state['max'] == 2                        # 全程峰值不超过 2
     assert all(crud.get_step(crud.get_project(u).id, 'download').status == 'done' for u in uids)
+
+
+def test_demucs_oom_falls_back_to_cpu(isolated_env, make_project, monkeypatch):
+    """显存不足自动降级 (模块承诺): run() 捕获 CUDA OOM → 归还缓存 → CPU 重跑;
+    非 OOM 异常照常穿透。"""
+    from dubforge.pipeline import step_preprocess
+    attempts = []
+    def _touch_out(cmd):
+        # ffmpeg 抽轨桩: 模拟产出 raw.wav (命令最后一个是输出路径)。
+        from pathlib import Path as _P
+        dst = _P(cmd[-1])
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b'raw')
+        return 0
+    def fake_demucs(ctx, src, out, *, device=None):
+        attempts.append(device or 'cuda')
+        if attempts[-1] == 'cuda':
+            raise RuntimeError('CUDA error: out of memory')
+        out.mkdir(parents=True, exist_ok=True)
+        (out / 'vocal.wav').write_bytes(b'v')
+        (out / 'background.wav').write_bytes(b'b')
+        return out / 'vocal.wav', out / 'background.wav'
+    monkeypatch.setattr(step_preprocess, '_run_demucs', fake_demucs)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.release_unused', lambda log=None: None)
+    # 最小 ctx 桩: 只需要 log 与 run() 用到的路径/上游。
+    import types
+    from pathlib import Path
+    uid = make_project()
+    project = crud.get_project(uid)
+    root = crud.project_dir(uid)
+    (root / 'media').mkdir(parents=True, exist_ok=True)
+    video = root / 'media' / 'video.mp4'
+    video.write_bytes(b'x')
+    from dubforge.domain import crud as _crud
+    _crud.add_artifact(project.id, 'download', 'media', 'video.mp4', video, 'media/video.mp4')
+    ctx = types.SimpleNamespace(
+        project=project, pdir=root,
+        log=lambda m: None,
+        run_subprocess=lambda cmd, **k: (_touch_out(cmd), '', '')[0:3],
+        report_progress=lambda pct: None,
+        check_pause=lambda: None,
+        check_cancel=lambda: None,
+        upstream=lambda step, name: root / 'media' / 'video.mp4',
+        write_json=lambda name, data: None,
+        register_file=lambda *a, **k: None,
+        cfg=lambda key, default=None: {'separate.model': 'htdemucs'}.get(key, default),
+    )
+    step_preprocess.run(ctx)
+    assert attempts == ['cuda', 'cpu']
+    assert (root / 'audio' / 'vocal.wav').exists()
+
+    # 非 OOM 异常穿透, 不降级 (新项目, 避免首轮登记的产物导致跳过)。
+    uid2 = make_project()
+    project2 = crud.get_project(uid2)
+    root2 = crud.project_dir(uid2)
+    (root2 / 'media').mkdir(parents=True, exist_ok=True)
+    video2 = root2 / 'media' / 'video.mp4'
+    video2.write_bytes(b'x')
+    _crud.add_artifact(project2.id, 'download', 'media', 'video.mp4', video2, 'media/video.mp4')
+    attempts.clear()
+    def boom(ctx, src, out, *, device=None):
+        raise ValueError('坏音频')
+    monkeypatch.setattr(step_preprocess, '_run_demucs', boom)
+    import pytest as _pytest
+    with _pytest.raises(ValueError):
+        step_preprocess.run(types.SimpleNamespace(
+            project=project2, pdir=root2,
+            log=lambda m: None,
+            run_subprocess=lambda cmd, **k: (_touch_out(cmd), '', '')[0:3],
+            report_progress=lambda pct: None,
+            check_pause=lambda: None,
+            check_cancel=lambda: None,
+            upstream=lambda step, name: video2,
+            write_json=lambda name, data: None,
+            register_file=lambda *a, **k: None,
+            cfg=lambda key, default=None: {'separate.model': 'htdemucs'}.get(key, default),
+        ))
+    assert attempts == []

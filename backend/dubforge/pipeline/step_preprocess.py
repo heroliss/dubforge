@@ -67,14 +67,25 @@ def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int, stride_sec=0.0
     return cb
 
 
-def _run_demucs(ctx, src_wav: Path, out_dir: Path) -> tuple:
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """torch 各版本 CUDA OOM 的形态: torch.cuda.OutOfMemoryError、
+    AcceleratorError('CUDA error: out of memory') 或含 out of memory 的运行时错误。"""
+    import torch
+    oom_cls = getattr(torch.cuda, "OutOfMemoryError", ())
+    if oom_cls and isinstance(exc, oom_cls):
+        return True
+    text = str(exc).lower()
+    return "out of memory" in text
+
+
+def _run_demucs(ctx, src_wav: Path, out_dir: Path, *, device: str | None = None) -> tuple:
     """htdemucs 分离人声/伴奏; 输入须为 44.1kHz 立体声 (模型训练规格)"""
     from dubforge import config
     from dubforge.environment import require_component
     require_component("separation")
     config.ensure_hf_env()
     import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     model_name = str(ctx.cfg("separate.model", "htdemucs"))
     shifts = int(ctx.cfg("separate.shifts", 0) or 0)
     overlap = float(ctx.cfg("separate.overlap", 0.25) or 0.25)
@@ -186,7 +197,20 @@ def run(ctx) -> None:
         try:
             ctx.check_cancel()
             ctx.log("分段分离中 —— 进度逐段上报; 暂停/取消在段间检查点生效 (数秒粒度)")
-            vocal, bg = _run_demucs(ctx, src441, audio_dir)
+            try:
+                vocal, bg = _run_demucs(ctx, src441, audio_dir)
+            except Exception as exc:
+                # 显存不足自动降级 (模块承诺的行为, 此前缺失): CUDA OOM 时
+                # 归还缓存后用 CPU 重跑, 批量流程不因显存竞争而中断。
+                import torch
+                from dubforge.utils.gpu_memory import release_unused
+                if not (_is_cuda_oom(exc) and torch.cuda.is_available()):
+                    raise
+                ctx.log(f"⚠ CUDA 显存不足，自动降级为 CPU 分离 (速度约慢一个量级；"
+                        f"可在设置把分离模型换为 htdemucs、shifts 设为 0，"
+                        f"或暂停配音服务释放显存): {exc}")
+                release_unused(ctx.log)
+                vocal, bg = _run_demucs(ctx, src441, audio_dir, device="cpu")
         finally:
             src441.unlink(missing_ok=True)
         ctx.report_progress(85)
