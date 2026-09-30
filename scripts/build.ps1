@@ -19,5 +19,7 @@ Pop-Location
 
 Write-Host ""
 Write-Host "== 构建完成 ==" -ForegroundColor Green
-Write-Host "启动生产: cd backend; uv run uvicorn app.main:app --port 8600"
-Write-Host "(API 与前端页面均由 8600 一个进程托管)"
+$portMatch = Select-String -Path "$Root\config.yaml" -Pattern '^\s*port:\s*(\d+)' -ErrorAction SilentlyContinue
+$port = if ($portMatch) { $portMatch.Matches[0].Groups[1].Value } else { '8600' }
+Write-Host "启动生产: cd backend; uv run uvicorn app.main:app --port $port"
+Write-Host "(API 与前端页面均由后端的 $port 端口托管)"

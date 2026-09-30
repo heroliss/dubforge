@@ -24,7 +24,7 @@
 | TTS | IndexTTS2.5 主 + GPT-SoVITS 备 | 外部服务 URL 接入（gradio /gen_single），延续工作台验证过的双维度参考设计 |
 | ASR | faster-whisper (large-v3-turbo) | 官方推荐档，8G 显存可跑；词级时间戳 |
 | 分离 | demucs（人声/背景）+ pyannote 3.1（可选说话人） | VideoLingo 同款，已验证 |
-| 翻译 | OpenAI 兼容接口（智谱 GLM）+ 三档策略（ADR-0002 of workspace，即整篇直译/分块+全局审校/滚动摘要） | 质量与抗截断平衡，已有设计论证 |
+| 翻译 | OpenAI 兼容接口（智谱 GLM 等）+ 上下文预算驱动的整体窗口/串行交接摘要 | 质量与长文连续性平衡；单次请求默认保守控制在 0.2M token |
 | 下载 | yt-dlp 库内嵌 + --download-archive 去重 | 用户拍板 V1 含 YouTube 集成 |
 
 ### 3. 不做（V1）

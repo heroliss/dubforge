@@ -1,0 +1,2 @@
+# 批处理保留 CRLF 原始字节，避免 Git 归一化后下载 ZIP 又变成 LF。
+*.bat -text whitespace=blank-at-eol,blank-at-eof,space-before-tab,cr-at-eol

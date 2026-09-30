@@ -4,8 +4,8 @@ AI 助手在本仓库工作前必读。架构决策见 `docs/decisions/`。
 
 ## 仓库布局与运行
 
-- `backend/`：Python 3.13（uv 管理）。`uv sync` 装依赖；跑服务 `uv run uvicorn app.main:app --port 8600 --reload`；跑测试 `uv run pytest`。
-- `frontend/`：Vue3 + Vite + Naive UI。`npm install` / `npm run dev`（:5273，/api 代理 8600）/ `npm run build`（产物 dist/ 由 FastAPI 托管）。
+- `backend/`：Python 3.13（uv 管理）。`uv sync` 装依赖；跑服务 `uv run uvicorn app.main:app --port 8600 --reload`（实际端口以 `config.yaml` 的 `server.port` 为准）；跑测试 `uv run pytest`。
+- `frontend/`：Vue3 + Vite + Naive UI。`npm install` / `npm run dev`（默认 :5273，代理端口由 `DUBFORGE_BACKEND_PORT` 传入；直接运行时默认 8600）/ `npm run build`（产物 dist/ 由 FastAPI 托管）。
 - **AI 测试纪律：起服务验证一律用 8611 端口**（`--port 8611`），8600 属于用户的常驻实例，禁止占用/杀进程。
 - 两个 GitHub 仓库约定：本仓 `heroliss/dubforge`（private）；videoLingo-Workspace 是旧系统，保持生产可用，不在本仓维护其代码。
 
