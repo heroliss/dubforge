@@ -297,17 +297,22 @@ def _format_phrase_timeline(lines: list[SubLine], pause_threshold: float = 0.6) 
 
 def _resegment_batches(lines: list[SubLine], *, token_budget: int,
                        words: list[dict] | None = None,
-                       include_words: bool = True
+                       include_words: bool = True,
+                       max_input_chars: int = 0,
                        ) -> list[list[SubLine]]:
-    """只按 token 预算组织连续短语窗口。
+    """按 token 预算 + 输出规模上限组织连续短语窗口。
 
     一条短语不会被拆开；如果单条本身超过预算，会独立成窗，再由本地规则
-    保证最终字幕上限。字符数、行数和时间长度不再作为人为分块条件，避免把
-    80 行/约 12k 字符的普通稿件机械拆成很多慢请求。
+    保证最终字幕上限。上下文预算只保证「装得下」；但单次响应要生成的正文
+    过长时，长输出会让模型退化（实测同一 448 行输入的重组结果在 281~448 句
+    之间随机波动，甚至原样复述输入、行协议劣化）。因此输入字符数超过
+    max_input_chars（预期输出约为其一半）即开新窗——普通稿件（约 12k 字符）
+    仍是单窗，长视频稿件被稳定拆成若干小窗，逐窗校验、定点重试、互不牵连。
     """
     batches: list[list[SubLine]] = []
     current: list[SubLine] = []
     tokens = 0
+    chars = 0
     for line in lines:
         line_words = _words_for_lines([line], words)
         word_row = (
@@ -315,11 +320,14 @@ def _resegment_batches(lines: list[SubLine], *, token_budget: int,
             if include_words and line_words else "")
         cost = _estimate_tokens(
             f"{line.index}. [{line.start:.3f}-{line.end:.3f}s] {line.text}\n{word_row}")
-        if current and tokens + cost > token_budget:
+        if current and (tokens + cost > token_budget
+                        or (max_input_chars > 0
+                            and chars + len(line.text) > max_input_chars)):
             batches.append(current)
-            current, tokens = [], 0
+            current, tokens, chars = [], 0, 0
         current.append(line)
         tokens += cost
+        chars += len(line.text)
     if current:
         batches.append(current)
     return batches
@@ -488,10 +496,12 @@ def _llm_resegment(ctx, lines: list[SubLine], max_len: int,
         f"每句显示字符尽量不超过 {max_len}，语音时长尽量不超过 {max_duration:g} 秒。"
         "每行输出“序号. 开始秒-结束秒: 原文片段”，不要 Markdown、解释或其他文字。")
     token_budget = max(2_000, context_limit - output_reserve - prompt_reserve)
+    max_input_chars = int(ctx.cfg("split.window_max_chars", 16000) or 0)
     batches = _resegment_batches(lines, token_budget=token_budget, words=words,
-                                  include_words=word_mode)
+                                  include_words=word_mode, max_input_chars=max_input_chars)
     ctx.log(f"LLM 整体语义重组: {len(lines)} 条短语 → {len(batches)} 个连续窗口，"
-            f"总上下文上限={context_limit:,} token，正文窗口预算约={token_budget:,} token"
+            f"总上下文上限={context_limit:,} token，正文窗口预算约={token_budget:,} token，"
+            f"单窗输入上限={max_input_chars:,} 字符"
             f"（预留提示词约{prompt_reserve:,}、输出约{output_reserve:,}），"
             f"时间轴粒度={'词级' if word_mode else '短语级'}，长停顿阈值={pause:.2f}s，"
             f"可重组短间隔边界={len(short_gap_boundaries)}处")

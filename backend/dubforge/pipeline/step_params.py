@@ -82,6 +82,8 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
                    help="控制一次语义整理请求可容纳的正文规模；超过预算后自动分窗，系统会另外预留提示词和输出空间"),
         ParamField("split.context_lines", "分窗前后参考句数", "int", depends_on=(("split.use_llm", True),), min=0, max=4, step=1,
                    help="长稿分窗时，给每个窗口前后各 N 句作为理解锚点，帮助判断代词、转折和边界；只作参考，不会输出"),
+        ParamField("split.window_max_chars", "单窗输入上限（字符，0=不限制）", "int", depends_on=(("split.use_llm", True),), min=0, max=100_000, step=2000,
+                   help="控制单次响应要生成的正文规模：超长单窗输出会让模型退化（原样复述输入、行协议劣化）。超过后自动分窗，每窗独立校验与重试"),
         ParamField("split.max_split_length", "目标单句长度（字符）", "int", min=8, max=80, step=1,
                    help="主要作为 LLM 的阅读节奏参考；本地只兜底处理明显过长的结果，不是逐句硬性限制"),
         ParamField("split.max_segment_seconds", "目标单句时长（秒）", "float", min=4, max=20, step=0.5,
