@@ -58,9 +58,9 @@ def test_runner_releases_gpu_before_returning_slot(make_project, isolated_env, m
     monkeypatch.setattr(steps, 'get_runner', lambda key: run if key == 'preprocess' else original(key))
     monkeypatch.setattr(gpu_memory, 'release_unused', lambda log: events.append('release'))
     release_slot = runner.release_slot
-    def release(key):
+    def release(key, slot_key=None):
         events.append('slot')
-        release_slot(key)
+        release_slot(key, slot_key)
     monkeypatch.setattr(runner, 'release_slot', release)
     runner.start_step(uid, 'preprocess')
     wait_status(uid, 'preprocess', {'failed' if fails else 'done'})

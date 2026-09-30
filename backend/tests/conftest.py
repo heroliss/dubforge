@@ -26,9 +26,20 @@ def isolated_env(tmp_path, monkeypatch):
         return future
 
     monkeypatch.setattr(runner._pool, "submit", tracked_submit)
+    # runner 是跨测试的单例: 清掉重试计划/槽位/废弃标记等运行态,
+    # 否则上一个测试的残留 (project_id 从 1 重新计数) 会污染后续测试。
+    def _reset_runner_state():
+        with runner._lock:
+            for cancel, _attempts, _at in runner._retries.values():
+                cancel.set()
+            runner._retries.clear()
+            runner._held.clear()
+            runner._abandoned.clear()
+    _reset_runner_state()
     try:
         yield tmp_path
     finally:
+        _reset_runner_state()
         try:
             index = 0
             while index < len(pending):   # 续跑链可能在收尾时提交下一步。

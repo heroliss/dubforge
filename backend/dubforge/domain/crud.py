@@ -437,6 +437,7 @@ def update_project_status(project_id: int, status: str) -> None:
 
 def update_project_title(uid: str, title: str) -> None:
     """只更新标题列 (理由同 update_project_status: 避免旧快照整行覆盖)。"""
+    from sqlmodel import select
     with session() as s:
         row = s.exec(select(Project).where(Project.uid == uid)).first()
         if row is None:
