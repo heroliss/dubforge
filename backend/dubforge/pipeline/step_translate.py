@@ -246,7 +246,8 @@ def _window_prompt(chunk: list[dict], handoff_summary: str,
     ctx_block = (f"\n【上一窗口交接摘要，仅作连续性参考】\n{handoff_summary}"
                  if handoff_summary else "")
     body = "\n".join(_timed_source(l) for l in chunk)
-    result = f"第 {index}/{total} 个翻译窗口。直接返回编号文本，每行“行号. 译文”。"
+    result = (f"第 {index}/{total} 个翻译窗口。直接返回编号文本，每行“行号. 译文”。"
+              "输出行数与输入行数完全一致，逐行对应原文，任何一行都不得留空或把多行并成一行。")
     if index == total:
         result += "除编号译文外，不输出任何其他内容。"
     result += f"{ctx_block}\n\n【待翻译原文】\n{body}"
@@ -296,6 +297,7 @@ def _repair_prompt(chunk: list[dict], handoff_summary: str,
     ids = ", ".join(str(line["id"]) for line in source_lines)
     return (f"第 {index}/{total} 个翻译窗口：只补齐「待重译片段」。"
             "直接返回编号文本，每行“行号. 译文”，无需交接标记；除所列行号的译文外，不输出任何其他内容。"
+            "每行译文都必须非空。"
             f"{ctx_block}\n\n【待重译片段】\n{source_body}"
             f"\n\n待返回行号：{ids}"
             + reference_block)

@@ -306,3 +306,14 @@ def test_streaming_chat_emits_trace_and_uses_stream_body(isolated_env, monkeypat
                for args, _ in events)
     assert any(args and args[0] == "status" and "思考中" in str(args[1])
                for args, _ in events)
+
+
+def test_translate_prompt_requires_one_to_one_nonempty_lines(isolated_env):
+    """翻译提示词的协议底线: 输出行数与输入完全一致, 每行译文非空 (防空行)。"""
+    from dubforge.pipeline.step_translate import _window_prompt, _repair_prompt
+    chunk = [{'id': 1, 'start': 0.0, 'end': 2.0, 'text': 'we tried'},
+             {'id': 2, 'start': 2.0, 'end': 4.0, 'text': 'the best food'}]
+    window = _window_prompt(chunk, '', 1, 1)
+    assert '输出行数与输入行数完全一致' in window and '不得留空' in window
+    repair = _repair_prompt(chunk, '', 1, 1, [2], {1: '我们试过'})
+    assert '每行译文都必须非空' in repair
