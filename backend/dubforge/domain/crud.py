@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 领域 CRUD 层 (SQLModel 会话封装)
 ================================
@@ -7,17 +6,23 @@
 - manifest.json 双写 (人类可读快照; DB 为准)
 """
 import datetime
+import hashlib
 import json
 import re
 import secrets
+import threading
 from pathlib import Path
 
 import sqlmodel
 
 from dubforge import config
 from dubforge.domain.models import Artifact, Job, Project, StepRun
+from dubforge.errors import DubForgeError
 from dubforge.pipeline.registry import STEPS
-from dubforge.utils.fs import atomic_replace
+from dubforge.utils.fs import atomic_write_bytes
+
+_MANIFEST_LOCK = threading.RLock()
+_CREATE_LOCK = threading.RLock()
 
 
 def new_uid() -> str:
@@ -37,7 +42,7 @@ def _sanitize_dir_title(t: str) -> str:
 
 def _new_dir_name(title: str) -> str:
     """语义化项目目录名: 日期_时间_标题 (天然按时间排序), 重名追加 _2/_3…"""
-    base = f"{datetime.datetime.now():%Y%m%d_%H%M}_{_sanitize_dir_title(title)}"
+    base = f"{datetime.datetime.now().astimezone():%Y%m%d_%H%M}_{_sanitize_dir_title(title)}"
     taken = {p.dir_name for p in list_projects() if p.dir_name}
     name, i = base, 2
     while name in taken or (config.projects_dir() / name).exists():
@@ -52,36 +57,67 @@ def _dir_name_of(project: Project | None, uid: str) -> str:
 
 def project_dir(uid: str) -> Path:
     """项目目录: 语义化名 (新项目) / uid (旧项目回退)"""
-    return config.projects_dir() / _dir_name_of(get_project(uid), uid)
+    project = get_project(uid)
+    base = config.projects_dir().resolve()
+    candidate = (base / _dir_name_of(project, uid)).resolve()
+    return candidate if candidate.is_relative_to(base) else base / _sanitize_dir_title(uid)
 
 
 def create_project(title: str, source_url: str = "", source_kind: str = "youtube",
-                   params: dict | None = None) -> Project:
+                   params: dict | None = None, *, initialize=None) -> Project:
+    """目录独占创建；项目、步骤及可选初始化登记在同一个事务内。"""
+    with _CREATE_LOCK:
+        return _create_project(title, source_url, source_kind, params, initialize)
+
+
+def _create_project(title, source_url, source_kind, params, initialize):
     uid = new_uid()
     dir_name = _new_dir_name(title or "未命名")
-    pdir = config.projects_dir() / dir_name
+    root = config.projects_dir().resolve()
+    pdir = (root / dir_name).resolve()
+    if pdir.parent != root:
+        raise DubForgeError('项目目录超出工作目录', code='PROJECT_CREATE_FAIL')
     # 目录骨架 + 登记: 任一步失败 → 清掉半成品目录并抛错,
     # 绝不留"有目录没登记"的空壳 (列表上显示不出来)
     import shutil
+    owned = False
+    committed = False
     try:
+        root.mkdir(parents=True, exist_ok=True)
+        pdir.mkdir(exist_ok=False)
+        owned = True
         for sub in ("media", "audio", "srt", "logs", *[f"artifacts/{s.key}" for s in STEPS]):
             (pdir / sub).mkdir(parents=True, exist_ok=True)
 
+        initial_params = dict(params or {})
+        initial_settings = initial_params.pop('step_params', {})
         project = Project(uid=uid, dir_name=dir_name, title=title or uid,
                           source_url=source_url, source_kind=source_kind,
-                          params=json.dumps(params or {}, ensure_ascii=False))
+                          params=json.dumps(initial_params, ensure_ascii=False))
         with session() as s:
             s.add(project)
-            s.commit()
-            s.refresh(project)
+            s.flush()
+            if initial_settings:
+                from dubforge.configuration_models import ConfigurationScope
+                from dubforge.configuration import defaults
+                initial_settings = {k: v for k, v in initial_settings.items() if k in defaults() and v is not None}
+                if initial_settings:
+                    s.add(ConfigurationScope(key='project:' + uid, values=json.dumps(initial_settings, ensure_ascii=False), revision=0))
             for step in STEPS:
                 s.add(StepRun(project_id=project.id, step_key=step.key, status="pending"))
+            if initialize is not None:
+                initialize(s, project)
             s.commit()
-        write_manifest(uid)
-        return project
+            committed = True
+            s.refresh(project)
     except Exception:
-        shutil.rmtree(pdir, ignore_errors=True)
+        # 仅清理本次独占创建且事务未完成的目录，不能删除原有路径。
+        if owned and not committed:
+            shutil.rmtree(pdir, ignore_errors=True)
         raise
+    # 数据库已提交；清单写入失败也不能删除已登记的项目目录。
+    write_manifest(uid)
+    return project
 
 
 def get_project(uid: str) -> Project | None:
@@ -95,6 +131,15 @@ def list_projects() -> list[Project]:
 
 
 def delete_project(uid: str) -> bool:
+    # 资料刷新不占用流水线状态，但也不能与项目删除并发写入。
+    from dubforge import video_info
+    from dubforge.publishing import service as publishing
+    with publishing.project_removal(uid), video_info.gate:
+        video_info.check_idle(uid)
+        return _delete_project(uid)
+
+
+def _delete_project(uid: str) -> bool:
     """删除项目: 取消登记 + 目录移入系统回收站。
     反悔 = 从回收站还原目录 → 设置页「从项目目录重建索引」即可整个找回;
     回收站被禁用时由系统永久删除 (删除确认弹窗里已说明)。"""
@@ -112,6 +157,12 @@ def delete_project(uid: str) -> bool:
         for model in (Artifact, Job, StepRun):
             for row in s.exec(sqlmodel.select(model).where(model.project_id == pid)).all():
                 s.delete(row)
+        from dubforge.pipeline.assembly_models import AssemblyResult
+        from dubforge.configuration_models import ConfigurationScope
+        settings = s.get(ConfigurationScope, 'project:' + uid)
+        if settings: s.delete(settings)
+        for row in s.exec(sqlmodel.select(AssemblyResult).where(AssemblyResult.project_uid == uid)).all():
+            s.delete(row)
         s.delete(s.get(Project, pid))
         s.commit()
     return True
@@ -139,6 +190,35 @@ def get_steps(project_id: int) -> list[StepRun]:
             StepRun.project_id == project_id)))
     order = {s.key: i for i, s in enumerate(STEPS)}
     return sorted(rows, key=lambda r: order.get(r.step_key, 99))
+
+
+def repair_unstarted_stale_steps() -> int:
+    """修复旧版把尚未运行的下游误标过期；有执行或产物证据的一律保留。"""
+    repaired_projects = set()
+    count = 0
+    with session() as s:
+        rows = s.exec(sqlmodel.select(StepRun).where(StepRun.status == "stale")).all()
+        for step in rows:
+            if (step.input_fingerprint or step.started_at or step.finished_at
+                    or step.retry_count or step.progress):
+                continue
+            has_job = s.exec(sqlmodel.select(Job.id).where(
+                Job.project_id == step.project_id, Job.step_key == step.step_key)).first()
+            has_artifact = s.exec(sqlmodel.select(Artifact.id).where(
+                Artifact.project_id == step.project_id, Artifact.step_key == step.step_key)).first()
+            if has_job is not None or has_artifact is not None:
+                continue
+            step.status = "pending"
+            step.error_code = step.error_message = step.error_suggestion = ""
+            step.eta_seconds = 0.0
+            s.add(step)
+            repaired_projects.add(step.project_id)
+            count += 1
+        s.commit()
+        uids = [s.get(Project, pid).uid for pid in repaired_projects]
+    for uid in uids:
+        write_manifest(uid)
+    return count
 
 
 def get_step(project_id: int, step_key: str) -> StepRun | None:
@@ -170,8 +250,75 @@ def latest_artifacts(project_id: int, step_keys: list[str] | None = None) -> dic
     return out
 
 
+def step_artifacts_exist(project_id: int, step_key: str,
+                         *, verify_hash: bool = False,
+                         arts: dict | None = None, pdir: Path | None = None) -> bool:
+    """检查步骤登记的最新产物是否都还在磁盘上。
+
+    状态和指纹只是索引；用户可能手动删除、移动或截断产物。没有这个检查，执行器
+    会错误地把一个缺文件的 ``done`` 步骤判成 fresh，直到下游才失败。执行器跳过
+    前还会按登记的 SHA-256 校验一次内容，列表接口只做廉价的文件大小检查。
+    调用方已持有最新产物快照 (arts) 和项目目录 (pdir) 时传入, 免去轮询路径的重复查询。
+    """
+    if arts is not None:
+        arts = {k: a for k, a in arts.items() if a.step_key == step_key}
+    else:
+        project = get_project_by_id(project_id)
+        if project is None:
+            return False
+        arts = latest_artifacts(project_id, [step_key])
+        pdir = project_dir_by_project(project)
+    if step_key == 'assemble':
+        from dubforge.pipeline.assembly_outputs import final_variant
+        # 同组合只校验最近登记的成品；已保留的历史记录缺失，不应让新成品永远过期。
+        latest = {}
+        for art in arts.values():
+            group = final_variant(art.name) or art.name
+            if group not in latest or (art.created_at, art.id) > (latest[group].created_at, latest[group].id):
+                latest[group] = art
+        arts = latest
+    if not arts:
+        return False
+    root = pdir.resolve()
+    for art in arts.values():
+        path = Path(art.rel_path)
+        if not path.is_absolute():
+            path = (pdir / path).resolve()
+            if not path.is_relative_to(root):
+                return False
+        try:
+            stat = path.stat()
+        except OSError:
+            return False
+        if not path.is_file() or (art.size >= 0 and stat.st_size != art.size):
+            return False
+        if verify_hash and art.sha256:
+            h = hashlib.sha256()
+            try:
+                with path.open("rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 20), b""):
+                        h.update(chunk)
+            except OSError:
+                return False
+            if h.hexdigest() != art.sha256:
+                return False
+    return True
+
+
+def get_project_by_id(project_id: int) -> Project | None:
+    with session() as s:
+        return s.get(Project, project_id)
+
+
+def project_dir_by_project(project: Project) -> Path:
+    base = config.projects_dir().resolve()
+    candidate = (base / _dir_name_of(project, project.uid)).resolve()
+    return (candidate if candidate.is_relative_to(base)
+            else base / _sanitize_dir_title(project.uid))
+
+
 def add_artifact(project_id: int, step_key: str, kind: str, name: str,
-                 abs_path: Path, rel_path: str) -> Artifact:
+                 abs_path: Path, rel_path: str, *, replace_existing: bool = False) -> Artifact:
     import hashlib
     h = hashlib.sha256()
     with open(abs_path, "rb") as f:
@@ -180,6 +327,16 @@ def add_artifact(project_id: int, step_key: str, kind: str, name: str,
     art = Artifact(project_id=project_id, step_key=step_key, kind=kind, name=name,
                    rel_path=rel_path, sha256=h.hexdigest(), size=abs_path.stat().st_size)
     with session() as s:
+        if replace_existing:
+            existing = s.exec(sqlmodel.select(Artifact).where(
+                Artifact.project_id == project_id, Artifact.step_key == step_key,
+                Artifact.name == name, Artifact.rel_path == rel_path
+            ).order_by(Artifact.id.desc())).first()
+            if existing:
+                # 保持发布草稿的产物 ID；更新摘要后旧确认快照自动失效。
+                existing.sha256, existing.size = art.sha256, art.size
+                existing.kind, existing.created_at = kind, art.created_at
+                art = existing
         s.add(art)
         s.commit()
         s.refresh(art)
@@ -189,8 +346,8 @@ def add_artifact(project_id: int, step_key: str, kind: str, name: str,
 def delete_step_artifacts(project_id: int, step_key: str) -> None:
     """重跑前置: 删该步骤产物 (DB 行 + 磁盘文件)。
 
-    例外: media/ 下的源视频不删 —— 获取步骤没有"过期"概念, 本地文件在/链接已
-    归档就应复用 (step_download 的幂等分支依赖它); 真要删请整项目删除。
+    例外: media/ 下的源视频不删 —— 下载成功校验后才原子替换；assemble/output/ 下的正式
+    成片和索引都保留，新成品成功后再替换。真要删请整项目删除。
     项目目录外的引用文件 (本地导入零拷贝, rel_path 为绝对路径) 是用户原文件,
     无论如何绝不删除。
     """
@@ -198,11 +355,20 @@ def delete_step_artifacts(project_id: int, step_key: str) -> None:
         rows = list(s.exec(sqlmodel.select(Artifact).where(
             Artifact.project_id == project_id, Artifact.step_key == step_key)))
         pdir = project_dir_by_id(s, project_id)
+        root = pdir.resolve()
         for a in rows:
             p = Path(a.rel_path)
             if not p.is_absolute():
-                p = pdir / a.rel_path
-            if p.is_relative_to(pdir) and not a.rel_path.replace("\\", "/").startswith("media/"):
+                p = pdir / p
+            p = p.resolve()
+            # 强制重跑失败时，已有成品仍能在预览和发布中心使用。
+            preserve_history = (step_key == "assemble"
+                                and p.is_relative_to((root / "output").resolve()))
+            if preserve_history and a.name.startswith('final_'):
+                continue
+            if (p.is_relative_to(root)
+                    and not p.is_relative_to((root / "media").resolve())
+                    and not preserve_history):
                 p.unlink(missing_ok=True)
             s.delete(a)
         s.commit()
@@ -210,12 +376,15 @@ def delete_step_artifacts(project_id: int, step_key: str) -> None:
 
 def project_dir_by_id(s, project_id: int) -> Path:
     project = s.get(Project, project_id)
+    if project is None:
+        raise ValueError(f"项目不存在: {project_id}")
     # 复用调用方会话 (不再走 get_project 开新会话); 语义化目录名/uid 回退
-    return config.projects_dir() / _dir_name_of(project, project.uid)
+    return project_dir_by_project(project)
 
 
-def add_job(project_id: int, step_key: str, log_path: str) -> Job:
-    job = Job(project_id=project_id, step_key=step_key, log_path=log_path)
+def add_job(project_id: int, step_key: str, log_path: str, *, task_data: dict | None = None) -> Job:
+    job = Job(project_id=project_id, step_key=step_key, log_path=log_path,
+              task_data=json.dumps(task_data or {}, ensure_ascii=False))
     with session() as s:
         s.add(job)
         s.commit()
@@ -223,13 +392,26 @@ def add_job(project_id: int, step_key: str, log_path: str) -> Job:
     return job
 
 
-def update_job(job: Job) -> None:
+def latest_job(project_id: int, step_key: str) -> Job | None:
+    from sqlmodel import select
+    with session() as s:
+        return s.exec(select(Job).where(Job.project_id == project_id, Job.step_key == step_key)
+                      .order_by(Job.id.desc()).limit(1)).first()
+
+
+def update_job(job: Job, *, heartbeat_only: bool = False) -> None:
     # 只更新已存在的行: 心跳线程可能持有上个测试/旧库的 Job 引用,
     # merge 会把它当新行插进当前库 (幽灵行) —— 此处按主键存在性守卫
     with session() as s:
-        if s.get(Job, job.id) is None:
+        current = s.get(Job, job.id)
+        if current is None:
             return
-        s.merge(job)
+        if heartbeat_only:
+            # 心跳不能用旧快照覆盖执行线程刚保存的逐句结果或终态。
+            current.heartbeat_at = job.heartbeat_at
+            s.add(current)
+        else:
+            s.merge(job)
         s.commit()
 
 
@@ -240,8 +422,39 @@ def save_project(project: Project) -> None:
         s.commit()
 
 
+def update_project_status(project_id: int, status: str) -> None:
+    """只更新聚合状态列。收尾路径与链写入并发时, 整行 merge 会用旧快照
+    覆盖 params 里的自动续跑计划 (挂起状态被冲掉), 因此必须走列级更新。"""
+    with session() as s:
+        row = s.get(Project, project_id)
+        if row is None or row.status == status:
+            return
+        row.status = status
+        row.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        s.add(row)
+        s.commit()
+
+
+def update_project_title(uid: str, title: str) -> None:
+    """只更新标题列 (理由同 update_project_status: 避免旧快照整行覆盖)。"""
+    with session() as s:
+        row = s.exec(select(Project).where(Project.uid == uid)).first()
+        if row is None:
+            return
+        row.title = title
+        row.updated_at = datetime.datetime.now(datetime.timezone.utc)
+        s.add(row)
+        s.commit()
+
+
 def write_manifest(uid: str) -> None:
     """manifest.json 双写: 人类可读的项目自描述快照 (DB 为准, 便于排查/搬移)"""
+    # 锁覆盖读取快照到落盘，防止较早取得的快照晚于新快照写入。
+    with _MANIFEST_LOCK:
+        _write_manifest(uid)
+
+
+def _write_manifest(uid: str) -> None:
     project = get_project(uid)
     if not project:
         return
@@ -262,7 +475,7 @@ def write_manifest(uid: str) -> None:
                      and Path(project.source_url or "").is_absolute()
                      else ""),
         },
-        "status": project.status, "params": json.loads(project.params or "{}"),
+        "status": project.status, "params": project_params(project),
         "updated_at": project.updated_at.isoformat(),
         "steps": [{"key": s.step_key, "status": s.status,
                    # 指纹 = "已最新可跳过"的判断依据, 一并入 manifest (重建索引时恢复)
@@ -271,11 +484,34 @@ def write_manifest(uid: str) -> None:
         # 每步骤产物清单: file 为相对项目目录路径; 绝对路径 = 外部引用文件
         "artifacts": by_step,
     }
-    p = project_dir(uid) / "manifest.json"
-    tmp = p.with_suffix(".json.tmp")
-    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    import os
-    atomic_replace(tmp, p)
+    from dubforge.pipeline.assembly_models import AssemblyResult
+    from dubforge.configuration_models import ConfigurationScope
+    with session() as s:
+        from dubforge.configuration import _resolve
+        settings = _resolve(s, 'project:' + uid)
+        layers = []
+        for key in ['global'] + ([settings['parent']] if settings['parent'] else []):
+            layer = _resolve(s, key)
+            layers.append(dict(key=key, name=layer['name'], revision=layer['revision'],
+                               values=layer['values'] if key == 'global' else layer['overrides']))
+        data['configuration'] = dict(values=settings['overrides'], parent=settings['parent'],
+                                     revision=settings['revision'], layers=layers)
+        names = {a.id: a.name for a in arts.values() if a.step_key == 'assemble'}
+        data['assembly_results'] = [dict(version_id=r.version_id, name=names[r.artifact_id],
+            artifact_hash=r.artifact_hash, fingerprint=r.fingerprint, snapshot=json.loads(r.snapshot))
+            for r in s.exec(sqlmodel.select(AssemblyResult).where(AssemblyResult.project_uid == uid)).all()
+            if r.artifact_id in names]
+    pdir = project_dir_by_project(project)
+    if not pdir.is_dir():
+        return
+    p = pdir / "manifest.json"
+    try:
+        atomic_write_bytes(p, json.dumps(data, ensure_ascii=False, indent=1).encode("utf-8"),
+                           create_parent=False)
+    except FileNotFoundError:
+        # 项目可能在快照读取后被移走/删除；不能因清单收尾重新创建空项目目录。
+        if pdir.is_dir():
+            raise
 
 
 def get_engine():
@@ -300,48 +536,137 @@ def rebuild_from_dirs() -> dict:
             data = json.loads(m.read_text(encoding="utf-8"))
         except Exception:
             continue                    # 损坏的 manifest 跳过, 不挡其余项目
+        if not isinstance(data, dict):
+            continue
         uid = data.get("uid")
-        if not uid or uid in known:
+        if not isinstance(uid, str) or not uid.strip() or uid in known:
             continue
         known.add(uid)
         source = data.get("source") or {}
+        if not isinstance(source, dict):
+            source = {}
+        raw_dir = data.get("dir_name")
+        dir_name = (raw_dir if isinstance(raw_dir, str)
+                    and raw_dir not in ("", ".", "..")
+                    and "/" not in raw_dir and "\\" not in raw_dir
+                    else m.parent.name)
+        raw_params = data.get("params")
+        params = raw_params if isinstance(raw_params, dict) else {}
+        raw_title = data.get("title")
+        title = raw_title if isinstance(raw_title, str) and raw_title else uid
+        raw_url = source.get("url")
+        source_url = raw_url if isinstance(raw_url, str) else ""
+        raw_kind = source.get("kind")
+        source_kind = raw_kind if isinstance(raw_kind, str) and raw_kind else "link"
+        raw_status = data.get("status")
+        status = raw_status if raw_status in {"created", "processing", "done", "failed"} else "created"
         with session() as s:
-            proj = Project(uid=uid, dir_name=data.get("dir_name") or m.parent.name,
-                           title=data.get("title") or uid,
-                           source_url=source.get("url") or "",
-                           source_kind=source.get("kind") or "link",
-                           status=data.get("status") or "created",
-                           params=json.dumps(data.get("params") or {}, ensure_ascii=False))
+            proj = Project(uid=uid, dir_name=dir_name,
+                           title=title,
+                           source_url=source_url,
+                           source_kind=source_kind,
+                           status=status,
+                           params=json.dumps(params, ensure_ascii=False))
             s.add(proj)
             s.commit()
             s.refresh(proj)
             counts["projects"] += 1
             # 步骤行: manifest 记载的状态/错误/指纹; 缺的按注册表补 pending
             have: set[str] = set()
-            for st in data.get("steps") or []:
+            raw_steps = data.get("steps")
+            for st in raw_steps if isinstance(raw_steps, list) else []:
+                if not isinstance(st, dict):
+                    continue
                 key = st.get("key")
-                if not key or key in have:
+                if not isinstance(key, str) or not key or key in have:
                     continue
                 have.add(key)
                 status = st.get("status") or "pending"
+                if status not in {"pending", "running", "queued", "done", "failed",
+                                  "stale", "interrupted"}:
+                    status = "pending"
                 if status == "running":     # 崩溃残留, 与 recover() 同语义
                     status = "interrupted"
+                elif status == "queued":
+                    status = "pending"
                 s.add(StepRun(project_id=proj.id, step_key=key, status=status,
-                              input_fingerprint=st.get("fingerprint") or "",
-                              error_message=st.get("error") or ""))
+                              input_fingerprint=(st.get("fingerprint")
+                                                 if isinstance(st.get("fingerprint"), str)
+                                                 else ""),
+                              error_message=(st.get("error")
+                                             if isinstance(st.get("error"), str)
+                                             else "")))
                 counts["steps"] += 1
             for step_def in STEPS:
                 if step_def.key not in have:
                     s.add(StepRun(project_id=proj.id, step_key=step_def.key))
                     counts["steps"] += 1
             # 产物行: manifest 的 by_step 清单 (file 为相对路径; 绝对路径 = 外部引用)
-            for step_key, arts in (data.get("artifacts") or {}).items():
+            raw_artifacts = data.get("artifacts")
+            for step_key, arts in (raw_artifacts.items()
+                                   if isinstance(raw_artifacts, dict) else []):
+                if not isinstance(step_key, str) or not isinstance(arts, list):
+                    continue
                 for a in arts:
+                    if not isinstance(a, dict):
+                        continue
+                    rel_path = str(a.get("file") or "")
+                    name = a.get("name")
+                    if not rel_path or not isinstance(name, str) or not name:
+                        continue
+                    artifact_path: Path | None = Path(rel_path)
+                    if not artifact_path.is_absolute():
+                        artifact_path = (m.parent / artifact_path).resolve()
+                        if not artifact_path.is_relative_to(m.parent.resolve()):
+                            artifact_path = None  # 越界路径永不视为存在
+                    # manifest 只保存了大小，重建时补算哈希；缺失文件保留登记，
+                    # 但用空哈希让 fresh 检查明确失效，而不是伪造可复用产物。
+                    sha256 = ""
+                    try:
+                        size = max(0, int(a.get("size") or 0))
+                    except (TypeError, ValueError):
+                        size = 0
+                    if artifact_path is not None and artifact_path.is_file():
+                        h = hashlib.sha256()
+                        with artifact_path.open("rb") as f:
+                            for chunk in iter(lambda: f.read(1 << 20), b""):
+                                h.update(chunk)
+                        sha256 = h.hexdigest()
+                        size = artifact_path.stat().st_size
                     s.add(Artifact(project_id=proj.id, step_key=step_key,
-                                   name=a.get("name") or "",
-                                   rel_path=a.get("file") or "",
-                                   size=int(a.get("size") or 0)))
+                                    name=name,
+                                    rel_path=rel_path, sha256=sha256, size=size))
                     counts["artifacts"] += 1
+            # 绑定按逻辑文件名恢复，不复用旧数据库的自增编号。
+            from dubforge.pipeline.assembly_models import AssemblyResult
+            from dubforge.configuration_models import ConfigurationScope
+            from dubforge.pipeline.assembly_versions import validate_list, validate, VersionError
+            raw_settings = data.get('configuration')
+            if isinstance(raw_settings, dict) and isinstance(raw_settings.get('values'), dict):
+                parent = raw_settings.get('parent', '')
+                for layer in raw_settings.get('layers', []):
+                    key = layer.get('key', '')
+                    if key in ('global', parent) and not s.get(ConfigurationScope, key):
+                        s.add(ConfigurationScope(key=key, name=layer.get('name', ''),
+                            values=json.dumps(layer.get('values', {}), ensure_ascii=False), revision=layer.get('revision', 0)))
+                        s.flush()
+                if parent and not s.get(ConfigurationScope, parent):
+                    raise DubForgeError('项目引用的系列模板不存在，请同时恢复配置数据库', code='CONFIGURATION_PARENT_MISSING')
+                s.merge(ConfigurationScope(key='project:' + uid, parent=parent,
+                    values=json.dumps(raw_settings['values'], ensure_ascii=False), revision=int(raw_settings.get('revision', 0))))
+            s.flush()
+            names = {a.name: a for a in s.exec(sqlmodel.select(Artifact).where(Artifact.project_id == proj.id, Artifact.step_key == 'assemble')).all()}
+            for row in data.get('assembly_results', []) if isinstance(data.get('assembly_results'), list) else []:
+                try:
+                    snapshot = row['snapshot']
+                    validate({k: snapshot[k] for k in ('id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides')})
+                    art = names[row['name']]
+                    if snapshot['id'] != row['version_id'] or not isinstance(snapshot.get('values'), dict): continue
+                    s.merge(AssemblyResult(key=f'{uid}:{row["version_id"]}', project_uid=uid,
+                        version_id=row['version_id'], artifact_id=art.id, artifact_hash=str(row['artifact_hash']),
+                        fingerprint=str(row['fingerprint']), snapshot=json.dumps(snapshot, ensure_ascii=False)))
+                except (VersionError, TypeError, ValueError, KeyError):
+                    continue
             s.commit()
     return counts
 
@@ -351,10 +676,16 @@ def session():
     return sqlmodel.Session(get_engine(), expire_on_commit=False)
 
 
-def project_step_params(project) -> dict:
-    """项目级步骤参数覆盖 (params JSON 的 step_params 段, 点分路径 → 值)。
-    无覆盖的键跟随全局 config —— 全局默认是兜底, 项目改过才生效。"""
+def project_params(project) -> dict:
+    """读取项目参数；手动编辑或旧版本留下的坏 JSON 不应拖垮列表/恢复。"""
     try:
-        return (json.loads(project.params or "{}").get("step_params") or {})
-    except Exception:
+        value = json.loads(project.params or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
         return {}
+    return value if isinstance(value, dict) else {}
+
+
+def project_step_params(project) -> dict:
+    """制作入口统一消费全局、系列、项目解析后的步骤值。"""
+    from dubforge.configuration import step_values
+    return step_values(project)

@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """项目 API: 改名 / 标题自动命名 / 语义化目录名 / manifest 自描述 / 总目录解析"""
 import os
 from pathlib import Path
@@ -19,6 +18,7 @@ def test_rename_project(isolated_env):
         assert r.json()["title"] == "新标题"
         # manifest 双写同步
         import json as _json
+
         from dubforge.domain import crud
         m = _json.loads((crud.project_dir(uid) / "manifest.json").read_text("utf-8"))
         assert m["title"] == "新标题"
@@ -51,6 +51,7 @@ def test_semantic_dir_name_and_manifest(isolated_env):
     """新项目目录名 = 日期_时间_标题 (Windows 非法字符被清理); manifest 完全自描述"""
     import json as _json
     import re as _re
+
     from dubforge import config
     from dubforge.domain import crud
     with _client() as client:
@@ -97,9 +98,11 @@ def test_legacy_uid_dir_fallback(isolated_env):
 
 def test_data_root_config_resolution(isolated_env):
     """总工作目录: 环境变量优先; config server.data_root 次之; 默认 <repo>/data"""
-    from dubforge import config
+    from dubforge import config, db
     # isolated_env 走环境变量 → 优先级最高
     assert Path(config.data_root()) == Path(os.environ["DUBFORGE_DATA_ROOT"])
+    # 解析优先级针对数据库尚未初始化的启动阶段；运行中目录固定到下次重启。
+    db.reset_engine()
     # 无环境变量时读 config (相对路径相对程序目录解析)
     config.set_key("server.data_root", "mydata")
     os.environ.pop("DUBFORGE_DATA_ROOT")
@@ -130,6 +133,7 @@ def test_delete_running_project_guard(isolated_env, stub_heavy_steps, make_proje
 def test_run_chain_auto_continue(isolated_env, stub_heavy_steps, make_project):
     """勾选链: split 完成后自动续跑 translate, 链空后清空"""
     import time
+
     from conftest import mark_upstream_done
     stub_heavy_steps("split", "translate")
     uid = make_project()
@@ -151,8 +155,9 @@ def test_run_chain_auto_continue(isolated_env, stub_heavy_steps, make_project):
 
 
 def test_run_chain_stops_on_failure(isolated_env, stub_heavy_steps, make_project):
-    """链中步骤失败 → 自动续跑停止, _chain 清空"""
+    """链中步骤失败 → 计划挂起保留 (失败步压回链头), 供显式恢复而不是销毁"""
     import time
+
     from conftest import mark_upstream_done
     stub_heavy_steps("split", "translate")
     uid = make_project(params={"fail_step": "translate"})
@@ -169,12 +174,40 @@ def test_run_chain_stops_on_failure(isolated_env, stub_heavy_steps, make_project
             time.sleep(0.05)
         assert st["translate"] == "failed"
         p = client.get(f"/api/projects/{uid}").json()
-        assert not p["params"].get("_chain")
+        assert p["chain"]["state"] == "held"
+        assert p["chain"]["remaining"] == ["translate"]
+        assert p["chain"]["hold"]["step"] == "translate"
+
+
+def test_duplicate_run_chain_is_idempotent(isolated_env, stub_heavy_steps, make_project):
+    """刷新/重试导致的重复链请求不能清掉原有的自动续跑队列。"""
+    import time
+
+    from conftest import mark_upstream_done
+    stub_heavy_steps("split", "translate")
+    uid = make_project(params={"delay_step": {"split": 0.25}})
+    mark_upstream_done(uid, "split")
+    with _client() as client:
+        first = client.post(f"/api/projects/{uid}/run_chain",
+                            json={"steps": ["split", "translate"]})
+        assert first.status_code == 200, first.json()
+        second = client.post(f"/api/projects/{uid}/run_chain",
+                             json={"steps": ["split", "translate"]})
+        assert second.status_code == 200, second.json()
+        assert second.json().get("status") == "already_running"
+        for _ in range(200):
+            steps = {s["key"]: s["status"]
+                     for s in client.get(f"/api/projects/{uid}/steps").json()}
+            if steps["translate"] == "done":
+                break
+            time.sleep(0.05)
+        assert steps["translate"] == "done"
 
 
 def test_auto_steps_and_run_many(isolated_env, stub_heavy_steps, make_project):
     """勾选集持久化; run_many 按勾选链启动并自动续跑; 空链/已完成跳过"""
     import time
+
     from conftest import mark_upstream_done
     stub_heavy_steps("split", "translate")
     uid = make_project()
@@ -184,7 +217,7 @@ def test_auto_steps_and_run_many(isolated_env, stub_heavy_steps, make_project):
                    json={"steps": ["split", "translate"]})
         r = client.post("/api/projects/run_many", json={"uids": [uid]})
         assert r.status_code == 200
-        assert r.json()["results"][0]["started"] == "拆分句子"
+        assert r.json()["results"][0]["started"] == "语义整理"
         st = {}
         for _ in range(200):
             steps = client.get(f"/api/projects/{uid}/steps").json()
@@ -202,10 +235,10 @@ def test_auto_steps_and_run_many(isolated_env, stub_heavy_steps, make_project):
 def test_project_step_params_layering(isolated_env):
     """项目级参数: 覆盖生效并标记 overridden; 与全局同值或 reset 后指纹恢复 ——
     「改参数→过期, 改回原值→过期自动撤销」语义 (指纹实时重算, 非固定事件)"""
-    from fastapi.testclient import TestClient
     from app.main import app
     from dubforge.domain import crud
     from dubforge.runner import compute_fingerprint
+    from fastapi.testclient import TestClient
     p = crud.create_project(title="参数项目")
     fp0 = compute_fingerprint(p, "preprocess")
     with TestClient(app) as client:
@@ -223,25 +256,44 @@ def test_project_step_params_layering(isolated_env):
         assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs_ft"
     assert compute_fingerprint(crud.get_project(p.uid), "preprocess") != fp0
 
-    # 覆盖值改回与全局相同 → 指纹立即恢复 (即使覆盖条目还在)
+    # 相同值仍是明确覆盖；指纹由生效值决定，恢复继承需显式reset。
     with TestClient(app) as client:
         client.put(f"/api/projects/{p.uid}/step_params", json={
             "updates": {"separate.model": "htdemucs"}, "reset": []})
+        j = client.get(f"/api/projects/{p.uid}/step_params").json()
+        assert j["overridden"]["separate.model"] is True
+        client.put(f"/api/projects/{p.uid}/step_params", json={"reset": ["separate.model"]})
+        assert client.get(f"/api/projects/{p.uid}/step_params").json()['overridden']['separate.model'] is False
     assert compute_fingerprint(crud.get_project(p.uid), "preprocess") == fp0
 
-    # 显式 reset 清掉覆盖条目 → 标记回到「跟随全局」, 指纹不变
+
+def test_project_step_params_equal_global_stays_explicit_override(isolated_env):
+    """全局默认改到相同值不等于取消项目设置。"""
+    from app.main import app
+    from dubforge import config
+    from dubforge.domain import crud
+    from fastapi.testclient import TestClient
+
+    p = crud.create_project(title="全局同步项目")
     with TestClient(app) as client:
         client.put(f"/api/projects/{p.uid}/step_params", json={
-            "updates": {}, "reset": ["separate.model"]})
+            "updates": {"separate.model": "htdemucs_ft"}, "reset": []})
         j = client.get(f"/api/projects/{p.uid}/step_params").json()
-        assert j["overridden"]["separate.model"] is False
-        assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs"
-    assert compute_fingerprint(crud.get_project(p.uid), "preprocess") == fp0
+        assert j["overridden"]["separate.model"] is True
 
+        # 上级临时出现同值，不改变继承关系。
+        config.set_key("separate.model", "htdemucs_ft")
+        j = client.get(f"/api/projects/{p.uid}/step_params").json()
+        assert j["overridden"]["separate.model"] is True
+        assert j["steps"]["preprocess"]["values"]["separate.model"] == "htdemucs_ft"
+
+        config.set_key('separate.model', 'htdemucs')
+    assert crud.project_step_params(crud.get_project(p.uid))['separate.model'] == 'htdemucs_ft'
 
 def test_missing_dir_flag_and_delete(isolated_env, tmp_path):
     """目录被外部移走: 列表标 dir_exists=false; 删除仍成功 (跳过回收站只清登记)"""
     import shutil as _shutil
+
     from dubforge.domain import crud
     p = crud.create_project(title="目录丢失项目")
     _shutil.rmtree(crud.project_dir(p.uid))
@@ -255,6 +307,7 @@ def test_missing_dir_flag_and_delete(isolated_env, tmp_path):
 def test_ghost_project_cannot_run(isolated_env):
     """目录缺失的项目不允许启动 (否则运行会失败并"补回"空目录骨架)"""
     import shutil as _shutil
+
     from dubforge.domain import crud
     p = crud.create_project(title="幽灵项目")
     _shutil.rmtree(crud.project_dir(p.uid))

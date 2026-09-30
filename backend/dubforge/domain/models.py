@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 DubForge 领域模型 (SQLModel / SQLite)
 =====================================
@@ -10,10 +9,9 @@ DubForge 领域模型 (SQLModel / SQLite)
 
 状态机约定:
   step:    pending → running → done / failed / stale (下游过期) / interrupted
-  重跑某步 = 该步置 pending + 清产物 + 所有下游置 stale
+  重跑某步 = 该步重新执行 + 清产物 + 已有结果的下游置 stale，未运行的保持 pending
 """
 import datetime
-from typing import Optional
 
 from sqlmodel import Field, SQLModel
 
@@ -23,7 +21,7 @@ def _now() -> datetime.datetime:
 
 
 class Project(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     uid: str = Field(index=True, unique=True)          # 稳定标识 (API/URL 用, 永不变)
     dir_name: str = ""                                 # 项目目录名: 日期_标题 (空=旧项目沿用 uid)
     title: str = ""                                    # 展示名 (视频标题/文件名)
@@ -36,22 +34,23 @@ class Project(SQLModel, table=True):
 
 
 class StepRun(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     project_id: int = Field(index=True, foreign_key="project.id")
     step_key: str = Field(index=True)                  # download/preprocess/...
     status: str = "pending"                            # pending/running/done/failed/stale/interrupted
     progress: float = 0.0                              # 运行进度 0-100 (running 时上报, done=100)
+    eta_seconds: float = 0.0                           # 预计剩余秒数快照 (0=无可靠预估)
     input_fingerprint: str = ""                        # 输入指纹 (配置+上游产物哈希)
     error_code: str = ""
     error_message: str = ""
     error_suggestion: str = ""
     retry_count: int = 0
-    started_at: Optional[datetime.datetime] = None
-    finished_at: Optional[datetime.datetime] = None
+    started_at: datetime.datetime | None = None
+    finished_at: datetime.datetime | None = None
 
 
 class Artifact(SQLModel, table=True):
-    id: Optional[int] = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     project_id: int = Field(index=True, foreign_key="project.id")
     step_key: str = Field(index=True)
     kind: str = ""                                     # video/audio/srt/json/table ...
@@ -64,12 +63,13 @@ class Artifact(SQLModel, table=True):
 
 class Job(SQLModel, table=True):
     """步骤执行记录: 一个 StepRun 可有多次 Job (重试)"""
-    id: Optional[int] = Field(default=None, primary_key=True)
+    id: int | None = Field(default=None, primary_key=True)
     project_id: int = Field(index=True, foreign_key="project.id")
     step_key: str = Field(index=True)
     status: str = "running"                            # running/done/failed/cancelled/dead
     heartbeat_at: datetime.datetime = Field(default_factory=_now)
     log_path: str = ""                                 # 项目 logs/ 下的日志文件
     started_at: datetime.datetime = Field(default_factory=_now)
-    finished_at: Optional[datetime.datetime] = None
+    finished_at: datetime.datetime | None = None
     error_detail: str = ""                             # 原始异常文本 (中文消息之外的调试信息)
+    task_data: str = "{}"                              # 本次任务范围与逐句结果 (JSON)

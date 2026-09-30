@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 运行控制测试: 暂停 / 停止 / 强制结束 / 半成品清理
 ================================================
@@ -11,6 +10,8 @@
 import sys
 import threading
 import time
+
+import pytest
 
 from conftest import mark_upstream_done, wait_status
 from dubforge.domain import crud
@@ -55,7 +56,7 @@ def test_pause_blocks_and_resumes(make_project, isolated_env, monkeypatch):
 
         pid = crud.get_project(uid).id
         r = runner.pause_step(uid, "assemble", pause=True)
-        assert r["status"] == "paused"
+        assert r["status"] in {"pausing", "paused"}
         assert runner.is_paused(pid, "assemble")
         time.sleep(0.8)                # 允许"当前单元"跑完
         frozen = ticks[0]
@@ -67,6 +68,58 @@ def test_pause_blocks_and_resumes(make_project, isolated_env, monkeypatch):
         stop.set()                     # 失败也不能把 worker 永久留在暂停点
         runner.pause_step(uid, "assemble", pause=False)
     wait_status(uid, "assemble", {"done"})
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_pause_status_distinguishes_request_from_waiting(make_project, isolated_env, monkeypatch, cancel):
+    """正在处理时只能报正在暂停；进入暂停点后报已暂停，继续/取消清除状态。"""
+    from app.api.steps import list_steps
+    from fastapi import Response
+
+    uid = make_project()
+    mark_upstream_done(uid, "assemble")
+    project = crud.get_project(uid)
+    started, release, resumed = threading.Event(), threading.Event(), threading.Event()
+
+    def worker(ctx):
+        started.set()
+        assert release.wait(10)
+        ctx.check_pause()
+        resumed.set()
+        ctx.write_json("assemble_result.json", {"ok": True})
+
+    def view():
+        return next(s for s in list_steps(uid, Response()) if s["key"] == "assemble")
+
+    _patch_step(monkeypatch, "assemble", worker)
+    runner = _runner()
+    try:
+        runner.start_step(uid, "assemble")
+        assert started.wait(5)
+        assert view()["pause_state"] == "none"
+        assert runner.pause_step(uid, "assemble")["status"] == "pausing"
+        pending = view()
+        assert pending["pausing"] and pending["pause_state"] == "requested"
+        release.set()
+        deadline = time.monotonic() + 5
+        while runner.pause_state(project.id, "assemble") != "paused":
+            assert time.monotonic() < deadline
+            time.sleep(.01)
+        paused = view()
+        assert paused["pausing"] and paused["pause_state"] == "paused"
+        assert not resumed.is_set()
+        if cancel:
+            runner.cancel_step(uid, "assemble")
+        else:
+            assert runner.pause_step(uid, "assemble", pause=False)["status"] == "resumed"
+            assert resumed.wait(5)
+        assert view()["pause_state"] == "none"
+    finally:
+        release.set()
+        runner.pause_step(uid, "assemble", pause=False)
+    wait_status(uid, "assemble", {"failed" if cancel else "done"})
+    assert view()["pause_state"] == "none"
+    assert resumed.is_set() is not cancel
 
 
 def test_force_stop_immediate_and_discard(make_project, isolated_env, monkeypatch):
@@ -102,6 +155,7 @@ def test_force_stop_immediate_and_discard(make_project, isolated_env, monkeypatc
     step = crud.get_step(crud.get_project(uid).id, "assemble")
     assert step.status == "failed"                        # 收尾不覆盖状态
     assert step.error_code == "STEP_FORCE_STOPPED"
+    assert crud.latest_artifacts(crud.get_project(uid).id, ["assemble"]) == {}
 
     # 强制结束后可直接重跑
     _patch_step(monkeypatch, "assemble",
@@ -118,7 +172,7 @@ def test_cancel_kills_subprocess(make_project, isolated_env, monkeypatch):
 
     def worker(ctx):
         started.set()
-        rc, out, err = ctx.run_subprocess(
+        rc, _out, _err = ctx.run_subprocess(
             [sys.executable, "-c", "import time; time.sleep(30)"])
         ctx.write_json("never.json", {"rc": rc})      # 正常路径不该走到
 
@@ -155,7 +209,7 @@ def test_sweep_temp_files(make_project, isolated_env, pdir):
         t.parent.mkdir(parents=True, exist_ok=True)
         t.write_bytes(b"x")
 
-    removed = _sweep_temp_files(d, "assemble")
+    _sweep_temp_files(d, "assemble")
     for t in temps:
         assert not t.exists(), f"未清理: {t.name}"
     assert not tmpdir.exists()
@@ -190,15 +244,15 @@ def test_sweep_runs_after_cancel(make_project, isolated_env, monkeypatch, pdir):
 
 def test_steps_api_inputs_outputs_pausing(isolated_env):
     """清单 API: 每步返回上游文件/计划产物/暂停标记"""
-    from fastapi.testclient import TestClient
     from app.main import app
+    from fastapi.testclient import TestClient
     with TestClient(app) as client:
         r = client.post("/api/projects", json={"title": "清单项目"})
         uid = r.json()["uid"]
         steps = {s["key"]: s for s in
                  client.get(f"/api/projects/{uid}/steps").json()}
         assert steps["download"]["inputs"] == []
-        assert steps["preprocess"]["inputs"][0] == {
+        assert {k: steps["preprocess"]["inputs"][0][k] for k in ("step", "name", "desc")} == {
             "step": "download", "name": "video.mp4",
             "desc": "源视频 (提取音轨与分离输入)"}
         outs = {o["name"] for o in steps["preprocess"]["outputs"]}
@@ -208,9 +262,9 @@ def test_steps_api_inputs_outputs_pausing(isolated_env):
 
 def test_reveal_artifact_endpoint(isolated_env, monkeypatch):
     """单产物定位: 已登记产物 → reveal 收到真实路径; 未登记 → 400"""
-    from fastapi.testclient import TestClient
-    from app.main import app
     import dubforge.utils.reveal as reveal_mod
+    from app.main import app
+    from fastapi.testclient import TestClient
     calls: list[str] = []
     monkeypatch.setattr(reveal_mod, "reveal_in_explorer", lambda p: calls.append(p))
 
@@ -255,17 +309,138 @@ def test_cancelling_flag_only_after_cancel(make_project, isolated_env, monkeypat
         assert started.wait(5)
         pid = crud.get_project(uid).id
         assert runner.is_cancelling(pid, "assemble") is False    # 运行中 ≠ 取消中
+        assert runner.stop_reason(pid, 'assemble') is None
         assert runner.is_paused(pid, "assemble") is False
         runner.cancel_step(uid, "assemble")
         assert runner.is_cancelling(pid, "assemble") is True     # 置位后才是
+        assert runner.stop_reason(pid, 'assemble') == 'user'
     finally:
         release.set()
     wait_status(uid, "assemble", {"failed"}, timeout=8)
     assert runner.is_cancelling(crud.get_project(uid).id, "assemble") is False
 
 
+def test_timeout_exposes_reason_until_worker_exits(make_project, isolated_env, monkeypatch):
+    from app.main import app
+    from fastapi.testclient import TestClient
+    uid = make_project()
+    mark_upstream_done(uid, 'assemble')
+    started, release = threading.Event(), threading.Event()
+    contexts = []
+    def worker(ctx):
+        contexts.append(ctx)
+        started.set()
+        assert release.wait(10)
+        ctx.check_cancel()
+    _patch_step(monkeypatch, 'assemble', worker)
+    runner = _runner()
+    runner.start_step(uid, 'assemble')
+    try:
+        assert started.wait(5)
+        contexts[0].request_timeout(7200)
+        # 任务已经启动，不能在这里再次运行应用启动恢复（会把在跑任务标成中断）。
+        client = TestClient(app)
+        try:
+            row = next(s for s in client.get(f'/api/projects/{uid}/steps').json() if s['key'] == 'assemble')
+        finally:
+            client.close()
+        assert row['cancelling'] and row['stop_reason'] == 'timeout'
+    finally:
+        release.set()
+    wait_status(uid, 'assemble', {'failed'})
+    assert crud.get_step(crud.get_project(uid).id, 'assemble').error_code == 'STEP_TIMEOUT'
+
+
+def test_cancel_is_idempotent_on_repeated_clicks(make_project, isolated_env, monkeypatch):
+    """连续点击停止只接受第一个信号，后续请求不会重复改变控制状态。"""
+    uid = make_project()
+    mark_upstream_done(uid, "assemble")
+    started = threading.Event()
+    release = threading.Event()
+
+    def worker(ctx):
+        started.set()
+        release.wait(10)
+        ctx.check_cancel()
+
+    _patch_step(monkeypatch, "assemble", worker)
+    runner = _runner()
+    runner.start_step(uid, "assemble")
+    assert started.wait(5)
+    first = runner.cancel_step(uid, "assemble")
+    second = runner.cancel_step(uid, "assemble")
+    assert first["status"] == "cancelling"
+    assert second["status"] == "already_cancelling"
+    release.set()
+    wait_status(uid, "assemble", {"failed"}, timeout=8)
+
+
+def test_control_action_rejects_stale_job_id(make_project, isolated_env, monkeypatch):
+    """弹窗打开后任务已结束/换代时，旧弹窗不能控制新任务。"""
+    uid = make_project()
+    mark_upstream_done(uid, "assemble")
+    started = threading.Event()
+    release = threading.Event()
+
+    def worker(ctx):
+        started.set()
+        release.wait(10)
+        ctx.check_cancel()
+
+    _patch_step(monkeypatch, "assemble", worker)
+    runner = _runner()
+    runner.start_step(uid, "assemble")
+    assert started.wait(5)
+    pid = crud.get_project(uid).id
+    job_id = runner.current_job_id(pid, "assemble")
+    assert job_id is not None
+
+    # 伪造一个旧弹窗代次: 不应发出取消信号。
+    stale = runner.cancel_step(uid, "assemble", expected_job_id=job_id + 999)
+    assert stale["status"] == "stale_action"
+    assert runner.is_cancelling(pid, "assemble") is False
+
+    release.set()
+    wait_status(uid, "assemble", {"done"}, timeout=8)
+    stale_after_done = runner.force_stop(uid, "assemble", expected_job_id=job_id)
+    assert stale_after_done["status"] == "stale_action"
+
+
+def test_force_stop_blocks_rerun_until_old_worker_finishes(make_project, isolated_env, monkeypatch):
+    """强制结束先改变界面状态，但旧线程未收尾前禁止同 key 重跑。"""
+    uid = make_project()
+    mark_upstream_done(uid, "assemble")
+    started = threading.Event()
+    release = threading.Event()
+
+    def worker(ctx):
+        started.set()
+        release.wait(10)
+        ctx.write_json("assemble_result.json", {"discard": True})
+
+    _patch_step(monkeypatch, "assemble", worker)
+    runner = _runner()
+    runner.start_step(uid, "assemble")
+    assert started.wait(5)
+    assert runner.force_stop(uid, "assemble")["status"] == "force_stopped"
+
+    from dubforge.errors import DubForgeError
+    with pytest.raises(DubForgeError) as ei:
+        runner.start_step(uid, "assemble")
+    assert ei.value.code == "STEP_FINALIZING"
+
+    release.set()
+    deadline = time.time() + 8
+    while time.time() < deadline and runner.current_job_id(
+            crud.get_project(uid).id, "assemble") is not None:
+        time.sleep(0.05)
+    assert runner.current_job_id(crud.get_project(uid).id, "assemble") is None
+    runner.start_step(uid, "assemble")
+    assert wait_status(uid, "assemble", {"done"}, timeout=8) == "done"
+
+
 def test_force_download_really_redownloads(make_project, isolated_env, monkeypatch, pdir):
-    """回归: 强制重跑获取视频必须真重下 —— 清掉旧视频文件 + 重新调用 yt-dlp
+    """回归: 强制重跑获取视频必须真重下，成功前保留旧视频
     (旧行为: media/ 有文件就跳过, 改分辨率重跑等于没跑)"""
     from dubforge.pipeline import step_download
     uid = make_project()                       # source_kind 默认 youtube
@@ -276,11 +451,15 @@ def test_force_download_really_redownloads(make_project, isolated_env, monkeypat
     calls = []
 
     def fake_ytdlp(ctx, url, out_template):
+        from pathlib import Path
         calls.append((url, getattr(ctx, "force", False)))
-        (media / "video.mp4").write_bytes(b"new-video")
-        return {"title": "t", "filepath": str(media / "video.mp4")}
+        assert (media / "video.mp4").is_file()
+        out = Path(out_template.replace("%(ext)s", "mp4"))
+        out.write_bytes(b"new-video")
+        return {"title": "t", "filepath": str(out)}
 
     monkeypatch.setattr(step_download, "_run_ytdlp", fake_ytdlp)
+    monkeypatch.setattr(step_download, "_validate_download", lambda *args: None)
     runner = _runner()
     runner.start_step(uid, "download", force=True)
     wait_status(uid, "download", {"done"})
