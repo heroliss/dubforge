@@ -363,11 +363,7 @@ def _coarse_resegment_prompt(lines: list[SubLine], max_len: int,
         "序号从 1 连续、片段非空，方便后续字幕对齐。\n",
         "\n【输出示例】输入 3 行短语，第 1+2 句语义连续被合并，时间取跨度:\n"
         "1. 0.000-4.050: we tried the best food in hanoi\n"
-        "2. 4.050-6.200: and it was amazing\n"
-        "【错误输出示例（不要这样输出）】\n"
-        "1, 0.000-4.050: we tried the best food in hanoi\n"
-        "0.000-4.050: we tried the best food in hanoi\n"
-        "1. 0,000-4,050: we tried the best food in hanoi\n",
+        "2. 4.050-6.200: and it was amazing\n",
         f"{context}\n",
         "【本窗口时间轴输入】\n",
         timeline,
