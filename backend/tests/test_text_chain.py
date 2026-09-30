@@ -117,10 +117,15 @@ def read_translate(uid):
                       for line_id, dst in sorted(rows.items())]}
 
 
-def test_split_long_line_with_word_timestamps(make_project, isolated_env, pdir):
+def test_split_long_line_with_word_timestamps(make_project, isolated_env, monkeypatch, pdir):
     uid = make_project()
     long_text = " ".join(["word"] * 40)          # 40 词 > 默认 max_split_length=22
     _seed_transcribe(uid, [(0.0, 10.0, long_text)])
+
+    def responder(prompt, system):
+        # LLM 返回单条超长行 (合法协议); 超上限的本地细分用词级时间戳完成
+        return "1. 0.000-10.000: " + long_text
+    _mock_llm(monkeypatch, responder)
     assert _run_until(uid, "split") == "done"
 
     data = read_split(uid)
@@ -301,7 +306,8 @@ def test_split_llm_phrase_mode_omits_word_timeline(make_project, isolated_env,
 
     def responder(prompt, system):
         calls.append(prompt)
-        assert "当前时间轴模式为短语级" in prompt
+        assert "【任务：整体语义重组】" in prompt
+        assert "词级: " not in prompt
         assert "【本窗口时间轴输入】" in prompt
         assert "输入词级时间轴:" not in prompt
         assert "0.00-1.80: 这是第一句，" in prompt
@@ -592,8 +598,7 @@ def test_translate_numbered_output_requires_ordered_known_ids(
         if "【待翻译原文】" in prompt:
             translate_started = True
         if not translate_started:
-            return json.dumps({"lines": [{"id": 1, "text": "alpha"},
-                                         {"id": 2, "text": "beta"}]})
+            return "1. 0.000-2.000: alpha\n2. 2.000-4.000: beta"
         return next(responses)
     _mock_llm(monkeypatch, responder)
     from dubforge.domain import crud as _crud
@@ -608,19 +613,21 @@ def test_translate_numbered_output_requires_ordered_known_ids(
     assert mapped == {1: "阿尔法", 2: "贝塔"}
 
 
-def test_split_llm_garbage_falls_back(make_project, isolated_env, monkeypatch, pdir):
-    """LLM 拆分返回垃圾 → 校验失败 → 回退规则切 (鲁棒)"""
+def test_split_llm_garbage_fails_loudly(make_project, isolated_env, monkeypatch, pdir):
+    """LLM 拆分返回垃圾 → 校验失败 → 任务响亮失败 (不静默回退规则切,
+    避免无声学语义的结果流进翻译/配音); 链挂起后「重试并继续」即可恢复"""
     uid = make_project()
     long_text = " ".join(["hello"] * 30)
     _seed_transcribe(uid, [(0.0, 8.0, long_text)])
 
     def responder(prompt, system):
-        return "这不是 JSON"                      # 拆分模型返回垃圾 → 回退规则切
+        return "这不是 JSON"
     _mock_llm(monkeypatch, responder)
 
-    assert _run_until(uid, "split") == "done"
-    data = read_split(uid)
-    assert data["count"] > 1
+    assert _run_until(uid, "split") == "failed"
+    from dubforge.domain import crud as _crud
+    step = _crud.get_step(_crud.get_project(uid).id, "split")
+    assert step.error_code == "SPLIT_WINDOW_UNTRUSTED"
 
 
 def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
@@ -630,9 +637,7 @@ def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
         if "【待翻译原文】" in prompt:
             return ("1. 你好，世界，这是一句比较长的翻译需要换行处理\n"
                     "2. 第二行")
-        return json.dumps({"lines": [
-            {"id": 1, "text": "Hello world"},
-            {"id": 2, "text": "Second line"}]})
+        return "1. 0.000-2.000: Hello world\n2. 2.000-4.000: Second line"
     _mock_llm(monkeypatch, responder)
     for key in ("split", "translate", "subtitles"):
         assert _run_until(uid, key) == "done"

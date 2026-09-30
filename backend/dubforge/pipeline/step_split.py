@@ -16,7 +16,7 @@ import math
 import re
 import unicodedata
 
-from dubforge.errors import DubForgeError
+from dubforge.errors import DubForgeError, StepFailedError
 from dubforge.utils.srt import SubLine, parse_srt
 from dubforge.progress import LlmProgress
 from dubforge.pipeline.text_prompts import ASR_CORRECTION_GUIDANCE, SEMANTIC_TIMING_GUIDANCE
@@ -361,6 +361,14 @@ def _coarse_resegment_prompt(lines: list[SubLine], max_len: int,
         "ASR 可能把后句开头的短词挂到前句末尾，可结合语境调整归属；遇到刻意停顿、犹豫或归属不明时，保留原时间通常更稳妥。\n",
         "\n【输出约定】只返回本窗口的编号时间轴文本，每行“序号. 开始秒-结束秒: 原文片段”，"
         "序号从 1 连续、片段非空，方便后续字幕对齐。\n",
+        "\n【输出示例】输入 3 行短语，第 1+2 句语义连续被合并，时间取跨度:\n"
+        "1. 0.000-4.050: we tried the best food in hanoi\n"
+        "2. 4.050-6.200: and it was amazing\n"
+        "【常见错误（任一都会让本窗口整体作废）】\n"
+        "- 原样复述输入、一行不合并（输出行数与输入完全相同通常意味着没有整理）\n"
+        "- 改写、翻译或增删原文内容；只允许调整边界与词语归属\n"
+        "- 输出 Markdown 代码块、解释或致歉等协议之外的文字\n"
+        "- 时间戳乱序、越界、缺秒或用逗号作小数点；序号不连续或重复\n",
         f"{context}\n",
         "【本窗口时间轴输入】\n",
         timeline,
@@ -456,25 +464,6 @@ def _split_repair_prompt(batch: list[SubLine], timeline: str,
         "直接返回完整编号文本，每行“序号. 开始秒-结束秒: 原文片段”，序号从 1 连续、片段非空。\n\n"
         + ASR_CORRECTION_GUIDANCE + SEMANTIC_TIMING_GUIDANCE + "\n【本窗口时间轴输入】\n" + timeline)
 
-
-
-def _fallback_batch_parts(lines: list[SubLine], max_len: int,
-                          max_duration: float,
-                          words: list[dict] | None = None) -> list[dict]:
-    """单个 LLM 窗口失败时，逐条使用本地规则，保证任务仍可继续。"""
-    parts: list[dict] = []
-    for line in lines:
-        duration = max(0.0, line.end - line.start)
-        effective = max_len
-        if duration > max_duration and _wc(line.text) >= 8:
-            needed = max(2, math.ceil(duration / max_duration))
-            effective = max(4, min(max_len, (_wc(line.text) + needed - 1) // needed))
-        local_parts = _rule_split(line.text, effective)
-        for text, (start, end) in zip(
-                local_parts, _times_for_parts(
-                    local_parts, line, _words_for_lines([line], words))):
-            parts.append({"text": text, "start": start, "end": end})
-    return parts
 
 
 def _llm_resegment(ctx, lines: list[SubLine], max_len: int,
@@ -604,19 +593,23 @@ def _llm_resegment(ctx, lines: list[SubLine], max_len: int,
                 cursor = end_cursor
             progress.finish()
             ctx.log(f"LLM 窗口 {bi}/{len(batches)} 完成: {len(batch)} 条短语 → {len(parts)} 条字幕句")
+        except DubForgeError:
+            # LLM 层已给出明确错误码 (未配置/超时/限流/输出截断), 原样上抛不改写
+            raise
         except Exception as e:  # noqa: BLE001
             ctx.check_cancel()
             progress.finish(success=False)
-            ctx.log(f"LLM 窗口 {bi}/{len(batches)} 重组失败，回退本地切分: {e}")
+            # 不回退本地规则切分: 机械切分会把无声学语义的结果静默送进翻译/配音/
+            # 字幕，全自动流程里宁可响亮失败——链会挂起，「重试并继续」即可恢复；
+            # 单窗输入上限保证一次退化不牵连其他窗口。
+            ctx.log(f"LLM 窗口 {bi}/{len(batches)} 输出不可信，不回退本地切分，任务失败: {e}")
             ctx.llm_trace("fallback",
-                          f"窗口 {bi}/{len(batches)} LLM 输出不可信，已回退本地规则切分（任务仍成功）")
-            fallback = _fallback_batch_parts(batch, max_len, max_duration, words)
-            for fallback_part in fallback:
-                fallback_part["_window"] = bi
-            if boundary_space and fallback:
-                if not fallback[0]["text"].startswith((" ", "\t", "\n", "\r")):
-                    fallback[0]["text"] = " " + fallback[0]["text"]
-            all_parts.extend(fallback)
+                          f"窗口 {bi}/{len(batches)} LLM 输出不可信，任务失败等待重试")
+            raise StepFailedError(
+                f"LLM 窗口 {bi}/{len(batches)} 重组结果不可信: {e}",
+                code="SPLIT_WINDOW_UNTRUSTED",
+                suggestion="可直接重跑本步骤；反复出现时在设置中更换语义整理模型、"
+                           "调小「单窗输入上限」，或检查模型输出 token 上限与思考预算。")
     stitched = _stitch_window_edges(all_parts, max_len, max_duration, pause)
     if len(stitched) != len(all_parts):
         ctx.log(f"窗口边界整理: 合并 {len(all_parts) - len(stitched)} 个跨窗口技术断点")

@@ -150,6 +150,9 @@ import os
 
 
 def test_dubtask_and_tts_chain(make_project, isolated_env, monkeypatch, pdir):
+    # 本测试聚焦配音链; 语义整理走本地规则 (未配置 LLM 也不再静默回退)
+    from dubforge import config as _cfg
+    _cfg.update_config({'split.use_llm': False})
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 3.0, "Hello world this is a test"),
                            (3.5, 6.0, "Second line for dubbing")])
@@ -174,6 +177,8 @@ def test_dubtask_and_tts_chain(make_project, isolated_env, monkeypatch, pdir):
 
 
 def test_workbench_api(make_project, isolated_env, monkeypatch):
+    from dubforge import config as _cfg
+    _cfg.update_config({'split.use_llm': False})
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 3.0, "Hello world this is a test"),
                            (3.5, 6.0, "Second line for dubbing")])
