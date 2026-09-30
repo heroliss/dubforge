@@ -188,6 +188,10 @@ runner:
     download: 1
   # 自动重试前的等待秒数
   retry_delay: 15
+  # 全自动显存协调: 分离/转写前显存不足时自动停止托管配音服务, 配音前自动启动
+  auto_tts_vram: true
+  gpu_free_reserve_mb: 4096
+  tts_start_timeout: 300
   # 每个步骤进入运行后的最大活动时间 (秒); 排队和用户暂停不计时; 0=关闭兜底
   step_timeout_seconds:
     download: 3600

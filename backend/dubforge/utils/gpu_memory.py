@@ -17,3 +17,15 @@ def release_unused(log=lambda message: None):
     except Exception as exc:
         # 资源统计失败不能覆盖原始步骤结果；活跃模型的显存不会被强制释放。
         log(f'GPU 空闲缓存释放未完成：{type(exc).__name__}；请检查显存占用')
+
+
+def free_mb() -> int | None:
+    """设备级空闲显存 (MiB, 含其他进程占用后的余量); torch 不可用或无 CUDA 时 None。"""
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return None
+        free, _total = torch.cuda.mem_get_info()
+        return int(free // (1024 * 1024))
+    except Exception:
+        return None

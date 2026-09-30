@@ -965,6 +965,7 @@ class Runner:
                                    or (step.input_fingerprint
                                        and step.input_fingerprint != fingerprint))
                 self._begin_running(ctx, step, step_def, fingerprint)
+                self._prepare_gpu(ctx, step_key)
                 run_fn = get_runner(step_key)
                 timeout_seconds = self.step_timeout_seconds(step_key, ctx)
                 watchdog_stop = threading.Event()
@@ -1349,6 +1350,67 @@ class Runner:
         ctx._paused_seconds = 0.0
         crud.save_step(step)
         ctx.log(f"▶ 开始步骤 [{step_def.label}] ({step.step_key})")
+
+    def _prepare_gpu(self, ctx: StepContext, step_key: str) -> None:
+        """全自动显存协调 (ADR-0077): 配音服务驻留显存会挤掉分离/转写, 反之亦然 ——
+        由运行器按需自动停/启托管配音服务, 用户不插手。
+        - 配音步骤前: 托管服务未在线 → 自动启动并等待就绪 (超时则明确失败)
+        - 分离/转写步骤前: 空闲显存低于阈值 → 自动停止托管服务释放显存
+        外部启动的服务不受管控 (无法安全代停), 只提示; 显存仍不足时走 CPU 降级。"""
+        if not config.get("runner.auto_tts_vram", True):
+            return
+        from dubforge import tts_service
+        try:
+            svc = tts_service.status()
+        except Exception as exc:                     # 服务探测失败不阻塞制作
+            ctx.log(f"⚠ 读取配音服务状态失败，跳过显存协调: {exc}")
+            return
+        if step_key == 'tts':
+            if svc.get('online'):
+                return
+            if not svc.get('managed'):
+                ctx.log(f"⚠ 配音服务未在线且为外部启动，无法自动启动: {svc.get('message') or '请在服务页启动'}")
+                return
+            try:
+                timeout = max(30, int(config.get("runner.tts_start_timeout", 300) or 300))
+            except (TypeError, ValueError):
+                timeout = 300
+            ctx.log("🎙 配音服务未在线，自动启动并等待就绪…")
+            try:
+                tts_service.start()
+            except Exception as exc:
+                raise DubForgeError(f"配音服务自动启动失败: {exc}", code="TTS_SERVICE_START_FAIL",
+                                    suggestion="请到服务页手动启动配音服务并查看启动日志。")
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                if tts_service.status().get('online'):
+                    ctx.log("🎙 配音服务已就绪")
+                    return
+                ctx.check_cancel()
+                time.sleep(2)
+            raise DubForgeError(f"配音服务在 {timeout} 秒内未就绪", code="TTS_SERVICE_TIMEOUT",
+                                suggestion="请到服务页查看启动日志; 模型首次加载可能较慢，可调大 runner.tts_start_timeout。")
+        if step_key not in ('preprocess', 'transcribe'):
+            return
+        if not (svc.get('online') or svc.get('status') == 'starting'):
+            return
+        if not svc.get('managed'):
+            ctx.log("⚠ 配音服务为外部启动，无法自动释放其显存；显存不足时分离将自动降级 CPU")
+            return
+        from dubforge.utils.gpu_memory import free_mb
+        try:
+            reserve = max(0, int(config.get("runner.gpu_free_reserve_mb", 4096) or 4096))
+        except (TypeError, ValueError):
+            reserve = 4096
+        free = free_mb()
+        if free is None or free >= reserve:
+            return
+        ctx.log(f"🧹 空闲显存 {free} MiB 低于阈值 {reserve} MiB，自动停止配音服务释放显存"
+                f"（之后的配音步骤会自动重启服务）…")
+        try:
+            tts_service.stop()
+        except Exception as exc:
+            ctx.log(f"⚠ 配音服务停止失败，显存不足时将自动降级 CPU: {exc}")
 
     def _slot_key(self, step_key: str) -> str:
         """槽位键: 配置了资源组的步骤共享同组槽位 (如 preprocess/transcribe/tts

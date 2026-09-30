@@ -258,3 +258,85 @@ def test_demucs_oom_falls_back_to_cpu(isolated_env, make_project, monkeypatch):
             cfg=lambda key, default=None: {'separate.model': 'htdemucs'}.get(key, default),
         ))
     assert attempts == []
+
+
+def _fake_tts_service(monkeypatch, *, managed=True, online=True, record=None):
+    from dubforge import tts_service
+    state = {'stopped': 0, 'started': 0}
+    def status(cfg_get=config.get, *, probe=True):
+        return {'backend': 'indextts25', 'managed': managed, 'online': online,
+                'status': 'online' if online else 'offline', 'message': '', 'can_stop': True}
+    def stop(cfg_get=config.get):
+        state['stopped'] += 1
+        if record is not None:
+            record.append('stop')
+        return {'status': 'offline'}
+    def start(cfg_get=config.get):
+        state['started'] += 1
+        if record is not None:
+            record.append('start')
+        monkeypatch.setattr(tts_service, 'status', lambda cfg_get=config.get, *, probe=True: status(probe=False) | {'online': True, 'status': 'online'})
+        return {'status': 'online'}
+    monkeypatch.setattr(tts_service, 'status', status)
+    monkeypatch.setattr(tts_service, 'stop', stop)
+    monkeypatch.setattr(tts_service, 'start', start)
+    return state
+
+
+def _stub_step(monkeypatch, make_project, key: str):
+    """桩掉目标步骤并播种上游, 返回可直接 start 的项目 uid。"""
+    from dubforge.pipeline import steps as steps_mod
+    def run(ctx):
+        ctx.write_json(f'{key}_result.json', {'ok': True})
+    monkeypatch.setitem(steps_mod._RUNNERS, key, run)
+    uid = make_project()
+    mark_upstream_done(uid, key)
+    return uid
+
+
+def test_gpu_prep_stops_managed_tts_service_for_preprocess(isolated_env, make_project, monkeypatch):
+    """分离前空闲显存低于阈值 → 自动停止托管配音服务; 显存充足或非托管不动作。"""
+    config.update_config({'runner.gpu_free_reserve_mb': 4096})
+    record = []
+    state = _fake_tts_service(monkeypatch, managed=True, online=True, record=record)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.free_mb', lambda: 500)
+    uid = _stub_step(monkeypatch, make_project, 'preprocess')
+    runner.start_step(uid, 'preprocess')
+    wait_status(uid, 'preprocess', {'done'})
+    assert state['stopped'] == 1 and record == ['stop']
+
+    # 显存充足: 不停止
+    record.clear(); state['stopped'] = 0
+    monkeypatch.setattr('dubforge.utils.gpu_memory.free_mb', lambda: 6000)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.free_mb', lambda: 6000)
+    uid2 = _stub_step(monkeypatch, make_project, 'preprocess')
+    runner.start_step(uid2, 'preprocess')
+    wait_status(uid2, 'preprocess', {'done'})
+    assert state['stopped'] == 0
+
+    # 外部服务: 不代停
+    record.clear()
+    _fake_tts_service(monkeypatch, managed=False, online=True, record=record)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.free_mb', lambda: 500)
+    uid3 = _stub_step(monkeypatch, make_project, 'preprocess')
+    runner.start_step(uid3, 'preprocess')
+    wait_status(uid3, 'preprocess', {'done'})
+    assert state['stopped'] == 0
+
+
+def test_gpu_prep_starts_tts_service_for_tts_step(isolated_env, make_project, monkeypatch):
+    """配音步骤前托管服务未在线 → 自动启动并等待就绪; 关闭开关则完全不动。"""
+    config.update_config({'runner.tts_start_timeout': 60})
+    record = []
+    state = _fake_tts_service(monkeypatch, managed=True, online=False, record=record)
+    uid = _stub_step(monkeypatch, make_project, 'tts')
+    runner.start_step(uid, 'tts')
+    wait_status(uid, 'tts', {'done'})
+    assert state['started'] == 1 and 'start' in record
+
+    config.update_config({'runner.auto_tts_vram': False})
+    _fake_tts_service(monkeypatch, managed=True, online=False, record=record)
+    uid2 = _stub_step(monkeypatch, make_project, 'tts')
+    runner.start_step(uid2, 'tts')
+    wait_status(uid2, 'tts', {'done'})
+    assert not any(a == 'start' for a in record[len(record):]) or state['started'] == 1
