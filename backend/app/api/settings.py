@@ -89,9 +89,15 @@ def get_settings():
 def update_settings(body: SettingsUpdate):
     from dubforge.pipeline.step_params import validate_numeric_updates
     from dubforge.comment_studio import validate_default_updates
-    validate_numeric_updates(body.updates)
-    validate_default_updates(body.updates)
-    config.update_config(body.updates)
+    from dubforge import runtime_edit
+    from dubforge.pipeline import dubbing_session
+    from dubforge.runner import runner
+    with runner._start_lock, dubbing_session.gate:
+        if not runtime_edit.display_only(body.updates):
+            runtime_edit.assert_editable('global')
+        validate_numeric_updates(body.updates)
+        validate_default_updates(body.updates)
+        config.update_config(body.updates)
     return {"ok": True, "applied": body.updates}
 
 

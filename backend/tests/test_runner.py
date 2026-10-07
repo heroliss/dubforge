@@ -36,14 +36,26 @@ def test_running_context_keeps_config_snapshot(make_project, isolated_env, pdir)
 
 
 
-def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps, pdir):
+def test_run_done_and_artifact(make_project, isolated_env, stub_heavy_steps, pdir, monkeypatch):
     stub_heavy_steps("assemble")
     uid = make_project()
     runner = _runner()
+    futures = []
+    submit = runner._pool.submit
+
+    def track(*args, **kwargs):
+        future = submit(*args, **kwargs)
+        futures.append(future)
+        return future
+
+    monkeypatch.setattr(runner._pool, 'submit', track)
     mark_upstream_done(uid, "assemble")
     r = runner.start_step(uid, "assemble")
     assert r["status"] == "started"
     wait_status(uid, "assemble", {"done"})
+    # done 先入库，清扫及 manifest 在 finally；等待本次任务收尾后核对清单。
+    for future in futures:
+        future.result(timeout=5)
 
     project = crud.get_project(uid)
     arts = crud.latest_artifacts(project.id, ["assemble"])

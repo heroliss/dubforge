@@ -9,7 +9,7 @@ import pytest
 from fastapi.testclient import TestClient
 from sqlmodel import Session
 
-from dubforge import db, comment_studio
+from dubforge import config, db, comment_studio
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.publishing import credentials, imports, service, studio, transport
@@ -21,6 +21,8 @@ BV = 'BV1234567890'
 @pytest.fixture
 def env(make_project, monkeypatch):
     uid = make_project()
+    # 本组仅核对远端修改协议；占位文件没有字幕，实际内容审查由独立用例覆盖。
+    config.set_key('content_review.enabled', False)
     with Session(db.get_engine()) as s:
         s.add(PublishAccount(id='123', name='测试账号', credential='fixture'))
         s.add(PublishAccount(id='456', name='另一个账号', credential='fixture'))
@@ -139,7 +141,7 @@ def test_inflight_blocks_parallel_commit_plan_and_manual_release(env,monkeypatch
 
 
 def uploaded(env):
-    record=Publication(project_uid=env.uid,status='uploaded',snapshot=service._json(dict(account_id='123',origins={},
+    record=Publication(project_uid=env.uid,status='uploaded',snapshot=service._json(dict(project_uid=env.uid,account_id='123',origins={},
         settings={**service.DEFAULTS,'declaration_id':1},parts=[dict(artifact_id=3,title='新配音版',has_dubbing=True)])),
         transfers=service._json({'3':dict(cid=3,filename='new-upload')}))
     with Session(db.get_engine()) as session:

@@ -166,6 +166,8 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path, total=0.0, *,
          start: float | None = None, burn: bool = False,
          progress_range: tuple[float, float] = (40.0, 99.0), comment_plan=None) -> None:
     """阶段 B: ffmpeg 封装 (配音混音/背景/ducking/烧录)；试合成输出短片段。"""
+    from dubforge.pipeline.content_redaction import audio_filter, safe_overlay
+    comment_plan = safe_overlay(ctx, comment_plan)
     bgm_vol = float(ctx.cfg("assemble.bgm_volume", 1.0))
     voice_vol = float(ctx.cfg('assemble.voice_volume', 1.0))
     bg = ctx.upstream("preprocess", "background.wav") if bgm_vol > 0 else None
@@ -193,6 +195,11 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path, total=0.0, *,
                 f"[voice][bg]amix=inputs=2:duration=first:normalize=0[aout]")
     else:
         filters.append("[voice]anull[aout]")
+    if mute := audio_filter(ctx, start=start or 0.0, duration=duration):
+        filters.append(f'[aout]{mute}[reviewed_audio]')
+        audio_output = '[reviewed_audio]'
+    else:
+        audio_output = '[aout]'
 
     preview_srt = None
     video_filters = ['setpts=PTS-STARTPTS'] if preview else []
@@ -218,7 +225,7 @@ def _mux(ctx, pdir: Path, video: Path, dub: Path, out: Path, total=0.0, *,
         cmd += ["-map", "[v]", "-c:v", "libx264", "-crf", str(crf), "-preset", "medium"]
     else:
         cmd += ["-map", "0:v", "-c:v", "copy"]
-    cmd += ["-map", "[aout]", "-c:a", "aac", "-b:a", "192k", "-shortest"]
+    cmd += ["-map", audio_output, "-c:a", "aac", "-b:a", "192k", "-shortest"]
     cmd += ["-filter_complex", ";".join(filters), out.name]
     # 先写临时名, 成功才转正 —— 中断/取消不留下半成品 mp4
     out_dir = pdir / "output"
@@ -280,6 +287,8 @@ def _has_audio_stream(path: Path) -> bool:
 def _mux_original_sub(ctx, video: Path, out: Path, total: float,
                       progress_range: tuple[float, float], *, burn=True, start=None, comment_plan=None) -> None:
     """原声组合：不依赖配音；试片与完整成品共用字幕/评论渲染。"""
+    from dubforge.pipeline.content_redaction import audio_filter, safe_overlay
+    comment_plan = safe_overlay(ctx, comment_plan)
     from dubforge.pipeline.subtitle_style import prepare_burn_filter
     srt = ctx.upstream("subtitles", ctx.cfg("assemble.subtitle_track", "trans") + ".srt") if burn else None
     crf = int(ctx.cfg("assemble.crf", 18))
@@ -299,12 +308,16 @@ def _mux_original_sub(ctx, video: Path, out: Path, total: float,
     if comment_filter:
         video_filters.append(comment_filter)
     # 字幕滤镜路径转义繁琐 → 以 srt 目录为工作目录用相对文件名 (与 _mux 一致)
-    cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", *_input(video, start, total if start is not None else None),
-           "-vf", ','.join(video_filters),
-           "-map", "0:v"]
+    cmd = ["ffmpeg", "-y", "-progress", "pipe:1", "-nostats", *_input(video, start, total if start is not None else None)]
+    if video_filters:
+        cmd += ['-vf', ','.join(video_filters)]
+    cmd += ['-map', '0:v']
     if _has_audio_stream(video):
         cmd += ["-map", "0:a", "-c:a", "aac", "-b:a", "192k"]
-    cmd += ["-c:v", "libx264", "-crf", str(crf), "-preset", "medium", out.name]
+        if mute := audio_filter(ctx, start=start or 0.0, duration=total):
+            cmd += ['-af', mute]
+    cmd += (["-c:v", "libx264", "-crf", str(crf), "-preset", "medium"] if video_filters else ['-c:v', 'copy'])
+    cmd += [out.name]
 
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp_out = out.with_name(f".tmp_{out.name}")

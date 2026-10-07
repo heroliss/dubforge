@@ -12,6 +12,7 @@ import { versionSpec, versionSummary, effectiveVersion, type AssemblyVersion } f
 import { textColorPatch } from '../utils/textColorPresets'
 import { textStyleFieldGroups } from '../utils/textStyleFields'
 import { refreshInBackground } from '../utils/backgroundRefresh'
+import { createLatestRefresh } from '../utils/preview'
 import { subtitleSettingsLink } from '../utils/subtitleWorkspace'
 import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import type { ConfigurationSource } from '../utils/configurationSource'
@@ -21,7 +22,8 @@ const nav = useNavStore(), dialog = useDialog(), message = useMessage()
 const state = ref<any>(null), versions = ref<AssemblyVersion[]>([]), activeId = ref(''), selected = ref<string[]>([])
 const busy = ref(false), error = ref(''), blockers = ref<any[]>([]), ready = ref(false)
 const {revision:commentRevision, refresh:refreshComments} = useCommentOverlay(() => props.uid)
-let disposed = false, confirmation: any
+let disposed = false, confirmation: any, contextGeneration = 0
+let savedRead: AbortController | null = null
 const dirty = computed(() => !!state.value && JSON.stringify(versions.value) !== JSON.stringify(state.value.versions.map(versionSpec)))
 const running = computed(() => ['running','queued'].includes(nav.stepMap.assemble?.status))
 const locked = computed(() => !!props.disabled || busy.value || running.value)
@@ -36,8 +38,8 @@ function versionStatus(v:AssemblyVersion) {
   const saved=state.value.versions.find((row:any)=>row.id===v.id)
   return !saved?'新增版本':JSON.stringify(v)!==JSON.stringify(versionSpec(saved))?'未保存调整':saved.status
 }
-async function api(path='', body?:any, method=body === undefined ? 'GET' : 'POST') {
-  const r = await fetch(`/api/projects/${props.uid}/assembly-versions${path}`, {method,headers:body === undefined ? undefined : {'Content-Type':'application/json'},body:body === undefined ? undefined : JSON.stringify(body)})
+async function api(path='', body?:any, method=body === undefined ? 'GET' : 'POST', signal?:AbortSignal, uid=props.uid) {
+  const r = await fetch(`/api/projects/${uid}/assembly-versions${path}`, {method,signal,cache:'no-store',headers:body === undefined ? undefined : {'Content-Type':'application/json'},body:body === undefined ? undefined : JSON.stringify(body)})
   const data = await r.json(); if(!r.ok) throw new Error(data.message || '成片版本操作失败'); return data
 }
 function adopt(data:any) {
@@ -45,21 +47,51 @@ function adopt(data:any) {
   if(!versions.value.some(v => v.id === activeId.value)) activeId.value=versions.value[0]?.id || ''
   selected.value=selected.value.filter(id => versions.value.some(v => v.id===id))
 }
-async function refresh() {
-  try { const data=await api(); if(disposed) return; if(!dirty.value) adopt(data); else state.value={...state.value, defaults:data.defaults, origins:data.origins, sources:data.sources}; ready.value=true }
-  catch(e:any) { if(!disposed) error.value=e.message }
+function currentContext(uid:string, generation:number) { return !disposed && uid===props.uid && generation===contextGeneration }
+function readError(e:any) { error.value=e?.name==='TimeoutError'?'读取成片版本超时，请重试':e?.message || '读取成片版本失败，请重试' }
+const versionReader=createLatestRefresh(async signal=>{
+  const uid=props.uid, generation=contextGeneration
+  const data=await api('',undefined,'GET',AbortSignal.any([signal,AbortSignal.timeout(15000)]),uid)
+  return {uid,generation,data}
+},({uid,generation,data})=>{
+  if(!currentContext(uid,generation) || busy.value) return
+  // 编辑中的稀疏定义和提交版本号保留；上级默认变化不能悄悄覆盖本页草稿。
+  if(!dirty.value) adopt(data)
+  else state.value={...state.value,defaults:data.defaults,origins:data.origins,sources:data.sources}
+  ready.value=true;error.value=''
+},readError)
+function refresh() {
+  return disposed || busy.value ? Promise.resolve() : versionReader.refresh()
+}
+function cancelReads() { versionReader.cancel();savedRead?.abort();savedRead=null }
+async function readSaved(uid:string, generation:number) {
+  const controller=new AbortController();savedRead=controller
+  try {
+    const data=await api('',undefined,'GET',AbortSignal.any([controller.signal,AbortSignal.timeout(15000)]),uid)
+    if(currentContext(uid,generation) && savedRead===controller) {
+      versionReader.cancel();adopt(data);ready.value=true;error.value=''
+    }
+  } finally { if(savedRead===controller) savedRead=null }
 }
 async function reloadSaved() {
   if(locked.value) return
-  const load=async()=>{busy.value=true;try{const data=await api();if(!disposed){adopt(data);error.value=''}}catch(e:any){error.value=e.message}finally{busy.value=false}}
+  const uid=props.uid, generation=contextGeneration
+  const load=async()=>{
+    if(!currentContext(uid,generation) || locked.value) return
+    cancelReads();busy.value=true
+    try{await readSaved(uid,generation)}
+    catch(e:any){if(currentContext(uid,generation) && e?.name!=='AbortError')readError(e)}
+    finally{if(currentContext(uid,generation))busy.value=false}
+  }
   if(!dirty.value){await load();return}
   confirmation=dialog.warning({title:'丢弃未保存调整并刷新版本？',content:'将读取其他页面最新保存的版本与默认值；不会生成或删除成品。',positiveText:'刷新已保存版本',negativeText:'继续编辑',onPositiveClick:load})
 }
 async function save() {
   if(locked.value) return
-  busy.value=true;error.value=''
-  try { const data=await api('',{versions:versions.value.map(versionSpec),revision:state.value.revision,fingerprint:state.value.fingerprint},'PUT'); if(!disposed){adopt(data);emit('saved',data);message.success('已保存成片版本；已有文件不会立即重做')} }
-  catch(e:any){error.value=e.message}finally{busy.value=false}
+  const uid=props.uid, generation=contextGeneration
+  cancelReads();busy.value=true;error.value=''
+  try { const data=await api('',{versions:versions.value.map(versionSpec),revision:state.value.revision,fingerprint:state.value.fingerprint},'PUT',undefined,uid); if(currentContext(uid,generation)){versionReader.cancel();adopt(data);emit('saved',data);message.success('已保存成片版本；已有文件不会立即重做')} }
+  catch(e:any){if(currentContext(uid,generation))error.value=e.message}finally{if(currentContext(uid,generation))busy.value=false}
 }
 function add(copy=false) {
   if(locked.value) return
@@ -79,34 +111,58 @@ function enableSourceStyle(group:string) { override((group==='字幕'?'assemble.
 function toggle(id:string,checked:boolean) { selected.value=checked?[...selected.value,id]:selected.value.filter(v=>v!==id) }
 function restoreInheritance() {
   if(locked.value) return
+  const uid=props.uid, generation=contextGeneration
   confirmation=dialog.warning({title:'恢复继承版本清单？',
     content:'移除本项目的版本清单覆盖，后续跟随系列模板或全局默认；保留磁盘成品。',positiveText:'恢复继承',negativeText:'取消',
     onPositiveClick:async()=>{
-      busy.value=true
-      try{const r=await fetch(`/api/configuration/project:${props.uid}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:['assembly.versions'],revision:state.value.revision,fingerprint:state.value.fingerprint})});const d=await r.json();if(!r.ok)throw new Error(d.message);await refresh();message.success('已恢复继承')}
-      catch(e:any){error.value=e.message}finally{busy.value=false}
+      if(!currentContext(uid,generation) || locked.value) return
+      cancelReads();busy.value=true
+      try{const r=await fetch(`/api/configuration/project:${uid}`,{method:'PUT',headers:{'Content-Type':'application/json'},body:JSON.stringify({reset:['assembly.versions'],revision:state.value.revision,fingerprint:state.value.fingerprint})});const d=await r.json();if(!r.ok)throw new Error(d.message);if(currentContext(uid,generation)){await readSaved(uid,generation);if(currentContext(uid,generation))message.success('已恢复继承')}}
+      catch(e:any){if(currentContext(uid,generation) && e?.name!=='AbortError')readError(e)}finally{if(currentContext(uid,generation))busy.value=false}
     }})
+}
+function generationReady(uid=props.uid, generation=contextGeneration) {
+  if(!currentContext(uid,generation)) return false
+  // 预检等待和确认窗口期间，父页的审查草稿或运行状态仍可能变化。
+  // 此时 busy 属于本次预检，不能用包含 busy 的 locked 判定。
+  if(props.disabled || dirty.value || running.value) {
+    error.value='当前状态或设置已变化，请先保存审查与版本设置，再重新确认生成'
+    return false
+  }
+  return true
 }
 async function generate() {
   if(locked.value || dirty.value || !selected.value.length) return
+  const uid=props.uid, generation=contextGeneration
   busy.value=true;error.value='';blockers.value=[]
   let awaiting=false, accepted=false
   try{
     await refreshComments()
-    const body={version_ids:[...selected.value],overlay_revision:commentRevision.value},plan=await api('/plan',body)
+    if(!generationReady(uid,generation)) return
+    const body={version_ids:[...selected.value],overlay_revision:commentRevision.value},plan=await api('/plan',body,'POST',undefined,uid)
+    if(!generationReady(uid,generation)) return
     blockers.value=plan.blockers
     if(plan.blockers.length) return
     awaiting=true
     confirmation=dialog.warning({title:'生成选中的成片版本',content:plan.versions.map((v:any)=>`${v.name}：${versionSummary(v)}`).join('\n')+'\n\n未变化的版本直接复用；已变化的版本成功后替换自己的成品，失败保留原文件。',positiveText:'确认生成',negativeText:'返回调整',maskClosable:false,
-      onAfterLeave:()=>{busy.value=false},onPositiveClick:async()=>{
-        if(accepted || disposed) return
+      onAfterLeave:()=>{if(currentContext(uid,generation))busy.value=false},onPositiveClick:async()=>{
+        if(accepted || !currentContext(uid,generation)) return
+        if(!generationReady(uid,generation)) return false
         accepted=true
-        try{const result=await api('/run',{...body,fingerprint:plan.fingerprint});nav.stepStarted(props.uid,'assemble',result);refreshInBackground(()=>nav.poll());message.success('已开始生成所选版本')}
-        catch(e:any){error.value=e.message}finally{busy.value=false}
+        try{const result=await api('/run',{...body,fingerprint:plan.fingerprint},'POST',undefined,uid);if(currentContext(uid,generation)){nav.stepStarted(uid,'assemble',result);refreshInBackground(()=>nav.poll());message.success('已开始生成所选版本')}}
+        catch(e:any){if(currentContext(uid,generation))error.value=e.message}finally{if(currentContext(uid,generation))busy.value=false}
       }})
-  }catch(e:any){error.value=e.message}finally{if(!awaiting)busy.value=false}
+  }catch(e:any){if(currentContext(uid,generation))error.value=e.message}finally{if(!awaiting && currentContext(uid,generation))busy.value=false}
 }
 watch(dirty,v=>emit('dirty-change',v),{immediate:true})
+function resetContext() {
+  contextGeneration++;cancelReads();confirmation?.destroy();confirmation=null
+  state.value=null;versions.value=[];activeId.value='';selected.value=[];blockers.value=[]
+  ready.value=false;busy.value=false;error.value=''
+  if(!disposed) void refresh()
+}
+function disposeWorkspace() { disposed=true;contextGeneration++;cancelReads();confirmation?.destroy() }
+watch(()=>props.uid,resetContext)
 watch(()=>nav.stepMap.assemble?.status,(value,old)=>{if(value!==old && !['running','queued'].includes(value)) void refresh()})
 watch(()=>props.disabled,(value,old)=>{if(old && !value) void refresh()})
 function beforeUnload(event:BeforeUnloadEvent){if(dirty.value){event.preventDefault();event.returnValue=''}}
@@ -114,7 +170,7 @@ function confirmLeave(){return !dirty.value || window.confirm('成片版本设�
 onBeforeRouteLeave(confirmLeave)
 onBeforeRouteUpdate((to,from)=>(to.params.uid===from.params.uid && to.params.key===from.params.key) || confirmLeave())
 onMounted(()=>{void refresh();window.addEventListener('beforeunload',beforeUnload)})
-onBeforeUnmount(()=>{disposed=true;confirmation?.destroy();window.removeEventListener('beforeunload',beforeUnload);emit('dirty-change',false)})
+onBeforeUnmount(()=>{disposeWorkspace();window.removeEventListener('beforeunload',beforeUnload);emit('dirty-change',false)})
 </script>
 <template>
   <n-card title="成片版本" size="small" class="version-workspace">

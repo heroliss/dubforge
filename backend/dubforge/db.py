@@ -82,10 +82,18 @@ def _ensure_columns() -> None:
             conn.exec_driver_sql(
                 "ALTER TABLE steprun ADD COLUMN eta_seconds FLOAT DEFAULT 0 NOT NULL")
             conn.commit()
+        if "input_snapshot" not in cols2:
+            conn.exec_driver_sql(
+                "ALTER TABLE steprun ADD COLUMN input_snapshot VARCHAR DEFAULT '{}' NOT NULL")
+            conn.commit()
         job_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(job)")}
         if "task_data" not in job_cols:
             conn.exec_driver_sql(
                 "ALTER TABLE job ADD COLUMN task_data VARCHAR DEFAULT '{}' NOT NULL")
+            conn.commit()
+        import_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(projectimport)")}
+        if "created_at" not in import_cols:
+            conn.exec_driver_sql("ALTER TABLE projectimport ADD COLUMN created_at VARCHAR DEFAULT '' NOT NULL")
             conn.commit()
 
 

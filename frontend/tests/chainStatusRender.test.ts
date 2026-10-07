@@ -14,7 +14,7 @@ import { NDialogProvider, NMessageProvider } from 'naive-ui'
 
 let server: ViteDevServer, Chain: any, useNavStore: any
 before(async () => {
-  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } })
+  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
   Chain = (await server.ssrLoadModule('/src/components/ChainStatus.vue')).default
   ;({ useNavStore } = await server.ssrLoadModule('/src/stores/nav.ts'))
   mock.method(globalThis, 'fetch', () => { throw new Error('不允许未声明网络请求') })
@@ -52,7 +52,7 @@ test('挂起显示原因分类与 恢复/放弃 双操作', async () => {
   const html = (await render(heldChain())).html
   assert.match(html, /自动运行已挂起/)
   assert.match(html, /「翻译」失败 \[STEP_FAILED\]：模拟失败/)
-  assert.match(html, /重试并继续/)
+  assert.match(html, /检查恢复方案/)
   assert.match(html, /放弃计划/)
   assert.match(html, /查看该步骤/)
 })
@@ -66,7 +66,8 @@ test('组件文案与帮助保持一致: 恢复动作明确指向剩余计划', 
   const source = readFileSync(new URL('../src/components/ChainStatus.vue', import.meta.url), 'utf8')
   // 调用 chain/{resume,stop} 两个端点; 恢复按钮在项目运行中被禁用, 避免争抢。
   assert.match(source, /chain\/\$\{path\}/)
-  assert.match(source, /'resume'/)
+  assert.match(source, /kind="chain"/)
+  assert.doesNotMatch(source, /call\('resume'/)
   assert.match(source, /'stop'/)
   assert.match(source, /nav\.busy/)
 })

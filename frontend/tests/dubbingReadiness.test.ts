@@ -10,7 +10,7 @@ import { setup } from '@css-render/vue3-ssr'
 
 let server: ViteDevServer, Panel: any
 before(async () => {
-  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } })
+  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
   Panel = (await server.ssrLoadModule('/src/components/DubbingReadiness.vue')).default
 })
 after(async () => { await server.close() })

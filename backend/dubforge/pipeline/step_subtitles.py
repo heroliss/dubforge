@@ -3,7 +3,7 @@ from dubforge.pipeline.subtitle_document import read
 from dubforge.utils.srt import SubLine, write_srt
 
 
-def _extend_short_cues(lines, min_duration, total=None, fixed_ids=()):
+def _extend_short_cues(lines, min_duration, total=None, fixed_ids=(), barriers=()):
     """只利用空隙延长，不引入重叠，也不越过已知内容终点。"""
     threshold = max(0.0, float(min_duration or 0))
     total = total if total is not None else max((l.end for l in lines), default=0)
@@ -12,6 +12,7 @@ def _extend_short_cues(lines, min_duration, total=None, fixed_ids=()):
         if line.index in fixed_ids:
             continue
         limit = lines[i + 1].start if i + 1 < len(lines) else total
+        limit = min([limit, *(r['start'] for r in barriers if r['start'] >= line.end)])
         end = max(line.end, min(line.start + threshold, limit))
         if end > line.end:
             line.end = end
@@ -26,6 +27,8 @@ def build_tracks(ctx, mode=None):
         from dubforge.errors import DubForgeError
         raise DubForgeError("请选择有效的字幕导出类型", code="CONFIG_INVALID")
     document = read(ctx, translation=mode != 'source')
+    from dubforge.pipeline.content_redaction import redact_document, plan
+    document = redact_document(ctx, document)
     source = [{**l, 'text': l['source_text']} for l in document]
     target = document if mode != 'source' else []
     source_first = bool(ctx.cfg("subtitles.source_first", False))
@@ -47,7 +50,8 @@ def build_tracks(ctx, mode=None):
             target_part = ('trans', original['text'])
             line.parts = (source_part,) if name == 'source.srt' else (target_part,) if name == 'trans.srt' else (
                 (source_part, target_part) if source_first else (target_part, source_part))
-        _extend_short_cues(lines, minimum, fixed_ids={l['id'] for l in rows if 'voice_timing' in l})
+        _extend_short_cues(lines, minimum, fixed_ids={l['id'] for l in rows if 'voice_timing' in l},
+                           barriers=plan(ctx)['ranges'])
         tracks[name] = lines
     return tracks, document
 

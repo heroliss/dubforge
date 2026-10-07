@@ -12,8 +12,10 @@ import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import type { ConfigurationSource } from '../utils/configurationSource'
 import { commentTextIssues, commentTextLength, defaultCommentTextLimits } from '../utils/commentOverlay'
 import { textStyleFieldGroups } from '../utils/textStyleFields'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const props = defineProps<{ uid: string; version?: string; blocked?: boolean; videoDuration?: number; automation?: { state: string; message: string } | null }>()
+const { locked: projectLocked, reason: projectLockReason, canEdit, observing } = useConfigurationEditability(() => 'project:' + props.uid)
 const emit = defineEmits<{ 'busy-change': [value: string]; 'show-diagnostics': [] }>()
 const dialog = useDialog(), message = useMessage()
 const route = useRoute(), rootEl = ref<HTMLElement | null>(null)
@@ -31,8 +33,8 @@ const rulesDirty=ref(false),styleEdited=ref(new Set<string>()),styleReset=ref(ne
 const styleFields=computed(()=>(state.value?.fields||[]).filter((f:any)=>Object.hasOwn(initialSettings,f.path.slice(9))))
 const styleGroups=computed(()=>textStyleFieldGroups(styleFields.value,'comments.',Object.fromEntries(Object.entries(settings.value).map(([k,v])=>['comments.'+k,v])),'整体布局'))
 function styleSource(key:string):ConfigurationSource|undefined{return styleReset.value.has(key)?state.value?.configuration?.parent_sources?.['comments.'+key]:styleEdited.value.has(key)?{kind:'project'}:state.value?.configuration?.sources?.['comments.'+key]}
-function setStyle(key:string,value:any){if(saving.value)return;settings.value[key]=value;styleEdited.value.add(key);styleReset.value.delete(key)}
-function inheritStyle(key:string){if(saving.value)return;settings.value[key]=state.value.configuration.defaults['comments.'+key];styleReset.value.add(key);styleEdited.value.delete(key)}
+function setStyle(key:string,value:any){if(editLocked.value)return;settings.value[key]=value;styleEdited.value.add(key);styleReset.value.delete(key)}
+function inheritStyle(key:string){if(editLocked.value)return;settings.value[key]=state.value.configuration.defaults['comments.'+key];styleReset.value.add(key);styleEdited.value.delete(key)}
 function ownsStyle(key:string){return !styleReset.value.has(key)&&(styleEdited.value.has(key)||Object.hasOwn(state.value?.configuration?.overrides||{},'comments.'+key))}
 let disposed = false, epoch = 0, readSequence = 0, timer: ReturnType<typeof setTimeout> | undefined
 const rows = computed<any[]>(() => state.value?.rows || [])
@@ -43,7 +45,8 @@ const ratingSaved = computed(()=>Number(state.value?.rating_progress?.saved)||0)
 const ratingRemaining = computed(()=>state.value?.rating_progress?.remaining??rows.value.length)
 const ratingAction = computed(()=>ratingSaved.value&&ratingRemaining.value?`继续评分（${ratingRemaining.value} 条）`:ratingSaved.value?'更新候选（复用评分）':assessments.value.size?'补充 / 更新评分':'为全部评论评分')
 const working = computed(() => pending.value || (job.value?.status === 'running' ? job.value.action : ''))
-const locked = computed(() => !!working.value || !!props.blocked || props.automation?.state === 'running')
+const locked = computed(() => projectLocked.value || !!working.value || !!props.blocked || props.automation?.state === 'running')
+const editLocked = computed(() => locked.value || saving.value)
 const untranslated = computed(() => rows.value.filter(row => !row.text_zh).length)
 const assessments = computed(() => new Map<string, any>((state.value?.available_assessments ?? (state.value?.filter_stale ? [] : state.value?.filter?.assessments || [])).map((item: any) => [item.id, item])))
 const ranked = computed<any[]>(() => [...assessments.value.values()].sort((a, b) => Number(b.eligible) - Number(a.eligible) || b.score - a.score))
@@ -93,7 +96,7 @@ function plannedPosition(item: any) {
 }
 const planChanged = computed(() => !!revision.value && state.value?.overlay_revision !== revision.value)
 function applyTextColors(id: string, source = false) {
-  if (saving.value) return
+  if (editLocked.value) return
   const patch = textColorPatch(id)
   if (patch) Object.entries(patch).forEach(([key,value])=>setStyle((source?'source_':'')+key,value))
 }
@@ -139,7 +142,8 @@ watch(() => props.automation?.state, (value, previous) => {
 })
 
 async function process(action: 'translate' | 'filter', force = false, options:Record<string,boolean> = {}) {
-  if (locked.value || !rows.value.length || (action === 'filter' && (rulesDirty.value || !prompt.value.trim() || !limit.value))) return
+  if (editLocked.value || !rows.value.length || (action === 'filter' && (rulesDirty.value || !prompt.value.trim() || !limit.value))) return
+  if (observing.value && !(await canEdit()) || editLocked.value) { error.value = projectLockReason.value || '项目正在运行，请完成后再处理评论'; return }
   const ticket = epoch, uid = props.uid
   pending.value = action; error.value = ''
   clearTimeout(timer); timer = setTimeout(() => void load(), 1000)
@@ -181,7 +185,7 @@ function editableRow(row: any) {
   return { id: row.id, source_hash: row.source_hash, text: row.text, author: row.author, url: row.url, display_text: row.text_zh || '', source_text: row.text }
 }
 function toggle(row: any, checked: boolean) {
-  if (saving.value) return
+  if (editLocked.value) return
   if (!checked) { items.value = items.value.filter(item => item.id !== row.id); return }
   if (selected(row.id)) return
   if (items.value.length >= 100) { message.warning('最多选择 100 条上屏评论'); return }
@@ -199,23 +203,24 @@ function assessmentReason(id: string) {
     : reasons.value.get(id) || '旧版筛选未记录未入选原因；逐条评分后可查看判断理由。'
 }
 function useCandidates() {
-  if (saving.value) return
+  if (editLocked.value) return
   const ticket = epoch
   const wanted = suggestions.value.slice(0, 100).map(suggestion => rowsById.value.get(suggestion.id)).filter(Boolean)
   const next = JSON.parse(JSON.stringify(wanted.map(row => items.value.find(item => item.id === row.id && item.source_hash === row.source_hash) || editableRow(row))))
   const removed = items.value.filter(item => !wanted.some(row => row.id === item.id)).length
   const replaced = items.value.filter(item => wanted.some(row => row.id === item.id && row.source_hash !== item.source_hash)).length
   const changes = [removed ? `移出 ${removed} 条不在当前候选中的评论` : '', replaced ? `替换 ${replaced} 条原文已变化的评论及其上屏草稿` : ''].filter(Boolean).join('，')
-  if (removed || replaced) dialog.warning({ title: `调整为前 ${next.length} 条候选`, content: `将${changes}；保留其余评论已编辑的文字。不调用 AI，不自动保存或合成。`, positiveText: '调整列表', negativeText: '保留当前选择', onPositiveClick: () => { if (!disposed && ticket === epoch) items.value = next } })
+  if (removed || replaced) dialog.warning({ title: `调整为前 ${next.length} 条候选`, content: `将${changes}；保留其余评论已编辑的文字。不调用 AI，不自动保存或合成。`, positiveText: '调整列表', negativeText: '保留当前选择', onPositiveClick: () => { if (!disposed && ticket === epoch && !editLocked.value) items.value = next } })
   else items.value = next
 }
 function move(index: number, direction: number) {
+  if (editLocked.value) return
   const other = index + direction
   if (other < 0 || other >= items.value.length) return
   ;[items.value[index], items.value[other]] = [items.value[other], items.value[index]]
 }
 function confirmPlan() {
-  if (invalid.value || saving.value || !state.value) return
+  if (invalid.value || editLocked.value || !state.value) return
   const body = { ...JSON.parse(snapshot.value), items: JSON.parse(JSON.stringify(plannedItems.value)), revision: revision.value, configuration_fingerprint:state.value.configuration?.fingerprint, settings_explicit:[...styleEdited.value],settings_reset:[...styleReset.value] }, uid = props.uid, ticket = epoch
   const excludedNotice = excludedItems.value.length ? ` 已排除 ${excludedItems.value.length} 条文字不符合要求的草稿，不会保存这些草稿的编辑；完整原文和已完成译文仍保留。` : ''
   saving.value = true
@@ -227,6 +232,11 @@ function confirmPlan() {
     onNegativeClick: close, onClose: close,
     onPositiveClick: async () => {
       try {
+        if (disposed || ticket !== epoch || props.uid !== uid || locked.value || observing.value && !(await canEdit())) {
+          error.value = projectLockReason.value || '项目正在运行，请完成后再确认上屏方案'
+          return false
+        }
+        if (disposed || ticket !== epoch || props.uid !== uid || locked.value) return false
         const response = await fetch(`/api/projects/${uid}/comments/overlay`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
         const value = await response.json()
         if (!response.ok) throw new Error(value.message || '方案保存失败')
@@ -259,6 +269,7 @@ onBeforeUnmount(() => { disposed = true; epoch++; clearTimeout(timer); emit('bus
 
 <template>
   <div id="comments-studio" ref="rootEl" class="comment-studio">
+    <n-alert v-if="projectLocked || blocked" type="info" :show-icon="false" class="notice">{{ projectLockReason || '项目正在运行，请完成后再修改评论方案' }}；原文、评分和日志仍可查看。</n-alert>
     <n-alert v-if="automation && (automation.state !== 'done' || !rows.length)" :type="automation.state==='stopped'?'warning':'info'" :show-icon="false" class="notice">{{ automation.message }}</n-alert>
     <details class="filter-panel"><summary>评论准备与评分规则</summary><ConfigurationForm :scope="'project:'+uid" :sections="['comments']" :paths="['comments.mode','comments.limit','comments.count','comments.prompt','comments.failure_policy']" @dirty-change="rulesDirty=$event" @saved="load()"/></details>
     <n-alert v-if="error" type="error" :show-icon="false" class="notice">{{ error }} <n-button size="tiny" @click="load()">重新读取</n-button></n-alert>
@@ -291,13 +302,13 @@ onBeforeUnmount(() => { disposed = true; epoch++; clearTimeout(timer); emit('bus
       <p v-else-if="state?.filter_outdated" class="muted">旧结果没有逐条分数，评分后可自由调整数量。</p>
       <p v-else-if="state?.filter?.generated_at && !eligibleCandidates.length" class="muted">本次评分未找到符合要求的评论，可以调整要求后重试。</p>
       <div v-if="ranked.length || suggestions.length" class="tools suggestion-bar">
-        <div class="tools"><span class="muted">候选前</span><n-input-number v-model:value="limit" :min="1" :max="500" :precision="0" style="width:90px" :input-props="{ 'aria-label': '候选评论数量（不调用 AI）' }" /><span class="muted">条</span><n-checkbox v-model:checked="onlySuggested">只看候选（{{ suggestions.length }}）</n-checkbox><n-checkbox v-if="ranked.length" v-model:checked="sortByScore">按分数排序</n-checkbox></div>
-        <n-tooltip><template #trigger><n-button size="small" :disabled="saving || !suggestions.length" @click="useCandidates">使用前 {{ Math.min(suggestions.length, 100) }} 条可用评论</n-button></template>按评分选择，自动跳过超长或缺少所选语言文字的评论并递补；保留仍入选的编辑文字。最多上屏 100 条，不调用 AI。</n-tooltip>
+        <div class="tools"><span class="muted">候选前</span><n-input-number v-model:value="limit" :disabled="editLocked" :min="1" :max="500" :precision="0" style="width:90px" :input-props="{ 'aria-label': '候选评论数量（不调用 AI）' }" /><span class="muted">条</span><n-checkbox v-model:checked="onlySuggested">只看候选（{{ suggestions.length }}）</n-checkbox><n-checkbox v-if="ranked.length" v-model:checked="sortByScore">按分数排序</n-checkbox></div>
+        <n-tooltip><template #trigger><n-button size="small" :disabled="editLocked || !suggestions.length" @click="useCandidates">使用前 {{ Math.min(suggestions.length, 100) }} 条可用评论</n-button></template>按评分选择，自动跳过超长或缺少所选语言文字的评论并递补；保留仍入选的编辑文字。最多上屏 100 条，不调用 AI。</n-tooltip>
       </div>
       <p v-if="excludedCandidates" class="exclusion-summary">{{ excludedCandidates }} 条评分合格的评论因超长或缺少所选语言文字已排除，按分数递补。完整评论仍可阅读、翻译。</p>
       <div class="comment-list" aria-label="紧凑评论列表">
         <article v-for="row in pageRows" :key="row.id" class="comment-row" :class="{ selected: selected(row.id) }">
-          <n-checkbox :checked="selected(row.id)" :disabled="saving" :aria-label="'选择评论：' + (row.author || '匿名观众')" @update:checked="toggle(row, $event)" />
+          <n-checkbox :checked="selected(row.id)" :disabled="editLocked" :aria-label="'选择评论：' + (row.author || '匿名观众')" @update:checked="toggle(row, $event)" />
           <div class="comment-body">
             <div class="byline"><span class="author">{{ row.author || '匿名观众' }}</span><span v-if="row.like_count != null">♥ {{ row.like_count }}</span><n-tag v-if="row.is_pinned" size="tiny" :bordered="false">置顶</n-tag><n-tag v-if="row.author_is_uploader" size="tiny" :bordered="false">作者</n-tag>
               <n-tooltip v-if="assessments.has(row.id)"><template #trigger><n-tag size="tiny" :bordered="false" :type="reasons.has(row.id) ? 'info' : 'default'" tabindex="0">{{ assessmentLabel(row.id) }}</n-tag></template>{{ assessmentReason(row.id) }}</n-tooltip>
@@ -327,16 +338,16 @@ onBeforeUnmount(() => { disposed = true; epoch++; clearTimeout(timer); emit('bus
           <div class="ordered-list">
             <article v-for="(item, index) in items" :key="item.id" class="edit-row" :class="{ excluded: textIssues(item).length }">
               <div class="tools"><span class="muted">{{ plannedPosition(item) }} · {{ item.author || '匿名观众' }}</span><div>
-                <n-button size="tiny" quaternary :disabled="saving || index === 0" :aria-label="'上移第 ' + (index + 1) + ' 条'" @click="move(index, -1)">↑</n-button>
-                <n-button size="tiny" quaternary :disabled="saving || index === items.length - 1" :aria-label="'下移第 ' + (index + 1) + ' 条'" @click="move(index, 1)">↓</n-button>
-                <n-button size="tiny" quaternary :disabled="saving" @click="toggle(item, false)">移除</n-button>
+                <n-button size="tiny" quaternary :disabled="editLocked || index === 0" :aria-label="'上移第 ' + (index + 1) + ' 条'" @click="move(index, -1)">↑</n-button>
+                <n-button size="tiny" quaternary :disabled="editLocked || index === items.length - 1" :aria-label="'下移第 ' + (index + 1) + ' 条'" @click="move(index, 1)">↓</n-button>
+                <n-button size="tiny" quaternary :disabled="editLocked" @click="toggle(item, false)">移除</n-button>
               </div></div>
               <div class="bilingual-editor" :class="{ 'source-first': settings.source_first }">
                 <div v-if="showChinese" class="chinese-editor"><span class="edit-label">中文 <small>{{ commentTextLength(item.display_text) }} / {{ textLimits.translated }} 字符</small></span>
-                  <n-input v-model:value="item.display_text" type="textarea" :autosize="{ minRows: 1, maxRows: 5 }" :disabled="saving" :status="textIssues(item).some(issue => issue.field === 'display_text') ? 'warning' : undefined" placeholder="尚无译文，可先全部翻译，或在此填写" :input-props="{ 'aria-label': '第 ' + (index + 1) + ' 条中文上屏文字' }" />
+                  <n-input v-model:value="item.display_text" type="textarea" :autosize="{ minRows: 1, maxRows: 5 }" :disabled="editLocked" :status="textIssues(item).some(issue => issue.field === 'display_text') ? 'warning' : undefined" placeholder="尚无译文，可先全部翻译，或在此填写" :input-props="{ 'aria-label': '第 ' + (index + 1) + ' 条中文上屏文字' }" />
                 </div>
                 <div v-if="showSource" class="source-editor"><span class="edit-label">原文 <small>{{ commentTextLength(item.source_text) }} / {{ textLimits.original }} 字符</small></span>
-                  <n-input v-model:value="item.source_text" type="textarea" :autosize="{ minRows: 1, maxRows: 5 }" :disabled="saving" :status="textIssues(item).some(issue => issue.field === 'source_text') ? 'warning' : undefined" :input-props="{ 'aria-label': '第 ' + (index + 1) + ' 条原文上屏文字' }" />
+                  <n-input v-model:value="item.source_text" type="textarea" :autosize="{ minRows: 1, maxRows: 5 }" :disabled="editLocked" :status="textIssues(item).some(issue => issue.field === 'source_text') ? 'warning' : undefined" :input-props="{ 'aria-label': '第 ' + (index + 1) + ' 条原文上屏文字' }" />
                 </div>
               </div>
               <p v-if="textIssues(item).length" class="row-issue">{{ textIssues(item).map(issue => issue.message).join('；') }}</p>
@@ -346,11 +357,11 @@ onBeforeUnmount(() => { disposed = true; epoch++; clearTimeout(timer); emit('bus
           <div class="layout-controls">
             <h4>出现节奏与排版</h4>
             <n-tooltip><template #trigger><span class="limit-hint" tabindex="0">上屏上限：中文 {{ textLimits.translated }} · 原文 {{ textLimits.original }} 字符 ⓘ</span></template>这是应用内置的排版保护上限，目前不可在设置中修改，不是 B 站要求。仅检查所选显示语言；不截断完整原文或译文。实际画面还受字号和画幅影响。</n-tooltip>
-            <TextColorPresets kind="评论" :color="settings.color" :outline-color="settings.outline_color" :outline="settings.outline" :source-enabled="settings.source_style_enabled" :source-color="settings.source_color" :source-outline-color="settings.source_outline_color" :source-outline="settings.source_outline" :disabled="saving" @select="applyTextColors" @enable-source="setStyle('source_style_enabled',true)" />
+            <TextColorPresets kind="评论" :color="settings.color" :outline-color="settings.outline_color" :outline="settings.outline" :source-enabled="settings.source_style_enabled" :source-color="settings.source_color" :source-outline-color="settings.source_outline_color" :source-outline="settings.source_outline" :disabled="editLocked" @select="applyTextColors" @enable-source="setStyle('source_style_enabled',true)" />
             <section v-for="group in styleGroups" :key="group.name" class="language-style-group"><h5>{{ group.name }}</h5>
               <div v-for="field in group.fields" :key="field.path" class="style-field" role="group" :aria-label="field.label">
-                <span class="style-source" :title="field.help">{{ field.label }}<small><ConfigurationSourceBadge :source="styleSource(field.path.slice(9))" :inherited="!ownsStyle(field.path.slice(9))"/> <n-button v-if="ownsStyle(field.path.slice(9))" text size="tiny" :disabled="saving" :aria-label="`${field.label}恢复继承`" @click="inheritStyle(field.path.slice(9))">↶</n-button></small></span>
-                <ParamControl :model-value="settings[field.path.slice(9)]" :field="field" :disabled="saving" @update:model-value="setStyle(field.path.slice(9),$event)"/>
+                <span class="style-source" :title="field.help">{{ field.label }}<small><ConfigurationSourceBadge :source="styleSource(field.path.slice(9))" :inherited="!ownsStyle(field.path.slice(9))"/> <n-button v-if="ownsStyle(field.path.slice(9))" text size="tiny" :disabled="editLocked" :aria-label="`${field.label}恢复继承`" @click="inheritStyle(field.path.slice(9))">↶</n-button></small></span>
+                <ParamControl :model-value="settings[field.path.slice(9)]" :field="field" :disabled="editLocked" @update:model-value="setStyle(field.path.slice(9),$event)"/>
               </div>
             </section>
             <n-alert v-if="settingsError" type="warning" :show-icon="false">{{ settingsError }}</n-alert>
@@ -358,7 +369,7 @@ onBeforeUnmount(() => { disposed = true; epoch++; clearTimeout(timer); emit('bus
         </div>
         <div class="tools save-bar">
           <RouterLink :to="`/projects/${uid}/steps/assemble`">去合成成片 →</RouterLink>
-          <div class="tools"><n-button v-if="dirty" size="small" :disabled="saving" @click="dialog.warning({ title: '放弃当前草稿？', content: '重新读取已确认方案，已完成的翻译保留。', positiveText: '放弃草稿', negativeText: '继续编辑', onPositiveClick: () => load(true) })">重置草稿</n-button><n-button type="primary" size="small" :disabled="!state || invalid || saving || (!dirty && !!baseline && !excludedItems.length)" @click="confirmPlan">确认上屏方案（{{ plannedItems.length }} 条）</n-button></div>
+          <div class="tools"><n-button v-if="dirty" size="small" :disabled="editLocked" @click="dialog.warning({ title: '放弃当前草稿？', content: '重新读取已确认方案，已完成的翻译保留。', positiveText: '放弃草稿', negativeText: '继续编辑', onPositiveClick: () => load(true) })">重置草稿</n-button><n-button type="primary" size="small" :disabled="!state || invalid || editLocked || (!dirty && !!baseline && !excludedItems.length)" @click="confirmPlan">确认上屏方案（{{ plannedItems.length }} 条）</n-button></div>
         </div>
       </n-collapse-item>
     </n-collapse>

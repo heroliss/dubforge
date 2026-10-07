@@ -2,8 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NAlert, NButton, NInputNumber, useMessage } from 'naive-ui'
 import PreviewTimeline from './PreviewTimeline.vue'
+import VideoPreview from './VideoPreview.vue'
 import { versionSpec } from '../utils/assemblyVersions'
-import { newestVideoFirst, vReleaseMedia } from '../utils/preview'
+import { createLatestRefresh, newestVideoFirst } from '../utils/preview'
 import { useNavStore } from '../stores/nav'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 const props = defineProps<{ uid: string; version: any; overlayRevision: string; disabled?: boolean }>()
@@ -20,13 +21,14 @@ const cues = computed(() => [
 ])
 const preview = computed(() => (nav.stepMap.assemble?.artifacts || []).filter((a: any) => a.exists !== false && a.name.startsWith(`preview_version_${props.version.id}_`)).sort(newestVideoFirst)[0])
 const previewUrl = computed(() => preview.value ? `/api/projects/${props.uid}/steps/assemble/artifacts/${encodeURIComponent(preview.value.name)}/raw?v=${preview.value.sha256}` : '')
-async function loadContext() {
-  try {
-    const r = await fetch(`/api/projects/${props.uid}/assembly-versions/preview-context`), data = await r.json()
-    if (!r.ok) throw new Error(data.message || '时间轴读取失败')
-    if (!disposed) { context.value = data; schedule() }
-  } catch (e: any) { if (!disposed) error.value = e.message }
-}
+const contextReader = createLatestRefresh(async signal => {
+  const r = await fetch(`/api/projects/${props.uid}/assembly-versions/preview-context`, {
+    cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
+  }), data = await r.json()
+  if (!r.ok) throw new Error(data.message || '时间轴读取失败')
+  return data
+}, data => { context.value = data; schedule() }, (e: any) => { if (!disposed) error.value = e.message || '时间轴读取失败' })
+function loadContext() { return contextReader.refresh() }
 function schedule() { if (timer) clearTimeout(timer); if (!scrubbing.value && !disposed) timer = setTimeout(render, 500) }
 function beginScrub() { scrubbing.value=true; if(timer) clearTimeout(timer) }
 function endScrub() { scrubbing.value=false; schedule() }
@@ -36,7 +38,7 @@ async function render() {
   const stamp = signature.value
   loading.value = true; error.value = ''; controller = new AbortController()
   try {
-    const response = await fetch(`/api/projects/${props.uid}/assembly-versions/frame`, {method:'POST', signal:controller.signal,
+    const response = await fetch(`/api/projects/${props.uid}/assembly-versions/frame`, {method:'POST', signal:AbortSignal.any([controller.signal, AbortSignal.timeout(30000)]),
       headers:{'Content-Type':'application/json'}, body:JSON.stringify({version:versionSpec(props.version), seconds:seconds.value, overlay_revision:props.overlayRevision})})
     if (!response.ok) throw new Error((await response.json()).message || '预览失败')
     const blob = await response.blob()
@@ -61,9 +63,9 @@ async function trial() {
 }
 watch(signature, schedule)
 watch(() => props.disabled, value => { if (!value) schedule() })
-watch(() => props.overlayRevision, loadContext)
+watch(() => props.overlayRevision, () => contextReader.refresh(true))
 onMounted(loadContext)
-onBeforeUnmount(() => { disposed = true; if(timer) clearTimeout(timer); controller?.abort(); if(image.value) URL.revokeObjectURL(image.value) })
+onBeforeUnmount(() => { disposed = true; contextReader.cancel(); if(timer) clearTimeout(timer); controller?.abort(); if(image.value) URL.revokeObjectURL(image.value) })
 </script>
 <template>
   <section class="version-preview" aria-label="当前版本预览">
@@ -74,9 +76,9 @@ onBeforeUnmount(() => { disposed = true; if(timer) clearTimeout(timer); controll
     <PreviewTimeline v-model:value="seconds" :max="Math.max(0, context.duration - .1)" :cues="cues" label="版本预览位置" kind="字幕 / 评论" :disabled="disabled" @dragstart="beginScrub" @dragend="endScrub" />
     <div v-if="version.dubbing || version.burn_subtitles || version.include_comments" class="trial"><span>从当前位置试合成</span><n-input-number v-model:value="length" :min=".2" :max="60" :disabled="disabled" :input-props="{'aria-label':'试片长度'}"><template #suffix>秒</template></n-input-number><n-button size="small" :disabled="disabled || !context.duration" :loading="submitting" @click="trial">生成试片</n-button></div>
     <small v-else>此版本直接使用原片，不额外创建成品或试片。</small>
-    <details v-if="previewUrl"><summary>最近试片（可能早于当前调整）</summary><video v-release-media :key="previewUrl" :src="previewUrl" controls preload="metadata" /></details>
+    <details v-if="previewUrl"><summary>最近试片（可能早于当前调整）</summary><VideoPreview :key="previewUrl" :src="previewUrl" /></details>
   </section>
 </template>
 <style scoped>
-.version-preview{min-width:0;border-top:1px solid var(--df-border);padding-top:16px;margin-top:18px}.heading,.trial{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.heading small,.empty,.trial,summary{color:var(--df-muted);font-size:12px}.heading small{flex:1}.version-preview img,.version-preview video{width:100%;max-height:420px;object-fit:contain;background:#111;border-radius:8px;margin-bottom:12px}.pending{opacity:.65}.trial{margin-top:16px}.trial :deep(.n-input-number){width:110px}summary{cursor:pointer;margin:10px 0}
+.version-preview{min-width:0;border-top:1px solid var(--df-border);padding-top:16px;margin-top:18px;--df-preview-height:420px}.heading,.trial{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:12px}.heading small,.empty,.trial,summary{color:var(--df-muted);font-size:12px}.heading small{flex:1}.version-preview img{width:100%;max-height:420px;object-fit:contain;background:#111;border-radius:8px;margin-bottom:12px}.pending{opacity:.65}.trial{margin-top:16px}.trial :deep(.n-input-number){width:110px}summary{cursor:pointer;margin:10px 0}
 </style>

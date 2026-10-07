@@ -9,6 +9,7 @@ from dubforge.runner import _cfg_snapshot, compute_fingerprint, runner
 from dubforge.utils.fs import atomic_replace
 from fastapi import APIRouter, Query, Request, Response
 from fastapi.responses import FileResponse
+from app.media import MediaFileResponse
 
 router = APIRouter(prefix="/api/projects/{uid}/steps", tags=["steps"])
 
@@ -75,8 +76,7 @@ def list_steps(uid: str, response: Response):
         "input_fingerprint": s.input_fingerprint,
         "fresh": deps.display_fresh(s.step_key),
         "default_fresh": deps.fresh(s.step_key),
-        **({'freshness_label': deps.assembly_state()['label'], 'freshness_reason': deps.assembly_state()['reason']}
-           if s.step_key == 'assemble' else {}),
+        **deps.freshness_feedback(s.step_key),
         "selected": s.step_key in selected,
         "missing_inputs": [i for i in inputs[s.step_key] if i['state'] in {'missing', 'deleted'}],
         "unready_inputs": [i for i in inputs[s.step_key] if not i['ready']],
@@ -329,12 +329,12 @@ def forget_output(uid: str, name: str, body: dict, request: Request, response: R
     return forget_missing(uid, name, body)
 
 
-@router.get("/{key}/artifacts/{name}/raw")
+@router.api_route("/{key}/artifacts/{name}/raw", methods=["GET", "HEAD"])
 def artifact_raw(uid: str, key: str, name: str):
     """按登记产物提供原文/原文件 (预览用); 只允许本步骤已登记的名字, 不接受路径"""
     p = _artifact_file(uid, key, name)
     mime = _ART_MIME.get(p.suffix.lower(), "application/octet-stream")
-    return FileResponse(p, media_type=mime,
+    return MediaFileResponse(p, media_type=mime,
                         headers={"Cache-Control": "no-store"})
 
 

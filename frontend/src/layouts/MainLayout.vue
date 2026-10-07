@@ -26,10 +26,11 @@ onMounted(() => {
   syncNarrowScreen()
   window.addEventListener('resize', syncNarrowScreen)
 })
-onUnmounted(() => window.removeEventListener('resize', syncNarrowScreen))
+onUnmounted(() => { window.removeEventListener('resize', syncNarrowScreen); nav.suspend() })
 
 watch(() => route.params.uid, (u) => {
-  if (u && u !== nav.uid) nav.enter(u as string)
+  if (u) { if (u !== nav.uid || nav.suspended) nav.enter(u as string) }
+  else nav.suspend()
 }, { immediate: true })
 
 // 链接负责文字点击，菜单负责图标与留白；阻止一次点击触发两次导航及离开提醒。
@@ -117,6 +118,7 @@ const projActive = computed(() => {
         <div v-if="!collapsed || narrowScreen" class="proj-title" :title="nav.title">
           {{ nav.title || (nav.projectError ? '项目信息加载失败' : '正在读取项目…') }}
         </div>
+        <div v-if="nav.suspended && (!collapsed || narrowScreen)" class="sidebar-hint snapshot-hint">显示最近状态 · 进入项目后刷新</div>
         <n-menu :options="projectOptions" :value="projActive"
                 @update:value="navigateProject"
                 :collapsed="narrowScreen ? false : collapsed" :collapsed-width="64" :collapsed-icon-size="20" />

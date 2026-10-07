@@ -5,6 +5,7 @@ import { NAlert, NButton, NCollapse, NCollapseItem, NDescriptions, NDescriptions
 import CommentStudioPanel from './CommentStudioPanel.vue'
 import { createLatestRefresh } from '../utils/preview'
 import { fmtDurCN } from '../utils/format'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const props = defineProps<{
   uid: string
@@ -12,6 +13,7 @@ const props = defineProps<{
   version?: string
   automation?: { state: string; message: string } | null
 }>()
+const { locked: projectLocked, reason: projectLockReason, canEdit, observing } = useConfigurationEditability(() => 'project:' + props.uid)
 
 const message = useMessage()
 const emit = defineEmits<{ 'show-diagnostics': [] }>()
@@ -61,7 +63,8 @@ watch(infoSignature, () => {
 }, { immediate: true })
 
 async function runAction(action: 'refresh' | 'summarize' | 'comments') {
-  if (active.value || (action === 'comments' && !validCommentLimit.value)) return
+  if (projectLocked.value || active.value || (action === 'comments' && !validCommentLimit.value)) return
+  if (observing.value && !(await canEdit()) || projectLocked.value || active.value) { error.value = projectLockReason.value || '项目正在运行，请完成后再更新资料'; return }
   const ticket = generation, uid = props.uid
   loader.cancel(); clearTimeout(pollTimer)
   pending.value = action; error.value = ''
@@ -201,11 +204,12 @@ function copySource() {
 
 <template>
   <section class="video-info">
+    <n-alert v-if="projectLocked" type="info" :show-icon="false" class="notice">{{ projectLockReason }}；资料和评论仍可查看。</n-alert>
     <header class="workspace-head">
       <h3>视频资料</h3>
       <div class="toolbar">
-        <n-tooltip><template #trigger><n-button size="small" secondary :disabled="!canRefresh || !!active" :loading="active === 'refresh'" @click="runAction('refresh')">刷新平台资料</n-button></template>只更新标题、简介等平台资料；不重新下载视频，不影响字幕、配音和成片，不调用 AI。</n-tooltip>
-        <n-tooltip><template #trigger><n-button size="small" secondary :disabled="!canSummarize || !!active" :loading="active === 'summarize'" @click="runAction('summarize')">整理中文标题与概要</n-button></template>调用已配置的 LLM，根据平台资料生成中文标题与概要；不分析完整视频。</n-tooltip>
+        <n-tooltip><template #trigger><n-button size="small" secondary :disabled="!canRefresh || projectLocked || !!active" :loading="active === 'refresh'" @click="runAction('refresh')">刷新平台资料</n-button></template>只更新标题、简介等平台资料；不重新下载视频，不影响字幕、配音和成片，不调用 AI。</n-tooltip>
+        <n-tooltip><template #trigger><n-button size="small" secondary :disabled="!canSummarize || projectLocked || !!active" :loading="active === 'summarize'" @click="runAction('summarize')">整理中文标题与概要</n-button></template>调用已配置的 LLM，根据平台资料生成中文标题与概要；不分析完整视频。</n-tooltip>
       </div>
     </header>
     <n-alert v-if="['refresh', 'comments', 'summarize'].includes(active)" type="info" :show-icon="false" class="notice">
@@ -278,11 +282,11 @@ function copySource() {
       <header class="workspace-head">
         <h3>评论精选 <n-tooltip><template #trigger><n-text depth="3" class="help-icon" tabindex="0">ⓘ</n-text></template>默认只采集评论数。可另取 1–500 条平台热门顶层评论，不含回复，不保证全站最高赞。重新获取会替换原文列表；已确认的上屏方案独立保留。</n-tooltip></h3>
         <div class="toolbar">
-          <n-input-number :input-props="{ 'aria-label': '热门评论采集数量' }" v-model:value="commentLimit" :min="1" :max="500" :precision="0" :disabled="!!active || automation?.state==='running'" style="width:108px"><template #suffix>条</template></n-input-number>
-          <n-button size="small" :disabled="!canComments || !!active || !validCommentLimit || automation?.state==='running'" :loading="active === 'comments'" @click="runAction('comments')">{{ comments ? '刷新热门评论' : '获取热门评论' }}</n-button>
+          <n-input-number :input-props="{ 'aria-label': '热门评论采集数量' }" v-model:value="commentLimit" :min="1" :max="500" :precision="0" :disabled="projectLocked || !!active || automation?.state==='running'" style="width:108px"><template #suffix>条</template></n-input-number>
+          <n-button size="small" :disabled="!canComments || projectLocked || !!active || !validCommentLimit || automation?.state==='running'" :loading="active === 'comments'" @click="runAction('comments')">{{ comments ? '刷新热门评论' : '获取热门评论' }}</n-button>
         </div>
       </header>
-      <CommentStudioPanel :uid="uid" :version="comments?.collected_at || ''" :automation="automation" :video-duration="Number(info?.source?.duration) || 0" :blocked="!!pending || !!busy" @busy-change="commentWork = $event" @show-diagnostics="emit('show-diagnostics')" />
+      <CommentStudioPanel :uid="uid" :version="comments?.collected_at || ''" :automation="automation" :video-duration="Number(info?.source?.duration) || 0" :blocked="projectLocked || !!pending || !!busy" @busy-change="commentWork = $event" @show-diagnostics="emit('show-diagnostics')" />
     </section>
   </section>
 </template>

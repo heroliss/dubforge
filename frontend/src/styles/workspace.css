@@ -42,6 +42,17 @@ button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex="0"]:foc
 .section-nav button[aria-pressed="true"] { background: #27394f; color: #c4ddff; }
 .section-nav .dirty-dot { color: #efbd70; }
 .workspace-page pre { tab-size: 2; }
+/* 发布内容同级分组共用卡片样式，组内工具只使用分隔线。 */
+.publication-panel { min-width:0; border:1px solid var(--df-border); border-radius:12px; background:var(--df-panel); margin:0 0 20px; }
+.publication-panel:not(.n-card) { padding:20px; }
+.publication-panel-heading { display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap; gap:10px 16px; margin:0 0 18px; }
+.publication-panel-heading h2,.publication-panel-heading h3 { margin:0; color:var(--df-text); font-size:15px; font-weight:600; line-height:1.5; }
+.publication-panel-heading>h2,.publication-panel-heading>h3 { margin-right:auto; }
+.publication-panel-heading small { display:block; color:var(--df-muted); font-size:11px; line-height:1.7; margin-top:5px; }
+.publication-panel.n-card>.n-card-header { padding:20px 20px 18px; }
+.publication-panel.n-card>.n-card-header .n-card-header__main { font-size:15px; font-weight:600; line-height:1.5; }
+.publication-panel.n-card>.n-card__content { padding:0 20px 20px; }
+.publication-panel>.field-grid:last-child { margin-bottom:0; }
 @media (min-width: 1700px) { .workspace-page { padding-top: 36px; } }
 @media (max-width: 900px) { .workspace-page { padding: 22px 20px 36px; } }
 @media (max-width: 600px) {
@@ -50,6 +61,9 @@ button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex="0"]:foc
   .section-nav { gap: 3px; }
   .section-nav button, .section-nav a { padding: 8px 10px; }
   .workspace-page .n-card-header { padding-bottom: 12px; }
+  .publication-panel:not(.n-card) { padding:16px; }
+  .publication-panel.n-card>.n-card-header { padding:16px 16px 14px; }
+  .publication-panel.n-card>.n-card__content { padding:0 16px 16px; }
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; transition-duration: .01ms !important; animation-duration: .01ms !important; animation-iteration-count: 1 !important; }

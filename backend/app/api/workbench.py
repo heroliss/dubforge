@@ -17,7 +17,8 @@ from dubforge.pipeline.video_source import resolve_video
 from dubforge.pipeline import line_settings, dubbing_session, dubbing_edit, subtitle_document
 from dubforge.utils.fs import atomic_replace
 from fastapi import APIRouter
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import Response
+from app.media import MediaFileResponse
 from dubforge.runner import runner
 from dubforge.pipeline import dubbing_task
 
@@ -396,13 +397,13 @@ def line_audio(uid: str, line_id: int, take: int = 1):
     if not p.is_file():
         return Response("not found", status_code=404)
     # 单句音频先读完并关闭文件；慢速播放请求不能在 Windows 上锁住正在重合成的版本。
-    # 浏览器拿到完整短音频后可本地定位，长视频/长音轨仍使用 FileResponse 流式读取。
+    # 浏览器拿到完整短音频后可本地定位，长视频/长音轨使用可取消的分段读取。
     return Response(p.read_bytes(), media_type="audio/wav",
                         headers={"Cache-Control": "no-store"})
 
 
-@router.get("/audio/bg")
-@router.get('/audio/{track}')
+@router.api_route("/audio/bg", methods=['GET', 'HEAD'])
+@router.api_route('/audio/{track}', methods=['GET', 'HEAD'])
 def bg_audio(uid: str, track: str = 'bg'):
     if not crud.get_project(uid):
         return Response("no project", status_code=404)
@@ -412,11 +413,11 @@ def bg_audio(uid: str, track: str = 'bg'):
     p = crud.project_dir(uid) / "audio" / names[track]
     if not p.is_file():
         return Response("not found", status_code=404)
-    return FileResponse(p, media_type="audio/wav",
+    return MediaFileResponse(p, media_type="audio/wav",
                         headers={"Cache-Control": "no-store"})
 
 
-@router.get("/video")
+@router.api_route("/video", methods=['GET', 'HEAD'])
 def video(uid: str):
     project = crud.get_project(uid)
     if not project:
@@ -424,6 +425,6 @@ def video(uid: str):
     v = resolve_video(project, crud.project_dir(uid))
     if v is None or not v.is_file():
         return Response("no video", status_code=404)
-    return FileResponse(v, media_type="video/mp4",
+    return MediaFileResponse(v, media_type="video/mp4",
                         headers={"Cache-Control": "no-store",
                                  "Accept-Ranges": "bytes"})

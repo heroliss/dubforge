@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfigurationEditability } from '../utils/configurationEditability'
 import FilePathLink from '../components/FilePathLink.vue'
 // 设置入口：制作规则复用统一配置编辑器，本机连接与运行偏好分别保存。
 // 注意: v-for 容器一律用原生 flex div —— naive-ui 2.45 的 n-space 在嵌套 n-card
@@ -13,6 +14,8 @@ import EnvironmentPanel from '../components/EnvironmentPanel.vue'
 import ConfigurationWorkspace from '../components/ConfigurationWorkspace.vue'
 
 const message = useMessage()
+const editability = useConfigurationEditability('global')
+const settingsLocked = computed(() => editability.locked.value || anySaving.value || loadingConfig.value)
 const cfg = ref<any>(null)
 const saving = ref(false)
 const testing = ref(false) // 「并行测试全部」的全局转圈 (与单组测试互不影响)
@@ -174,12 +177,14 @@ function paramsJsonBad(p: any): boolean {
 }
 
 function addProfile() {
+  if (settingsLocked.value) return
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
                         base_url: '', api_key: '', model: '', enabled: true,
                         params: {}, paramsJson: '' }) // 专属参数默认留空
 }
-function delProfile(i: number) { profiles.value.splice(i, 1) }
+function delProfile(i: number) { if (!settingsLocked.value) profiles.value.splice(i, 1) }
 function move(i: number, d: number) {
+  if (settingsLocked.value) return
   const j = i + d
   if (j < 0 || j >= profiles.value.length) return
   ;[profiles.value[i], profiles.value[j]] = [profiles.value[j], profiles.value[i]]
@@ -218,7 +223,7 @@ watch(section, key => { if (key !== 'production' && !cfg.value && !loadError.val
 
 // 「应用」是唯一写入口: 只保存本卡内容 (LLM 配置组 + 通用参数)
 async function applySettings() {
-  if (saving.value) return
+  if (settingsLocked.value) return
   const bad = profiles.value.filter(paramsJsonBad).map(p => p.name?.trim() || '未命名配置')
   if (bad.length) { message.warning(`请先修正专属参数的 JSON 格式：${bad.join('、')}`); return }
   saving.value = true
@@ -226,6 +231,7 @@ async function applySettings() {
   const submittedProfiles = profiles.value.map(p => toWire(p))
   const submittedForm = { timeout: form.value.timeout }
   try {
+    if (editability.observing.value && !await editability.canEdit()) { message.info(editability.reason.value); return }
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: {
@@ -245,10 +251,11 @@ async function applySettings() {
 // —— 各卡独立的应用入口 (就近保存, 互不牵连) ——
 const savingConc = ref(false)
 async function applyConc() {
-  if (savingConc.value) return
+  if (settingsLocked.value) return
   savingConc.value = true
   const submitted = { ...form.value.conc }
   try {
+    if (editability.observing.value && !await editability.canEdit()) { message.info(editability.reason.value); return }
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: { 'runner.step_concurrency': submitted } }),
@@ -263,10 +270,11 @@ async function applyConc() {
 
 const savingRoot = ref(false)
 async function applyRoot() {
-  if (savingRoot.value) return
+  if (settingsLocked.value) return
   savingRoot.value = true
   const submitted = form.value.data_root.trim()
   try {
+    if (editability.observing.value && !await editability.canEdit()) { message.info(editability.reason.value); return }
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ updates: { 'server.data_root': submitted } }),
@@ -287,7 +295,7 @@ function concChanged(k: string) {
 
 const savingDisplay = ref(false)
 async function applyDisplay() {
-  if (savingDisplay.value) return
+  if (anySaving.value || loadingConfig.value) return
   savingDisplay.value = true
   const submitted = form.value.stream_reference_distance
   try {
@@ -297,7 +305,11 @@ async function applyDisplay() {
     })
     if (!r.ok) throw new Error('HTTP ' + r.status)
     savedDisplay.value = submitted
-    message.success('已保存显示偏好')
+    if (typeof window !== 'undefined') {
+      window.dispatchEvent(new CustomEvent('dubforge:llm-display-changed', { detail: { reference_distance_chars: submitted } }))
+      try { localStorage.setItem('dubforge:llm-display-changed', JSON.stringify({ reference_distance_chars: submitted, at: Date.now() })) } catch { /* 浏览器禁用存储不影响当前页应用 */ }
+    }
+    message.success('已保存显示偏好；打开的文字输出页立即生效')
   } catch (e: any) { message.error(`保存失败：${e.message}`) }
   finally { savingDisplay.value = false }
 }
@@ -328,6 +340,7 @@ function extraParamsStr(r: any): string {
     <nav class="section-nav" aria-label="设置分类"><button v-for="item in sections" :key="item.key" :aria-pressed="section === item.key" @click="selectSection(item.key)">{{ item.label }}<span v-if="item.dirty" class="dirty-dot" aria-label="有未保存修改">●</span></button></nav>
     <ConfigurationWorkspace v-if="visited.has('production')" v-show="section === 'production'" :scope="selectedScope" @select="selectScope" @dirty-change="productionDirty = $event" @busy-change="productionBusy = $event" />
     <div v-show="section !== 'production'">
+    <n-alert v-if="editability.locked.value" type="info" :show-icon="false" style="margin-bottom:16px">{{ editability.reason.value }} 显示追赶距离仍可实时调整。<n-button text :loading="editability.checking.value" @click="editability.refresh">重新核对</n-button></n-alert>
     <n-alert v-if="section === 'models'" type="info" :show-icon="false" style="margin-bottom: 20px">
       首次使用：填写接口地址、密钥和模型名 → 测试连接 → 保存模型设置。支持 OpenAI 兼容接口；多个配置按顺序自动切换。
     </n-alert>
@@ -347,10 +360,10 @@ function extraParamsStr(r: any): string {
                 <n-tag size="small" :bordered="false" round>#{{ i + 1 }}</n-tag>
                 <n-tag v-if="cardDirty[i]" size="small" type="warning"
                        :bordered="false">未应用</n-tag>
-                <n-switch v-model:value="p.enabled" size="small">
+                <n-switch v-model:value="p.enabled" :disabled="settingsLocked" size="small">
                   <template #checked>启用</template><template #unchecked>停用</template>
                 </n-switch>
-                <n-input v-model:value="p.name" size="small" placeholder="配置名称"
+                <n-input v-model:value="p.name" :disabled="settingsLocked" size="small" placeholder="配置名称"
                          class="name-input" />
                 <div class="flex-sp" />
                 <n-button size="small" type="primary" secondary :loading="isTesting(i)"
@@ -358,32 +371,32 @@ function extraParamsStr(r: any): string {
                   <template #icon><span style="font-size:12px">⚡</span></template>
                   测试
                 </n-button>
-                <n-button size="small" quaternary :disabled="i === 0"
+                <n-button size="small" quaternary :disabled="settingsLocked || i === 0"
                           aria-label="提高配置优先级" @click="move(i, -1)">↑</n-button>
-                <n-button size="small" quaternary :disabled="i === profiles.length - 1"
+                <n-button size="small" quaternary :disabled="settingsLocked || i === profiles.length - 1"
                           aria-label="降低配置优先级" @click="move(i, 1)">↓</n-button>
                 <n-button size="small" quaternary type="error"
-                          @click="delProfile(i)">删除</n-button>
+                          :disabled="settingsLocked" @click="delProfile(i)">删除</n-button>
               </div>
               <!-- 字段区: 行内标签两列布局, 减少换行 -->
               <div class="fields">
                 <n-text depth="3" class="lb">接口地址</n-text>
-                <n-input v-model:value="p.base_url" size="small" class="c-span"
+                <n-input v-model:value="p.base_url" :disabled="settingsLocked" size="small" class="c-span"
                          placeholder="https://ark.cn-beijing.volces.com/api/plan/v3" />
                 <n-text depth="3" class="lb">模型名</n-text>
-                <n-input v-model:value="p.model" size="small"
+                <n-input v-model:value="p.model" :disabled="settingsLocked" size="small"
                          placeholder="如 glm-5.3-flash / deepseek-chat" />
                 <n-text depth="3" class="lb">API Key</n-text>
-                <n-input v-model:value="p.api_key" type="password"
+                <n-input v-model:value="p.api_key" :disabled="settingsLocked" type="password"
                          show-password-on="click" size="small"
                          placeholder="密钥保存在本地 config.yaml" />
                 <n-text depth="3" class="lb lb-top">专属参数</n-text>
                 <div class="c-span">
-                  <n-input v-model:value="p.paramsJson" type="textarea" size="small" :rows="2"
+                  <n-input v-model:value="p.paramsJson" :disabled="settingsLocked" type="textarea" size="small" :rows="2"
                            placeholder='可选，留空=服务商默认；例如 {"temperature":1,"top_p":0.95} 或 {"reasoning_effort":"low"}' />
                   <div class="param-hint">
                     核心参数各家通用 (OpenAI 协议: temperature / top_p / max_tokens 等)；
-                    厂家私有参数 (如 GLM 的 reasoning_effort、thinking) 也写在这里原样发送；
+                    厂家私有参数（如 reasoning_effort、thinking）也写在这里。整理/翻译选择“低思考强度”时，适配模型会覆盖 reasoning_effort 为 low，并移除不兼容的 thinking；选择“跟随自定义 JSON / 服务商默认”则原样使用。其他参数保留；连通测试使用此处原参数。
                     GLM-5.3/5.3-Flash 通常不能关闭思考，建议用
                     <code>{"reasoning_effort":"low"}</code> 降低思考量；其他支持开关的模型才使用
                     <code>{"thinking":{"type":"disabled"}}</code>。具体字段以该接口文档为准，返回 400 时删除不支持的字段即可
@@ -422,12 +435,12 @@ function extraParamsStr(r: any): string {
                 </template>
               </div>
             </div>
-            <n-button size="small" dashed block @click="addProfile">＋ 新增一组配置</n-button>
+            <n-button size="small" dashed block :disabled="settingsLocked" @click="addProfile">＋ 新增一组配置</n-button>
           </div>
           <!-- LLM 运行设置: DubForge 自身参数 (非模型请求参数), 对所有配置组生效 -->
           <div class="globals-cap">
             <n-text depth="3" style="font-size:12px">
-              请求超时对所有模型配置生效。
+              请求时限对所有模型配置生效。
             </n-text>
             <n-tag v-if="formDirty" size="small" type="warning"
                    :bordered="false">未应用</n-tag>
@@ -435,16 +448,18 @@ function extraParamsStr(r: any): string {
           <div class="globals">
             <div class="g-item">
               <n-tooltip trigger="hover" placement="top">
-                <template #trigger><span class="g-lb">读超时(秒) ⓘ</span></template>
-                单次请求最长等待秒数; 思考型模型输出慢, 建议 ≥300
+                <template #trigger><span class="g-lb">请求时限（秒） ⓘ</span></template>
+                语义整理和翻译：单次请求总时限，包括等待、思考和持续输出；收到新内容不会重置计时。
+                其他 LLM 调用：读超时，即单次等待返回数据的最长时间。
+                到时关闭本地连接，但不能确认服务商已停止计算或计费；慢模型可适当调大。
               </n-tooltip>
-              <n-input-number v-model:value="form.timeout" size="small"
+              <n-input-number v-model:value="form.timeout" :disabled="settingsLocked" size="small"
                               :min="10" :max="3600" style="width:100px" />
             </div>
           </div>
           <!-- 「应用」是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
           <div class="actions">
-            <n-button type="primary" :loading="saving" :disabled="!isDirty"
+            <n-button type="primary" :loading="saving" :disabled="settingsLocked || !isDirty"
                       @click="applySettings()">保存模型设置</n-button>
             <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
             <n-text v-if="isDirty" type="warning" style="font-size: 12px">
@@ -465,12 +480,12 @@ function extraParamsStr(r: any): string {
                 <template #trigger><span class="g-lb">流式追赶距离(字符) ⓘ</span></template>
                 显示文字落后最新模型文字多少字符时，追赶速度达到参考生成速度
               </n-tooltip>
-              <n-input-number v-model:value="form.stream_reference_distance" size="small"
+              <n-input-number v-model:value="form.stream_reference_distance" :disabled="anySaving || loadingConfig" size="small"
                               :min="50" :max="5000" :step="50" style="width:130px" />
             </div>
           </div>
           <n-text depth="3" class="display-note">默认 500。调大更平滑，调小更跟手；仅影响网页文字显示，不影响生成速度和产物。</n-text>
-          <div class="actions"><n-button type="primary" size="small" :loading="savingDisplay" :disabled="!displayDirty" @click="applyDisplay">保存显示偏好</n-button><n-text v-if="displayDirty" type="warning">有未保存的修改</n-text></div>
+          <div class="actions"><n-button type="primary" size="small" :loading="savingDisplay" :disabled="anySaving || loadingConfig || !displayDirty" @click="applyDisplay">保存显示偏好</n-button><n-text v-if="displayDirty" type="warning">有未保存的修改</n-text></div>
         </n-card>
 
         <!-- ============ 运行并行度 ============ -->
@@ -482,7 +497,7 @@ function extraParamsStr(r: any): string {
                 <n-tag v-if="concChanged(c.k)" size="tiny" type="warning"
                        :bordered="false">已改</n-tag>
               </n-text>
-              <n-input-number v-model:value="form.conc[c.k]" size="small"
+              <n-input-number v-model:value="form.conc[c.k]" :disabled="settingsLocked" size="small"
                               :min="1" :max="4" style="width: 76px" />
             </div>
           </div>
@@ -493,7 +508,7 @@ function extraParamsStr(r: any): string {
           </n-text>
           <div class="actions" style="margin-top: 8px">
             <n-button type="primary" size="small" :loading="savingConc"
-                      :disabled="!concDirty" @click="applyConc">💾 应用并行度</n-button>
+                      :disabled="settingsLocked || !concDirty" @click="applyConc">💾 应用并行度</n-button>
             <n-text v-if="concDirty" type="warning" style="font-size:12px">
               ● 有未应用的修改
             </n-text>
@@ -507,7 +522,7 @@ function extraParamsStr(r: any): string {
               <template #trigger><span class="g-lb">总工作目录 ⓘ</span></template>
               所有项目数据 (项目目录 / 数据库) 的根目录
             </n-tooltip>
-            <n-input v-model:value="form.data_root" size="small" style="width: min(420px, 100%)"
+            <n-input v-model:value="form.data_root" :disabled="settingsLocked" size="small" style="width: min(420px, 100%)"
                      placeholder="留空 = 默认 程序目录\data" />
             <FilePathLink v-if="form.data_root" :path="form.data_root" label="定位目录" />
           </div>
@@ -516,7 +531,7 @@ function extraParamsStr(r: any): string {
           </n-text>
           <div class="actions" style="margin-top: 8px">
             <n-button type="primary" size="small" :loading="savingRoot"
-                      :disabled="!rootDirty" @click="applyRoot">💾 应用存储位置</n-button>
+                      :disabled="settingsLocked || !rootDirty" @click="applyRoot">💾 应用存储位置</n-button>
             <n-text v-if="rootDirty" type="warning" style="font-size:12px">
               ● 有未应用的修改
             </n-text>

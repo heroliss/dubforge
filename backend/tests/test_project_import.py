@@ -269,3 +269,76 @@ def test_api_preview_create_receipt_and_cross_origin_protection():
     response = client.post('/api/project-import/create', json=command_body)
     assert response.status_code == 200, response.text
     assert client.get('/api/project-import/'+command_body['request_id']).json() == response.json()
+
+
+def test_restart_history_and_resume_without_browser_text(monkeypatch):
+    from dubforge import db
+    body = command({'text':'https://example.com/a\nhttps://example.com/b'})
+    original = crud.create_project
+    def interrupt(**kwargs):
+        if kwargs['source_url'].endswith('/b'):
+            raise SystemExit('模拟重启')
+        return original(**kwargs)
+    monkeypatch.setattr(crud, 'create_project', interrupt)
+    with pytest.raises(SystemExit):
+        imp.execute(body)
+    db.reset_engine();db.init_db()
+    recent = imp.history()['items'][0]
+    assert recent['request_id'] == body['request_id'] and recent['created'] == 1 and recent['pending'] == 1
+    assert recent['created_at'] and not recent['running']
+    assert 'settings' not in recent and 'plan' not in recent
+    with pytest.raises(imp.ImportError):
+        imp.resume(recent['request_id'], {'confirmed':False})
+    assert len(crud.list_projects()) == 1
+    monkeypatch.setattr(crud, 'create_project', original)
+    first = imp.status(recent['request_id'])['items'][0]['uid']
+    done = imp.resume(recent['request_id'], {'confirmed':True})
+    assert done['created'] == 2 and done['items'][0]['uid'] == first
+    assert imp.resume(recent['request_id'], {'confirmed':True}) == done
+    assert len(crud.list_projects()) == 2
+
+
+def test_history_and_status_query_projects_in_one_batch():
+    from sqlalchemy import event
+    result = imp.execute(command({'text':'\n'.join(f'https://example.com/{i}' for i in range(5))}))
+    queries = []
+    def record(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith('SELECT'):
+            queries.append(statement)
+    engine = get_engine();event.listen(engine, 'before_cursor_execute', record)
+    try:
+        assert imp.status(result['request_id'])['created'] == 5
+        assert len(queries) == 2
+        queries.clear()
+        assert imp.history()['items'][0]['created'] == 5
+        assert len(queries) == 2
+    finally:
+        event.remove(engine, 'before_cursor_execute', record)
+
+
+def test_history_limit_and_http_resume_are_validated():
+    from app.main import app
+    body = command({'text':'https://example.com/a'})
+    imp.execute(body)
+    client = TestClient(app)
+    assert client.get('/api/project-import/history?limit=0').status_code == 400
+    assert client.get('/api/project-import/history?limit=1').json()['items'][0]['request_id'] == body['request_id']
+    assert client.post('/api/project-import/'+body['request_id']+'/resume', json={'confirmed':True}).json()['created'] == 1
+    assert client.post('/api/project-import/'+body['request_id']+'/resume', json={'confirmed':True,'settings':{}}).status_code == 400
+    assert client.post('/api/project-import/missing/resume', json={'confirmed':True}).status_code == 400
+
+
+def test_created_time_column_upgrade_preserves_receipts():
+    from dubforge import db
+    result = imp.execute(command({'text':'https://example.com/a'}))
+    with get_engine().connect() as connection:
+        connection.exec_driver_sql('ALTER TABLE projectimport DROP COLUMN created_at');connection.commit()
+    db.init_db()
+    assert imp.history()['items'][0]['created'] == 1
+    assert imp.status(result['request_id'])['created_at'] == ''
+
+
+def test_different_non_default_url_ports_are_not_duplicates():
+    plan = imp.preview({'text':'https://example.com:80/video\nhttps://example.com/video\nhttp://example.com:443/video'})
+    assert plan['selected'] == [0,1,2]
+    assert imp.source('http://[::1]:8600/video')['identity'] == 'http://[::1]:8600/video'

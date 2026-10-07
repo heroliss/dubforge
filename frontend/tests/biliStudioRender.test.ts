@@ -10,7 +10,7 @@ import {NDialogProvider,NMessageProvider,useDialog} from 'naive-ui'
 
 let server:ViteDevServer,Studio:any,Assist:any,Import:any
 before(async()=>{
-  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null}})
+  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null,ws:false}})
   Studio=(await server.ssrLoadModule('/src/components/BiliStudio.vue')).default
   Assist=(await server.ssrLoadModule('/src/components/PublishPlatformAssist.vue')).default
   Import=(await server.ssrLoadModule('/src/components/BiliContentImport.vue')).default

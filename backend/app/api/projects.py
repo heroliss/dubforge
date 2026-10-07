@@ -1,13 +1,14 @@
 """项目 API: CRUD (M1; M4 前端接手)"""
 import json
 import threading
+import uuid
 from pathlib import Path
 from typing import Literal
 
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.registry import PIPELINE_KEYS, STEP_KEYS, STEP_MAP
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from pydantic import BaseModel, Field
 
 router = APIRouter(prefix="/api/projects", tags=["projects"])
@@ -79,6 +80,13 @@ def create_project(body: ProjectCreate):
 
 @router.post("/{uid}/ingest")
 async def ingest_video(uid: str, request: Request, filename: str = "video.mp4"):
+    from dubforge import video_info
+    # 上传期间只保留项目占用标记，不跨 await 持有线程锁。
+    with video_info.operation(uid, 'ingest'):
+        return await _ingest_video(uid, request, filename)
+
+
+async def _ingest_video(uid: str, request: Request, filename: str):
     """拖入导入: 项目创建后把文件内容流式写进项目目录 media/。
     浏览器拿不到拖入文件的真实磁盘路径, 只能传内容 —— 先建项目目录作容器,
     字节流直写最终位置 (不落收件箱/临时目录), 副本即项目自有文件, 随项目存亡。"""
@@ -143,18 +151,20 @@ def rename_project(uid: str, body: ProjectRename):
     if not title:
         raise DubForgeError("标题不能为空", code="TITLE_EMPTY",
                             suggestion="请输入一个能认出这个视频的名字。")
-    project = crud.get_project(uid)
-    if not project:
-        raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
-    # 只改标题列: 整行 merge 会用旧快照覆盖 params 里的链计划 (ADR-0075)。
-    crud.update_project_title(uid, title)
-    crud.write_manifest(uid)
-    return _project_view(crud.get_project(uid))
+    from dubforge import runtime_edit
+    with runtime_edit.editing('project:' + uid):
+        # 只改标题列: 整行 merge 会用旧快照覆盖 params 里的链计划 (ADR-0075)。
+        crud.update_project_title(uid, title)
+        crud.write_manifest(uid)
+        return _project_view(crud.get_project(uid))
 
 
 @router.get("")
 def list_projects():
-    return [_project_view(p) for p in crud.list_projects()]
+    from dubforge.publishing.service import project_statuses
+    projects = crud.list_projects()
+    publications = project_statuses([p.uid for p in projects])
+    return [_project_view(p, publications[p.uid]) for p in projects]
 
 
 @router.get("/{uid}")
@@ -163,6 +173,21 @@ def get_project(uid: str):
     if not project:
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
     return _project_view(project)
+
+
+@router.get('/{uid}/navigation')
+def project_navigation(uid: str, response: Response):
+    """导航只取本地项目摘要；制作有效性由同批步骤状态提供。"""
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f'项目不存在: {uid}', code='PROJECT_NOT_FOUND')
+    response.headers['Cache-Control'] = 'no-store'
+    params = crud.project_params(project)
+    selected = params.get('auto_steps')
+    return dict(title=project.title, status=project.status,
+                dir_exists=crud.project_dir_by_project(project).exists(),
+                auto_steps=[key for key in selected if key in PIPELINE_KEYS] if isinstance(selected, list) else None,
+                chain=_chain_view(project, params=params))
 
 
 class RunMany(BaseModel):
@@ -215,8 +240,8 @@ class AutoSteps(BaseModel):
 @router.put("/{uid}/auto_steps")
 def set_auto_steps(uid: str, body: AutoSteps):
     """保存项目的勾选步骤集 (链式执行的依据; 未保存过 = 全部)"""
-    from dubforge.pipeline import dubbing_session
-    with dubbing_session.gate:
+    from dubforge import runtime_edit
+    with runtime_edit.editing('project:' + uid):
         return _set_auto_steps(uid, body)
 
 
@@ -318,6 +343,7 @@ def _run_chain(uid: str, body: RunChain):
     params["_chain"] = body.steps
     params["_chain_state"] = "active"
     params.pop("_chain_hold", None)
+    params.pop("_chain_resume_plan", None)
     project.params = json.dumps(params, ensure_ascii=False)
     crud.save_project(project)
     try:
@@ -337,18 +363,41 @@ def _run_chain(uid: str, body: RunChain):
     return {"ok": True, "started": body.steps[0], "stopped": None}
 
 
+@router.post("/{uid}/chain/plan")
+def chain_resume_plan(uid: str):
+    from dubforge.chain_recovery import plan
+    return plan(uid)
+
+
 @router.post("/{uid}/chain/resume")
-def chain_resume(uid: str):
-    """继续挂起的自动运行计划: 重新激活并从链头执行 (依赖未就绪会再次挂起)。"""
+def chain_resume(uid: str, body: dict | None = None):
+    """新版确认补齐必要依赖；旧调用只恢复原链，不隐式扩大制作范围。"""
     from dubforge.runner import runner
     from dubforge.pipeline import dubbing_session
-    with _CHAIN_LOCK, runner._start_lock, dubbing_session.gate:
+    from dubforge import video_info
+    from dubforge.publishing import service
+    with service._lock, _CHAIN_LOCK, runner._start_lock, dubbing_session.gate, video_info.gate:
         from dubforge.workflows import check_idle
         check_idle(uid)
         project = crud.get_project(uid)
         if not project:
             raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
         params = crud.project_params(project)
+        checked = bool(body)
+        request_id = None
+        if checked:
+            from dubforge.chain_recovery import ChainRecoveryError
+            if body.get('confirmed') is not True:
+                raise ChainRecoveryError('请先检查恢复方案并确认', code='CONFIRM_REQUIRED')
+            try:
+                request_id = str(uuid.UUID(body.get('request_id', '')))
+            except (ValueError, TypeError, AttributeError):
+                raise ChainRecoveryError('恢复请求标识无效，请重新检查', code='REQUEST_INVALID')
+            previous = params.get('_chain_resume_receipts', {}).get(request_id)
+            if previous:
+                if previous['fingerprint'] != body.get('fingerprint'):
+                    raise ChainRecoveryError('此恢复请求已用于另一方案，请重新检查', code='REQUEST_CONFLICT')
+                return {**previous['result'], 'reused': True, 'chain': _chain_view(project)}
         if (not isinstance(params.get("_chain"), list) or not params.get("_chain")
                 or params.get("_chain_state") != "held"):
             raise DubForgeError("没有挂起的自动运行计划", code="CHAIN_NOT_HELD",
@@ -358,12 +407,38 @@ def chain_resume(uid: str):
         if active:
             raise DubForgeError("项目已有任务运行中", code="PIPELINE_BUSY",
                                 suggestion="等当前步骤结束后再继续剩余计划。")
+        dubbing_session.check_idle(uid)
+        video_info.check_idle(uid)
+        service.check_project_idle(uid)
+        if checked:
+            from dubforge.chain_recovery import plan, ChainRecoveryError
+            candidate = plan(uid)
+            if candidate['blockers']:
+                raise ChainRecoveryError('暂时无法恢复：' + '；'.join(candidate['blockers']), code='DEPS_NOT_MET')
+            if candidate['fingerprint'] != body.get('fingerprint'):
+                raise ChainRecoveryError('恢复起点、设置或依赖已变化，请重新检查恢复方案')
+            params['_chain'] = candidate['steps']
+            params['_chain_resume_plan'] = candidate['execution']
+            # 先持久接收记录，响应丢失或首轮快速失败后同一请求都不会再启动。
+            receipts = dict(params.get('_chain_resume_receipts', {}))
+            receipts[request_id] = dict(fingerprint=candidate['fingerprint'],
+                result=dict(ok=True, started=candidate['recovery']['start_step'], stopped=None))
+            params['_chain_resume_receipts'] = receipts
+        else:
+            params.pop('_chain_resume_plan', None)
         params["_chain_state"] = "active"
         params.pop("_chain_hold", None)
         project.params = json.dumps(params, ensure_ascii=False)
         crud.save_project(project)
         info = runner.continue_chain(project)
-        return {"ok": True, "started": info["started"], "stopped": info["stopped"]}
+        result = {"ok": True, "started": info["started"], "stopped": info["stopped"]}
+        if request_id:
+            latest = crud.get_project(uid)
+            current = crud.project_params(latest)
+            current['_chain_resume_receipts'][request_id]['result'] = result
+            latest.params = json.dumps(current, ensure_ascii=False)
+            crud.save_project(latest)
+        return result
 
 
 @router.post("/{uid}/chain/stop")
@@ -514,9 +589,9 @@ def _workflow_status_of(uid: str) -> str | None:
         return row.status if row else None
 
 
-def _chain_view(project) -> dict | None:
+def _chain_view(project, *, params=None) -> dict | None:
     """自动续跑链对外视图: 计划与活性分离, held = 挂起可恢复 (ADR-0072)。"""
-    params = crud.project_params(project)
+    params = crud.project_params(project) if params is None else params
     chain = params.get("_chain")
     if not isinstance(chain, list) or not chain:
         return None
@@ -529,7 +604,31 @@ def _chain_view(project) -> dict | None:
     return view
 
 
-def _project_view(project) -> dict:
+@router.get('/{uid}/freshness')
+def freshness_details(uid: str, response: Response, step: str | None = None):
+    """按需查看更新证据；只读取状态，不改配置、不启动制作。"""
+    from dubforge.pipeline.dependencies import Dependencies
+    project = crud.get_project(uid)
+    if not project:
+        raise DubForgeError(f'项目不存在: {uid}', code='PROJECT_NOT_FOUND')
+    if step is not None and step not in PIPELINE_KEYS:
+        raise DubForgeError('请选择有效的制作步骤', code='STEP_NOT_FOUND')
+    response.headers['Cache-Control'] = 'no-store'
+    deps = Dependencies(project)
+    keys = [step] if step is not None else [key for key in PIPELINE_KEYS
+        if key in deps.steps and not deps.display_fresh(key)
+        and (deps.steps[key].input_fingerprint
+             or deps.steps[key].status in {'done', 'stale'})]
+    return {'project_uid': uid, 'steps': [
+        {**deps.explain(key), 'key': key, 'label': STEP_MAP[key].label,
+         'status': deps.status(key),
+         **deps.freshness_feedback(key),
+         'affected_steps': [{'key': affected, 'label': STEP_MAP[affected].label}
+                            for affected in deps.downstream(key)]}
+        for key in keys], 'warnings': []}
+
+
+def _project_view(project, publication=None) -> dict:
     # 旧版本或手工 manifest 可能留下未知步骤；项目列表仍应可用，未知行由
     # 重建/迁移流程保留但不让 API 因 STEP_MAP 缺项整体 500。
     from dubforge.pipeline.dependencies import Dependencies, project_status, selected_steps
@@ -539,10 +638,14 @@ def _project_view(project) -> dict:
     running = next((s.step_key for s in steps
                     if s.status in ("running", "queued")), None)
     from dubforge.runner import runner
+    if publication is None:
+        from dubforge.publishing.service import project_status as publishing_status
+        publication = publishing_status(project.uid)
     step_views_by_key = {s.step_key: {"key": s.step_key, "label": STEP_MAP[s.step_key].label,
                    "status": deps.status(s.step_key),
                    "progress": 100.0 if deps.status(s.step_key) == "done" else round(s.progress or 0, 1),
                    "selected": s.step_key in selected, "fresh": deps.display_fresh(s.step_key),
+                   **deps.freshness_feedback(s.step_key),
                    "error": s.error_message if deps.status(s.step_key) != "done" else None,
                    **(runner.progress_eta(project.id, s.step_key)
                       if s.status == "running" else {})} for s in steps}
@@ -559,6 +662,7 @@ def _project_view(project) -> dict:
         "params": crud.project_params(project),
         "chain": _chain_view(project),
         "workflow_status": _workflow_status_of(project.uid),
+        "publication": publication,
         "created_at": project.created_at.isoformat(),
         # 项目目录是否还在磁盘上 (被移走/删除 → 列表标注「目录缺失」)
         "dir_exists": deps.root.exists(),

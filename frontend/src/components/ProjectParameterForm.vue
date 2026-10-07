@@ -9,9 +9,11 @@ import { textColorPatch } from '../utils/textColorPresets'
 import { textStyleFieldGroups } from '../utils/textStyleFields'
 import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import { sourcePresentation, type ConfigurationSource } from '../utils/configurationSource'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const props = defineProps<{ uid: string; stepKey: string; disabled?: boolean; lineId?: number; paths?: string[];
   additionalStepKeys?: string[]; sectionTitles?: Record<string, string>; excludePaths?: string[] }>()
+const editability = useConfigurationEditability(() => `project:${props.uid}`)
 const endpoint = computed(() => props.lineId == null ? `/api/projects/${props.uid}/step_params`
   : `/api/projects/${props.uid}/workbench/lines/${props.lineId}/params`)
 const scopeLabel = computed(() => props.lineId == null ? '项目' : '本句')
@@ -32,6 +34,7 @@ const edited = ref<Record<string, boolean>>({})
 const resetKeys = ref(new Set<string>())
 const saved = ref('')
 const loading = ref(false), saving = ref(false), error = ref('')
+const locked = computed(() => props.disabled || saving.value || loading.value || editability.locked.value)
 let request: AbortController | null = null
 let disposed = false
 const same = (a: any, b: any) => JSON.stringify(a) === JSON.stringify(b)
@@ -44,7 +47,10 @@ function fieldSource(path: string): ConfigurationSource | undefined {
 }
 const groups = computed(() => {
   const result = new Map<string, any[]>()
+  const useLlm = Boolean(draft.value['split.use_llm'] ?? true)
   for (const field of fields.value) {
+    if (field.path === 'split.target_word_count' && !useLlm) continue
+    if (field.path === 'split.max_split_length' && useLlm) continue
     if (props.stepKey === 'tts') {
       if ((field.depends_on ?? []).some(([key, value]: [string, any]) => key === 'tts.backend' && draft.value[key] !== value)) continue
       if (['vector', 'text'].includes(field.type) && (field.depends_on ?? []).some(([key, value]: [string, any]) => draft.value[key] !== value)) continue
@@ -65,21 +71,23 @@ function hasTextColors(group: { fields: any[] }) {
   return ['assemble.subtitle_color', 'assemble.subtitle_outline_color'].every(path => group.fields.some(field => field.path === path))
 }
 function applyTextColors(id: string, source = false) {
-  if (props.disabled || saving.value || loading.value) return
+  if (locked.value) return
   const patch = textColorPatch(id, source ? 'assemble.subtitle_source_' : 'assemble.subtitle_')
   if (patch && Object.keys(patch).every(path => fields.value.some(field => field.path === path))) applyPreset(patch)
 }
 function enableSourceStyle() {
   const path = 'assemble.subtitle_source_style_enabled'
-  if (!props.disabled && !saving.value && !loading.value && fields.value.some(field => field.path === path)) editField(path, true)
+  if (!locked.value && fields.value.some(field => field.path === path)) editField(path, true)
 }
 watch(draft, value => emit('draft-change', { ...value }), { deep: true })
 watch(dirty, value => emit('dirty-change', value), { immediate: true })
 function disabledField(field: any) {
-  if (props.disabled || saving.value) return true
+  if (locked.value) return true
   if (field.path === 'subtitles.source_first' && !['all', 'bilingual'].includes(draft.value['subtitles.mode'])
       && draft.value['assemble.subtitle_track'] !== 'bilingual') return true
-  return (field.depends_on ?? []).some(([path, value]: [string, any]) => !same(draft.value[path], value))
+  const splitLength = ['split.target_word_count', 'split.max_split_length'].includes(field.path)
+  return (field.depends_on ?? []).some(([path, value]: [string, any]) =>
+    !same(splitLength && path === 'split.use_llm' ? Boolean(draft.value[path] ?? true) : draft.value[path], value))
 }
 
 async function load() {
@@ -115,20 +123,23 @@ async function load() {
   }
 }
 async function save() {
-  if (saving.value || props.disabled) return
+  if (locked.value) return
   saving.value = true
+  const key = endpoint.value
   try {
+    if (editability.observing.value && !await editability.canEdit()) { message.info(editability.reason.value || '运行中不能保存设置'); return }
+    if (disposed || key !== endpoint.value) return
     const updates: Record<string, any> = {}, reset: string[] = []
     for (const field of fields.value) {
       if (resetKeys.value.has(field.path)) reset.push(field.path)
       else if (edited.value[field.path] || !same(draft.value[field.path], JSON.parse(saved.value)[field.path])) updates[field.path] = draft.value[field.path]
     }
-    const response = await fetch(endpoint.value, {
+    const response = await fetch(key, {
       method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ updates, reset, revision: revision.value, fingerprint: fingerprint.value }),
     })
     const data = await response.json()
     if (!response.ok) throw new Error(data.message || '参数保存失败')
-    if (disposed) return
+    if (disposed || key !== endpoint.value) return
     await load()
     message.success(`已保存${scopeLabel.value}参数`)
     emit('saved')
@@ -139,8 +150,8 @@ async function save() {
 function resetAll() {
   for (const field of fields.value) inheritField(field.path)
 }
-function inheritField(path:string) { draft.value[path]=defaults.value[path];resetKeys.value.add(path);delete edited.value[path] }
-function editField(path:string,value:any) { draft.value[path]=value;edited.value[path]=true;resetKeys.value.delete(path) }
+function inheritField(path:string) { if (locked.value) return; draft.value[path]=defaults.value[path];resetKeys.value.add(path);delete edited.value[path] }
+function editField(path:string,value:any) { if (locked.value) return; draft.value[path]=value;edited.value[path]=true;resetKeys.value.delete(path) }
 function discard() { if (saved.value && !saving.value) {draft.value = JSON.parse(saved.value);edited.value={};resetKeys.value=new Set()} }
 watch(() => [props.uid, props.stepKey, props.lineId], load, { immediate: true })
 onUnmounted(() => { disposed = true; request?.abort() })
@@ -148,18 +159,19 @@ onUnmounted(() => { disposed = true; request?.abort() })
 
 <template>
   <n-spin :show="loading">
+    <n-alert v-if="editability.locked.value" type="info" :show-icon="false">{{ editability.reason.value }} <n-button text :loading="editability.checking.value" @click="editability.refresh">重新核对</n-button></n-alert>
     <n-alert v-if="error" type="error" :show-icon="false">
       {{ error }} <n-button size="tiny" @click="load">重试</n-button>
     </n-alert>
     <n-form v-else-if="fields.length" label-placement="top" size="small" :show-feedback="false">
       <DubbingPresets v-if="lineId == null && stepKey === 'tts' && draft['tts.backend'] === 'indextts25'" :draft="draft"
-                      :disabled="disabled || saving" @load="applyPreset" />
+                      :disabled="locked" @load="applyPreset" />
       <section v-for="group in groups" :key="group.name" class="parameter-group">
       <h3 v-if="group.name">{{ group.name }}</h3>
       <TextColorPresets v-if="hasTextColors(group)" kind="字幕" class="subtitle-palettes"
         :color="draft['assemble.subtitle_color']" :outline-color="draft['assemble.subtitle_outline_color']" :outline="draft['assemble.subtitle_outline']"
         :source-enabled="!!draft['assemble.subtitle_source_style_enabled']" :source-color="draft['assemble.subtitle_source_color']" :source-outline-color="draft['assemble.subtitle_source_outline_color']" :source-outline="draft['assemble.subtitle_source_outline']"
-        :disabled="disabled || saving || loading" @select="applyTextColors" @enable-source="enableSourceStyle" />
+        :disabled="locked" @select="applyTextColors" @enable-source="enableSourceStyle" />
       <div class="parameter-grid">
         <n-form-item v-for="field in group.fields" :key="field.path" :class="{ 'wide-field': field.type === 'vector' }">
           <template #label>
@@ -177,16 +189,16 @@ onUnmounted(() => { disposed = true; request?.abort() })
               <template #trigger><div class="control-tip"><ParamControl :field="field" :model-value="draft[field.path]" :disabled="disabledField(field)" @update:model-value="editField(field.path,$event)" /></div></template>
               {{ field.help }}
             </n-tooltip>
-            <n-button v-if="changed(field.path)" size="tiny" quaternary :disabled="disabled || saving"
+            <n-button v-if="changed(field.path)" size="tiny" quaternary :disabled="locked"
                       :aria-label="`${field.label}恢复继承`" :title="`恢复继承 · ${sourcePresentation(parentSources[field.path]).title}，保存后生效`" @click="inheritField(field.path)">↶</n-button>
           </div>
         </n-form-item>
       </div>
       </section>
-      <slot name="actions" :save="save" :saving="saving" :loading="loading" :dirty="dirty" :has-overrides="hasOverrides" :reset-all="resetAll" :discard="discard">
+      <slot name="actions" :save="save" :saving="saving" :loading="loading" :locked="locked" :dirty="dirty" :has-overrides="hasOverrides" :reset-all="resetAll" :discard="discard">
         <n-space align="center" class="parameter-footer">
-          <n-button type="primary" size="small" :loading="saving" :disabled="!dirty || disabled || loading" @click="save">保存{{ scopeLabel }}参数</n-button>
-          <n-button v-if="hasOverrides" size="small" quaternary :disabled="disabled || saving" @click="resetAll">恢复继承（待保存）</n-button>
+          <n-button type="primary" size="small" :loading="saving" :disabled="!dirty || locked" @click="save">保存{{ scopeLabel }}参数</n-button>
+          <n-button v-if="hasOverrides" size="small" quaternary :disabled="locked" @click="resetAll">恢复继承（待保存）</n-button>
           <n-text v-if="dirty" type="warning" style="font-size: 12px">有未保存的修改</n-text>
         </n-space>
       </slot>

@@ -21,7 +21,7 @@ const responseFor=(url:any)=>String(url).includes('/api/configuration/')
   ? {name:'本项目',overrides:{},defaults:{},sections:{},sources:{},parent_sources:{}}
   : activeFixture
 before(async()=>{
-  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null}})
+  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null,ws:false}})
   Panel=(await server.ssrLoadModule('/src/components/CommentStudioPanel.vue')).default
   mock.method(globalThis,'fetch',async(url)=>({ok:true,json:async()=>responseFor(url)} as any))
 })

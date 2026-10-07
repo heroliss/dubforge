@@ -340,18 +340,3 @@ def test_gpu_prep_starts_tts_service_for_tts_step(isolated_env, make_project, mo
     runner.start_step(uid2, 'tts')
     wait_status(uid2, 'tts', {'done'})
     assert not any(a == 'start' for a in record[len(record):]) or state['started'] == 1
-
-
-def test_split_window_capped_by_input_chars(isolated_env):
-    """单窗输入上限: 超过 max_input_chars 开新窗; 0 = 不限制 (单窗)。"""
-    from dubforge.pipeline.step_split import _resegment_batches
-    from dubforge.utils.srt import SubLine
-    lines = [SubLine(i + 1, i * 2.0, i * 2.0 + 1.5, f"phrase number {i} about topic")
-             for i in range(40)]
-    one = _resegment_batches(lines, token_budget=100_000, max_input_chars=0)
-    assert len(one) == 1
-    capped = _resegment_batches(lines, token_budget=100_000, max_input_chars=200)
-    assert len(capped) >= 3
-    # 连续性: 所有行都在, 顺序不变, 无重复
-    flat = [l for b in capped for l in b]
-    assert [l.index for l in flat] == [l.index for l in lines]

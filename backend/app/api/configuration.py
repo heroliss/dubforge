@@ -31,6 +31,12 @@ def view(key: str):
     return configuration.view(key)
 
 
+@router.get('/{key}/editability')
+def editability(key: str):
+    from dubforge import runtime_edit
+    return runtime_edit.editability(key)
+
+
 @router.post('/batch-plan')
 def batch_plan(body: dict):
     return configuration.batch_plan(body)

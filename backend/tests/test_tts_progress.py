@@ -18,7 +18,8 @@ def test_adapter_forwards_only_reported_progress(isolated_env, monkeypatch, tmp_
     import gradio_client
 
     source = tmp_path / 'service.wav'
-    source.write_bytes(b'audio')
+    import soundfile as sf
+    sf.write(source, [0.1] * 3200, 32000)
     target = tmp_path / 'result.wav'
     job = Mock()
     job.status.side_effect = [SimpleNamespace(

@@ -10,6 +10,7 @@ import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import ProgressActivity from './ProgressActivity.vue'
 import PublicationRightsHint from './PublicationRightsHint.vue'
 import DubbingReadiness from './DubbingReadiness.vue'
+import RecoveryPlan from './RecoveryPlan.vue'
 
 const props = defineProps<{uid:string}>()
 const nav = useNavStore()
@@ -21,12 +22,14 @@ const active=computed(()=>WORKFLOW_OPEN.includes(latest.value?.status))
 const resumable=computed(()=>['paused','failed','attention'].includes(latest.value?.status)&&!latest.value?.publication_id)
 const modeLabel=computed(()=>workflowModeLabel(nav.workflow?.mode))
 const selectedVersions=computed(()=>preview.value?.version_specs || (state.value?.recipe?.version_ids||[]).map((id:string)=>state.value?.version_catalog?.versions.find((v:any)=>v.id===id)).filter(Boolean))
-const canConfirm=computed(()=>!busy.value&&!!preview.value&&preview.value.recipe.mode===mode.value&&!preview.value.blockers.length)
-const confirmLabel=computed(()=>mode.value==='publish'?'确认制作并投稿':mode.value==='draft'?'确认制作并准备草稿':'确认制作成片')
+const canConfirm=computed(()=>!busy.value&&!nav.busy&&!active.value&&!nav.dirMissing&&!!preview.value&&preview.value.recipe.mode===mode.value&&!preview.value.blockers.length&&(!selectedRun.value||(!!preview.value.recovery&&!!preview.value.recovery_fingerprint)))
+const confirmLabel=computed(()=>selectedRun.value
+  ? mode.value==='publish'?'确认恢复并投稿':mode.value==='draft'?'确认恢复并准备草稿':'确认恢复制作'
+  : mode.value==='publish'?'确认制作并投稿':mode.value==='draft'?'确认制作并准备草稿':'确认制作成片')
 let disposed=false, generation=0, requestId='', readAbort:AbortController|undefined
 async function api(path='',body?:any,signal?:AbortSignal){
   const r=await fetch('/api/projects/'+encodeURIComponent(props.uid)+'/workflow'+path,{method:body===undefined?'GET':'POST',headers:body===undefined?undefined:{'Content-Type':'application/json'},body:body===undefined?undefined:JSON.stringify(body),signal:signal?AbortSignal.any([signal,AbortSignal.timeout(60000)]):undefined})
-  const d=await r.json();if(!r.ok)throw new Error(d.message||'运行检查失败');return d
+  const d=await r.json();if(!r.ok)throw Object.assign(new Error(d.message||'运行检查失败'),{code:d.code,status:r.status});return d
 }
 async function requestPlan(ticket:number){
   const result=await api('/plan',{mode:mode.value,...(selectedRun.value?{resume_id:selectedRun.value}:{})},readAbort?.signal)
@@ -63,11 +66,11 @@ async function confirmStart(){
   if(!requestId)requestId=crypto.randomUUID()
   busy.value=true;error.value=''
   try{
-    const result=await api(run?'/'+run+'/resume':'/start',{recipe:snapshot.recipe,fingerprint:snapshot.fingerprint,confirmed:true,request_id:requestId})
+    const result=await api(run?'/'+run+'/resume':'/start',{recipe:snapshot.recipe,fingerprint:snapshot.fingerprint,...(run?{recovery_fingerprint:snapshot.recovery_fingerprint}:{}),confirmed:true,request_id:requestId})
     if(disposed)return
     nav.workflowStarted(uid,result);show.value=false
     void nav.refreshWorkflow()
-  }catch(e:any){if(!disposed)error.value=friendlyError(e)}
+  }catch(e:any){if(!disposed){error.value=friendlyError(e);if(e.status===409||['WORKFLOW_PLAN_CHANGED','WORKFLOW_CONFLICT','PIPELINE_BUSY','REQUEST_CONFLICT'].includes(e.code)){preview.value=null;requestId='';error.value+=' 请重新检查后确认。'}}}
   finally{busy.value=false}
 }
 async function stop(){
@@ -82,7 +85,7 @@ onUnmounted(()=>{disposed=true;generation++;readAbort?.abort()})
   <n-card size="small" title="自动运行" class="run-card" id="automatic-workflow">
     <template #header-extra>
       <n-button v-if="active" :disabled="busy||latest.status==='stopping'" size="small" @click="stop">{{ latest.status==='monitoring'?'停止自动查询':'停止完整流程' }}</n-button>
-      <n-button v-else-if="resumable" :disabled="busy||nav.busy||nav.dirMissing" type="primary" size="small" @click="open(latest.id)">检查并继续流程…</n-button>
+      <n-button v-else-if="resumable" :disabled="busy||nav.busy||nav.dirMissing" type="primary" size="small" @click="open(latest.id)">检查恢复方案…</n-button>
       <RouterLink v-else-if="nav.workflow?.existing_publication_id&&nav.workflow.mode!=='produce'" :to="'/projects/'+uid+'/publish'">查看或继续现有稿件 →</RouterLink>
       <n-button v-else :disabled="busy||nav.busy||nav.dirMissing||!nav.workflow||!!nav.workflowError" type="primary" size="small" @click="open()">检查并运行完整流程…</n-button>
     </template>
@@ -102,7 +105,7 @@ onUnmounted(()=>{disposed=true;generation++;readAbort?.abort()})
     <n-alert v-if="error&&!show" type="error">{{ error }}</n-alert>
   </n-card>
   <n-drawer :show="show" width="min(760px,100vw)" :mask-closable="!busy||checking" :close-on-esc="!busy||checking" @update:show="value=>{if(!value)close()}">
-    <n-drawer-content :title="selectedRun?'检查并继续流程':'检查完整流程'" :closable="!busy||checking">
+    <n-drawer-content :title="selectedRun?'检查恢复方案':'检查完整流程'" :closable="!busy||checking">
       <div class="run-check">
         <div class="run-links"><RouterLink :to="'/projects/'+uid+'/steps/assemble'">成片版本</RouterLink><RouterLink :to="'/projects/'+uid+'/steps/download#comments-studio'">评论设置</RouterLink><RouterLink :to="'/projects/'+uid+'/publish#project-rules'">发布规则</RouterLink></div>
         <label>本次执行到<n-select v-model:value="mode" :options="WORKFLOW_ENDS" :disabled="busy" @update:value="inspect"/><small class="muted">仅影响本次运行，不修改项目或模板设置。</small></label>
@@ -110,13 +113,14 @@ onUnmounted(()=>{disposed=true;generation++;readAbort?.abort()})
         <n-spin v-if="busy&&!preview" size="small" description="正在检查已保存设置和依赖…"/>
         <n-alert v-if="error" type="error">{{ error }}</n-alert>
         <template v-if="preview">
+          <RecoveryPlan v-if="selectedRun && preview.recovery" :recovery="preview.recovery" />
           <DubbingReadiness v-if="preview.dubbing" :summary="preview.dubbing" />
           <section class="run-scope"><h3>执行范围</h3><p>{{ preview.steps.map((key:string)=>preview.labels[key]).join(' → ') }}</p><p v-if="preview.account_name">账号：{{ preview.account_name }} · {{ preview.settings.season_id ? '合集 ID '+preview.settings.season_id : '不加入合集' }}</p><p v-if="mode==='publish'">{{ preview.settings.visibility==='self'?'仅自己可见':'公开可见' }} · {{ preview.settings.publish_at?new Date(preview.settings.publish_at*1000).toLocaleString('zh-CN')+' 定时发布':'完成上传后提交审核' }}</p><p class="muted">{{ mode==='publish'?'确认后连续完成制作、上传和投稿，不再二次询问。':mode==='draft'?'制作完成后准备本地草稿，不上传、不投稿。':'仅生成所列成片，不上传、不投稿。' }}</p></section>
           <n-alert v-if="preview.blockers.length" type="warning" title="还需处理"><div v-for="item in preview.blockers" :key="item">{{ item }}</div></n-alert>
           <details v-if="preview.warnings.length"><summary>运行说明</summary><p v-for="item in preview.warnings" :key="item">{{ item }}</p></details>
         </template>
       </div>
-      <template #footer><PublicationRightsHint v-if="mode==='publish'"/><div class="run-row run-actions"><n-button :disabled="busy&&!checking" @click="close">{{ checking?'取消检查':'取消' }}</n-button><n-button :disabled="busy" @click="inspect">重新检查</n-button><n-button type="primary" :loading="busy&&!!preview" :disabled="!canConfirm" @click="confirmStart">{{ selectedRun?'确认继续 · ':'' }}{{ confirmLabel }}</n-button></div></template>
+      <template #footer><PublicationRightsHint v-if="mode==='publish'"/><div class="run-row run-actions"><n-button :disabled="busy&&!checking" @click="close">{{ checking?'取消检查':'取消' }}</n-button><n-button :disabled="busy" @click="inspect">重新检查</n-button><n-button type="primary" :loading="busy&&!!preview" :disabled="!canConfirm" @click="confirmStart">{{ confirmLabel }}</n-button></div></template>
     </n-drawer-content>
   </n-drawer>
 </template>

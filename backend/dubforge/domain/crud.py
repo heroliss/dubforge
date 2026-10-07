@@ -481,6 +481,7 @@ def _write_manifest(uid: str) -> None:
         "steps": [{"key": s.step_key, "status": s.status,
                    # 指纹 = "已最新可跳过"的判断依据, 一并入 manifest (重建索引时恢复)
                    "fingerprint": s.input_fingerprint or None,
+                   "input_snapshot": s.input_snapshot or "{}",
                    "error": s.error_message or None} for s in steps],
         # 每步骤产物清单: file 为相对项目目录路径; 绝对路径 = 外部引用文件
         "artifacts": by_step,
@@ -594,6 +595,9 @@ def rebuild_from_dirs() -> dict:
                               input_fingerprint=(st.get("fingerprint")
                                                  if isinstance(st.get("fingerprint"), str)
                                                  else ""),
+                              input_snapshot=(st.get("input_snapshot")
+                                              if isinstance(st.get("input_snapshot"), str)
+                                              else "{}"),
                               error_message=(st.get("error")
                                              if isinstance(st.get("error"), str)
                                              else "")))

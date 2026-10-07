@@ -4,8 +4,10 @@ import { NAlert, NButton, NInput, NTag, useDialog } from 'naive-ui'
 import ConfigurationForm from './ConfigurationForm.vue'
 import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import { SOURCE_STYLES } from '../utils/configurationSource'
+import { checkConfigurationEditability, useConfigurationEditability } from '../utils/configurationEditability'
 
 const props = defineProps<{ scope: string }>()
+const editability = useConfigurationEditability(() => props.scope)
 const emit = defineEmits<{
   select: [scope: string]
   'dirty-change': [value: boolean]
@@ -47,7 +49,7 @@ async function create() {
   if (key) emit('select', key)
 }
 function archive(row: any) {
-  if (locked.value || dirty.value) return
+  if (locked.value || dirty.value || props.scope === row.key && editability.locked.value) return
   dialog.warning({
     title: row.archived ? '恢复系列模板？' : '归档系列模板？',
     content: '已绑定项目继续继承原设置；归档后不能被新项目选择。不会删除B站合集或视频。',
@@ -56,6 +58,7 @@ function archive(row: any) {
       if (locked.value || dirty.value) return false
       busy.value = true; error.value = ''; let completed = false
       try {
+        if (editability.observing.value && !await checkConfigurationEditability(row.key)) { error.value = '模板影响的项目正在运行，或未能核对运行状态；暂不能归档或恢复。'; return false }
         await api(`/${encodeURIComponent(row.key)}/archive`, { revision: row.revision, archived: !row.archived })
         completed = true; await refresh()
       } catch (e: any) { error.value = e.message }
@@ -77,7 +80,7 @@ onMounted(refresh)
         <div class="series-heading" :style="{color:SOURCE_STYLES.series.color}">系列模板 <span>{{ rows.filter(row => !row.archived).length }}</span></div>
         <div v-for="row in rows" :key="row.key" class="template-item">
           <button class="scope-button" :class="{ selected: scope === row.key }" :aria-pressed="scope === row.key" :disabled="locked" @click="choose(row.key)"><strong :style="{color:SOURCE_STYLES.series.color}">{{ row.name }}</strong><small>{{ row.project_count }} 个项目 <n-tag v-if="row.archived" size="tiny">已归档</n-tag></small></button>
-          <n-button text size="tiny" :disabled="dirty || locked" @click="archive(row)">{{ row.archived ? '恢复' : '归档' }}</n-button>
+          <n-button text size="tiny" :disabled="dirty || locked || scope === row.key && editability.locked.value" :title="scope === row.key ? editability.reason.value : undefined" @click="archive(row)">{{ row.archived ? '恢复' : '归档' }}</n-button>
         </div>
         <div class="new-template"><n-input v-model:value="name" placeholder="新模板名称" :input-props="{ 'aria-label': '新模板名称' }" maxlength="80" :disabled="locked || dirty" @keydown.enter="create"/><n-button :disabled="!name.trim() || locked || dirty" :loading="busy" @click="create">新建</n-button></div>
       </aside>

@@ -15,12 +15,60 @@ from pathlib import Path
 from typing import Callable
 
 import httpx
+import soundfile as sf
 
-from dubforge.errors import ServiceOfflineError
+from dubforge.errors import DubForgeError, ServiceOfflineError
 from dubforge.utils.fs import atomic_replace
 
 # WebUI 枚举 (中英双语界面兼容)
 METHOD_SAME = "与音色参考音频相同"
+# IndexTTS 的 Kaldi fbank 以 16 kHz、25 ms 帧提取参考特征；不足一帧会触发断言。
+MINIMUM_REFERENCE_SECONDS = .025
+
+
+class ReferenceAudioError(DubForgeError):
+    code = 'REF_AUDIO_INVALID'
+    suggestion = '请检查本句时间轴与原声文件，或为本句选择同一说话人的有效参考音频后重试。'
+
+
+class IndexTTSRequestError(DubForgeError):
+    code = 'TTS_REQUEST_FAILED'
+
+
+class IndexTTSAudioError(DubForgeError):
+    code = 'TTS_AUDIO_INVALID'
+
+
+def validate_reference(path: Path, label: str, *, minimum_seconds: float = 0) -> None:
+    """切片检查可读帧，上传模型时另核对最低特征帧时长。"""
+    try:
+        info = sf.info(str(path))
+    except (OSError, RuntimeError, ValueError) as exc:
+        # librosa 也能通过 FFmpeg 读取 m4a 等格式；不能因 libsndfile 不支持而拒绝有效预设。
+        try:
+            if not path.is_file() or path.stat().st_size == 0:
+                raise ValueError('参考文件不存在或为空')
+            decoded = subprocess.run(['ffmpeg', '-v', 'error', '-i', str(path), '-t', '0.1',
+                '-ar', '16000', '-ac', '1', '-f', 's16le', 'pipe:1'],
+                check=True, capture_output=True, timeout=15)
+            if len(decoded.stdout) < 2:
+                raise ValueError('音频没有有效采样帧')
+            duration = (len(decoded.stdout) // 2) / 16000
+        except (OSError, subprocess.SubprocessError, ValueError) as decode_error:
+            detail = (decode_error.stderr.decode('utf-8', errors='replace')
+                      if isinstance(decode_error, subprocess.CalledProcessError) and decode_error.stderr
+                      else str(decode_error))
+            raise ReferenceAudioError(f'{label}参考音频无效或没有音频帧：{path}',
+                                      detail=detail) from exc
+    else:
+        if info.frames <= 0 or info.samplerate <= 0 or not math.isfinite(info.duration) or info.duration <= 0:
+            raise ReferenceAudioError(f'{label}参考音频无效或没有音频帧：{path}',
+                                      detail='音频没有有效采样帧')
+        duration = info.duration
+    if duration < minimum_seconds:
+        raise ReferenceAudioError(
+            f'{label}参考音频过短：{duration:.6f} 秒；IndexTTS 至少需要 {minimum_seconds:g} 秒参考音频。',
+            detail={'path': str(path), 'duration_seconds': duration, 'minimum_seconds': minimum_seconds})
 
 
 def synthesis_profiles() -> list[dict]:
@@ -114,6 +162,12 @@ def synth(url: str, text: str, out_path: Path, lang: str,
           check_cancel=lambda: None, timeout_seconds=300) -> Path:
     """合成一句; 返回 out_path (原子落盘由调用方保证临时名)"""
     from gradio_client import Client, handle_file
+    from gradio_client.exceptions import AppError
+
+    check_cancel()
+    validate_reference(timbre_ref, '音色', minimum_seconds=MINIMUM_REFERENCE_SECONDS)
+    if emo_ref is not None and emo_mode in {'preset', 'stable', 'dynamic'}:
+        validate_reference(emo_ref, '情感', minimum_seconds=MINIMUM_REFERENCE_SECONDS)
 
     if not is_online(url):
         raise ServiceOfflineError(
@@ -153,15 +207,13 @@ def synth(url: str, text: str, out_path: Path, lang: str,
         kwargs[f"vec{i + 1}"] = float(vec[i]) if emo_mode == "vector" and i < len(vec) else 0.0
 
     from dubforge.tts_requests import Request
-    from dubforge.errors import DubForgeError
-    check_cancel()
     request = Request(url)
     try:
         client = Client(url, ssl_verify=False, verbose=False,
                         httpx_kwargs={'timeout': 30, 'trust_env': False})
-    except Exception:
+    except Exception as exc:
         request.finish()
-        raise ServiceOfflineError('无法建立 IndexTTS 连接，请检查服务状态') from None
+        raise ServiceOfflineError('无法建立 IndexTTS 连接，请检查服务状态', detail=str(exc)) from exc
     job = None
     try:
         check_cancel()
@@ -169,12 +221,22 @@ def synth(url: str, text: str, out_path: Path, lang: str,
         result = _result_with_progress(job, progress or (lambda value: None),
             check_cancel=check_cancel, timeout_seconds=timeout_seconds)
     except BaseException as exc:
-        if job is not None:
+        # AppError 来自服务的最终失败回执；客户端 Future.done() 也可能只是断线，不能据此释放。
+        if job is not None and not isinstance(exc, AppError):
             request.detach(job, client, log)
         if isinstance(exc, DubForgeError) or not isinstance(exc, Exception):
             raise
-        raise DubForgeError('IndexTTS 请求失败，请检查服务日志', code='TTS_REQUEST_FAILED',
-                           detail=str(exc)) from exc
+        if isinstance(exc, AppError):
+            hidden = 'has not enabled verbose error reporting' in str(exc)
+            message = ('IndexTTS 服务端合成失败；服务未返回原因，请查看配音服务日志' if hidden
+                       else f'IndexTTS 服务端合成失败：{exc}')
+            suggestion = ('请检查当前句的时间轴与参考音频，再查看配音服务日志中的原始异常。'
+                          '本次请求已经结束，修复原因后可以补齐配音，无需为此重启服务。')
+        else:
+            message = f'IndexTTS 请求失败：{exc}'
+            from dubforge.tts_requests import RECOVERY_HINT
+            suggestion = RECOVERY_HINT
+        raise IndexTTSRequestError(message, suggestion=suggestion, detail=str(exc)) from exc
     finally:
         if not request.detached:
             request.finish()
@@ -192,7 +254,8 @@ def synth(url: str, text: str, out_path: Path, lang: str,
                 out = cand
                 break
     if not out or not Path(str(out)).exists():
-        raise RuntimeError(f"IndexTTS 返回值中未找到音频: {result!r}")
+        raise IndexTTSAudioError('IndexTTS 已结束请求，但返回值中没有可读取的音频',
+                                detail=repr(result))
 
     # 统一转 32k mono wav (铺轨/试听的公共格式), 临时名 → 原子替换
     tmp = out_path.with_suffix(".wav.tmp")

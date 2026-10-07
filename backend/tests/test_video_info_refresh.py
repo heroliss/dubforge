@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from dubforge import video_info as vi
+from dubforge.runtime_edit import RuntimeEditError
 from dubforge.domain import crud
 from dubforge.runner import compute_fingerprint, runner
 
@@ -225,12 +226,13 @@ def test_refresh_occupancy_blocks_duplicate_download_and_delete(project, source,
         try:
             assert started.wait(5)
             assert vi.view(project.uid)['busy'] == 'refresh'
-            for operation in [lambda: vi.update(project.uid, 'refresh'),
-                              lambda: runner.start_step(project.uid, 'download', force=True),
-                              lambda: crud.delete_project(project.uid)]:
-                with pytest.raises(vi.VideoInfoError) as exc:
+            for operation, error, code in [
+                    (lambda: vi.update(project.uid, 'refresh'), RuntimeEditError, 'CONFIGURATION_BUSY'),
+                    (lambda: runner.start_step(project.uid, 'download', force=True), vi.VideoInfoError, 'VIDEO_INFO_BUSY'),
+                    (lambda: crud.delete_project(project.uid), vi.VideoInfoError, 'VIDEO_INFO_BUSY')]:
+                with pytest.raises(error) as exc:
                     operation()
-                assert exc.value.code == 'VIDEO_INFO_BUSY'
+                assert exc.value.code == code
         finally:
             release.set()
         assert future.result(timeout=5)['title_original'] == 'Source title'
@@ -268,6 +270,6 @@ def test_download_in_progress_rejects_refresh(project):
     step = crud.get_step(project.id, 'download')
     step.status = 'queued'
     crud.save_step(step)
-    with pytest.raises(vi.VideoInfoError) as exc:
+    with pytest.raises(RuntimeEditError) as exc:
         vi.update(project.uid, 'refresh')
-    assert exc.value.code == 'VIDEO_INFO_DOWNLOAD_BUSY'
+    assert exc.value.code == 'CONFIGURATION_BUSY'

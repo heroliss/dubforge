@@ -121,6 +121,11 @@ def _uploaded(session, key, account):
         videos.append(dict(cid=value['cid'], filename=value['filename'], title=part['title']))
     if not videos:
         raise pub.PublishError('上传清单为空')
+    # 上传回执只证明文件已传送；新增规则或校对后，旧文件仍需重新核对。
+    from dubforge.content_review_service import assert_snapshot
+    assert_snapshot(snap)
+    from dubforge.publishing.review_draft import assert_snapshot_current
+    assert_snapshot_current(snap)
     return row, snap, videos
 
 
@@ -236,7 +241,8 @@ def _finish(session, row, result):
 def commit(account, key, body):
     if body != {'confirmed': True} or body.get('confirmed') is not True:
         raise pub.PublishError('请先预览并明确确认修改')
-    with pub._lock, Session(get_engine()) as session:
+    append_snapshot = None
+    with pub._lock, pub._execution_gate(), Session(get_engine()) as session:
         row = pub._get(session, PublishChange, key)
         if row.account_id != account:
             raise pub.PublishError('修改计划不属于当前账号')
@@ -249,11 +255,21 @@ def commit(account, key, body):
         _ensure_free(session, account, row.bvid, row.publication_id, key)
         payload = json.loads(row.payload)
         if row.publication_id:
-            publication, _, _ = _uploaded(session, row.publication_id, account)
+            publication, append_snapshot, _ = _uploaded(session, row.publication_id, account)
+            from dubforge import runtime_edit
+            runtime_edit.assert_editable('project:' + publication.project_uid)
             if publication.revision != payload['publication_revision']:
                 raise pub.PublishError('上传清单资料已变化，请重新预览')
         row.status = 'committing'; session.add(row); session.commit(); _inflight.add(key)
+    write_started = False
     try:
+        if append_snapshot is not None:
+            # 状态落库后、真正发送前再读当前审查，避免预览或上传后的规则变化绕过门禁。
+            from dubforge.content_review_service import assert_snapshot
+            assert_snapshot(append_snapshot)
+            from dubforge.publishing.review_draft import assert_snapshot_current
+            assert_snapshot_current(append_snapshot)
+        write_started = True
         result = _remote(account, 'write', {**payload, 'confirmed': True})
         if result.get('bvid') != payload['bvid'] or result.get('accepted') is not True:
             raise pub.PublishError('修改响应不完整', code='PUBLISH_WRITE_UNKNOWN')
@@ -262,12 +278,14 @@ def commit(account, key, body):
             _finish(session, row, result); session.refresh(row)
             return _public(row)
     except Exception as exc:
-        definite = getattr(exc, 'code', '') in {'PUBLISH_WRITE_NOT_SENT', 'PUBLISH_WRITE_REJECTED', 'PUBLISH_REMOTE_CHANGED', 'PUBLISH_EDIT_UNSUPPORTED'}
+        definite = not write_started or getattr(exc, 'code', '') in {'PUBLISH_WRITE_NOT_SENT', 'PUBLISH_WRITE_REJECTED', 'PUBLISH_REMOTE_CHANGED', 'PUBLISH_EDIT_UNSUPPORTED'}
         message = exc.message if isinstance(exc, DubForgeError) else '修改结果尚未确认，请先核对B站'
         with pub._lock, Session(get_engine()) as session:
             row = pub._get(session, PublishChange, key)
             row.status, row.error = ('failed' if definite else 'unknown'), message
             session.add(row); session.commit()
+        if not write_started and isinstance(exc, DubForgeError):
+            raise
         raise pub.PublishError(message, code='PUBLISH_WRITE_FAILED' if definite else 'PUBLISH_WRITE_UNKNOWN') from None
     finally:
         with pub._lock:

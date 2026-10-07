@@ -13,7 +13,7 @@ import { SOURCE_STYLES, scopeSource, sourcePresentation } from '../src/utils/con
 let server: ViteDevServer, Badge: any, Form: any, Project: any, Publish: any, Binding: any, Workspace: any
 before(async () => {
   server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false,
-    plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } })
+    plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
   ;[Badge, Form, Project, Publish, Binding, Workspace] = await Promise.all(['ConfigurationSourceBadge', 'ConfigurationForm', 'ProjectParameterForm', 'PublishSettingsForm', 'ProjectTemplateBinding', 'ConfigurationWorkspace'].map(async name => (await server.ssrLoadModule(`/src/components/${name}.vue`)).default))
 })
 after(() => server.close())
@@ -111,4 +111,47 @@ test('模板导航沿用来源色，项目绑定摘要沿用项目设置标识�
   assert.ok(html.includes(`color:${SOURCE_STYLES.global.color};`))
   assert.ok(html.includes(`color:${SOURCE_STYLES.series.color};`))
   assert.match(html, /旅行系列/)
+})
+
+test('步骤参数按有效整理模式显示适用长度，空开关默认LLM；切换不丢隐藏值或自动保存', async t => {
+  const writes:any[]=[]
+  t.mock.method(globalThis,'fetch',(_url:any,options:any)=>{
+    if(options?.body)writes.push(options.body)
+    return new Promise(()=>{})
+  })
+  const fields=[
+    {path:'split.use_llm',label:'启用 LLM 语义整理',type:'bool'},
+    {path:'split.target_word_count',label:'语义目标词数（约）',type:'int',depends_on:[['split.use_llm',true]]},
+    {path:'split.max_split_length',label:'本地单句长度（字符）',type:'int',depends_on:[['split.use_llm',false]]},
+    {path:'split.llm_profile',label:'语义整理模型',type:'str',depends_on:[['split.use_llm',true]]},
+  ]
+  for(const mode of [true,false,null,undefined]){
+    let page:any
+    const values:any={'split.target_word_count':10,'split.max_split_length':20,'split.llm_profile':'fixture'}
+    if(mode!==undefined)values['split.use_llm']=mode
+    const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(Project,{uid:'fixture',stepKey:'split'})})})
+    setup(app)
+    app.mixin({created(){if(this.$options.__name==='ProjectParameterForm'){
+      page=this.$.setupState;page.fields=fields;page.draft={...values};page.defaults={...values};page.loading=false
+      page.saved=JSON.stringify(values)
+    }}})
+    const html=await renderToString(app),useLlm=mode!==false
+    const active=fields[useLlm?1:2],inactive=fields[useLlm?2:1]
+    assert.ok(html.includes(active.label))
+    assert.ok(!html.includes(inactive.label))
+    assert.match(html,/语义整理模型/,'其它depends_on字段保持显示')
+    assert.equal(page.disabledField(active),false)
+    assert.equal(page.disabledField(inactive),true)
+    page.editField('split.use_llm',true)
+    page.editField('split.target_word_count',14)
+    page.editField('split.use_llm',false)
+    assert.deepEqual(page.groups.flatMap((group:any)=>group.fields.map((field:any)=>field.path)),['split.use_llm','split.max_split_length','split.llm_profile'])
+    assert.equal(page.draft['split.max_split_length'],20)
+    page.editField('split.use_llm',true)
+    assert.deepEqual(page.groups.flatMap((group:any)=>group.fields.map((field:any)=>field.path)),['split.use_llm','split.target_word_count','split.llm_profile'])
+    assert.equal(page.draft['split.target_word_count'],14)
+    assert.equal(page.draft['split.max_split_length'],20)
+    assert.equal(page.dirty,true)
+  }
+  assert.equal(writes.length,0)
 })

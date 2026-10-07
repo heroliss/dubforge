@@ -171,6 +171,20 @@ def prepare_burn_filter(ctx, video, source, start=None, duration=None):
     import uuid
     from dubforge.pipeline.step_subtitles import build_tracks
     canvas = video_canvas(video)
+    if ctx.cfg('content_review.enabled', True):
+        # 旧导出文件可能尚未更新；烧录始终从已筛查的统一稿重新生成临时字幕。
+        track = ctx.cfg('assemble.subtitle_track', 'trans')
+        tracks, _ = build_tracks(ctx, mode={'trans': 'target', 'source': 'source', 'bilingual': 'bilingual'}[track])
+        name = '.subtitle_' + uuid.uuid4().hex
+        lines = tracks[track + '.srt']
+        if start is not None and not separate_source_style(ctx.cfg):
+            from dubforge.utils.srt import SubLine
+            lines = [SubLine(l.index, max(0.0, l.start-start), min(l.end, start+duration)-start, l.text)
+                     for l in lines if l.end > start and l.start < start+duration]
+        graph = prepare_subtitle_lines(lines, ctx.cfg, canvas, source.parent, name=name,
+            start=start or 0 if separate_source_style(ctx.cfg) else 0,
+            end=start + duration if separate_source_style(ctx.cfg) and start is not None else None)
+        return graph, source.parent / (name + ('.ass' if separate_source_style(ctx.cfg) else '.srt'))
     if separate_source_style(ctx.cfg):
         track = ctx.cfg('assemble.subtitle_track', 'trans')
         tracks, _ = build_tracks(ctx, mode='target' if track == 'trans' else track)

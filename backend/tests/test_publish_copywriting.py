@@ -7,6 +7,7 @@ from sqlmodel import Session
 
 from dubforge.db import get_engine
 from dubforge.domain import crud
+from dubforge.errors import DubForgeError
 from dubforge.publishing import copywriting, service
 from dubforge.publishing.models import Publication, PublishAccount
 
@@ -67,19 +68,21 @@ def test_ai_invalid_requests_do_not_call_model(draft, body):
         service.suggest(draft['id'], body)
 
 
-def test_ai_concurrent_generation_and_midflight_edit(draft, monkeypatch):
+def test_ai_concurrent_generation_locks_draft_and_releases_after_completion(draft, monkeypatch):
     def fake(*a, **k):
         with pytest.raises(service.PublishError) as caught:
             service.suggest(draft['id'], {'revision': 1})
         assert caught.value.code == 'PUBLISH_AI_BUSY'
-        service.save(draft['id'], dict(draft['draft'], revision=1, overrides={'title': '手动新标题'}))
+        with pytest.raises(DubForgeError) as caught:
+            service.save(draft['id'], dict(draft['draft'], revision=1, overrides={'title': '手动新标题'}))
+        assert caught.value.code == 'CONFIGURATION_BUSY'
         return COPY.copy()
     monkeypatch.setattr(copywriting.llm, 'chat_json', fake)
-    with pytest.raises(service.PublishError) as caught:
-        service.suggest(draft['id'], {'revision': 1})
-    assert caught.value.code == 'PUBLISH_CONFLICT'
-    assert service.view(draft['id'])['draft']['overrides']['title'] == '手动新标题'
+    assert service.suggest(draft['id'], {'revision': 1})['revision'] == 1
+    assert service.view(draft['id'])['draft']['overrides'] == {}
     assert draft['id'] not in service._suggesting
+    saved = service.save(draft['id'], dict(draft['draft'], revision=1, overrides={'title': '完成后手动新标题'}))
+    assert saved['draft']['overrides']['title'] == '完成后手动新标题'
 
 
 def test_ai_timeout_or_failure_releases_busy_guard(draft, monkeypatch):

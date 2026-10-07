@@ -6,7 +6,7 @@ import PublishCollectionCreate from './PublishCollectionCreate.vue'
 import PublishPlatformAssist from './PublishPlatformAssist.vue'
 import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import type { ConfigurationSource } from '../utils/configurationSource'
-const props = withDefaults(defineProps<{ values: any; overrides: any; sourcePublishedDate?: string; sources?: Record<string, ConfigurationSource>; metadata?: any; metadataLoading?: boolean; metadataError?: string; metadataReady?: boolean; metadataAccount?: string; metadataAccountName?: string; coverId?: string; contextKey?: string; hasAiDubbing?: boolean; disabled?: boolean; template?: boolean }>(), { metadata: () => ({}), sources: () => ({}) })
+const props = withDefaults(defineProps<{ values: any; overrides: any; sourcePublishedDate?: string; sources?: Record<string, ConfigurationSource>; metadata?: any; metadataLoading?: boolean; metadataError?: string; metadataReady?: boolean; metadataAccount?: string; metadataAccountName?: string; coverId?: string; contextKey?: string; hasAiDubbing?: boolean; disabled?: boolean; template?: boolean; fieldKeys?: string[]; restoreLabels?: Record<string, string>; showMore?: boolean; showPlatformAssist?: boolean }>(), { metadata: () => ({}), sources: () => ({}), restoreLabels: () => ({}), showMore: true, showPlatformAssist: true })
 const emit = defineEmits<{ change: [key: string, value: any]; inherit: [key: string]; collectionCreated: [value: any]; refreshMetadata: [] }>()
 const message = useMessage()
 const datedDescription = computed(() => withSourcePublishedDate(props.values.description || '', props.sourcePublishedDate || ''))
@@ -32,7 +32,8 @@ function emptyOptions(kind: string) {
   return kind === 'season' ? '此账号暂无可用合集，可先在B站创建' : kind === 'section' ? '所选合集暂无可用小节' : '平台未返回可用选项，请刷新重试'
 }
 const labels: Record<string, string> = { title: '标题', description: '简介', tags: '标签', human_type2: '分区', copyright: '稿件类型', source: '原视频来源', declaration_id: '创作声明', visibility: '可见范围', season_id: '合集', section_id: '合集小节', publish_at: '定时发布', dynamic: '粉丝动态' }
-const fields = computed(() => Object.keys(labels).filter(key => !props.template || !['title', 'description', 'source', 'dynamic', 'publish_at'].includes(key)))
+const fields = computed(() => Object.keys(labels).filter(key => (!props.fieldKeys || props.fieldKeys.includes(key))
+  && (!props.template || !['title', 'description', 'source', 'dynamic', 'publish_at'].includes(key))))
 const switches = { watermark: '添加B站水印', close_comments: '关闭评论', close_danmaku: '关闭弹幕', selected_comments: '开启精选评论' }
 function select(key: string, value: any) {
   emit('change', key, value)
@@ -46,7 +47,7 @@ function select(key: string, value: any) {
 <template>
   <div class="publish-fields">
     <div v-for="key in fields" :key="key" class="publish-field" role="group" :aria-label="labels[key]" :class="{ wide: ['title', 'description', 'tags', 'dynamic', 'source'].includes(key) }">
-      <span class="field-heading"><span>{{ labels[key] }}</span><span class="origin"><n-button v-if="key === 'description' && needsSourceDate && !disabled" text size="tiny" :title="`从平台资料补入 ${sourcePublishedDate}，仅修改当前简介，不会自动保存或投稿`" @click="insertPublishedDate">补入原视频日期</n-button><ConfigurationSourceBadge :source="sources[key]" :inherited="!(key in overrides)"/><n-button v-if="key in overrides && !disabled" text size="tiny" @click.prevent="emit('inherit', key)">恢复继承</n-button></span></span>
+      <span class="field-heading"><span>{{ labels[key] }}</span><span class="origin"><n-button v-if="key === 'description' && needsSourceDate && !disabled" text size="tiny" :title="`从平台资料补入 ${sourcePublishedDate}，仅修改当前简介，不会自动保存或投稿`" @click="insertPublishedDate">补入原视频日期</n-button><ConfigurationSourceBadge :source="sources[key]" :inherited="!(key in overrides)"/><n-button v-if="key in overrides && !disabled" text size="tiny" @click.prevent="emit('inherit', key)">{{ restoreLabels[key] || '恢复继承' }}</n-button></span></span>
       <n-input v-if="['title', 'description', 'source', 'dynamic'].includes(key)" :value="values[key]" :disabled="disabled" :input-props="{ 'aria-label': labels[key] }" :type="['description', 'dynamic'].includes(key) ? 'textarea' : 'text'" :autosize="{ minRows: 3, maxRows: 8 }" :maxlength="key === 'title' ? 80 : key === 'description' ? 2000 : key === 'source' ? 200 : 233" show-count @update:value="emit('change', key, $event)" />
       <n-dynamic-tags v-else-if="key === 'tags'" :value="values.tags" :disabled="disabled" :max="10" @update:value="emit('change', key, $event)" />
       <n-select v-else-if="key === 'human_type2'" :value="values.human_type2 || null" :options="categories" :disabled="disabled" :loading="metadataLoading" filterable placeholder="选择分区" @update:value="select(key, $event || 0)"><template #empty>{{ emptyOptions('category') }}</template></n-select>
@@ -66,8 +67,8 @@ function select(key: string, value: any) {
       <n-date-picker v-else-if="key === 'publish_at'" :value="values.publish_at ? values.publish_at * 1000 : null" type="datetime" clearable :disabled="disabled" placeholder="留空则立即提交审核" @update:value="emit('change', key, $event ? Math.floor($event / 1000) : null)" />
     </div>
   </div>
-  <PublishPlatformAssist v-if="!template" :account-id="metadataAccount || ''" :values="values" :disabled="disabled" @change="(key,value) => emit('change',key,value)" />
-  <details class="publish-more"><summary>更多设置 · 水印与互动</summary><div class="switch-grid">
+  <PublishPlatformAssist v-if="!template && showPlatformAssist" :account-id="metadataAccount || ''" :values="values" :disabled="disabled" @change="(key,value) => emit('change',key,value)" />
+  <details v-if="showMore" class="publish-more"><summary>更多设置 · 水印与互动</summary><div class="switch-grid">
     <div v-for="(label, key) in switches" :key="key" class="switch-row" role="group" :aria-label="label"><span>{{ label }}<small class="switch-source"><ConfigurationSourceBadge :source="sources[key]" :inherited="!(key in overrides)"/></small><small v-if="key === 'watermark' && values.copyright === 2">转载稿件不提交此选项</small></span><n-switch :aria-label="label" :value="key === 'watermark' && values.copyright === 2 ? false : values[key]" :disabled="disabled || (key === 'watermark' && values.copyright === 2)" @update:value="emit('change', key, $event)" /><n-button v-if="key in overrides && !disabled" text size="tiny" :aria-label="`${label}恢复继承`" @click.stop="emit('inherit', key)">恢复继承</n-button></div>
   </div></details>
 </template>

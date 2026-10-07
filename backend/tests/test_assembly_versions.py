@@ -191,10 +191,19 @@ def test_manifest_recovery_preserves_version_identity_and_missing_files(make_pro
     from sqlmodel import select
     from dubforge.domain.models import Project, Artifact, Job, StepRun
     from dubforge.pipeline.assembly_models import AssemblyResult
+    pending=[]
+    submit=runner._pool.submit
+    def track(*args,**kwargs):
+        future=submit(*args,**kwargs)
+        pending.append(future)
+        return future
+    monkeypatch.setattr(runner._pool,'submit',track)
     uid,root=_prepare_outputs_project(make_project,monkeypatch)
     av.save(uid,dict(revision=0,versions=[definition()]))
     plan=av.plan(uid,{'version_ids':['chinese']})
     runner.start_versions(uid,{'version_ids':['chinese'],'fingerprint':plan['fingerprint']});wait(uid)
+    # done及current_job清除早于worker末尾的清单/项目状态写入；破坏数据库前必须等完整收尾。
+    for future in pending:future.result(timeout=30)
     crud.write_manifest(uid)
     manifest=json.loads((root/'manifest.json').read_text(encoding='utf-8'))
     assert manifest['configuration']['values']['assembly.versions'][0]['id']=='chinese'

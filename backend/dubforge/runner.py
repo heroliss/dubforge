@@ -135,7 +135,7 @@ class StepContext:
         self._progress_provider = None
         self._progress_phase = ("", False)
         self._progress_lock = threading.RLock()
-        # 运行期间固定配置快照。设置页允许随时编辑，但不能让同一轮任务
+        # 运行期间固定配置快照。编辑门禁仍不能替代快照，避免外部文件修改让同一轮任务
         # 的后续窗口突然换模型/参数，否则会表现为“模型重新开始思考”或
         # 同一任务前后结果不可复现。下一次运行才读取新配置。
         self._config_snapshot = copy.deepcopy(config.load_config())
@@ -148,7 +148,7 @@ class StepContext:
         profile_names = [str(p.get("name") or "(未命名)")
                          for p in (llm_cfg.get("profiles") or [])
                          if isinstance(p, dict) and p.get("enabled", True)]
-        self.log("🔒 本次运行已固定配置快照；运行中修改设置只对下一次运行生效"
+        self.log("🔒 本次运行已固定配置快照；运行期间设置与勾选项已锁定（实时显示设置除外）"
                  + (f"（启用 LLM 配置: {'、'.join(profile_names)}）"
                     if profile_names else ""))
 
@@ -157,6 +157,13 @@ class StepContext:
         if self._job is not None:
             self._job.task_data = json.dumps(self.task_data, ensure_ascii=False)
             crud.update_job(self._job)
+
+    def dependencies(self, *, assemble_variants=None):
+        """执行校验与输入记录使用本轮冻结配置，不重新读取运行中修改的设置。"""
+        from dubforge.pipeline.dependencies import Dependencies
+        return Dependencies(self.project, assemble_variants=assemble_variants,
+                            settings=self._config_snapshot,
+                            overrides=self._project_step_params_snapshot)
 
     # ---- 日志 (带时间戳追加; 立即落盘, 崩溃后可读到最后状态) ----
     def log(self, msg: str) -> None:
@@ -478,8 +485,8 @@ def _cfg_snapshot(cfg_keys: tuple[str, ...], overrides: dict | None = None, *, s
     return snap
 
 
-def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, legacy=False) -> str:
-    """输入指纹 = 配置、上游产物以及首步源输入的稳定快照。"""
+def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False) -> dict:
+    """指纹的唯一输入表示；更新原因复用此数据，避免另写一套失效规则。"""
     from dubforge.pipeline.dependencies import Dependencies
     deps = dependencies or Dependencies(project)
     inputs = deps.inputs(step_key)
@@ -493,7 +500,14 @@ def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, l
                 and name != "download/video_info.json"}
         if step_key == "translate":
             cfg_keys = ("translate", "llm")
-    cfg_snapshot = {key: value for key in cfg_keys if (value := deps.cfg(key)) is not None}
+    from dubforge.pipeline.config_fingerprint import snapshot
+    cfg_snapshot = snapshot(deps, step_key, keys=cfg_keys, legacy=legacy_config)
+    if step_key in {'assemble', 'subtitles'} and deps.cfg('content_review.enabled', True):
+        from dubforge.content_review import REVIEW_VERSION
+        cfg_snapshot['content_review.version'] = REVIEW_VERSION
+        for source in ('transcribe/src.srt', 'split/split.txt', 'translate/translate.txt'):
+            if source in deps.arts:
+                arts.setdefault(source, deps.arts[source])
     if step_key == 'assemble' and isinstance(cfg_snapshot.get('assemble'), dict):
         assembly = cfg_snapshot['assemble']
         if not assembly.get('subtitle_source_style_enabled') or assembly.get('subtitle_track', 'trans') == 'trans':
@@ -549,6 +563,9 @@ def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, l
     from dubforge.pipeline.subtitle_document import fingerprint as edit_fingerprint
     if edited := edit_fingerprint(project, step_key, deps.cfg):
         payload['subtitle_edits'] = edited
+    if step_key in {'assemble', 'subtitles'} and deps.cfg('content_review.enabled', True):
+        from dubforge.pipeline.subtitle_document import records
+        payload['content_review_edits'] = records(project)
     if step_key == 'assemble':
         from dubforge.pipeline.dubbing_edit import production_lines
         payload['dubbing_edit'] = [{k: l[k] for k in ('id', 'source', 'take')}
@@ -556,9 +573,15 @@ def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, l
     if step_key in {"split", "translate"}:
         from dubforge.pipeline.text_prompts import ASR_CORRECTION_VERSION
         payload["correction_prompt"] = ASR_CORRECTION_VERSION
+    if step_key == "split":
+        split_llm_value = deps.cfg("split.use_llm", True)
+        if split_llm_value is None or bool(split_llm_value):
+            from dubforge.pipeline.text_prompts import SEMANTIC_SEGMENTATION_VERSION
+            payload["semantic_segmentation"] = SEMANTIC_SEGMENTATION_VERSION
     if step_key == "translate":
-        from dubforge.pipeline.text_prompts import TRANSLATION_PROMPT_VERSION
+        from dubforge.pipeline.text_prompts import TRANSLATION_PROMPT_VERSION, TRANSLATION_WINDOW_VERSION
         payload["translation_prompt"] = TRANSLATION_PROMPT_VERSION
+        payload["translation_windows"] = TRANSLATION_WINDOW_VERSION
     if step_key == "download":
         # 下载步骤没有上游产物，必须把链接/本地源纳入指纹；否则用户替换
         # source_url 或外部文件内容后，旧的 done 会永远被错误复用。
@@ -582,6 +605,13 @@ def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, l
                 except OSError:
                     source["missing"] = True
         payload["source"] = source
+    return payload
+
+
+def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False) -> str:
+    """输入指纹 = 配置、上游产物以及首步源输入的稳定快照。"""
+    payload = fingerprint_payload(project, step_key, dependencies=dependencies,
+                                  legacy=legacy, legacy_config=legacy_config)
     return hashlib.sha256(json.dumps(payload, sort_keys=True,
                                      ensure_ascii=False).encode()).hexdigest()
 
@@ -820,6 +850,9 @@ class Runner:
             raise DubForgeError("本项目已有步骤正在运行，请完成后再运行另一步", code="PIPELINE_BUSY",
                                 suggestion="同一项目依次执行；不同项目可并行处理。")
 
+        from dubforge import runtime_edit
+        runtime_edit.check_idle(uid, allow_owned=True, retry_step=step_key)
+
         # 按当前设置检查实际需要的文件，缺失或过期均在入队前说明。
         from dubforge.pipeline.dependencies import Dependencies
         task_data = task_data or {}
@@ -961,6 +994,35 @@ class Runner:
                     raise StepCancelled("步骤在排队时被取消")
                 if step is None:
                     raise StepCancelled("项目已删除, 结果丢弃")
+                # 入队与真正执行之间设置可能改变；记录实际执行快照，不能把
+                # 入队指纹和另一时刻的配置拼成一份虚假的生成历史。
+                scoped_outputs = ctx.task_data.get('scope') in {'outputs', 'preview'}
+                execution_deps = ctx.dependencies(
+                    assemble_variants=ctx.task_data.get('variants') if scoped_outputs else None)
+                if ctx.task_data.get('version_specs'):
+                    execution_deps = execution_deps.with_versions(ctx.task_data['version_specs'])
+                    from dubforge.pipeline import assembly_versions
+                    fingerprint = 'versions:' + assembly_versions.digest([
+                        assembly_versions.fingerprint(execution_deps, v)
+                        for v in ctx.task_data['version_specs']])
+                else:
+                    fingerprint = compute_fingerprint(project, step_key, dependencies=execution_deps)
+                    if ctx.task_data.get('scope') == 'outputs':
+                        ctx.task_data['production_fingerprint'] = fingerprint
+                        from dubforge.pipeline.assembly_outputs import default_variants
+                        if default_variants(execution_deps.cfg)[0] in ctx.task_data['variants']:
+                            # 包含默认成品时保留流程默认输入指纹；整批明确方案的
+                            # 指纹另存任务回执，不能因多选组合让默认成品过期。
+                            fingerprint = compute_fingerprint(project, step_key, dependencies=ctx.dependencies())
+                        else:
+                            fingerprint = 'outputs:' + fingerprint
+                            if ctx.task_data.get('comment_overlay'):
+                                fingerprint = 'comments:' + hashlib.sha256((fingerprint + json.dumps(
+                                    ctx.task_data['comment_overlay'], sort_keys=True)).encode()).hexdigest()
+                        ctx.save_task_data()
+                from dubforge.pipeline.stale_explanation import capture
+                input_snapshot = capture(execution_deps, step_key, fingerprint=fingerprint,
+                                         scope=ctx.task_data.get('scope', 'full'))
                 ctx.rebuild = bool(rebuild or force
                                    or (step.input_fingerprint
                                        and step.input_fingerprint != fingerprint))
@@ -1003,6 +1065,12 @@ class Runner:
             step.progress = 100.0
             step.eta_seconds = 0.0
             step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+            if not ctx.trial_only and ctx.task_data.get('scope') != 'selected':
+                # 自动准备评论等输入在编码前才最终确定；渲染器用本轮冻结
+                # 配置捕获实际方案，成功后才能提升为正式生成历史。
+                completed_snapshot = getattr(ctx, '_completed_input_snapshot', input_snapshot)
+                step.input_snapshot = json.dumps(completed_snapshot, ensure_ascii=False)
+                step.input_fingerprint = completed_snapshot['fingerprint']
             crud.save_step(step)
             job.status = "done"
             self._retries.pop(k, None)
@@ -1209,8 +1277,8 @@ class Runner:
         with self._lock:
             ctx = self._ctxs.get((project.id, step_key))
         if ctx:
-            ctx.log("⛔ 收到停止请求：取消优先于暂停，当前原子步骤结束后退出")
-        return {"status": "cancelling", "message": "取消信号已发送, 等待步骤在下一个检查点退出"}
+            ctx.log("⛔ 收到停止请求：正在取消网络请求并安全收尾；进程内计算在检查点退出")
+        return {"status": "cancelling", "message": "取消信号已发送；网络请求将主动中断，进程内计算在检查点退出"}
 
     def pause_step(self, uid: str, step_key: str, pause: bool = True,
                    expected_job_id: int | None = None) -> dict:
@@ -1272,7 +1340,7 @@ class Runner:
             pending_retry[0].set()
         if ctx:
             ctx.kill_all_subprocesses()
-            ctx.log("⛔ 收到强制结束: 已终止全部可终止子进程；正在等待的同步请求返回后将丢弃结果")
+            ctx.log("⛔ 收到强制结束: 已终止全部可终止子进程并请求取消网络等待；其余后台结果将丢弃")
         with self._lock:
             self._abandoned.add(k)
         if job is not None:      # 就地改内存对象, 防心跳把状态写回 running
@@ -1342,7 +1410,7 @@ class Runner:
         step.started_at = datetime.datetime.now(datetime.timezone.utc)
         step.finished_at = None
         step.error_code = step.error_message = step.error_suggestion = ""
-        if not ctx.trial_only:
+        if not ctx.trial_only and ctx.task_data.get('scope') != 'selected':
             step.input_fingerprint = fingerprint
         step.progress = 0.0
         step.eta_seconds = 0.0
@@ -1490,7 +1558,8 @@ class Runner:
         # 与参数保存共用编辑锁，并遵循启动锁在前的顺序。只回写最新项目，
         # 不能用步骤开始时的旧对象覆盖用户在长任务期间保存的资料。
         from dubforge.pipeline import dubbing_session
-        with self._start_lock, dubbing_session.gate:
+        from dubforge import runtime_edit
+        with self._start_lock, dubbing_session.gate, runtime_edit.pipeline_writes(ctx):
             return self._continue_chain(project.uid, ctx)
 
     def _continue_chain(self, uid: str, ctx: StepContext | None = None) -> dict:
@@ -1510,7 +1579,7 @@ class Runner:
             if not chain:
                 if "_chain" in params:
                     # 跑完的空链: 清理计划三键, 项目回到无链状态。
-                    for key in ("_chain", "_chain_state", "_chain_hold"):
+                    for key in ("_chain", "_chain_state", "_chain_hold", "_chain_resume_plan"):
                         params.pop(key, None)
                     project.params = json.dumps(params, ensure_ascii=False)
                     crud.save_project(project)
@@ -1529,6 +1598,9 @@ class Runner:
                 crud.save_project(project)
                 continue
             try:
+                if snapshot := params.get('_chain_resume_plan'):
+                    from dubforge.chain_recovery import check_execution
+                    check_execution(project.uid, snapshot, chain)
                 r = self.start_step(project.uid, head)
             except DubForgeError as e:
                 self._hold_chain(project, head, e.code,
@@ -1670,6 +1742,7 @@ class Runner:
             if params.pop("_chain", None) is not None:
                 params.pop("_chain_state", None)
                 params.pop("_chain_hold", None)
+                params.pop("_chain_resume_plan", None)
                 latest.params = json.dumps(params, ensure_ascii=False)
                 crud.save_project(latest)
                 logger.info("自动续跑已停止 (%s): 项目 %s", reason, project.uid)

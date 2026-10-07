@@ -6,6 +6,7 @@
 import re
 import runpy
 import sys
+from functools import wraps
 from pathlib import Path
 
 
@@ -50,11 +51,27 @@ def main():
     import gradio as gr
     from gradio.context import LocalContext
     enable_progress(gr.Progress, LocalContext)
+    enable_error_details(gr.Blocks)
     script = Path(sys.argv[1]).resolve()
     sys.argv = [str(script), *sys.argv[2:]]
     sys.path.insert(0, str(script.parent))
     print('DubForge：已启用 IndexTTS 迭代进度上报', flush=True)
     runpy.run_path(str(script), run_name='__main__')
+
+
+def enable_error_details(blocks_class):
+    """只对本程序管理的服务启用原始错误回执，不修改第三方 WebUI 文件。"""
+    if getattr(blocks_class.launch, '_dubforge_diagnostics', False):
+        return
+    launch = blocks_class.launch
+
+    @wraps(launch)
+    def with_details(self, *args, **kwargs):
+        kwargs.setdefault('show_error', True)
+        return launch(self, *args, **kwargs)
+
+    with_details._dubforge_diagnostics = True
+    blocks_class.launch = with_details
 
 
 if __name__ == '__main__':

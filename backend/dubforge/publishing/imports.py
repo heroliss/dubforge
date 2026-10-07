@@ -48,14 +48,13 @@ def apply(account, body):
         raise pub.PublishError('导入候选已丢失，请重新读取') from None
     if doc.get('account_id') != account or pub._hash([account, doc.get('kind'), doc.get('data')]) != key:
         raise pub.PublishError('导入候选与账号不匹配')
-    from dubforge.runner import runner
+    from dubforge import runtime_edit
     # 与启动步骤同锁顺序，避免正在读取导入字幕时切换来源。
-    with runner._start_lock, video_info.gate:
+    uid = body['project_uid']
+    if not isinstance(uid, str) or not uid:
+        raise pub.PublishError('请选择有效的目标项目')
+    with runtime_edit.editing('project:' + uid), video_info.gate:
         project = pub._project(body['project_uid'])
-        video_info.check_idle(project.uid)
-        if any(s.status in {'queued', 'running'} or runner.current_job_id(project.id, s.step_key) is not None
-               for s in crud.get_steps(project.id)):
-            raise pub.PublishError('项目正在运行，请完成或停止后导入')
         root, data = crud.project_dir_by_project(project), doc['data']
         if doc['kind'] == 'comments':
             destination = root / 'imports/bilibili_comments.json'

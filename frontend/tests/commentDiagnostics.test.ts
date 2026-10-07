@@ -11,7 +11,7 @@ import { conversationRows } from '../src/utils/llmConversation.ts'
 
 let server:ViteDevServer, Panel:any
 before(async()=>{
-  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null}})
+  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null,ws:false}})
   Panel=(await server.ssrLoadModule('/src/components/CommentDiagnostics.vue')).default
   mock.method(globalThis,'fetch',()=>{throw new Error('不允许未声明请求')})
 })

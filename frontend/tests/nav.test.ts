@@ -12,6 +12,26 @@ const { useNavStore, createPinia, setActivePinia, STEP_LABELS } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`)
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
 
+test('勾选保存期间及完成后的旧项目轮询不覆盖新勾选，下一轮仍能读取当前偏好',async t=>{
+ const requests:any[]=[]
+ t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+ setActivePinia(createPinia());const nav=useNavStore()
+ try {
+  nav.enter('p');const old=requests.find(r=>r.url.endsWith('/navigation'))
+  nav.autoStepsVersion++;nav.autoStepsSaving=true;nav.autoSteps=['translate']
+  nav.autoStepsVersion++;nav.autoStepsSaving=false
+  old.resolve(new Response(JSON.stringify({title:'项目',auto_steps:['download']})));await flush()
+  assert.deepEqual(nav.autoSteps,['translate'])
+  requests.find(r=>r.url.endsWith('/steps')).resolve(new Response(JSON.stringify([
+   {key:'download',selected:true,status:'done',fresh:true},{key:'translate',selected:false,status:'done',fresh:true},
+  ])));await flush()
+  assert.equal(nav.requiredStepCount,1);assert.equal(nav.stepMap.translate.selected,true)
+  void nav.poll(false);const current=requests.filter(r=>r.url.endsWith('/navigation')).at(-1)
+  current.resolve(new Response(JSON.stringify({title:'项目',auto_steps:['split']})));await flush()
+  assert.deepEqual(nav.autoSteps,['split'])
+ }finally{nav.reset()}
+})
+
 test('慢状态请求跨过多个轮询周期也能显示，快速项目信息独立呈现', async t => {
   t.mock.timers.enable({apis: ['setInterval']})
   const requests: any[] = []
@@ -21,9 +41,11 @@ test('慢状态请求跨过多个轮询周期也能显示，快速项目信息�
   try {
     nav.enter('a')
     assert.equal(requests.length, 4)
-    requests[0].resolve(new Response(JSON.stringify({title: '中文工程', params: {}})))
+    assert.equal(requests[0].url, '/api/projects/a/navigation')
+    requests[0].resolve(new Response(JSON.stringify({title: '中文工程', auto_steps: ['tts'], chain:null})))
     await flush()
     assert.equal(nav.title, '中文工程')
+    assert.deepEqual(nav.autoSteps, ['tts'])
     assert.equal(nav.stepsLoaded, false)
     t.mock.timers.tick(6000)
     assert.equal(requests.filter(r => r.url.endsWith('/steps')).length, 1)
@@ -34,6 +56,72 @@ test('慢状态请求跨过多个轮询周期也能显示，快速项目信息�
     assert.equal(STEP_LABELS.download, '获取视频')
     assert.equal(requests.filter(r => r.url.endsWith('/steps')).length, 2)
   } finally { nav.reset() }
+})
+
+test('全局页暂停轮询并取消所有在途读取，保留侧栏快照，返回同项目立即恢复', async t=>{
+  t.mock.timers.enable({apis:['setInterval']})
+  const requests:any[]=[]
+  t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+  setActivePinia(createPinia());const nav=useNavStore()
+  try {
+    nav.$patch({uid:'a',title:'已读取的项目',status:'done',steps:[{key:'tts',selected:true,status:'done',fresh:true}]})
+    nav.enter('a')
+    requests[1].resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'running',fresh:false,job_id:8}])))
+    requests[3].resolve(new Response(JSON.stringify({run:{id:'r',status:'running'}})))
+    await flush()
+    assert.equal(requests.length,6,'步骤日志与冻结流程计划也属于可取消的后台读取')
+    nav.suspend()
+    assert.equal(nav.suspended,true);assert.equal(nav.timer,0)
+    assert.equal(nav.uid,'a');assert.equal(nav.title,'已读取的项目')
+    assert.equal(nav.stepMap.tts.status,'running');assert.equal(nav.workflow.run.id,'r')
+    for(const index of [0,2,4,5]) assert.equal(requests[index].options.signal.aborted,true)
+    t.mock.timers.tick(9000)
+    await nav.poll();await nav.refreshSteps();await nav.refreshWorkflow()
+    assert.equal(requests.length,6)
+    requests[0].resolve(new Response(JSON.stringify({title:'迟到项目',status:'done'})))
+    requests[2].resolve(new Response(JSON.stringify({status:'published'})))
+    requests[4].resolve(new Response(JSON.stringify({lines:['[12:00:00] [任务#8] 迟到动态']})))
+    requests[5].resolve(new Response(JSON.stringify({runs:[{id:'r',plan:{steps:['tts']}}]})))
+    await flush()
+    assert.equal(nav.title,'已读取的项目');assert.equal(nav.publication,null)
+    assert.deepEqual(nav.activities,{});assert.equal(nav.workflowPlan,null)
+    nav.enter('a')
+    assert.equal(nav.suspended,false);assert.ok(nav.timer)
+    assert.equal(requests.length,10,'同项目返回无需等待下个tick')
+    requests[6].resolve(new Response(JSON.stringify({title:'最新项目',status:'done',auto_steps:['tts'],chain:null})))
+    requests[7].resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'done',fresh:true}])))
+    requests[8].resolve(new Response(JSON.stringify({status:'submitted'})))
+    requests[9].resolve(new Response(JSON.stringify({run:null})))
+    await flush()
+    assert.equal(nav.title,'最新项目');assert.equal(nav.status,'done')
+    assert.equal(nav.publication.status,'submitted')
+  } finally {nav.reset()}
+})
+
+test('项目完成状态复用步骤有效性，迟到持久状态不覆盖设置过期与无选中结果', async t=>{
+  let steps:any[]=[{key:'translate',selected:true,status:'done',fresh:true}]
+  let projectResponse:any
+  t.mock.method(globalThis,'fetch',async(url:any)=>{
+    if(url.endsWith('/navigation'))return new Promise(resolve=>{projectResponse=resolve})
+    return new Response(JSON.stringify(url.endsWith('/steps')?steps:{run:null}))
+  })
+  setActivePinia(createPinia());const nav=useNavStore()
+  try {
+    nav.enter('a');await flush();assert.equal(nav.status,'done')
+    steps=[{key:'translate',selected:true,status:'done',fresh:false}]
+    await nav.refreshSteps();assert.equal(nav.status,'created')
+    projectResponse(new Response(JSON.stringify({title:'当前项目',status:'done',auto_steps:['translate'],chain:null})))
+    await flush();assert.equal(nav.status,'created','完整生成后的设置变化不能被旧持久status抹掉')
+    for(const [data,expected] of [
+      [[], 'created'],
+      [[{key:'split',selected:false,status:'done',fresh:true}], 'created'],
+      [[{key:'split',selected:true,status:'failed',fresh:false}], 'failed'],
+      [[{key:'split',selected:false,status:'failed',fresh:false},{key:'translate',selected:true,status:'done',fresh:true}], 'done'],
+      [[{key:'split',selected:false,status:'queued',fresh:false},{key:'translate',selected:true,status:'failed',fresh:false}], 'processing'],
+    ] as [any[],string][]) {
+      steps=data;await nav.refreshSteps();assert.equal(nav.status,expected)
+    }
+  } finally {nav.reset()}
 })
 
 test('切换工程丢弃旧响应，失败提供提示且重试能够恢复', async t => {
@@ -58,7 +146,7 @@ test('切换工程丢弃旧响应，失败提供提示且重试能够恢复', as
   } finally { nav.reset() }
 })
 
-test('发布状态独立轮询，切换项目丢弃旧稿件，不参与制作忙碌和完成数', async t => {
+test('发布状态独立轮询且上传锁设置，切换项目丢弃旧稿件，不参与制作完成数', async t => {
   const requests: any[] = []
   t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({url, options, resolve})))
   setActivePinia(createPinia())
@@ -69,6 +157,10 @@ test('发布状态独立轮询，切换项目丢弃旧稿件，不参与制作�
     requests.find(r => r.url === '/api/publishing/projects/new/status').resolve(new Response(JSON.stringify({id:'new',status:'uploading'})))
     await flush()
     assert.equal(nav.publication.id, 'new')
+    assert.equal(nav.busy, true)
+    nav.publication = { id:'new', status:'monitoring' }
+    assert.equal(nav.busy, false)
+    nav.publication = { id:'new', status:'checking' }
     assert.equal(nav.busy, false)
     assert.equal(nav.requiredStepCount, 0)
     assert.equal(nav.doneCount, 0)

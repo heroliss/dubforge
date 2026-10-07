@@ -10,7 +10,7 @@ from dubforge import comment_studio, environment
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.assembly_outputs import VARIANT_LABELS, dimensions
-from dubforge.pipeline.dependencies import Dependencies
+from dubforge.pipeline.recovery import RecoveryDependencies as Dependencies
 from dubforge.pipeline.registry import STEP_MAP
 from dubforge.publishing import service, transport
 
@@ -20,6 +20,12 @@ DEFAULT_RECIPE = dict(mode='draft', variants=['dub_hardsub_comments', 'src_hards
     ai_copy=True, comments_mode='saved', comment_limit=50, comment_count=10, comment_failure_policy='skip',
     comment_prompt=comment_studio.FILTER_PROMPT, comment_settings=comment_studio.DEFAULT_SETTINGS)
 LABELS = {'src': '原片 · 原声不烧录', **VARIANT_LABELS}
+
+
+def automatic_copy_fields(origins):
+    """仅默认来源允许自动补齐，明确空值也属于用户已经设置的文案。"""
+    from dubforge.publishing.copywriting import COPY_FIELDS
+    return sorted(key for key in COPY_FIELDS if origins.get(key) == '默认')
 
 
 class WorkflowError(DubForgeError):
@@ -70,25 +76,30 @@ def recipe(raw):
     return value
 
 
-def configuration_snapshot(deps, *, version_mode=False, steps=None):
+def configuration_snapshot(deps, *, version_mode=False, steps=None, legacy=False):
     # 只落不可逆指纹，不把 LLM 密钥、代理凭据写进流程数据库或 API 响应。
     # steps 限定参与指纹的步骤集合: 全流程按「剩余步骤实际消费的键」对比,
     # 与已完成步骤相关的修改不打断流程 (ADR-0075)。
-    if steps is None:
-        keys = {key for step in STEP_MAP.values() for key in step.cfg_keys}
-    else:
-        keys = {key for name in steps if name in STEP_MAP for key in STEP_MAP[name].cfg_keys}
+    from dubforge.pipeline.config_fingerprint import snapshot
+    names = list(STEP_MAP) if steps is None else [name for name in steps if name in STEP_MAP]
     if version_mode:
-        keys -= {'assemble', 'subtitles'}  # 版本呈现参数已单独冻结；不随全局样式漂移。
+        names = [name for name in names if name not in {'assemble', 'subtitles'}]
+    # 每个步骤按自己实际选择的模型取快照，固定模型组不跟随无关组漂移。
+    values = {name: snapshot(deps, name) for name in names}
+    if not legacy and (steps is None or 'comments' in steps):
+        values['comments'] = snapshot(deps, 'comments', keys=('llm', 'content_review'))
+    if legacy:
+        keys = {key for name in names for key in STEP_MAP[name].cfg_keys}
+        values = {key: deps.cfg(key) for key in sorted(keys)}
     from dubforge.pipeline.video_source import resolve_source
     local = resolve_source(deps.project, deps.root) if deps.project.source_kind == 'local' else None
     stat = local.stat() if local and local.is_file() else None
-    return dict(source=[deps.project.source_kind, deps.project.source_url, (stat.st_size, stat.st_mtime_ns) if stat else None],
-                settings={key: deps.cfg(key) for key in sorted(keys)})
+    return dict(source=[deps.project.source_kind, deps.project.source_url, [stat.st_size, stat.st_mtime_ns] if stat else None],
+                settings=values, **({} if legacy else {'schema': 2}))
 
 
-def configuration_stamp(deps, *, version_mode=False, steps=None):
-    return digest(configuration_snapshot(deps, version_mode=version_mode, steps=steps))
+def configuration_stamp(deps, *, version_mode=False, steps=None, legacy=False):
+    return digest(configuration_snapshot(deps, version_mode=version_mode, steps=steps, legacy=legacy))
 
 
 def production_checks(deps, steps, *, online=False, needs_ai=False):
@@ -186,12 +197,12 @@ def plan(uid, raw, *, online=True):
             if not _youtube(project.source_url):
                 issues.append('自动采集评论目前仅支持 YouTube 视频')
             warnings.append(f"自动采集最多{spec['comment_limit']}条评论，评分后最多上屏{spec['comment_count']}条；零条可用会暂停。")
-    issues += production_checks(deps, steps, online=online,
-        needs_ai=(spec['mode'] != 'produce' and spec['ai_copy']) or comments and spec['comments_mode'] == 'auto')
     settings, origins, account_name, cover_hash = {}, {}, '', ''
+    copy_fields = []
     if spec['mode'] != 'produce':
         try:
             settings, origins = service.resolve_defaults(spec['account_id'], spec['template_id'], spec['overrides'])
+            copy_fields = automatic_copy_fields(origins)
             account_name = next(a['name'] for a in service.catalog()['accounts'] if a['id'] == spec['account_id'])
             if not settings['human_type2']: issues.append('发布：请选择分区')
             if not settings['tags'] and (not spec['ai_copy'] or origins['tags'] != '默认'):
@@ -211,10 +222,13 @@ def plan(uid, raw, *, online=True):
                 warnings.append('下载后使用平台封面；来源无封面时暂停，请补选自定义封面。')
         except DubForgeError as exc:
             issues.append(f'发布：{exc.message}')
-        if spec['ai_copy']:
-            warnings.append('AI 自动填充未手动指定的标题、简介、标签和动态；失败时暂停，不用空文案投稿。')
+        if spec['ai_copy'] and copy_fields:
+            warnings.append('自动流程仅用 AI 补充未单独设置的文案；项目或模板中已明确设置的值（包括空值）保持不变，生成失败时暂停。')
         if any(v['dubbing'] if isinstance(v, dict) else dimensions(v)['dubbing'] for v in variants):
             warnings.append('含配音版本：请核对所选创作声明是否适用；软件不强制改选AI声明。')
+    issues += production_checks(deps, steps, online=online,
+        needs_ai=bool(spec['mode'] != 'produce' and spec['ai_copy'] and copy_fields)
+        or comments and spec['comments_mode'] == 'auto')
     stamp = configuration_stamp(deps, version_mode=version_specs is not None)
     snapshot = configuration_snapshot(deps, version_mode=version_specs is not None)
     binding = dict(recipe=spec, configuration=stamp, settings=settings, overlay_revision=overlay_revision, cover_hash=cover_hash)

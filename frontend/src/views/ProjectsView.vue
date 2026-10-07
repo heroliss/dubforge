@@ -4,10 +4,15 @@ import { friendlyError } from '../utils/http'
 import BatchWorkflow from '../components/BatchWorkflow.vue'
 import BatchWorkflowResume from '../components/BatchWorkflowResume.vue'
 import BatchProjectImport from '../components/BatchProjectImport.vue'
+import ProjectStepRun from '../components/ProjectStepRun.vue'
 import FilePathLink from '../components/FilePathLink.vue'
 import AutoRunBadge from '../components/AutoRunBadge.vue'
+import PublicationProgress from '../components/PublicationProgress.vue'
+import FreshnessDetails from '../components/FreshnessDetails.vue'
+import { freshnessStatus, needsFreshnessDetails } from '../utils/freshness'
+import { publicationStage } from '../utils/publishing'
 // 项目列表: 真实 CRUD + 新建 (yt-dlp 支持的任意站点链接 / 本地导入) + 改名
-import { computed, h, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRouter } from 'vue-router'
 import {
   NAlert, NButton, NCard, NCheckbox, NEmpty, NForm, NFormItem, NH1, NInput,
@@ -18,7 +23,10 @@ import { useNavStore, STEP_ORDER, STEP_LABELS, STATUS_TEXT, STATUS_HINTS } from 
 import { fmtSize } from '../utils/format'
 import { chainKind, chainSequence, holdDescription, parseChain, type ChainInfo } from '../utils/chainStatus'
 import AppIcon from '../components/AppIcon.vue'
-import { hiddenSelectionCount, runPlanDescription } from '../utils/actionScope'
+import { hiddenSelectionCount } from '../utils/actionScope'
+import { createLatestRefresh } from '../utils/preview'
+import { WORKFLOW_BUSY } from '../utils/workflow'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const router = useRouter()
 const message = useMessage()
@@ -28,7 +36,6 @@ const nav = useNavStore()
 const projects = ref<any[]>([])
 const loading = ref(true)
 const loadError = ref('')
-let loadSeq = 0
 const showNew = ref(false)
 const creating = ref(false)
 const form = ref({ source_kind: 'link', source_url: '', title: '' })
@@ -36,24 +43,27 @@ const form = ref({ source_kind: 'link', source_url: '', title: '' })
 const renaming = ref<any>(null)
 const renameTitle = ref('')
 const renameSaving = ref(false)
+const { locked: renameProjectLocked, reason: renameLockReason, canEdit: canRename, observing: renameObserving } = useConfigurationEditability(() => renaming.value ? 'project:' + renaming.value.uid : '')
+const renameLocked = computed(() => renameSaving.value || renameProjectLocked.value || !!renaming.value && projectBusy(projects.value.find(p => p.uid === renaming.value.uid) || renaming.value))
 
-async function load(showSpin = false) {
-  const seq = ++loadSeq
+// 慢请求只保留一次补读；切换页面时取消，隐藏标签页暂停轮询。
+const listReader = createLatestRefresh<any[]>(async signal => {
+  const r = await fetch('/api/projects', { cache: 'no-store', signal })
+  if (!r.ok) throw new Error(`读取项目失败（HTTP ${r.status}）`)
+  return r.json()
+}, next => {
+  projects.value = next
+  loadError.value = ''
+  const existing = new Set(next.map(p => p.uid))
+  sel.value = new Set([...sel.value].filter(uid => existing.has(uid)))
+  loading.value = false
+}, err => {
+  loadError.value = friendlyError(err, '无法连接服务，请检查连接后重试')
+  loading.value = false
+})
+function load(showSpin = false) {
   if (showSpin) loading.value = true
-  try {
-    const r = await fetch('/api/projects', { cache: 'no-store' })
-    if (!r.ok) throw new Error(`读取项目失败（HTTP ${r.status}）`)
-    const next = await r.json()
-    if (seq === loadSeq) {
-      projects.value = next
-      loadError.value = ''
-      sel.value = new Set([...sel.value].filter(uid => next.some((p: any) => p.uid === uid)))
-    }
-  } catch (err: any) {
-    if (seq === loadSeq) loadError.value = friendlyError(err, '无法连接服务，请检查连接后重试')
-  } finally {
-    if (seq === loadSeq) loading.value = false
-  }
+  return listReader.refresh(showSpin)
 }
 async function refreshList() {
   // 刷新只读取列表；找回目录使用独立的确认入口。
@@ -85,12 +95,13 @@ onMounted(async () => {
   await refreshList()
   // 项目列表也要像管线页一样持续取最新步骤状态；否则后台任务运行时，
   // 卡片进度条只会停在进入页面时的快照。
-  if (listAlive) listTimer = setInterval(() => load(), 2500)
+  if (listAlive) listTimer = setInterval(() => { if (!document.hidden) void load() }, 2500)
 })
 onUnmounted(() => {
   listAlive = false
   if (listTimer) clearInterval(listTimer)
   listTimer = 0
+  listReader.cancel()
 })
 
 // —— 勾选批量运行 / 单项目运行 / 资源管理器 ——
@@ -101,64 +112,33 @@ function toggleSel(uid: string, v: boolean) {
   else s.delete(uid)
   sel.value = s
 }
-const runningMany = ref(false)
-const planningMany = ref(false)
-async function confirmRuns(uids: string[]) {
-  if (!uids.length || planningMany.value || runningMany.value) return
-  planningMany.value = true
-  try {
-    const plans: Record<string, string[]> = {}
-    const summaries = await Promise.all(uids.map(async uid => {
-      const project = projects.value.find(p => p.uid === uid)
-      const steps = (project?.steps ?? []).filter((s: any) => s.selected).map((s: any) => s.key)
-      if (!steps.length) throw new Error(`「${project?.title || uid}」未勾选任何步骤`)
-      const response = await fetch(`/api/projects/${uid}/run_plan`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ steps, include_dependencies: false }),
-      })
-      const plan = await response.json()
-      if (!response.ok) throw new Error(plan.message || '读取运行计划失败')
-      if (plan.blockers?.length) throw new Error(`「${project?.title || uid}」依赖未就绪；请进入总览核对步骤和依赖`)
-      plans[uid] = [...plan.steps]
-      return `「${project?.title || uid}」：${runPlanDescription(plan)}`
-    }))
-    dialog.info({ title: `确认运行 ${uids.length} 个项目`,
-      content: () => h('div', { style: 'max-height:55vh;overflow:auto;white-space:pre-wrap;line-height:1.8' },
-        summaries.map(summary => h('p', { style: 'margin:0 0 12px' }, summary))),
-      positiveText: '按上述计划运行', negativeText: '取消',
-      onPositiveClick: () => runMany([...uids], plans),
-    })
-  } catch (error: any) { message.warning(error.message || '无法核对项目运行范围') }
-  finally { planningMany.value = false }
+// 单项目和批量共用一份可取消的运行检查，列表只负责传入明确的项目范围。
+const stepRun = ref<InstanceType<typeof ProjectStepRun> | null>(null)
+function openStepRun(targets: any[], scopeLabel: string) {
+  void stepRun.value?.open(targets.map(p => ({ uid: p.uid, title: p.title || p.uid })), scopeLabel)
 }
-async function runMany(uids: string[], plans: Record<string, string[]>) {
-  if (!uids.length || runningMany.value) return
-  runningMany.value = true
-  try {
-    const r = await fetch('/api/projects/run_many', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ uids, steps_by_uid: plans }),
-    })
-    const j = await r.json().catch(() => ({}))
-    if (!r.ok) { message.error(j.message || '批量启动失败'); return }
-    const skipped = (j.results ?? []).filter((x: any) => x.skipped).map((x: any) => x.skipped)
-    message.success(`已启动 ${j.started ?? 0} 个项目` +
-      (skipped.length ? `；跳过 ${skipped.length} 个 (${skipped[0]}${skipped.length > 1 ? ' 等' : ''})` : ''))
-    sel.value = new Set()
-    await load()
-  } catch { message.error('批量启动失败 (网络异常)') } finally { runningMany.value = false }
+function runSelected() {
+  openStepRun([...sel.value].map(uid => projects.value.find(p => p.uid === uid) || { uid }), recoveryScope.value)
 }
-function runSelected() { void confirmRuns([...sel.value]) }
 function runAllPending() {
-  // 有失败项目时按钮语义变为「重试失败项目」: 只针对失败的项目重新核对运行;
-  // 没有失败项目时保持原行为, 覆盖全部待处理项目。
-  const targets = failedInView.value.length ? failedInView.value : pendingInView.value
-  void confirmRuns(targets.map((p: any) => p.uid))
+  openStepRun(pendingInView.value, `当前列表待制作 · ${pendingInView.value.length} 个项目`)
 }
+const projectBusy = (p: any) => !!p.running_step || (p.steps || []).some((step: any) => ['running', 'queued'].includes(step.status))
+  || parseChain(p.chain ?? p.params?._chain)?.state === 'active' || WORKFLOW_BUSY.includes(p.workflow_status)
 const pendingInView = computed(() => sortedProjects.value
-  .filter((p: any) => p.status !== 'done' && !p.running_step && p.dir_exists !== false))
-const failedInView = computed(() => pendingInView.value.filter((p: any) => p.status === 'failed'))
-function runProject(p: any) { void confirmRuns([p.uid]) }
+  .filter((p: any) => p.status !== 'done' && !projectBusy(p) && p.dir_exists !== false))
+function runProject(p: any) { if (!projectBusy(p) && p.dir_exists !== false) openStepRun([p], p.title) }
+function showProjectProgress(p: any) {
+  void router.push(p.running_step ? `/projects/${p.uid}/steps/${p.running_step}` : `/projects/${p.uid}`)
+}
+function projectRunHint(p: any) {
+  if (p.dir_exists === false) return '项目目录缺失，请先还原目录。'
+  const selected = STEP_ORDER.filter(key => key !== 'dubtask' && (p.steps || []).some((step: any) => step.key === key && step.selected))
+  return selected.length
+    ? `先检查总览中勾选的 ${selected.length} 个制作步骤：${selected.map(key => STEP_LABELS[key]).join(' → ')}。确认后运行，已有最新产物会复用。`
+    : '尚未勾选制作步骤，打开检查可前往项目总览选择。'
+}
+function productionStarted() { sel.value = new Set(); void load() }
 
 // —— 自动续跑链 (ADR-0072): 批量卡片显示计划状态, 挂起可一键继续 ——
 const chainMap = computed(() => new Map(sortedProjects.value
@@ -173,47 +153,12 @@ function chainSummary(p: any): string {
   }
   return `⛓ 续跑中 · 剩余 ${chain.remaining.length} 步: ${chainSequence(chain, STEP_LABELS)}`
 }
-const heldProjects = computed(() => sortedProjects.value.filter((p: any) => chainOf(p)?.state === 'held' && !p.running_step))
-const resumingChain = ref(false)
-async function resumeChainQuiet(uid: string): Promise<boolean> {
-  const title = projects.value.find((p: any) => p.uid === uid)?.title || uid
-  try {
-    const r = await fetch(`/api/projects/${uid}/chain/resume`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}',
-    })
-    const d = await r.json()
-    if (!r.ok) throw new Error(d.message || '继续失败')
-    return true
-  } catch (e: any) {
-    message.error(`「${title}」${friendlyError(e)}`)
-    return false
-  }
-}
-async function resumeOneChain(uid: string) {
-  if (resumingChain.value) return
-  resumingChain.value = true
-  try {
-    if (await resumeChainQuiet(uid)) { message.success('已继续自动运行'); await load() }
-  } finally { resumingChain.value = false }
-}
-function resumeAllHeld() {
-  if (resumingChain.value || !heldProjects.value.length) return
-  const targets = [...heldProjects.value]
-  dialog.info({
-    title: `继续 ${targets.length} 个项目的自动运行？`,
-    content: '逐个项目从挂起的链头继续执行；依赖未就绪的项目会再次挂起并提示原因，不会偷跑下游。',
-    positiveText: '全部继续', negativeText: '取消',
-    onPositiveClick: async () => {
-      resumingChain.value = true
-      let ok = 0
-      try {
-        for (const p of targets) { if (await resumeChainQuiet(p.uid)) ok++ }
-        message.success(`${ok}/${targets.length} 个项目已继续自动运行`)
-        await load()
-      } finally { resumingChain.value = false }
-    },
-  })
-}
+const recoveryProjects = computed(() => (sel.value.size ? [...sel.value].map(uid =>
+  projects.value.find((project: any) => project.uid === uid) || { uid, title: uid }) : sortedProjects.value)
+  .map((project: any) => ({ uid: project.uid, title: project.title })))
+const recoveryScope = computed(() => sel.value.size
+  ? `所选 ${sel.value.size} 个项目${hiddenSelectionCount([...sel.value], sortedProjects.value.map(p => p.uid)) ? '（包含被筛选隐藏的选择）' : ''}`
+  : `当前列表 ${sortedProjects.value.length} 个项目`)
 async function reveal(p: any) {
   try {
     const r = await fetch(`/api/projects/${p.uid}/reveal`, { method: 'POST' })
@@ -227,8 +172,9 @@ const PROJECT_STATUS_OPTS = [
   { label: '全部状态', value: 'all' },
   { label: '待处理', value: 'created' },
   { label: '进行中', value: 'processing' },
-  { label: '已完成', value: 'done' },
+  { label: '制作完成', value: 'done' },
   { label: '有失败步骤', value: 'failed' },
+  { label: '需更新', value: 'needs_update' },
 ]
 const searchText = ref('')
 const statusFilter = ref('all')
@@ -242,7 +188,7 @@ const SORT_OPTS = [
 ]
 // 项目级状态文案 (步骤级状态用 nav store 的 STATUS_TEXT)
 const PROJECT_STATUS_TEXT: Record<string, string> = {
-  created: '待处理', processing: '进行中', done: '已完成', failed: '有失败步骤',
+  created: '待处理', processing: '制作中', done: '制作完成', failed: '有失败步骤',
 }
 const requiredSteps = (p: any) => (p.steps ?? []).filter((x: any) => x.selected)
 const doneCount = (p: any) =>
@@ -251,12 +197,20 @@ const orderedProjectSteps = (p: any) => {
   const map = Object.fromEntries((p.steps ?? []).map((x: any) => [x.key, x]))
   return STEP_ORDER.map(k => map[k]).filter(Boolean)
 }
+const updateSteps = (p:any) => (p.steps || []).filter(needsFreshnessDetails)
+const projectStepStatus = (step:any) => freshnessStatus(step) || STATUS_TEXT[step.status] || step.status
+// 制作状态和已有结果是否失效是两个维度；失败或运行不能隐藏其它步骤的更新原因。
+const projectCanExplain = (p:any) => updateSteps(p).length>0
+const updateSummary = (p:any) => updateSteps(p).slice(0,3).map((step:any)=>`${step.label}：${step.freshness_reason || step.freshness_label || projectStepStatus(step)}`).join('；')
+  + (updateSteps(p).length>3 ? `；另有${updateSteps(p).length-3}步，点击查看明细` : '；点击查看具体变化')
 const stepPath = (p: any, key: string) =>
   `/projects/${p.uid}/steps/${key}`
 const filteredProjects = computed(() => {
   const q = searchText.value.trim().toLocaleLowerCase()
   return projects.value.filter((p: any) => {
-    if (statusFilter.value !== 'all' && p.status !== statusFilter.value) return false
+    if (statusFilter.value === 'needs_update') {
+      if (!projectCanExplain(p)) return false
+    } else if (statusFilter.value !== 'all' && p.status !== statusFilter.value) return false
     if (!q) return true
     return [p.title, p.uid, p.source_url]
       .filter(Boolean)
@@ -301,20 +255,24 @@ function projectAction(action: string, project: any) {
 }
 
 function openRename(p: any) {
+  if (projectBusy(p)) { message.warning('项目正在运行，请完成后再改名'); return }
   renaming.value = p
   renameTitle.value = p.title
 }
 async function applyRename() {
+  if (!renaming.value || renameLocked.value) return
   if (!renameTitle.value.trim()) { message.warning('标题不能为空'); return }
+  const target = renaming.value
+  if (renameObserving.value && !(await canRename()) || renaming.value !== target || renameLocked.value) return
   renameSaving.value = true
   try {
-    const r = await fetch(`/api/projects/${renaming.value.uid}`, {
+    const r = await fetch(`/api/projects/${target.uid}`, {
       method: 'PATCH', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ title: renameTitle.value }),
     })
     const j = await r.json().catch(() => ({}))
     if (r.ok && j.uid) {
-      renaming.value.title = j.title
+      target.title = j.title
       renaming.value = null
       message.success('已改名')
     } else {
@@ -515,10 +473,10 @@ function resetNewForm() {
           从一段视频开始，让每一种声音被听见。管理译制进度，继续你的创作。
         </n-text>
       </div>
-      <n-space><BatchProjectImport @created="load()"/><n-button type="primary" @click="showNew = true"><template #icon><AppIcon name="plus" /></template>新建项目</n-button></n-space>
+      <n-space><BatchProjectImport @created="load()" @select-created="sel = new Set($event); load()"/><n-button type="primary" @click="showNew = true"><template #icon><AppIcon name="plus" /></template>新建项目</n-button></n-space>
     </div>
     <div v-if="projects.length" class="summary-strip">
-      <button v-for="item in [{label:'全部项目', value:'all', count:projects.length}, {label:'进行中', value:'processing', count:statusCounts.processing || 0}, {label:'已完成', value:'done', count:statusCounts.done || 0}, {label:'需关注', value:'failed', count:statusCounts.failed || 0}]"
+      <button v-for="item in [{label:'全部项目', value:'all', count:projects.length}, {label:'制作中', value:'processing', count:statusCounts.processing || 0}, {label:'制作完成', value:'done', count:statusCounts.done || 0}, {label:'需关注', value:'failed', count:statusCounts.failed || 0}]"
               :key="item.value" class="summary-item" :class="`summary-${item.value}`" :aria-pressed="statusFilter === item.value" @click="statusFilter = item.value">
         <span>{{ item.label }}</span><strong>{{ item.count.toString().padStart(2, '0') }}</strong>
         <span class="summary-caption">{{ item.value === 'all' ? '你的全部译制项目' : item.value === 'processing' ? '处理进度持续更新' : item.value === 'done' ? '所选步骤已完成' : '查看失败步骤与日志' }}</span>
@@ -544,13 +502,11 @@ function resetNewForm() {
       <span class="list-count">{{ sel.size ? `已选 ${sel.size} 个项目` : `共 ${sortedProjects.length} 个项目` }}</span>
       <n-text v-if="hiddenSelectionCount([...sel], sortedProjects.map(p => p.uid))" type="warning" style="font-size:12px">含 {{ hiddenSelectionCount([...sel], sortedProjects.map(p => p.uid)) }} 个被筛选隐藏的项目</n-text>
       <n-button v-if="sel.size" size="small" quaternary @click="sel = new Set()">取消选择</n-button>
-      <n-button v-if="heldProjects.length" size="small" secondary type="primary" :loading="resumingChain"
-                title="把列表中所有挂起的自动运行计划从链头继续执行"
-                @click="resumeAllHeld">继续全部已挂起（{{ heldProjects.length }}）…</n-button>
-      <BatchWorkflowResume v-if="projects.length" :projects="sortedProjects.map(p => ({ uid: p.uid, title: p.title }))" @resumed="load()" />
+      <BatchWorkflowResume v-if="recoveryProjects.length" :projects="recoveryProjects" :scope-label="recoveryScope"
+        :label="`检查恢复${sel.size ? '所选项目' : '当前列表'}（${recoveryProjects.length}）…`" @resumed="load()" />
       <BatchWorkflow v-if="sel.size" :uids="[...sel]" @started="refreshList" />
-      <n-button v-if="sel.size" size="small" :loading="runningMany || planningMany" @click="runSelected">仅运行制作步骤（{{ sel.size }}）…</n-button>
-      <n-button v-else-if="pendingInView.length" size="small" secondary :loading="runningMany || planningMany" @click="runAllPending">{{ failedInView.length ? `重试失败项目（${failedInView.length}）…` : '核对并运行当前列表待处理项目…' }}</n-button>
+      <n-button v-if="sel.size" size="small" @click="runSelected">运行所选项目的制作步骤（{{ sel.size }}）…</n-button>
+      <n-tooltip v-else-if="pendingInView.length" trigger="hover" :delay="300"><template #trigger><n-button size="small" secondary @click="runAllPending">批量运行制作步骤（{{ pendingInView.length }}）…</n-button></template>检查当前列表中待制作的 {{ pendingInView.length }} 个项目，使用各项目总览中勾选的步骤。</n-tooltip>
     </div>
     <n-alert v-if="loadError" type="error" class="load-error">{{ loadError }}<template #action><n-button size="small" @click="load(true)">重试</n-button></template></n-alert>
     <ProjectTemplateBinding v-if="sel.size" :uids="[...sel]" @changed="refreshList" />
@@ -581,7 +537,10 @@ function resetNewForm() {
                   <n-tag size="small" :type="(STATUS_TAG as any)[p.status] || 'default'">
                     {{ PROJECT_STATUS_TEXT[p.status] || p.status }}
                   </n-tag>
+                  <FreshnessDetails v-if="projectCanExplain(p)" :uid="p.uid" :label="p.title"
+                                    :status-text="`需更新 · ${updateSteps(p).length}步`" :summary="updateSummary(p)" />
                   <AutoRunBadge :workflow-status="p.workflow_status" :chain="chainOf(p)" :running-label="p.running_label" />
+                  <router-link class="publication-link" :to="`/projects/${p.uid}/publish`"><n-tag size="small" :type="publicationStage(p.publication?.status).tone">B站 · {{ publicationStage(p.publication?.status).text }}</n-tag></router-link>
                   <n-tooltip v-if="p.dir_exists === false" trigger="hover" :delay="0"
                              placement="top">
                     <template #trigger>
@@ -598,7 +557,8 @@ function resetNewForm() {
             </div>
             <div class="project-actions">
               <n-button size="small" secondary type="primary" @click.stop="router.push(`/projects/${p.uid}`)">打开项目 →</n-button>
-              <n-button size="small" :disabled="!!p.running_step || p.dir_exists === false" :loading="runningMany || planningMany" @click.stop="runProject(p)">{{ p.running_step ? '运行中' : '核对运行步骤…' }}</n-button>
+              <n-button v-if="projectBusy(p)" size="small" @click.stop="showProjectProgress(p)">查看进度 →</n-button>
+              <n-tooltip v-else trigger="hover" :delay="300"><template #trigger><n-button size="small" :disabled="p.dir_exists === false" @click.stop="runProject(p)">运行制作步骤…</n-button></template>{{ projectRunHint(p) }}</n-tooltip>
               <n-dropdown :options="projectMenu" trigger="click" @select="(action: string) => projectAction(action, p)"><n-button size="small" quaternary :aria-label="`${p.title}的更多操作`">更多 ···</n-button></n-dropdown>
             </div>
           </div>
@@ -608,34 +568,38 @@ function resetNewForm() {
               <n-tooltip v-for="st in orderedProjectSteps(p)" :key="st.key" trigger="hover"
                          :delay="0" :duration="0" placement="top">
                 <template #trigger>
-                  <button type="button" class="seg" :class="'seg-' + (st.status === 'done' && !st.fresh ? 'stale' : st.status)" :aria-label="`${st.label}：${st.status === 'done' && !st.fresh ? '需更新' : STATUS_TEXT[st.status] || st.status}，进入步骤`"
+                  <button type="button" class="seg" :class="'seg-' + (st.status === 'done' && !st.fresh ? 'stale' : st.status)" :aria-label="`${st.label}：${projectStepStatus(st)}，进入步骤`"
                        @click.stop="router.push(stepPath(p, st.key))">
                     <div class="fill" v-if="st.status === 'running'"
                          :style="{ width: (st.progress || 0) + '%' }" />
                   </button>
                 </template>
-                {{ st.label }} · {{ st.status === 'done' && !st.fresh ? '需更新' : STATUS_TEXT[st.status] || st.status
+                {{ st.label }} · {{ projectStepStatus(st)
                 }}{{ st.status === 'running' ? (st.progress_indeterminate ? ` · ${st.progress_phase}` : ` ${st.progress_estimated ? '预计 ' : ''}${Math.round(st.progress || 0)}%`) : ''
                 }}{{ st.error ? ` — ${st.error}` : STATUS_HINTS[st.status]
                 ? ` — ${STATUS_HINTS[st.status]}` : '' }}
                 <n-text depth="3" style="font-size: 11px">(点击进入步骤页)</n-text>
               </n-tooltip>
+              <n-tooltip trigger="hover" :delay="0" placement="top"><template #trigger><button type="button" class="seg" :class="'seg-' + publicationStage(p.publication?.status).dot" :aria-label="`发布到B站：${publicationStage(p.publication?.status).text}，进入发布页`" @click.stop="router.push(`/projects/${p.uid}/publish`)"><div v-if="p.publication?.status === 'uploading'" class="fill" :style="{ width: (p.publication.progress || 0) + '%' }" /></button></template>发布到B站 · {{ publicationStage(p.publication?.status).text }}</n-tooltip>
             </div>
             <n-text depth="3" style="font-size: 11px">
               已完成 {{ doneCount(p) }}/{{ requiredSteps(p).length }} 个所选步骤
               <span v-if="p.running_label"> · 正在「{{ p.running_label }}」…</span>
             </n-text>
+            <PublicationProgress :publication="p.publication" compact />
+            <BatchWorkflowResume v-if="!chainOf(p) && (p.status === 'failed' || ['paused', 'failed', 'attention'].includes(p.workflow_status))" :projects="[{ uid: p.uid, title: p.title }]"
+              label="检查恢复方案…" :disabled="projectBusy(p) || p.dir_exists === false" @resumed="load()" />
             <div v-if="chainOf(p)" class="chain-line">
               <span :class="chainOf(p)!.state === 'held' ? 'chain-held' : 'chain-active'"
                     :title="chainOf(p)!.state === 'held' ? holdDescription(chainOf(p)!, STEP_LABELS) : '本步完成后自动继续剩余计划'">{{ chainSummary(p) }}</span>
-              <n-button v-if="chainOf(p)!.state === 'held'" size="tiny" type="primary" secondary
-                        :loading="resumingChain" :disabled="!!p.running_step || p.dir_exists === false"
-                        @click.stop="resumeOneChain(p.uid)">重试并继续</n-button>
+              <BatchWorkflowResume v-if="chainOf(p)!.state === 'held'" :projects="[{ uid: p.uid, title: p.title }]"
+                kind="chain" label="检查恢复方案…" :disabled="!!p.running_step || p.dir_exists === false" @resumed="load()" />
             </div>
           </div>
         </n-card>
       </div>
     </n-spin>
+    <ProjectStepRun ref="stepRun" @started="productionStarted" />
 
     <n-modal v-model:show="showNew" preset="card" title="新建项目"
              :closable="!creating && !ingesting && !ingestErr" :mask-closable="!creating && !ingesting && !ingestErr" :close-on-esc="!creating && !ingesting && !ingestErr"
@@ -738,14 +702,17 @@ function resetNewForm() {
     </n-modal>
 
     <n-modal :show="!!renaming" preset="card" title="重命名项目"
+             :mask-closable="!renameSaving" :closable="!renameSaving" :close-on-esc="!renameSaving"
              style="width: min(460px, calc(100vw - 32px)); max-width: calc(100vw - 32px)"
              @update:show="v => !v && (renaming = null)">
       <n-input v-model:value="renameTitle" maxlength="200" show-count
+               :disabled="renameLocked"
                placeholder="输入新的标题" @keyup.enter="applyRename" />
+      <n-alert v-if="renameLocked && !renameSaving" type="info" :show-icon="false">{{ renameLockReason || '项目正在运行，请完成后再改名' }}</n-alert>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="renaming = null">取消</n-button>
-          <n-button type="primary" :loading="renameSaving" @click="applyRename">应用</n-button>
+          <n-button :disabled="renameSaving" @click="renaming = null">取消</n-button>
+          <n-button type="primary" :loading="renameSaving" :disabled="renameLocked" @click="applyRename">应用</n-button>
         </n-space>
       </template>
     </n-modal>
@@ -801,6 +768,7 @@ function resetNewForm() {
 .title-line { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; }
 .project-title { max-width: min(50vw, 640px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 16px; font-weight: 600; text-decoration: none; color: var(--df-text); }
 .project-title:hover { color: var(--df-accent); }
+.publication-link { text-decoration:none; }
 .project-source {
   display: block;
   max-width: min(58vw, 760px);

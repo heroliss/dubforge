@@ -8,6 +8,7 @@ import { useMessage } from 'naive-ui'
 import { friendlyError } from '../utils/http'
 import { STEP_LABELS, useNavStore } from '../stores/nav'
 import { chainKind, chainSequence, holdDescription, type ChainInfo } from '../utils/chainStatus'
+import BatchWorkflowResume from './BatchWorkflowResume.vue'
 
 const props = defineProps<{ uid: string; chain: ChainInfo | null }>()
 const nav = useNavStore()
@@ -49,8 +50,8 @@ async function call(path: string, okText: string) {
       </div>
       <div class="chain-actions">
         <RouterLink v-if="holdStep" :to="`/projects/${uid}/steps/${holdStep}`" class="chain-link">查看该步骤 →</RouterLink>
-        <NButton size="tiny" type="primary" :loading="busy" :disabled="nav.busy || nav.dirMissing"
-          @click="call('resume', '已继续自动运行')">重试并继续</NButton>
+        <BatchWorkflowResume :projects="[{ uid, title: nav.title || uid }]" kind="chain" label="检查恢复方案…"
+          :disabled="busy || nav.busy || nav.dirMissing" @resumed="nav.poll()" />
         <NButton size="tiny" quaternary :disabled="busy" @click="call('stop', '已放弃剩余计划')">放弃计划</NButton>
       </div>
     </template>

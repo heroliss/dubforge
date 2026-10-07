@@ -364,7 +364,8 @@ def test_raw_recognition_does_not_replace_semantic_result(make_project, key):
 
 def _old_source_choice_fingerprint(project, key, source):
     """按移除来源选项之前的存储格式构造指纹，验证升级不会误用旧产物。"""
-    from dubforge.pipeline.text_prompts import ASR_CORRECTION_VERSION, TRANSLATION_PROMPT_VERSION
+    from dubforge.pipeline.text_prompts import (ASR_CORRECTION_VERSION, TRANSLATION_PROMPT_VERSION,
+                                                TRANSLATION_WINDOW_VERSION)
     deps = Dependencies(project)
     old_keys = {"translate": ("translate", "llm"), "subtitles": ("subtitles",),
                 "dubtask": ("tts.tolerance",)}
@@ -378,7 +379,8 @@ def _old_source_choice_fingerprint(project, key, source):
                                   for up, name in inputs)}
     if key == "translate":
         payload.update(correction_prompt=ASR_CORRECTION_VERSION,
-                       translation_prompt=TRANSLATION_PROMPT_VERSION)
+                       translation_prompt=TRANSLATION_PROMPT_VERSION,
+                       translation_windows=TRANSLATION_WINDOW_VERSION)
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
@@ -392,8 +394,10 @@ def test_old_semantic_caches_survive_but_raw_source_caches_expire(make_project, 
     row = crud.get_step(p.id, key)
     row.input_fingerprint = _old_source_choice_fingerprint(p, key, old_source)
     crud.save_step(row)
-    assert Dependencies(p).fresh(key) == (old_source == "split")
-    if old_source == "split":
+    # 字幕新增了原声审查与派生屏蔽，旧导出不能作为已处理结果继续复用。
+    compatible = old_source == "split" and key != "subtitles"
+    assert Dependencies(p).fresh(key) == compatible
+    if compatible:
         assert runner.start_step(uid, key)["status"] == "skipped"
 
 

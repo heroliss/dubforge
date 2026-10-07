@@ -13,11 +13,11 @@ from dubforge import comment_studio, video_info
 from dubforge.db import get_engine
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
-from dubforge.pipeline.dependencies import Dependencies
+from dubforge.pipeline.recovery import RecoveryDependencies as Dependencies
 from dubforge.pipeline.assembly_outputs import final_variant, dimensions
 from dubforge.publishing import service
 from dubforge.workflow_models import WorkflowRun
-from dubforge.workflow_plan import LABELS, WorkflowError, configuration_stamp, plan, recipe
+from dubforge.workflow_plan import LABELS, WorkflowError, automatic_copy_fields, configuration_stamp, digest, plan, recipe
 
 _lock = threading.RLock()
 _pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix='workflow')
@@ -171,10 +171,53 @@ def _plan(uid, raw, *, online=True):
     return result
 
 
+def _plan_dependencies(project, candidate):
+    """恢复说明与执行使用相同的成片版本、配音及字幕依赖。"""
+    deps = Dependencies(project, assemble_variants=[v for v in candidate['recipe']['variants'] if v != 'src'] or None)
+    return deps.with_versions(candidate['version_specs']) if 'version_specs' in candidate else deps
+
+
+def _recovery_plan(run, candidate, project=None):
+    """只读解析真正的恢复起点；预检和入队前共用，不能各自修复游标。"""
+    from dubforge.pipeline.recovery import describe, fresh
+    candidate = copy.deepcopy(candidate)
+    previous = run.get('plan') or {}
+    previous_steps = previous.get('steps') or []
+    previous_cursor = run.get('cursor', 0)
+    changed = candidate['fingerprint'] != previous.get('fingerprint')
+    cursor = 0 if changed else previous_cursor
+    project = project or crud.get_project(run['project_uid'])
+    deps = _plan_dependencies(project, candidate)
+    if not changed:
+        # 已有产物会缩短新计划；原游标仍须对应最初确认的步骤表。
+        if set(candidate['steps']) - set(previous_steps):
+            cursor = 0  # 新增缺失依赖按新计划补齐，不能套用原游标。
+        else:
+            candidate['steps'] = copy.deepcopy(previous_steps)
+            candidate['labels'] = {**candidate['labels'], **previous.get('labels', {})}
+            for index, step in enumerate(candidate['steps'][:cursor]):
+                if step != 'comments' and not fresh(deps, step):
+                    cursor = index
+                    break
+    candidate['recovery'] = describe(deps, candidate['steps'], cursor=cursor,
+        previous_steps=previous_steps, previous_cursor=previous_cursor, changed=changed)
+    candidate['recovery_fingerprint'] = digest(dict(
+        fingerprint=candidate['fingerprint'], recovery=candidate['recovery']))
+    return candidate, cursor
+
+
 def preview(uid, raw):
     result = _plan(uid, raw)
-    result['blockers'] = list(dict.fromkeys(result['blockers'] + _availability(
-        uid, result['recipe']['mode'], (raw or {}).get('resume_id'))))
+    resume_id = (raw or {}).get('resume_id')
+    blockers = _availability(uid, result['recipe']['mode'], resume_id)
+    if resume_id:
+        run = get(resume_id)
+        if run['status'] in {'paused', 'failed', 'attention'} and not run['publication_id']:
+            result, _cursor = _recovery_plan(run, result)
+    else:
+        from dubforge.pipeline.recovery import describe
+        result['recovery'] = describe(_plan_dependencies(crud.get_project(uid), result), result['steps'])
+    result['blockers'] = list(dict.fromkeys(result['blockers'] + blockers))
     return result
 
 
@@ -254,11 +297,12 @@ def _check_configuration(run, steps=None):
     stored = run['plan'].get('configuration_snapshot')
     if not isinstance(stored, dict) or 'settings' not in stored:
         if configuration_stamp(Dependencies(crud.get_project(run['project_uid'])),
-                               version_mode='version_specs' in run['plan']) != run['plan']['configuration']:
+                               version_mode='version_specs' in run['plan'], legacy=True) != run['plan']['configuration']:
             raise WorkflowError('制作设置在运行期间发生变化，已暂停；请重新预检后继续', code='WORKFLOW_CONFIG_CHANGED')
         return
     current = configuration_snapshot(Dependencies(crud.get_project(run['project_uid'])),
-                                     version_mode='version_specs' in run['plan'], steps=steps)
+                                     version_mode='version_specs' in run['plan'], steps=steps,
+                                     legacy=stored.get('schema') != 2)
     drifted = (stored['source'] != current['source']
                or {k: v for k, v in stored['settings'].items() if k in current['settings']} != current['settings'])
     if drifted:
@@ -318,12 +362,12 @@ def _prepare_publication(run, event):
     for key, value in data['suggestion'].items():
         if not settings.get(key) and run['plan']['origins'].get(key) == '默认':
             settings[key] = value
-    if spec['ai_copy']:
+    copy_fields = automatic_copy_fields(run['plan']['origins'])
+    if spec['ai_copy'] and copy_fields:
         from dubforge.publishing.copywriting import generate
         generated = generate(crud.get_project(uid), settings, '')['values']
-        for key, value in generated.items():
-            if run['plan']['origins'].get(key) == '默认':
-                settings[key] = value
+        for key in copy_fields:
+            settings[key] = generated[key]
     _check_cancel(event)
     # 制作已完成: 发布资料使用计划冻结的设置快照, 只校验来源身份, 不再被制作参数修改打断。
     _check_configuration(run, [])
@@ -446,29 +490,77 @@ def _execute(key, event):
                 _leases.pop(uid, None)
 
 
+def _resume_identity(body):
+    """仅保存请求内容的摘要，兼容没有请求标识的早期调用。"""
+    if 'request_id' not in body:
+        return None, None
+    request = body['request_id']
+    if not isinstance(request, str) or len(request) != 36:
+        raise WorkflowError('继续任务的请求标识无效，请重新检查')
+    try:
+        request = str(uuid.UUID(request))
+    except ValueError as exc:
+        raise WorkflowError('继续任务的请求标识无效，请重新检查') from exc
+    return request, digest({key: body.get(key) for key in ('recipe', 'fingerprint', 'recovery_fingerprint')})
+
+
+def _resume_replayed(run, request, signature):
+    requests = run['plan'].get('_resume_requests') or {}
+    previous = requests.get(request) if request and isinstance(requests, dict) else None
+    if previous is None:
+        return False
+    if not isinstance(previous, dict) or previous.get('signature') != signature:
+        raise WorkflowError('同一恢复请求标识不能提交不同方案，请重新检查', code='WORKFLOW_CONFLICT')
+    return True
+
+
+def _resume_receipts(run, request, signature, candidate):
+    """所有已接受的恢复请求永久保留，重新规划不能丢失幂等回执。"""
+    requests = copy.deepcopy(run['plan'].get('_resume_requests') or {})
+    if not isinstance(requests, dict):
+        requests = {}
+    if request:
+        requests[request] = dict(signature=signature, fingerprint=candidate.get('fingerprint'),
+            recovery_fingerprint=candidate.get('recovery_fingerprint'),
+            accepted_state=dict(status=run['status'], cursor=run['cursor'], publication_id=run['publication_id']))
+    if requests:
+        candidate['_resume_requests'] = requests
+    return candidate
+
+
 def resume(key, body):
-    run = get(key)
-    if run['status'] not in {'paused', 'failed', 'attention'} or key in _running:
-        raise WorkflowError('当前任务不能继续')
     if body.get('confirmed') is not True:
         raise WorkflowError('继续前需要重新确认流程范围')
-    if run['publication_id']:
-        pub = service.view(run['publication_id'])
-        if pub['status'] == 'unknown':
-            raise WorkflowError('请先在发布页核对投稿回执，不会自动重投')
-        if pub['receipt'].get('bvid'):
-            _update(key, status='monitoring', phase='继续核对平台状态', next_check=time.time(), check_failures=0, error='')
-            return get(key)
-        # 已绑定发布文件的任务不重新制作；必须到发布页显式确认当前资料后继续。
-        raise WorkflowError('制作已完成，请到发布页核对现有草稿或已上传文件并继续，不能新建重复稿件')
+    request, signature = _resume_identity(body)
+    with _lock:
+        run = get(key)
+        if _resume_replayed(run, request, signature):
+            return run
+        if run['status'] not in {'paused', 'failed', 'attention'} or key in _running:
+            raise WorkflowError('当前任务不能继续')
+        if run['publication_id']:
+            pub = service.view(run['publication_id'])
+            if pub['status'] == 'unknown':
+                raise WorkflowError('请先在发布页核对投稿回执，不会自动重投')
+            if pub['receipt'].get('bvid'):
+                candidate = _resume_receipts(run, request, signature, copy.deepcopy(run['plan']))
+                _update(key, plan=candidate, status='monitoring', phase='继续核对平台状态', next_check=time.time(), check_failures=0, error='')
+                return get(key)
+            # 已绑定发布文件的任务不重新制作；必须到发布页显式确认当前资料后继续。
+            raise WorkflowError('制作已完成，请到发布页核对现有草稿或已上传文件并继续，不能新建重复稿件')
     candidate = _plan(run['project_uid'], body.get('recipe'))
     if candidate['blockers'] or body.get('fingerprint') != candidate['fingerprint']:
-        raise WorkflowError('预检未通过或已失效，请重新预检')
+        raise WorkflowError('预检未通过或已失效，请重新预检', code='WORKFLOW_PLAN_CHANGED')
     from dubforge.runner import runner
     from dubforge.pipeline import dubbing_session
     with service._lock, runner._start_lock, dubbing_session.gate, video_info.gate, _lock:
-        if key in _running or get(key)['status'] not in {'paused', 'failed', 'attention'}:
+        run = get(key)
+        if _resume_replayed(run, request, signature):
+            return run
+        if key in _running or run['status'] not in {'paused', 'failed', 'attention'}:
             raise WorkflowError('此流程已经在继续或状态已变化')
+        if run['publication_id']:
+            raise WorkflowError('此流程已进入发布阶段，请到发布页继续现有稿件', code='WORKFLOW_PLAN_CHANGED')
         check_idle(run['project_uid'])
         project = crud.get_project(run['project_uid'])
         if any(s.status in {'running', 'queued'} for s in crud.get_steps(project.id)):
@@ -476,22 +568,19 @@ def resume(key, body):
         service.check_project_idle(project.uid)
         video_info.check_idle(project.uid)
         dubbing_session.check_idle(project.uid)
-        if _plan(project.uid, candidate['recipe'], online=False)['fingerprint'] != candidate['fingerprint']:
+        current = _plan(project.uid, candidate['recipe'], online=False)
+        if current['fingerprint'] != candidate['fingerprint']:
             raise WorkflowError('预检期间设置已变化，请重新确认', code='WORKFLOW_CONFLICT')
-        cursor = run['cursor'] if candidate['fingerprint'] == run['plan']['fingerprint'] else 0
-        if candidate['fingerprint'] == run['plan']['fingerprint']:
-            # 已有产物会让新计划缩短；游标必须继续对应最初确认的步骤表。
-            if set(candidate['steps']) - set(run['plan']['steps']):
-                cursor = 0  # 暂停期间丢失了原本已就绪的依赖，按新计划补齐。
-            else:
-                candidate['steps'] = run['plan']['steps']
-                candidate['labels'] = run['plan']['labels']
-                deps = Dependencies(project, assemble_variants=[v for v in candidate['recipe']['variants'] if v != 'src'] or None)
-                if 'version_specs' in candidate: deps = deps.with_versions(candidate['version_specs'])
-                for index, step in enumerate(candidate['steps'][:cursor]):
-                    if step != 'comments' and not deps.fresh(step):
-                        cursor = index
-                        break
+        if current['blockers']:
+            raise WorkflowError('恢复检查期间依赖或资料已变化，请重新检查：' + '；'.join(current['blockers']),
+                                code='WORKFLOW_PLAN_CHANGED')
+        # 文件或已完成状态在预检后改变也会改变恢复范围，不能仅比较制作配置。
+        current, cursor = _recovery_plan(run, current, project)
+        if 'recovery_fingerprint' in body and body['recovery_fingerprint'] != current['recovery_fingerprint']:
+            raise WorkflowError('恢复起点或步骤已变化，请重新检查后确认', code='WORKFLOW_PLAN_CHANGED')
+        # 在线服务预检的警告仍保留，实际步骤、游标和说明使用锁内的最新解析。
+        candidate = {**candidate, **{name: current[name] for name in ('steps', 'labels', 'recovery', 'recovery_fingerprint')}}
+        candidate = _resume_receipts(run, request, signature, candidate)
         _update(key, recipe=candidate['recipe'], plan=candidate, cursor=cursor, status='queued', error='')
         runner._clear_chain(project, '恢复全流程')
         _launch(key, project.uid)

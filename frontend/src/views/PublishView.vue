@@ -1,12 +1,15 @@
 <script setup lang="ts">
 import FilePathLink from '../components/FilePathLink.vue'
 import ProgressActivity from '../components/ProgressActivity.vue'
+import PublicationProgress from '../components/PublicationProgress.vue'
 import PublicationRightsHint from '../components/PublicationRightsHint.vue'
+import ContentReviewPanel from '../components/ContentReviewPanel.vue'
+import CandidateReviewBadge from '../components/CandidateReviewBadge.vue'
 import { publicationActivity } from '../utils/progressActivity'
 import ConfigurationForm from '../components/ConfigurationForm.vue'
 import { computed, h, onMounted, onBeforeUnmount, ref } from 'vue'
-import { useRoute, onBeforeRouteLeave, RouterLink } from 'vue-router'
-import { NAlert, NButton, NCard, NCheckbox, NInput, NSelect, NTag, NTabs, NTabPane, NQrCode, NProgress, useMessage, useDialog } from 'naive-ui'
+import { useRoute, onBeforeRouteLeave, onBeforeRouteUpdate, RouterLink } from 'vue-router'
+import { NAlert, NButton, NCard, NCheckbox, NInput, NSelect, NTag, NTabs, NTabPane, NQrCode, useMessage, useDialog } from 'naive-ui'
 import PublishSettingsForm from '../components/PublishSettingsForm.vue'
 import PublishCopyAssistant from '../components/PublishCopyAssistant.vue'
 import BiliStudio from '../components/BiliStudio.vue'
@@ -16,29 +19,54 @@ import { fmtSize } from '../utils/format'
 import { usePublishMetadata } from '../composables/usePublishMetadata'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 import type { ConfigurationSource } from '../utils/configurationSource'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const route = useRoute(), message = useMessage(), dialog = useDialog()
 const catalog = ref<any>({ accounts: [], templates: [], defaults: {} }), records = ref<any[]>([]), projects = ref<any[]>([])
 const current = ref<any>(null), draft = ref<any>(null), source = ref<any>(null)
 const tab = ref(route.params.uid && route.hash === '#project-rules' ? 'rules' : 'drafts'), busy = ref(false), error = ref(''), saved = ref(''), projectUid = ref(String(route.params.uid || ''))
+const { locked: projectLocked, reason: projectLockReason, canEdit: canEditProject, observing: editorObserving } = useConfigurationEditability(() => current.value?.project_uid ? 'project:' + current.value.project_uid : '')
+const { locked: creationLocked, reason: creationLockReason, canEdit: canCreateDraft, observing: creationObserving } = useConfigurationEditability(() => projectUid.value ? 'project:' + projectUid.value : '')
 const loginId = ref(''), loginState = ref<any>(null), receiptBV = ref('')
 const confirming = ref(false)
+const copying = ref(false)
 const refreshingFiles = ref(false)
+const reviewDraftChecking = ref(false)
 const studioGuard = ref(false)
+const settingsDirty = ref(false), settingsBusy = ref(false)
+const reviewDirty = ref(false), reviewBusy = ref(false)
 const coverLoading = ref(false), coverError = ref(''), coverBroken = ref(false)
 let coverGeneration = 0
 let timer: ReturnType<typeof setTimeout> | undefined, disposed = false
 let listRevision = 0
+let copyRequest: {publicationId:string, revision:number, requestId:string} | null = null
 const dirty = computed(() => !!draft.value && JSON.stringify(draft.value) !== saved.value)
-const locked = computed(() => busy.value || current.value?.status !== 'draft')
-const metadataLocked = computed(() => busy.value || !['draft', 'uploaded'].includes(current.value?.status))
-const lockReason = computed(() => current.value?.status === 'unknown'
+const locked = computed(() => projectLocked.value || busy.value || current.value?.status !== 'draft')
+const metadataLocked = computed(() => projectLocked.value || busy.value || !['draft', 'uploaded'].includes(current.value?.status))
+const lockReason = computed(() => projectLocked.value ? projectLockReason.value : current.value?.status === 'unknown'
   ? '请先核对B站回执，暂不允许修改或复制，以免重复投稿。'
   : ['queued', 'uploading', 'paused', 'failed'].includes(current.value?.status)
     ? '上传清单已冻结；完成上传后可修改文案。若要更换文件或账号，请复制新草稿。'
-    : '当前资料已锁定；已有投稿请到「B站稿件」修改，另一条投稿请复制新草稿。')
+    : '当前资料已锁定；修改文案请到「编辑原BV」，替换原视频请到官网；发布修订版可准备本地新草稿。')
 const resolved = computed(() => ({values:draft.value?{...current.value?.base_settings,...draft.value.overrides}:{}}))
 const active = computed(() => PUBLISH_ACTIVE.includes(current.value?.status))
+const selectedNeedsReview = computed(() => (draft.value?.parts || []).some((part:any) => source.value?.files?.some((file:any) => file.id === part.artifact_id && file.review_ready === false)))
+const publishingStep = computed(() => current.value?.status === 'draft'
+  ? !draft.value?.parts.length || reviewDirty.value || selectedNeedsReview.value ? 1 : dirty.value ? 2 : 3
+  : current.value?.status === 'uploaded' ? 3 : 4)
+const canCreateReviewDraft = computed(() => !!current.value?.receipt?.bvid && !!current.value?.snapshot?.parts?.length
+  && !active.value && !['draft', 'unknown'].includes(current.value?.status))
+const reviewSource = computed(() => draft.value?.review_source)
+const confirmationScope = computed(() => publicationScope({ account_name: current.value?.status === 'draft'
+  ? catalog.value.accounts.find((account:any) => account.id === draft.value?.account_id)?.name || '尚未选择'
+  : current.value?.snapshot?.account_name || '尚未选择', parts: draft.value?.parts || [], settings: displayValues.value }))
+const preparationHint = computed(() => reviewDirty.value || reviewBusy.value ? '请先保存审查设置，并等待审查完成'
+  : coverLoading.value ? '封面仍在准备中，请稍候'
+  : dirty.value ? '投稿资料有未保存修改，请先保存资料'
+  : selectedNeedsReview.value ? '所选视频需要审查修订，请重新生成后选用'
+  : !draft.value?.parts.length ? '先选择需要发布的视频版本'
+  : !draft.value?.account_id ? '先选择发布账号'
+  : '确认后按下方范围继续；上传和投稿由后台自动完成')
 const hasAiDubbing = computed(() => current.value?.status === 'draft'
   ? !!draft.value?.parts.some((p:any) => source.value?.files.some((f:any) => f.id === p.artifact_id && f.has_dubbing))
   : !!current.value?.snapshot.parts?.some((p:any) => p.has_dubbing))
@@ -80,8 +108,19 @@ async function collectionCreated(result: any) {
 async function api(path: string, method = 'GET', body?: any) {
   const response = await fetch(`/api/publishing${path}`, { method, headers: body === undefined || body instanceof FormData ? undefined : { 'Content-Type': 'application/json' }, body: body === undefined ? undefined : body instanceof FormData ? body : JSON.stringify(body) })
   const data = await response.json().catch(() => ({}))
-  if (!response.ok) throw Object.assign(new Error(data.message || '发布中心请求失败'), { code: data.code })
+  if (!response.ok) throw Object.assign(new Error(data.message || '发布中心请求失败'), { code: data.code, detail: data.detail })
   return data
+}
+async function reviewDraftRequest(path:string,body:any) {
+  try { return await api(path,'POST',body) }
+  catch(e:any) {
+    if(e.code==='PUBLISH_REVIEW_MAPPING' && Array.isArray(e.detail?.parts)) {
+      const reasons=e.detail.parts.filter((part:any)=>Number.isInteger(part?.index) && part.index>0 && typeof part.reason==='string' && part.reason.trim())
+        .map((part:any)=>`P${part.index}${typeof part.title==='string' && part.title.trim() ? ` · ${part.title}` : ''}：${part.reason}`)
+      if(reasons.length)e.message+=`。${reasons.join('；')}`
+    }
+    throw e
+  }
 }
 async function run(action: () => Promise<any>) {
   if (busy.value) return
@@ -105,7 +144,8 @@ function apply(record: any) {
   coverGeneration++; coverLoading.value = false; coverError.value = ''; coverBroken.value = false
   current.value = record; draft.value = clone(record.draft); saved.value = JSON.stringify(draft.value)
 }
-function canSwitch() { if (busy.value || confirming.value) return false; if (dirty.value || studioGuard.value) { message.warning('请先保存/放弃当前修改，并等待当前操作完成，再切换页面'); return false }; return true }
+function canSwitch() { if (busy.value || confirming.value || reviewBusy.value || settingsBusy.value) return false; if (dirty.value || studioGuard.value || reviewDirty.value || settingsDirty.value) { message.warning('请先保存/放弃当前修改，并等待当前操作完成，再切换页面'); return false }; return true }
+function switchWorkspace(value:string) { if(canSwitch()) tab.value=value }
 async function studioRefresh() { catalog.value=await api('/catalog');await refreshList();if(current.value && !dirty.value)apply(await api(`/publications/${current.value.id}`)) }
 async function open(id: string) {
   if (!canSwitch()) return
@@ -117,18 +157,26 @@ async function open(id: string) {
   })
 }
 async function create() {
-  if (!projectUid.value || !canSwitch()) return
+  if (!projectUid.value || creationLocked.value || !canSwitch()) return
+  const uid = projectUid.value
+  if (creationObserving.value && !(await canCreateDraft()) || projectUid.value !== uid || !canSwitch()) return
   await run(async () => {
-    const record = await api(`/projects/${projectUid.value}/drafts`, 'POST', {})
-    source.value = await api(`/projects/${projectUid.value}/candidates`)
+    const record = await api(`/projects/${uid}/drafts`, 'POST', {})
+    source.value = await api(`/projects/${uid}/candidates`)
     apply(await api(`/publications/${record.id}`)); syncList()
   })
 }
-async function save() { if (coverLoading.value) return; await run(async () => { apply(await api(`/publications/${current.value.id}`, 'PUT', { ...draft.value, revision: current.value.revision })); syncList(); message.success('资料已保存，未触发投稿') }) }
-function change(key: string, value: any) { draft.value.overrides[key] = value }
-function inherit(key: string) { delete draft.value.overrides[key] }
-function selectAccount(value: string) { draft.value.account_id = value || ''; draft.value.template_id = '' }
+async function save() {
+  if (coverLoading.value || metadataLocked.value || !current.value) return
+  const key = current.value.id
+  if (editorObserving.value && !(await canEditProject()) || current.value?.id !== key || metadataLocked.value) return
+  await run(async () => { apply(await api(`/publications/${key}`, 'PUT', { ...draft.value, revision: current.value.revision })); syncList(); message.success('资料已保存，未触发投稿') })
+}
+function change(key: string, value: any) { if (!metadataLocked.value) draft.value.overrides[key] = value }
+function inherit(key: string) { if (!metadataLocked.value) delete draft.value.overrides[key] }
+function selectAccount(value: string) { if (locked.value) return; draft.value.account_id = value || ''; draft.value.template_id = '' }
 function addPart(file: any, selected: boolean) {
+  if (locked.value) return
   if (selected) draft.value.parts.push({ artifact_id: file.id, title: file.is_source ? '原声原片' : file.version_name || finalVideoLabel(file.name).split(' · ').slice(0, 2).join(' · ') })
   else draft.value.parts = draft.value.parts.filter((p: any) => p.artifact_id !== file.id)
 }
@@ -151,11 +199,15 @@ async function cover(event: Event) {
 }
 async function setCover(request: () => Promise<any>) {
   if (locked.value || coverLoading.value) return
-  const target = draft.value, id = current.value.id, ticket = ++coverGeneration
+  const target = draft.value, id = current.value.id
+  if (editorObserving.value && !(await canEditProject()) || locked.value || coverLoading.value || current.value?.id !== id || draft.value !== target || disposed) return
+  const ticket = ++coverGeneration
   coverLoading.value = true; coverError.value = ''
   try {
     const result = await request()
-    if (!disposed && ticket === coverGeneration && current.value?.id === id && draft.value === target) {
+    if (disposed || ticket !== coverGeneration || current.value?.id !== id || draft.value !== target) return
+    if (editorObserving.value && !(await canEditProject())) { coverError.value = projectLockReason.value || '项目正在运行，封面候选尚未应用'; return }
+    if (!disposed && ticket === coverGeneration && current.value?.id === id && draft.value === target && !projectLocked.value) {
       target.cover_id = result.cover_id; coverBroken.value = false
     }
   } catch (e: any) {
@@ -167,7 +219,9 @@ async function importCover() {
   if (uid) await setCover(() => api(`/projects/${uid}/platform-cover`, 'POST', {}))
 }
 async function upload(andSubmit = false) {
-  if (confirming.value || busy.value || coverLoading.value || disposed) return
+  if (projectLocked.value || confirming.value || busy.value || coverLoading.value || disposed) return
+  if (editorObserving.value && !(await canEditProject()) || projectLocked.value || busy.value || confirming.value || disposed) return
+  if (reviewDirty.value || reviewBusy.value) { message.warning('请先保存或放弃审查设置，并等待审查完成'); return }
   if (dirty.value) { message.warning('请先保存草稿'); return }
   await run(async () => {
     const key = current.value.id
@@ -182,10 +236,10 @@ async function upload(andSubmit = false) {
         : `只上传 ${preview.snapshot.parts.length} 个分P及封面至「${preview.snapshot.account_name}」，不会正式投稿。适合稍后投稿或追加到已有BV；上传后文字资料仍可修改。`) + (aiNotice ? `\n\n${aiNotice}` : ''),
       positiveText: andSubmit ? '确认上传并投稿' : '仅上传，不投稿', negativeText: '取消', onAfterLeave: () => { confirming.value = false },
       onPositiveClick: () => {
-        if (accepted || busy.value || disposed || current.value?.id !== key) return
-        if (dirty.value) { message.warning('资料已修改，请先保存并重新确认'); return false }
+        if (accepted || projectLocked.value || busy.value || disposed || current.value?.id !== key) return false
+        if (dirty.value || reviewDirty.value || reviewBusy.value) { message.warning('资料或审查设置已修改，请先保存并重新确认'); return false }
         accepted = true
-        return run(async () => { apply(await api(`/publications/${key}/actions`, 'POST', {
+        return run(async () => { if (editorObserving.value && !(await canEditProject())) throw new Error(projectLockReason.value || '项目正在运行，请完成后重新核对发布范围'); apply(await api(`/publications/${key}/actions`, 'POST', {
           action: andSubmit ? 'publish' : 'upload', revision: preview.revision, fingerprint: preview.fingerprint,
           ...(andSubmit ? {confirmed:true} : {}),
           ...(aiNotice ? {acknowledge_ai_notice:true} : {}),
@@ -194,7 +248,8 @@ async function upload(andSubmit = false) {
   })
 }
 async function submit() {
-  if (confirming.value || busy.value || dirty.value || disposed) return
+  if (projectLocked.value || confirming.value || busy.value || dirty.value || reviewDirty.value || reviewBusy.value || disposed) return
+  if (editorObserving.value && !(await canEditProject()) || projectLocked.value || busy.value || confirming.value || disposed) return
   await run(async () => {
     const key = current.value.id
     const preview = await api(`/publications/${key}/plan`, 'POST', {})
@@ -205,10 +260,10 @@ async function submit() {
     dialog.warning({ title: '确认正式投稿到B站', content: publicationScope(preview.snapshot) + (aiNotice ? `\n\n${aiNotice}` : ''), positiveText: '确认投稿', negativeText: '取消',
       onAfterLeave: () => { confirming.value = false },
       onPositiveClick: () => {
-        if (accepted || busy.value || disposed || current.value?.id !== key) return
-        if (dirty.value) { message.warning('资料已修改，请先保存并重新确认'); return false }
+        if (accepted || projectLocked.value || busy.value || disposed || current.value?.id !== key) return false
+        if (dirty.value || reviewDirty.value || reviewBusy.value) { message.warning('资料或审查设置已修改，请先保存并重新确认'); return false }
         accepted = true
-        return run(async () => { apply(await api(`/publications/${key}/actions`, 'POST', {
+        return run(async () => { if (editorObserving.value && !(await canEditProject())) throw new Error(projectLockReason.value || '项目正在运行，请完成后重新核对发布范围'); apply(await api(`/publications/${key}/actions`, 'POST', {
           action:'submit', revision:preview.revision, fingerprint:preview.fingerprint, confirmed:true,
           ...(aiNotice ? {acknowledge_ai_notice:true} : {}),
         })); syncList() })
@@ -217,7 +272,68 @@ async function submit() {
 }
 async function action(name: string) { await run(async () => { apply(await api(`/publications/${current.value.id}/actions`, 'POST', { action: name, revision: current.value.revision })); syncList() }) }
 async function pause() { await run(async () => { await api(`/publications/${current.value.id}/pause`, 'POST', {}); message.info('正在停止上传，不会删除B站稿件') }) }
-async function copy() { await run(async () => { const row = await api(`/publications/${current.value.id}/copy`, 'POST', {}); apply(await api(`/publications/${row.id}`)); syncList() }) }
+async function copy() {
+  if (!current.value || projectLocked.value || disposed || copying.value || active.value || ['draft','unknown'].includes(current.value.status) || !canSwitch()) return
+  const key = current.value.id, revision = current.value.revision
+  if (editorObserving.value && !(await canEditProject()) || current.value?.id !== key || copying.value || !canSwitch()) return
+  if (!copyRequest || copyRequest.publicationId !== key || copyRequest.revision !== revision)
+    copyRequest = {publicationId:key,revision,requestId:crypto.randomUUID()}
+  const request = copyRequest
+  copying.value = true
+  try {
+    await run(async () => {
+      const row = await api(`/publications/${key}/copy`, 'POST', {revision:request.revision,request_id:request.requestId})
+      if (disposed || current.value?.id !== key) return
+      // 写操作一次返回可编辑详情；列表慢或刷新失败都不耽误打开新草稿。
+      apply(row);copyRequest = null;syncList()
+      message.success(row.reused ? '已打开本次复制的草稿，未上传或投稿' : '已复制为本地新草稿，未上传或投稿')
+    })
+  } finally { copying.value = false }
+}
+async function createReviewDraft() {
+  if(!canCreateReviewDraft.value || projectLocked.value || busy.value || confirming.value || coverLoading.value || disposed) return
+  if(dirty.value || reviewDirty.value || reviewBusy.value) { message.warning('请先保存或放弃当前资料与审查设置'); return }
+  await run(async()=>{
+    const key=current.value.id
+    let plan:any
+    reviewDraftChecking.value=true
+    try { plan=await reviewDraftRequest(`/publications/${key}/review-draft/plan`,{}) }
+    finally { reviewDraftChecking.value=false }
+    if(disposed || current.value?.id!==key) return
+    if(dirty.value || reviewDirty.value || reviewBusy.value) { message.warning('当前资料或审查设置已变化，请保存后重新预览修订草稿'); return }
+    if(plan.mode!=='new_submission' || plan.source?.publication_id!==key || !Number.isInteger(plan.source?.revision)
+      || typeof plan.fingerprint!=='string' || !plan.fingerprint || !Array.isArray(plan.parts) || !plan.parts.length) throw new Error('修订草稿预览不完整，请刷新后重试')
+    const requestId=crypto.randomUUID()
+    // 只去除已在摘要中完整说明的固定提示；新增警告仍逐条展示。
+    const coveredNotices=new Set([
+      '这会创建新投稿并获得新BV；原稿件、审核记录和已发布快照保持保留。',
+      '创建草稿只保存到本地；上传与正式投稿仍需执行发布动作。',
+      '本版创作管理可修改文案、排序或追加分P；替换原BV的视频请前往B站创作中心。',
+    ])
+    confirming.value=true
+    let accepted=false
+    dialog.warning({title:'使用审查修订版新建草稿',style:{width:'min(680px, calc(100vw - 40px))'},positiveText:'创建本地修订草稿',negativeText:'取消',onAfterLeave:()=>{confirming.value=false},
+      content:()=>h('div',{style:{maxHeight:'60vh',overflow:'auto',fontSize:'12px',lineHeight:'1.8'}},[
+        h('p',`账号「${plan.account_name}」 · ${plan.parts.length} 个修订分P · 原BV：${plan.source.bvid}。只创建本地草稿，不上传、不投稿；保留原稿账号、封面、冻结文案及分P顺序和名称。随后可点击「上传并投稿」，确认后后台自动完成；发布时将创建新BV，原BV及其视频保持原状。保留原BV替换视频请在B站创作中心操作。`),
+        h('ol',plan.parts.map((part:any)=>h('li',{style:{marginBottom:'12px',overflowWrap:'anywhere'}},[
+          h('strong',`P${part.index} · ${part.title}`),h('div',`原文件：${part.source_name}`),h('div',`修订版本：${part.version_name || part.name}`),
+        ]))),
+        ...(Array.isArray(plan.notices)?plan.notices:[]).filter((notice:any)=>typeof notice==='string' && !coveredNotices.has(notice)).map((notice:string)=>h('p',notice)),
+      ]),
+      onPositiveClick:()=>{
+        if(accepted || projectLocked.value || busy.value || disposed || current.value?.id!==key) return false
+        if(dirty.value || reviewDirty.value || reviewBusy.value || current.value.revision!==plan.source.revision) { message.warning('当前资料或审查设置已变化，请重新预览修订草稿');return false }
+        accepted=true
+        return run(async()=>{
+          if (editorObserving.value && !(await canEditProject())) throw new Error(projectLockReason.value || '项目正在运行，请完成后重新核对修订草稿')
+          const created=await reviewDraftRequest(`/publications/${key}/review-draft`,{revision:plan.source.revision,fingerprint:plan.fingerprint,request_id:requestId})
+          if(disposed) return
+          apply(created);source.value=null;tab.value='drafts';syncList();refreshInBackground(refreshFiles)
+          message.success(created.reused?'已打开已有的本地修订草稿，未上传或投稿':'已创建本地修订草稿，未上传或投稿')
+        })
+      }})
+  })
+}
 async function attachReceipt() { await run(async () => { apply(await api(`/publications/${current.value.id}/receipt`, 'POST', { bvid: receiptBV.value })); syncList() }) }
 async function login() { await run(async () => { loginId.value = (await api('/login', 'POST', {})).id; loginState.value = { status: 'generating' } }) }
 async function cancelLogin() { await run(async () => {
@@ -265,7 +381,7 @@ async function pollLogin() {
     if (metadataAccount.value) void refreshMetadata()
   } else if (['failed', 'expired', 'cancelled'].includes(state.status)) loginId.value = ''
 }
-function beforeUnload(event: BeforeUnloadEvent) { if (dirty.value || studioGuard.value) { event.preventDefault(); event.returnValue = '' } }
+function beforeUnload(event: BeforeUnloadEvent) { if (dirty.value || studioGuard.value || reviewDirty.value || reviewBusy.value || settingsDirty.value || settingsBusy.value) { event.preventDefault(); event.returnValue = '' } }
 onMounted(async () => {
   window.addEventListener('beforeunload', beforeUnload)
   await run(async () => { catalog.value = await api('/catalog'); await refreshList(); const response = await fetch('/api/projects'); if (!response.ok) throw new Error('项目列表读取失败'); projects.value = await response.json() })
@@ -273,38 +389,59 @@ onMounted(async () => {
   if (!disposed) timer = setTimeout(poll, 2000)
 })
 onBeforeUnmount(() => { disposed = true; clearTimeout(timer); window.removeEventListener('beforeunload', beforeUnload) })
-onBeforeRouteLeave(() => {
-  if (!dirty.value && !studioGuard.value) return true
+function confirmLeave() {
+  if (settingsBusy.value) { message.warning('正在保存项目设置或生成候选文案，请稍候再离开'); return false }
+  if (reviewBusy.value) { message.warning('正在保存或刷新内容审查，请稍候再离开'); return false }
+  if (!dirty.value && !studioGuard.value && !reviewDirty.value && !settingsDirty.value) return true
   return new Promise<boolean>(resolve => dialog.warning({ title: '尚有未保存的发布资料', content: '离开会丢弃当前修改，不会取消已经开始的上传。', positiveText: '放弃修改并离开', negativeText: '继续编辑', onPositiveClick: () => resolve(true), onNegativeClick: () => resolve(false), onClose: () => resolve(false), onMaskClick: () => resolve(false) }))
-})
+}
+onBeforeRouteLeave(confirmLeave)
+// 切换项目会复用同一路由记录，仍需保护旧项目的编辑；页内锚点可以正常跳转。
+onBeforeRouteUpdate((to, from) => to.path === from.path || confirmLeave())
 </script>
 
 <template>
-  <main class="publish-page">
-    <header class="page-heading"><div><span class="eyebrow">{{ route.params.uid ? '08 / PUBLISH' : 'PUBLISH / BILIBILI' }}</span><h1>{{ route.params.uid ? '发布到B站' : '发布中心' }}</h1><p>一个稿件，多种配音版本；同类内容归入合集。</p></div><a href="https://member.bilibili.com/platform/upload/video/frame" target="_blank" rel="noopener noreferrer">打开B站创作中心 ↗</a></header>
+  <main class="publish-page workspace-page">
+    <header class="page-heading"><div><span class="eyebrow">{{ route.params.uid ? '08 / PUBLISH' : 'PUBLISH / BILIBILI' }}</span><h1>{{ route.params.uid ? '发布到B站' : '发布中心' }}</h1><p>先准备视频与资料，再确认发布；已有BV的修改使用独立入口。</p></div><a href="https://member.bilibili.com/platform/upload/video/frame" target="_blank" rel="noopener noreferrer">打开B站创作中心 ↗</a></header>
     <n-alert v-if="error" type="error" class="notice">{{ error }}</n-alert>
     <n-alert v-if="!catalog.worker_ready" type="warning" class="notice">发布组件尚未就绪。请在 workers/bilibili 目录运行 npm ci --ignore-scripts；本地草稿仍可编辑。</n-alert>
-    <n-tabs :value="tab" type="line" @update:value="value => { if (canSwitch()) tab = value }">
-      <n-tab-pane v-if="route.params.uid" name="rules" tab="项目发布设置"><ConfigurationForm :scope="`project:${route.params.uid}`" :sections="['publication']" @dirty-change="studioGuard=$event" @saved="studioRefresh" /></n-tab-pane>
-      <n-tab-pane name="drafts" tab="稿件与队列">
+    <n-tabs :value="tab" type="line" @update:value="switchWorkspace">
+      <n-tab-pane v-if="route.params.uid" name="rules" tab="项目发布设置"><ConfigurationForm :scope="`project:${route.params.uid}`" :sections="['publication']" @dirty-change="settingsDirty=$event" @busy-change="settingsBusy=$event" @saved="studioRefresh" /></n-tab-pane>
+      <n-tab-pane name="drafts" tab="发布新稿与记录">
         <div class="publish-workspace">
-          <aside class="publication-list"><div class="new-draft"><n-select v-model:value="projectUid" :options="projects.map(p => ({ label: p.title, value: p.uid }))" filterable placeholder="选择来源项目" :disabled="busy || !!route.params.uid" /><n-button :disabled="!projectUid || busy || dirty" secondary type="primary" @click="create">新建发布草稿</n-button></div>
+          <aside class="publication-list"><h2>新稿与发布记录</h2><p class="list-guide">审核退回后，先打开原发布记录，再使用审查修订版准备新稿。</p><div class="new-draft"><n-select v-model:value="projectUid" :options="projects.map(p => ({ label: p.title, value: p.uid }))" filterable placeholder="选择来源项目" :disabled="busy || !!route.params.uid" /><n-button :disabled="!projectUid || creationLocked || busy || dirty || reviewDirty || reviewBusy" secondary @click="create">新建发布草稿</n-button></div>
             <div v-if="!records.length" class="empty">还没有发布记录。新建草稿不会上传视频。</div>
-            <button v-for="item in records" :key="item.id" class="publication-item" :class="{ selected: current?.id === item.id }" :disabled="busy" @click="open(item.id)"><strong>{{ item.snapshot.settings?.title || item.draft.overrides?.title || item.draft.content?.title || '未命名稿件' }}</strong><span>{{ PUBLICATION_STATUS[item.status] || item.status }}</span><small>{{ item.draft.parts.length }} 个分P · {{ new Date(item.updated_at).toLocaleDateString() }}</small></button>
+            <button v-for="item in records" :key="item.id" class="publication-item" :class="{ selected: current?.id === item.id, rejected: item.status === 'rejected' }" :disabled="busy" @click="open(item.id)"><strong>{{ item.snapshot.settings?.title || item.draft.overrides?.title || item.draft.content?.title || '未命名稿件' }}</strong><span>{{ PUBLICATION_STATUS[item.status] || item.status }}</span><small>{{ item.draft.parts.length }} 个分P · {{ new Date(item.updated_at).toLocaleDateString() }}</small><small v-if="item.status === 'rejected'" class="revision-entry">打开原记录 → 准备审查修订草稿</small></button>
           </aside>
           <section v-if="current && draft" class="publication-editor">
+            <n-alert v-if="projectLocked" type="info" :show-icon="false" class="notice">{{ projectLockReason }}；稿件、成片和回执仍可查看。</n-alert>
             <div class="editor-heading"><div><n-tag size="small" :bordered="false">{{ PUBLICATION_STATUS[current.status] }}</n-tag><span v-if="dirty" class="dirty">未保存</span></div><RouterLink :to="`/projects/${current.project_uid}/steps/assemble`">返回成片 →</RouterLink></div>
+            <section v-if="canCreateReviewDraft" class="revision-workflow"><h3>使用审查修订版重新发布</h3><p>先在项目中完成审查修订并生成成片，再准备对应的新稿。保留原文案和分P顺序，发布后得到新BV。</p><n-button secondary type="primary" :loading="reviewDraftChecking" :disabled="projectLocked || busy || confirming || coverLoading || dirty || reviewDirty || reviewBusy" @click="createReviewDraft">使用审查修订版新建草稿</n-button><p v-if="reviewDraftChecking" role="status" aria-live="polite">正在核对修订文件，请稍候；大文件的完整性检查可能需要一些时间。</p><div class="original-bv-guide"><strong>保留原BV修改视频</strong><span>请在B站创作中心替换原视频；本页新稿发布和追加分P都不会替换原BV的视频。</span><a href="https://member.bilibili.com/platform/home" target="_blank" rel="noopener noreferrer">到官网替换原BV视频 ↗</a></div></section>
+            <div v-if="active" class="live-progress"><PublicationProgress :publication="current" compact /><a href="#publish-receipt">查看实时进度与回执 ↓</a></div>
+            <nav class="publishing-steps" aria-label="发布准备步骤"><a v-for="(label, index) in ['准备视频', '投稿资料', '确认发布', '进度与回执']" :key="label" :href="`#publish-${['video','metadata','confirm','receipt'][index]}`" :aria-current="publishingStep === index + 1 ? 'step' : undefined"><b>{{ index + 1 }}</b><span>{{ label }}</span></a></nav>
+            <n-alert v-if="reviewSource?.mode === 'new_submission'" type="info" class="notice">这是来自 {{ reviewSource.source_bvid }} 的审查修订草稿。上传并投稿会创建新BV，原BV不会自动替换。<span v-if="reviewSource.selection_changed">分P选择已手动调整，以当前清单为准。</span></n-alert>
+            <p v-else-if="current.status === 'draft'" class="publication-intent">当前准备发布新稿，投稿后生成新BV。已有稿件的视频替换请到B站创作中心处理。</p>
             <n-alert v-if="current.error" type="warning" class="notice">{{ current.error }}</n-alert>
             <n-alert v-if="current.status === 'unknown'" type="warning" class="notice">投稿可能已成功。请先在B站核对，填写BV号关联回执，不要重复发布。<div class="receipt-form"><n-input v-model:value="receiptBV" placeholder="BV号" /><n-button :disabled="busy" @click="attachReceipt">核对并关联</n-button></div></n-alert>
-            <n-card title="发布内容" size="small">
+            <n-card id="publish-video" title="1 · 准备视频" size="small" class="publication-stage publication-panel">
+              <p class="stage-description">选择发布账号、视频版本与分P顺序；需要修订的文件会在清单中标明。</p>
               <div class="two-columns"><label>发布账号<n-select :value="draft.account_id || null" :options="accountOptions" :disabled="locked" placeholder="先在账号页连接B站" @update:value="selectAccount" /></label><span class="muted">继承项目发布设置；此处修改仅用于当前稿件。</span></div>
               <div class="subheading"><strong>分P清单 · {{ draft.parts.length }} 个</strong><span>所有分P共用下方稿件设置</span><n-button size="tiny" quaternary :loading="refreshingFiles" :disabled="refreshingFiles" @click="refreshFiles">刷新文件列表</n-button></div>
-              <div v-for="(part, index) in draft.parts" :key="part.artifact_id" class="part-row"><span class="part-number">P{{ index + 1 }}</span><n-input v-model:value="part.title" :disabled="locked" maxlength="80" :aria-label="`P${index + 1}名称`" /><n-button size="tiny" :disabled="locked || index === 0" :aria-label="`上移P${index + 1}`" @click="draft.parts = movePart(draft.parts, index, -1)">↑</n-button><n-button size="tiny" :disabled="locked || index === draft.parts.length - 1" :aria-label="`下移P${index + 1}`" @click="draft.parts = movePart(draft.parts, index, 1)">↓</n-button><n-button size="tiny" :disabled="locked" @click="draft.parts.splice(index, 1)">移除</n-button></div>
+              <div v-for="(part, index) in draft.parts" :key="part.artifact_id" class="part-block">
+                <div class="part-row"><span class="part-number">P{{ index + 1 }}</span><n-input v-model:value="part.title" :disabled="locked" maxlength="80" :aria-label="`P${index + 1}名称`" /><n-button size="tiny" :disabled="locked || index === 0" :aria-label="`上移P${index + 1}`" @click="draft.parts = movePart(draft.parts, index, -1)">↑</n-button><n-button size="tiny" :disabled="locked || index === draft.parts.length - 1" :aria-label="`下移P${index + 1}`" @click="draft.parts = movePart(draft.parts, index, 1)">↓</n-button><n-button size="tiny" :disabled="locked" @click="draft.parts.splice(index, 1)">移除</n-button></div>
+                <CandidateReviewBadge :file="source?.files?.find((file: any) => file.id === part.artifact_id)" />
+              </div>
               <p v-if="source && draft.parts.some((p: any) => !source.files.some((f: any) => f.id === p.artifact_id && f.exists))" class="muted">部分已选分P的本地文件缺失。选择仍保留；还原文件后刷新，或移除该分P。已上传的远程文件不受影响。</p>
               <div v-if="!draft.parts.length" class="empty">尚未选择成片，不会自动勾选任何版本。</div>
-              <details v-if="!locked" class="available-files" open><summary>从成片或原片选择</summary><div v-for="file in source?.files || []" :key="file.id" class="candidate"><n-checkbox :checked="draft.parts.some((p: any) => p.artifact_id === file.id)" :disabled="!file.exists" @update:checked="addPart(file, $event)"><span>{{ file.is_source ? '原声原片 · 不叠加字幕或评论' : file.version_name ? `${file.version_name} · ${file.version_summary}` : finalVideoLabel(file.name) }}</span></n-checkbox><small>{{ fmtSize(file.size) }} · {{ new Date(file.created_at).toLocaleString() }}{{ file.exists ? '' : ' · 文件不存在' }} · <FilePathLink v-if="file.path" :path="file.path" label="定位文件" /></small></div><p v-if="!source?.files.length" class="muted">还没有可发布的 MP4/MOV/MKV 原片或成片；试片不会进入发布清单。</p><RouterLink :to="`/projects/${projectUid}/steps/assemble`">修改成片版本效果 →</RouterLink></details>
+              <details v-if="!locked" class="available-files" open><summary>从成片或原片选择</summary><div v-for="file in source?.files || []" :key="file.id" class="candidate"><n-checkbox :checked="draft.parts.some((p: any) => p.artifact_id === file.id)" :disabled="!file.exists" @update:checked="addPart(file, $event)"><span>{{ file.is_source ? '原声原片 · 不叠加字幕或评论' : file.version_name ? `${file.version_name} · ${file.version_summary}` : finalVideoLabel(file.name) }}</span></n-checkbox><small>{{ fmtSize(file.size) }} · {{ new Date(file.created_at).toLocaleString() }}{{ file.exists ? '' : ' · 文件不存在' }} · <FilePathLink v-if="file.path" :path="file.path" label="定位文件" /></small><CandidateReviewBadge :file="file" /></div><p v-if="!source?.files.length" class="muted">还没有可发布的 MP4/MOV/MKV 原片或成片；试片不会进入发布清单。</p><RouterLink :to="`/projects/${current.project_uid}/steps/assemble`">修改成片版本效果 →</RouterLink></details>
             </n-card>
-            <n-card title="稿件资料" size="small">
+            <details class="review-workspace" :open="reviewDirty || selectedNeedsReview"><summary>字幕、配音与评论审查<span>核对规则、命中明细及人工屏蔽时段</span></summary>
+            <ContentReviewPanel v-if="current.project_uid" :key="current.project_uid" :uid="current.project_uid"
+                                :disabled="projectLocked || busy || confirming || active" @dirty-change="reviewDirty = $event"
+                                @busy-change="reviewBusy = $event" @saved="refreshFiles" />
+            </details>
+            <n-card id="publish-metadata" title="2 · 投稿资料" size="small" class="publication-stage publication-panel">
+              <p class="stage-description">准备封面和文案，核对创作声明、可见范围、发布时间与合集。</p>
               <div class="cover-row"><div class="cover-preview"><img v-if="draft.cover_id" :src="`/api/publishing/covers/${draft.cover_id}`" alt="本稿件封面" /><img v-else-if="source?.thumbnail_preview && !coverBroken" :src="source.thumbnail_preview" alt="可选的平台封面" @error="coverBroken = true" /><div v-else class="cover-placeholder">选择封面</div><small v-if="!draft.cover_id && source?.thumbnail_preview && !coverBroken" class="muted">平台封面 · 尚未使用</small></div><div><label class="file-picker">上传封面<input type="file" accept="image/png,image/jpeg,image/webp" :disabled="locked || coverLoading" @change="cover" /></label><n-button size="small" :loading="coverLoading" :disabled="locked || coverLoading || !source?.platform_cover_available" @click="importCover">使用平台封面</n-button><small v-if="coverError" role="alert" class="cover-error">{{ coverError }}</small></div></div>
               <div class="metadata-bar"><span>{{ metadataLoading ? '正在读取账号选项，其他资料可继续编辑' : '标题、封面及以下设置由整个稿件共用' }}</span><n-button size="small" :loading="metadataLoading" :disabled="busy || metadataLoading || !metadataAccount" @click="refreshMetadata()">刷新账号选项</n-button></div>
               <n-alert v-if="metadataError" type="warning" class="notice">{{ metadataError }}<span v-if="metadataReady">；暂显示上次读取的选项。</span></n-alert>
@@ -314,37 +451,55 @@ onBeforeRouteLeave(() => {
               <PublishSettingsForm :values="displayValues" :source-published-date="source?.source_published_date" :sources="displaySources" :overrides="draft.overrides" :metadata="metadata" :metadata-loading="metadataLoading" :metadata-error="metadataError" :metadata-ready="metadataReady" :metadata-account="metadataAccount" :metadata-account-name="metadataAccountName" :context-key="collectionContext" :cover-id="draft.cover_id" :has-ai-dubbing="hasAiDubbing" :disabled="metadataLocked" @change="change" @inherit="inherit" @collection-created="collectionCreated" @refresh-metadata="refreshMetadata()" />
               <details class="api-scope"><summary>与B站网页设置的对应范围</summary><p>已接入基本文案、封面、分P、新版分区、稿件类型与声明、可见范围、定时发布、水印、互动开关和话题选择。合集在取得投稿回执后单独加入。</p><p>商业推广、付费推广、卡片、章节、平台外挂字幕、杜比／Hi-Res、空间隐藏尚未接入，可在B站补充。账号权限及最终校验以B站为准。</p></details>
             </n-card>
-            <div class="publish-actions"><span v-if="active">{{ PUBLICATION_STATUS[current.status] }}<template v-if="current.snapshot.publish_after_upload && ['queued','uploading'].includes(current.status)"> · 完成后自动投稿</template></span><span v-else-if="current.status === 'draft'">保存仅在本地；投稿需确认</span><span v-else>使用已确认的资料和成片版本</span>
-              <n-button v-if="['draft', 'uploaded'].includes(current.status)" :disabled="busy || coverLoading || !dirty" @click="save">保存资料</n-button>
-              <template v-if="['draft', 'paused', 'failed'].includes(current.status)"><n-button :disabled="busy || confirming || coverLoading || dirty || !draft.parts.length || !catalog.worker_ready" title="上传后停留待投稿，适合稍后投稿或追加到已有BV" @click="upload(false)">{{ current.status === 'draft' ? '仅上传文件' : '仅继续上传' }}</n-button><n-button type="primary" :disabled="busy || confirming || coverLoading || dirty || !draft.parts.length || !catalog.worker_ready" @click="upload(true)">{{ current.status === 'draft' ? '上传并投稿' : '继续上传并投稿' }}</n-button></template>
-              <n-button v-if="current.status === 'uploaded'" type="primary" :disabled="busy || dirty || confirming" @click="submit">确认投稿</n-button>
-              <n-button v-if="current.status === 'uploaded'" :disabled="busy || dirty || confirming" @click="tab='studio'">改为追加到已有BV</n-button>
-              <n-button v-if="['queued', 'uploading'].includes(current.status)" :disabled="busy" @click="pause">暂停上传</n-button>
-              <n-button v-if="current.receipt.bvid" :disabled="busy || active" @click="action('check')">查询平台状态</n-button>
-              <n-button v-if="current.status === 'collection_pending'" :disabled="busy" @click="action('collection')">重试加入合集</n-button>
-              <n-button v-if="!['draft', 'unknown'].includes(current.status) && !active" :disabled="busy" @click="copy">复制为新草稿</n-button>
-            </div>
-            <PublicationRightsHint v-if="['draft', 'uploaded', 'paused', 'failed'].includes(current.status)" />
-            <n-progress v-if="['uploading', 'paused', 'uploaded'].includes(current.status)" type="line" :percentage="Math.round(current.progress)" :show-indicator="true" />
-            <ProgressActivity :activity="publicationActivity(current)" />
+            <n-card id="publish-confirm" title="3 · 确认发布" size="small" class="publication-stage publication-panel confirmation-stage">
+              <p class="confirmation-scope">{{ confirmationScope }}</p>
+              <div class="preflight-summary"><span>{{ draft.parts.length }} 个分P</span><span :class="{attention:dirty}">{{ dirty ? '资料未保存' : '资料已保存' }}</span><span :class="{attention:reviewDirty || reviewBusy || selectedNeedsReview}">{{ reviewDirty ? '审查设置未保存' : reviewBusy ? '审查进行中' : selectedNeedsReview ? '视频需审查修订' : '按当前审查设置预检' }}</span></div>
+              <p v-if="['draft','uploaded','paused','failed'].includes(current.status)" class="preparation-hint" role="status">{{ preparationHint }}</p>
+              <PublicationRightsHint v-if="['draft', 'uploaded', 'paused', 'failed'].includes(current.status)" />
+              <div class="primary-publish-action">
+                <n-button v-if="['draft','paused','failed'].includes(current.status)" type="primary" size="large" :disabled="projectLocked || busy || confirming || coverLoading || dirty || reviewDirty || reviewBusy || !draft.parts.length || !catalog.worker_ready" @click="upload(true)">{{ current.status === 'draft' ? '上传并投稿' : '继续上传并投稿' }}</n-button>
+                <n-button v-if="current.status === 'uploaded'" type="primary" size="large" :disabled="projectLocked || busy || dirty || reviewDirty || reviewBusy || confirming" @click="submit">确认投稿</n-button>
+                <span v-if="['draft','paused','failed'].includes(current.status)">确认一次后自动上传视频、封面并投稿；关闭页面不会停止后台任务。</span>
+                <span v-else-if="active">{{ PUBLICATION_STATUS[current.status] }}<template v-if="current.snapshot.publish_after_upload && ['queued','uploading'].includes(current.status)"> · 完成后自动投稿</template> · 进度与回执见下方</span>
+                <span v-else-if="current.status === 'uploaded'">文件已上传，确认后提交稿件资料。</span>
+                <span v-else>此发布记录已冻结，核对平台状态或准备审查修订草稿。</span>
+              </div>
+              <div class="publish-actions secondary-publish-actions">
+                <n-button v-if="['draft', 'uploaded'].includes(current.status)" secondary :disabled="metadataLocked || coverLoading || !dirty" @click="save">保存资料</n-button>
+                <n-button v-if="['draft','paused','failed'].includes(current.status)" quaternary :disabled="projectLocked || busy || confirming || coverLoading || dirty || reviewDirty || reviewBusy || !draft.parts.length || !catalog.worker_ready" title="只上传文件，随后可单独投稿或追加至已有BV" @click="upload(false)">{{ current.status === 'draft' ? '仅上传文件' : '仅继续上传' }}</n-button>
+                <n-button v-if="current.status === 'uploaded'" quaternary :disabled="busy || dirty || reviewDirty || reviewBusy || confirming" @click="switchWorkspace('studio')">改为追加到已有BV</n-button>
+              </div>
+            </n-card>
+            <n-card id="publish-receipt" title="4 · 进度与回执" size="small" class="publication-stage publication-panel">
+            <PublicationProgress :publication="current" />
+            <ProgressActivity v-if="!current.progress_detail" :activity="publicationActivity(current)" />
+            <p v-if="current.status === 'draft'" class="stage-description">尚未启动上传；确认发布后在这里查看进度与回执。</p>
             <div v-if="current.receipt.bvid" class="receipt"><a :href="`https://www.bilibili.com/video/${current.receipt.bvid}`" target="_blank" rel="noopener noreferrer">{{ current.receipt.bvid }} ↗</a><span>{{ current.receipt.state_desc || '已取得投稿回执，上传完成不代表审核通过' }}</span><span v-if="current.receipt.collection_joined">已加入合集</span></div>
             <n-alert v-if="current.receipt.reject_reason" type="warning" class="notice">{{ current.receipt.reject_reason }}</n-alert>
             <details v-if="current.receipt.videos?.length" class="available-files"><summary>各分P审核 / 转码信息</summary><p v-for="(p,i) in current.receipt.videos" :key="p.cid">P{{ i+1 }} · {{ p.title }} · {{ p.state_desc || '平台未提供状态说明' }}<span v-if="p.xcode_state !== undefined && p.xcode_state !== null"> · 转码状态码 {{ p.xcode_state }}</span><br v-if="p.reject_reason" />{{ p.reject_reason }}</p></details>
+            <div class="receipt-actions"><n-button v-if="['queued','uploading'].includes(current.status)" :disabled="busy" @click="pause">暂停上传</n-button><n-button v-if="current.receipt.bvid" :disabled="busy || active" @click="action('check')">查询平台状态</n-button><n-button v-if="current.status === 'collection_pending'" :disabled="busy" @click="action('collection')">重试加入合集</n-button></div>
+            <div v-if="current.receipt.bvid && !canCreateReviewDraft" class="original-bv-guide"><strong>保留原BV修改视频</strong><span>请在B站创作中心替换原视频；本页新稿发布和追加分P都不会替换原BV的视频。</span><a href="https://member.bilibili.com/platform/home" target="_blank" rel="noopener noreferrer">到官网替换原BV视频 ↗</a></div>
+            <n-button v-if="!['draft','unknown'].includes(current.status) && !active" quaternary size="small" :loading="copying" :disabled="projectLocked || busy || copying || confirming || dirty || reviewDirty || reviewBusy" @click="copy">{{ copying ? '正在复制草稿' : '复制为新草稿' }}</n-button>
+            </n-card>
           </section>
           <div v-else class="editor-empty"><h2>准备下一条发布</h2><p>选择项目，新建草稿。原声、不同配音版本可按顺序加入同一个稿件。</p><n-button secondary @click="tab = 'accounts'">连接B站账号</n-button></div>
         </div>
       </n-tab-pane>
-      <n-tab-pane name="studio" tab="B站稿件">
+      <n-tab-pane name="studio" tab="编辑原BV">
+        <n-alert type="info" :show-icon="false" class="notice">此处修改已有BV的文案、分P顺序或合集，也可追加新分P。保留原BV替换视频请到官网处理；审查修订草稿从「新稿与发布记录」中的原记录创建，发布后得到新BV。<a href="https://member.bilibili.com/platform/home" target="_blank" rel="noopener noreferrer">到B站创作中心替换视频 ↗</a></n-alert>
         <BiliStudio v-if="tab==='studio'" :accounts="catalog.accounts" :projects="projects" :default-project="projectUid" @guard="studioGuard=$event" @refresh="studioRefresh" />
       </n-tab-pane>
       <n-tab-pane name="accounts" tab="账号">
-        <n-card title="B站账号" class="settings-card"><div v-for="account in catalog.accounts" :key="account.id" class="account-row"><strong>{{ account.name }}</strong><span>UID {{ account.id }}</span></div><p class="muted">登录凭据由 Windows 当前用户加密保存，不进入项目文件或 AI 请求。</p><n-button type="primary" :disabled="busy || !!loginId || !catalog.worker_ready" @click="login">扫码连接 / 重新登录</n-button><div v-if="loginState" class="qr"><div v-if="loginState.url" class="qr-frame"><n-qr-code :value="loginState.url" :size="180" :padding="0" type="svg" color="#111111" background-color="#ffffff" /></div><p role="status" aria-live="polite">{{ loginState.error || LOGIN_STATUS[loginState.status] || '正在读取登录状态…' }}</p><small v-if="loginState.code" class="muted">{{ loginState.code }}</small><n-button v-if="loginId" :disabled="busy" @click="cancelLogin">取消登录</n-button></div></n-card>
+        <n-card title="B站账号" size="small" class="settings-card publication-panel"><div v-for="account in catalog.accounts" :key="account.id" class="account-row"><strong>{{ account.name }}</strong><span>UID {{ account.id }}</span></div><p class="muted">登录凭据由 Windows 当前用户加密保存，不进入项目文件或 AI 请求。</p><n-button type="primary" :disabled="busy || !!loginId || !catalog.worker_ready" @click="login">扫码连接 / 重新登录</n-button><div v-if="loginState" class="qr"><div v-if="loginState.url" class="qr-frame"><n-qr-code :value="loginState.url" :size="180" :padding="0" type="svg" color="#111111" background-color="#ffffff" /></div><p role="status" aria-live="polite">{{ loginState.error || LOGIN_STATUS[loginState.status] || '正在读取登录状态…' }}</p><small v-if="loginState.code" class="muted">{{ loginState.code }}</small><n-button v-if="loginId" :disabled="busy" @click="cancelLogin">取消登录</n-button></div></n-card>
       </n-tab-pane>
     </n-tabs>
   </main>
 </template>
 
 <style scoped>
+.live-progress{margin:0 0 18px;padding:10px 14px;border:1px solid var(--df-border);border-radius:8px}.live-progress>a{display:block;font-size:12px;margin-top:10px}.publication-editor>.revision-workflow{margin-top:0}
+.list-guide,.publication-intent,.stage-description{font-size:12px;line-height:1.75;color:var(--df-muted)}.publication-list h2{font-size:13px;margin:0 0 8px}.list-guide{margin:0 0 16px}.publication-item.rejected .revision-entry{color:var(--df-accent);line-height:1.65}.publication-intent{margin:0 0 18px}.stage-description{margin:0 0 18px}.publication-stage{scroll-margin-top:24px}.publishing-steps{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:6px;margin-bottom:20px}.publishing-steps a{display:flex;align-items:center;gap:7px;padding:10px 8px;border-bottom:2px solid var(--df-border);color:var(--df-muted);font-size:12px;text-decoration:none}.publishing-steps b{display:grid;place-items:center;width:23px;height:23px;flex:0 0 23px;border:1px solid var(--df-border);border-radius:50%;font-size:11px}.publishing-steps a[aria-current=step]{color:var(--df-accent);border-bottom-color:var(--df-accent)}.publishing-steps a[aria-current=step] b{border-color:var(--df-accent)}.review-workspace{border:1px solid var(--df-border);border-radius:8px;padding:14px;margin:0 0 18px}.review-workspace>summary{display:flex;justify-content:space-between;flex-wrap:wrap;gap:8px;color:var(--df-text);font-size:12px}.review-workspace>summary span{color:var(--df-muted);font-size:11px}.review-workspace :deep(.content-review-panel){margin:14px 0 0}.confirmation-stage{border-color:var(--df-accent)}.confirmation-scope{font-size:13px;line-height:1.85;margin:0 0 14px;overflow-wrap:anywhere}.preflight-summary{display:flex;gap:10px;flex-wrap:wrap;margin-bottom:12px;font-size:11px;color:var(--df-muted)}.preflight-summary span{padding:5px 8px;border:1px solid var(--df-border);border-radius:5px}.attention,.preparation-hint{color:var(--df-accent)}.preparation-hint{font-size:12px;line-height:1.75;margin:0 0 12px}.primary-publish-action{display:flex;align-items:center;gap:16px;flex-wrap:wrap;margin:18px 0 6px}.primary-publish-action>span{font-size:12px;line-height:1.75;color:var(--df-muted);flex:1 1 240px}.secondary-publish-actions{justify-content:flex-start;padding:12px 0 0}.receipt-actions{display:flex;gap:10px;flex-wrap:wrap;margin:16px 0}.revision-workflow{padding:16px;border:1px solid var(--df-border);border-radius:8px;margin:18px 0;background:var(--df-accent-soft)}.revision-workflow h3{font-size:13px;margin:0 0 8px}.revision-workflow p,.original-bv-guide{font-size:12px;line-height:1.8;color:var(--df-muted)}.revision-workflow p{margin:0 0 14px}.original-bv-guide{display:grid;gap:6px;padding:14px 0;border-top:1px solid var(--df-border);margin:16px 0}.original-bv-guide strong{color:var(--df-text);font-size:12px}@media(max-width:760px){.publishing-steps a{flex-direction:column;align-items:flex-start;font-size:11px;padding:8px 4px}.primary-publish-action>.n-button{width:100%}.original-bv-guide,.revision-workflow p{overflow-wrap:anywhere}}
+.part-block{margin-bottom:12px}.part-block>.candidate-review{margin:0 0 8px 26px}.candidate>.candidate-review{margin-left:26px}
 .deleted-templates { margin-top:20px; color:var(--df-muted); font-size:12px; }.deleted-templates summary { cursor:pointer; padding:8px 0; }.delete-template { margin-right:auto; }
 .cover-preview { display:grid; gap:6px; }.cover-error { color:var(--df-danger, #f08d8d); max-width:360px; }
 .api-scope { margin-top:20px; color:var(--df-muted); font-size:11px; line-height:1.8; }.api-scope p { max-width:760px; }

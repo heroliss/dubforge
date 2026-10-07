@@ -12,7 +12,7 @@ import { createPinia } from 'pinia'
 import { NDialogProvider, NMessageProvider } from 'naive-ui'
 let server:ViteDevServer,Panel:any,useNavStore:any
 before(async()=>{
-  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null}})
+  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null,ws:false}})
   Panel=(await server.ssrLoadModule('/src/components/WorkflowPanel.vue')).default
   ;({useNavStore}=await server.ssrLoadModule('/src/stores/nav.ts'))
   mock.method(globalThis,'fetch',()=>{throw new Error('不允许未声明网络请求')})
@@ -20,7 +20,7 @@ before(async()=>{
 after(async()=>{mock.restoreAll();await server.close()})
 const version={id:'a',name:'原声双语',dubbing:false,burn_subtitles:true,include_comments:false,overrides:{}}
 const recipe={mode:'publish',part_titles:{a:'原声版'},version_ids:['a']}
-const plan=()=>({recipe:structuredClone(recipe),steps:['download','assemble'],labels:{download:'下载',assemble:'合成'},version_specs:[version],blockers:[],warnings:[],fingerprint:'f',settings:{visibility:'public',season_id:1},account_name:'测试账号'})
+const plan=()=>({recipe:structuredClone(recipe),steps:['download','assemble'],labels:{download:'下载',assemble:'合成'},version_specs:[version],blockers:[],warnings:[],fingerprint:'f',recovery_fingerprint:'recovery-f',recovery:{start_step:'split',start_label:'语义整理',previous_step:'translate',previous_label:'翻译',reason:'输入已变化',rows:[{key:'download',label:'下载',action:'reuse',reason:'已有结果可复用'},{key:'split',label:'语义整理',action:'update',reason:'设置已变化'}]},settings:{visibility:'public',season_id:1},account_name:'测试账号'})
 const state=()=>({recipe:structuredClone(recipe),version_catalog:{versions:[version]},runs:[]})
 async function render(seed:(p:any,n:any)=>void=()=>{}){
   let page:any
@@ -91,7 +91,7 @@ test('等待审核不显示新建运行；暂停制作可继续，已有稿件�
   assert.match(monitoring.html,/停止自动查询/);assert.doesNotMatch(monitoring.html,/检查并运行完整流程/)
   await monitoring.page.open();assert.equal(monitoring.page.show,false)
   const paused=await render((_p,n)=>n.workflow.run={id:'r',mode:'publish',status:'paused',phase:'合成',total:2,cursor:1})
-  assert.match(paused.html,/检查并继续流程/)
+  assert.match(paused.html,/检查恢复方案/)
   const ready=await render((_p,n)=>{n.workflow.existing_publication_id='pub';n.workflow.run={id:'r',mode:'draft',status:'ready',phase:'就绪',publication_id:'pub'}})
   assert.match(ready.html,/查看或继续现有稿件/);assert.doesNotMatch(ready.html,/检查并运行完整流程/)
 })
@@ -109,4 +109,19 @@ test('耗时预检可以取消，旧响应不会复活抽屉或确认按钮',asy
   page.close();assert.equal(signal.aborted,true);assert.equal(page.busy,false)
   resolve();await pending
   assert.equal(page.show,false);assert.equal(page.preview,null);assert.equal(page.canConfirm,false)
+})
+
+test('恢复确认发送权威恢复指纹并沿用同一请求UUID，缺少恢复方案不可确认',async t=>{
+  const {page}=await render(p=>{p.selectedRun='run-old';p.preview=plan();p.show=true});const writes:any[]=[]
+  t.mock.method(globalThis,'fetch',async(url,options)=>{writes.push([String(url),JSON.parse(String(options?.body))]);throw new Error('回执未收到')})
+  assert.equal(page.confirmLabel,'确认恢复并投稿');await page.confirmStart();await page.confirmStart()
+  assert.equal(writes[0][0],'/api/projects/fixture/workflow/run-old/resume')
+  assert.equal(writes[0][1].recovery_fingerprint,'recovery-f');assert.equal(writes[0][1].request_id,writes[1][1].request_id)
+  page.preview={...plan(),recovery_fingerprint:undefined};assert.equal(page.canConfirm,false)
+})
+test('HTTP400恢复方案冲突清除旧预检，不再发送旧确认',async t=>{
+  const {page}=await render(p=>{p.selectedRun='run-old';p.preview=plan();p.show=true});let writes=0
+  t.mock.method(globalThis,'fetch',async()=>{writes++;return {ok:false,status:400,json:async()=>({code:'WORKFLOW_PLAN_CHANGED',message:'恢复范围已变化'})}})
+  await page.confirmStart();assert.equal(page.preview,null);assert.equal(page.canConfirm,false);assert.match(page.error,/重新检查/)
+  await page.confirmStart();assert.equal(writes,1)
 })

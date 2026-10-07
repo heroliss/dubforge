@@ -125,10 +125,16 @@ def save(uid, body):
 
 def base_values(deps, comment_settings=None):
     from dubforge import comment_studio, configuration
-    data = configuration.resolve(deps.project.uid)
+    if deps._assembly_configuration is None:
+        deps._assembly_configuration = configuration.resolve(deps.project.uid, settings=deps.settings)
+    data = deps._assembly_configuration
     comments = comment_settings if comment_settings is not None else {k: data['values']['comments.' + k] for k in comment_studio.DEFAULT_SETTINGS}
     values = {key: deps.cfg(key) for key in RENDER_KEYS}
-    values.update({'comments.' + key: value for key, value in comments.items() if any(f['path'] == 'comments.' + key for f in fields())})
+    values.update({key: deps.cfg(key) for key in (
+        'content_review.enabled', 'content_review.mute_audio',
+        'content_review.blocked_terms', 'content_review.blocked_ranges')})
+    allowed = {f['path'] for f in fields()}
+    values.update({'comments.' + key: value for key, value in comments.items() if 'comments.' + key in allowed})
     origins = {key: data['origins'].get(key, '全局默认') for key in values}
     return values, origins
 
@@ -164,6 +170,7 @@ def active_values(version):
         if values['assemble.subtitle_track'] != 'bilingual': keys.discard('subtitles.source_first')
         if not values.get('assemble.subtitle_source_style_enabled') or values['assemble.subtitle_track'] == 'trans':
             keys = {key for key in keys if not key.startswith('assemble.subtitle_source_')}
+    keys |= {k for k in values if k.startswith('content_review.')} if values.get('content_review.enabled', True) else {'content_review.enabled'}
     return {k: values[k] for k in keys}
 
 
@@ -172,7 +179,14 @@ def fingerprint(deps, version):
     inputs = {f'{s}/{n}': scoped.arts.get(f'{s}/{n}') for s, n, _ in scoped.inputs('assemble')}
     data = dict(schema=1, dimensions={k: version[k] for k in ('dubbing', 'burn_subtitles', 'include_comments')},
                 values=active_values(version), inputs={k: a.sha256 if a else 'missing' for k, a in inputs.items()})
+    if scoped.cfg('content_review.enabled', True):
+        from dubforge.content_review import REVIEW_VERSION
+        data['content_review'] = dict(version=REVIEW_VERSION, inputs={
+            k: deps.arts[k].sha256 for k in ('transcribe/src.srt', 'split/split.txt', 'translate/translate.txt')
+            if k in deps.arts})
     from dubforge.pipeline.subtitle_document import records
+    if scoped.cfg('content_review.enabled', True):
+        data['content_review']['edits'] = records(deps.project)
     keys = {'text', 'start', 'end'} if version['dubbing'] else set()
     if version['burn_subtitles']:
         keys |= {'start', 'end'}
@@ -182,17 +196,25 @@ def fingerprint(deps, version):
     data['edits'] = {k: {part: {f: v for f, v in row.get(part, {}).items() if f in keys} for part in ('base', 'values')}
                      for k, row in records(deps.project).items() if keys.intersection(row.get('values', {}))}
     if version['dubbing']:
-        from dubforge.pipeline.dubbing_edit import production_lines
-        data['voices'] = [{k: l[k] for k in ('id', 'source', 'take')} for l in production_lines(deps.project, scoped.dubbing_lines(), scoped.root, dependencies=scoped)]
+        data['voices'] = [{k: l[k] for k in ('id', 'source', 'take')} for l in scoped.production_lines()]
     if version['include_comments']:
         from dubforge.comment_studio import render_fingerprint_plan
-        data['comments'] = render_fingerprint_plan(version['comment_overlay'])
+        from dubforge.pipeline.content_redaction import safe_overlay
+        # 正式编码先筛查评论；新鲜度须比较同一实际方案，不能把保留的阅读原案算入成片。
+        data['comments'] = render_fingerprint_plan(safe_overlay(scoped, version['comment_overlay']))
     return digest(data)
 
 
 def results(uid):
     with crud.session() as session:
         return {r.version_id: r for r in session.exec(select(AssemblyResult).where(AssemblyResult.project_uid == uid)).all()}
+
+
+def _results(deps):
+    """仅复用本次依赖读取中的版本登记；下次状态请求重新查询数据库。"""
+    if deps._assembly_records is None:
+        deps._assembly_records = results(deps.project.uid)
+    return deps._assembly_records
 
 
 def artifact_metadata(uid):
@@ -209,6 +231,7 @@ def artifact_metadata(uid):
         label = ('配音' if snapshot['dubbing'] else '原声') + ' · ' + (
             {'source': '原文字幕', 'trans': '中文字幕', 'bilingual': '双语字幕'}[track] if snapshot['burn_subtitles'] else '无字幕')
         if snapshot['include_comments']: label += ' · 叠加评论'
+        if snapshot.get('review_render'): label += ' · 审查修订（复用旧文字与音轨）'
         data[row.artifact_id] = dict(version_id=row.version_id, version_name=names.get(row.version_id, snapshot['name']),
                                      version_summary=label, has_dubbing=snapshot['dubbing'])
     return data
@@ -216,7 +239,7 @@ def artifact_metadata(uid):
 
 def assembly_state(deps):
     """已有版本各自判定，不因新增一个尚未生成的版本让旧成品全部过期。"""
-    saved = results(deps.project.uid)
+    saved = _results(deps)
     if not saved: return None
     from dubforge import comment_studio
     overlay = comment_studio.effective_overlay(deps.project.uid, comment_studio._read(deps.project).get('overlay'))
@@ -228,7 +251,7 @@ def assembly_state(deps):
 
 
 def result_artifact(deps, version, records=None):
-    record = (records if records is not None else results(deps.project.uid)).get(version['id'])
+    record = (records if records is not None else _results(deps)).get(version['id'])
     if record:
         return next((a for a in deps.arts.values() if a.id == record.artifact_id), None)
     if version['id'].startswith('legacy-'):
@@ -239,16 +262,19 @@ def result_artifact(deps, version, records=None):
 
 
 def is_current(deps, version, *, verify_hash=False):
-    record = results(deps.project.uid).get(version['id'])
+    from dubforge.content_review import ContentReviewError
+    from dubforge.pipeline.content_redaction import ContentRedactionError
+    record = _results(deps).get(version['id'])
     art = result_artifact(deps, version, {version['id']: record} if record else {})
-    if not record or not art or art.sha256 != record.artifact_hash or record.fingerprint != fingerprint(deps, version): return False
+    if not record or not art or art.sha256 != record.artifact_hash: return False
     path = deps.path(art.step_key, art.name)
     try:
+        if record.fingerprint != fingerprint(deps, version): return False
         if not path or not path.is_file() or path.stat().st_size != art.size or deps.for_version(version).unready('assemble'): return False
         if verify_hash:
             with path.open('rb') as stream:
                 return hashlib.file_digest(stream, 'sha256').hexdigest() == art.sha256
-    except OSError:
+    except (OSError, ContentReviewError, ContentRedactionError):
         return False
     return True
 
@@ -269,17 +295,24 @@ def view(uid):
     deps = Dependencies(crud.get_project(uid))
     defaults, origins = base_values(deps)
     overlay = comment_studio.effective_overlay(uid, comment_studio._read(deps.project).get('overlay'))
-    records = results(uid)
+    records = _results(deps)
     versions = []
     for spec in doc['versions']:
         resolved = resolve(deps, spec, comment_plan=overlay)
         art = result_artifact(deps, spec, records)
-        current = is_current(deps, resolved) if art else False
+        record = records.get(spec['id'])
+        reviewed = bool(record and json.loads(record.snapshot).get('review_render'))
+        if reviewed:
+            from dubforge.pipeline.review_render import is_current as review_current
+            current = bool(art and review_current(deps, resolved, record))
+        else:
+            current = is_current(deps, resolved) if art else False
         path = deps.path(art.step_key, art.name) if art else None
         exists = bool(path and path.is_file())
         versions.append({**spec, 'values': resolved['values'], 'origins': resolved['origins'],
                          'artifact_id': art.id if art else None, 'fresh': current,
                          'status': '原片直用' if not any(spec[k] for k in ('dubbing','burn_subtitles','include_comments')) else
+                                   '审查修订有效（复用旧文字与音轨）' if reviewed and current else
                                    '已是最新' if current else '文件缺失' if art and not exists else '需更新' if art else '尚未生成'})
     return dict(**{**doc, 'versions': versions}, defaults=defaults, origins=origins, fields=list(fields()))
 

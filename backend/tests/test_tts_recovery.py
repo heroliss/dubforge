@@ -122,6 +122,9 @@ def test_adapter_checks_cancel_and_preserves_existing_audio(isolated_env, monkey
     import gradio_client
     output = tmp_path / 'old.wav'
     output.write_bytes(b'old')
+    import soundfile as sf
+    reference = tmp_path / 'reference.wav'
+    sf.write(reference, [0.1] * 3200, 32000)
     client = Mock()
     job = client.submit.return_value
     job.status.return_value = SimpleNamespace(progress_data=None)
@@ -139,7 +142,7 @@ def test_adapter_checks_cancel_and_preserves_existing_audio(isolated_env, monkey
             raise error
     with pytest.raises(StepTimeout):
         tts_indextts25.synth('http://localhost:7860', '你好', output, 'ZH',
-                            timbre_ref=output, check_cancel=check)
+                            timbre_ref=reference, check_cancel=check)
     assert output.read_bytes() == b'old'
     assert tts_requests.needs_recovery('http://localhost:7860')
     assert len(observers) == 1

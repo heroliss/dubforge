@@ -72,13 +72,18 @@ def synthesize(client, url, **kwargs):
 
 
 def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15.0) -> str:
-    """轮询等待步骤到达终态 (执行器在后台线程)"""
+    """成功还需等待同一步后台收尾；失败/取消保留提前终结的观察能力。"""
     from dubforge.domain import crud
     deadline = time.time() + timeout
     while time.time() < deadline:
         project = crud.get_project(uid)
         step = crud.get_step(project.id, step_key)
         if step.status in statuses:
+            if step.status == 'done':
+                from dubforge.runner import runner
+                if runner.current_job_id(project.id, step_key) is not None:
+                    time.sleep(0.05)
+                    continue
             return step.status
         if step.status == "failed":
             raise AssertionError(f"步骤失败 {step_key}: {step.error_message}")

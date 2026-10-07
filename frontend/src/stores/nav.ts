@@ -1,4 +1,6 @@
 import { defineStore } from 'pinia'
+import { watch } from 'vue'
+import { setNavigationExecution } from '../utils/configurationEditability'
 import { createLatestRefresh } from '../utils/preview'
 import { WORKFLOW_BUSY, workflowPublication } from '../utils/workflow'
 import { latestJobActivity, stepActivity, workflowComments, type ProgressActivity } from '../utils/progressActivity'
@@ -48,25 +50,41 @@ export const STATUS_TAG: Record<string, 'default' | 'success' | 'error' | 'warni
 }
 
 type Loader = ReturnType<typeof createLatestRefresh>
+// 与领域 project_status 保持一致，复用已经取得的步骤状态，不另算一遍全部输入。
+function projectStatus(steps: any[]): string {
+  if (steps.some(step => ['running','queued'].includes(step.status))) return 'processing'
+  const chosen = steps.filter(step => step.selected)
+  if (chosen.some(step => step.status === 'failed')) return 'failed'
+  return chosen.length && chosen.every(step => step.fresh) ? 'done' : 'created'
+}
 const pollers = new WeakMap<object, { project: Loader; steps: Loader; publication: Loader; workflow: Loader; activity: Loader; workflowPlan: Loader }>()
+const executionWatches = new WeakSet<object>()
+function cancelPollers(store: object) {
+  const readers = pollers.get(store)
+  if (readers) for (const reader of Object.values(readers)) reader.cancel()
+}
 function getPollers(store: any) {
   let readers = pollers.get(store)
   if (!readers) {
     const reader = (kind: 'project' | 'steps' | 'publication' | 'workflow') => createLatestRefresh(async signal => {
       const uid = store.uid
-      const url = kind === 'publication' ? `/api/publishing/projects/${uid}/status` : `/api/projects/${uid}${kind === 'steps' ? '/steps' : kind === 'workflow' ? '/workflow/status' : ''}`
+      const selectionVersion = store.autoStepsVersion
+      const url = kind === 'publication' ? `/api/publishing/projects/${uid}/status` : `/api/projects/${uid}${kind === 'steps' ? '/steps' : kind === 'workflow' ? '/workflow/status' : '/navigation'}`
       const response = await fetch(url, {
         cache: 'no-store', signal: AbortSignal.any([signal, AbortSignal.timeout(15000)]),
       })
       const value = await response.json()
       if (!response.ok) throw new Error(value.message || '读取项目状态失败')
-      return { uid, value }
-    }, ({ uid, value }) => {
+      return { uid, value, selectionVersion }
+    }, ({ uid, value, selectionVersion }) => {
       if (uid !== store.uid) return
       store.connectionLost = false
       if (kind === 'steps') {
+        if (store.autoStepsSaving || selectionVersion !== store.autoStepsVersion) {
+          value = value.map((step: any) => ({ ...step, selected: store.autoSteps ? store.autoSteps.includes(step.key) : true }))
+        }
         const previous = store.steps.filter((s: any) => s.status === 'running').map((s: any) => `${s.key}:${s.job_id}`).join(',')
-        store.steps = value; store.stepsLoaded = true; store.stepsError = ''
+        store.steps = value; store.stepsLoaded = true; store.stepsError = ''; store.status = projectStatus(value)
         const active = value.filter((s: any) => s.status === 'running' && s.job_id)
         store.activities = Object.fromEntries(Object.entries(store.activities).filter(([key, entry]: any) => active.some((s: any) => s.key === key && s.job_id === entry.jobId)))
         if (active.length) void getPollers(store).activity.refresh(previous !== active.map((s: any) => `${s.key}:${s.job_id}`).join(','))
@@ -80,10 +98,10 @@ function getPollers(store: any) {
         if (value.run?.id && store.workflowPlan?.id !== value.run.id) void getPollers(store).workflowPlan.refresh(false)
       }
       else {
-        store.title = value.title; store.status = value.status
+        store.title = value.title; store.status = store.stepsLoaded ? projectStatus(store.steps) : value.status
         store.dirMissing = value.dir_exists === false
-        store.autoSteps = Array.isArray(value.params?.auto_steps) ? value.params.auto_steps : null
-        store.chain = parseChain(value.chain ?? value.params?._chain)
+        if (!store.autoStepsSaving && selectionVersion === store.autoStepsVersion) store.autoSteps = Array.isArray(value.auto_steps) ? value.auto_steps : null
+        store.chain = parseChain(value.chain)
         store.projectError = ''
       }
     }, error => {
@@ -129,6 +147,7 @@ function getPollers(store: any) {
 export const useNavStore = defineStore('nav', {
   state: () => ({
     uid: '',
+    suspended: false,
     title: '',
     status: '',
     steps: [] as any[],
@@ -144,6 +163,8 @@ export const useNavStore = defineStore('nav', {
     activities: {} as Record<string, { jobId: number; activity: ProgressActivity | null; unavailable: boolean }>,
     dirMissing: false,
     autoSteps: null as string[] | null,   // 勾选集 (null = 全部, 未自定义过)
+    autoStepsSaving: false,
+    autoStepsVersion: 0,
     chain: null as ChainInfo | null,      // 自动续跑计划 (null = 无链)
     timer: 0 as unknown as ReturnType<typeof setInterval> | 0,
   }),  getters: {
@@ -151,7 +172,9 @@ export const useNavStore = defineStore('nav', {
       return Object.fromEntries(this.steps.map((x: any) => [x.key, x]))
     },
     busy(): boolean {
-      return WORKFLOW_BUSY.includes(this.workflow?.run?.status) || this.steps.some((x: any) => x.status === 'running' || x.status === 'queued')
+      return WORKFLOW_BUSY.includes(this.workflow?.run?.status) || this.chain?.state === 'active'
+        || ['queued','preparing','uploading','submitting','joining'].includes(this.publication?.status)
+        || this.steps.some((x: any) => ['running','queued','stopping'].includes(x.status))
     },
     publicationDisplay(): ReturnType<typeof workflowPublication> {
       return workflowPublication(this.workflow, this.publication, this.publicationError || this.workflowError)
@@ -190,7 +213,7 @@ export const useNavStore = defineStore('nav', {
   },
   actions: {
     async refreshWorkflow(replace = true) {
-      if (this.uid) await getPollers(this).workflow.refresh(replace)
+      if (this.uid && !this.suspended) await getPollers(this).workflow.refresh(replace)
     },
     workflowStarted(uid: string, run: any) {
       if (uid !== this.uid || !run?.id) return
@@ -201,7 +224,7 @@ export const useNavStore = defineStore('nav', {
       this.workflowError = ''
     },
     async refreshSteps(replace = true) {
-      if (this.uid) await getPollers(this).steps.refresh(replace)
+      if (this.uid && !this.suspended) await getPollers(this).steps.refresh(replace)
     },
     outputRemoved(uid: string, file: { id: number; name: string }, missing: boolean) {
       if (uid !== this.uid) return
@@ -221,7 +244,7 @@ export const useNavStore = defineStore('nav', {
       if (step) Object.assign(step, {status:'queued', progress:0, job_id:result.job_id, cancelling:false, stop_reason:null})
     },
     async poll(replace = true) {
-      if (!this.uid) return
+      if (!this.uid || this.suspended) return
       // 后台标签页休眠轮询; 回到前台由下一个 tick 自然恢复。
       if (typeof document !== 'undefined' && document.hidden) return
       // 慢请求合并，各类状态独立呈现；发布失败不影响制作状态。
@@ -229,10 +252,13 @@ export const useNavStore = defineStore('nav', {
       await Promise.all([readers.project.refresh(replace), readers.steps.refresh(replace), readers.publication.refresh(replace), readers.workflow.refresh(replace)])
     },
     enter(uid: string) {
+      if (!executionWatches.has(this)) {
+        executionWatches.add(this)
+        watch(() => [this.uid, this.busy, this.suspended] as const,
+          ([key, busy, suspended]) => setNavigationExecution(key, busy, suspended), { immediate: true, flush: 'sync' })
+      }
       if (this.uid !== uid) {
-        const readers = pollers.get(this)
-        readers?.project.cancel(); readers?.steps.cancel(); readers?.publication.cancel(); readers?.workflow.cancel()
-        readers?.activity.cancel(); readers?.workflowPlan.cancel()
+        cancelPollers(this)
         this.uid = uid
         this.title = ''
         this.steps = []
@@ -240,18 +266,24 @@ export const useNavStore = defineStore('nav', {
         this.publication = null; this.publicationError = ''
         this.workflow = null; this.workflowError = ''
         this.workflowPlan = null; this.activities = {}
-        this.status = ''; this.autoSteps = null; this.chain = null; this.dirMissing = false
+        this.status = ''; this.autoSteps = null; this.autoStepsSaving = false; this.autoStepsVersion++; this.chain = null; this.dirMissing = false
       }
+      this.suspended = false
       this.connectionLost = false
       this.poll()
       // 与进度插值窗口一致：每 1.5 秒取得一次后端目标值，视觉上连续追赶，
       // 不会等待 2.5 秒后突然跳一大段。
       if (!this.timer) this.timer = setInterval(() => this.poll(false), 1500)
     },
+    suspend() {
+      // 全局页保留侧栏最近状态；离开项目后不继续读取旧项目或应用迟到响应。
+      this.suspended = true
+      if (this.timer) { clearInterval(this.timer); this.timer = 0 }
+      cancelPollers(this)
+    },
     reset() {
-      const readers = pollers.get(this)
-      readers?.project.cancel(); readers?.steps.cancel(); readers?.publication.cancel(); readers?.workflow.cancel()
-      readers?.activity.cancel(); readers?.workflowPlan.cancel()
+      this.suspend()
+      this.suspended = false
       this.uid = ''
       this.title = ''
       this.steps = []
@@ -259,12 +291,8 @@ export const useNavStore = defineStore('nav', {
       this.publication = null; this.publicationError = ''
       this.workflow = null; this.workflowError = ''
       this.workflowPlan = null; this.activities = {}
-      this.status = ''; this.autoSteps = null; this.chain = null; this.dirMissing = false
+      this.status = ''; this.autoSteps = null; this.autoStepsSaving = false; this.autoStepsVersion++; this.chain = null; this.dirMissing = false
       this.connectionLost = false
-      if (this.timer) {
-        clearInterval(this.timer)
-        this.timer = 0
-      }
     },
   },
 })

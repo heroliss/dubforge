@@ -5,6 +5,28 @@ export const PUBLICATION_STATUS: Record<string, string> = {
   joining: '正在加入合集', collection_pending: '已投稿 · 待加入合集', checking: '正在核对状态',
 }
 export const PUBLISH_ACTIVE = ['queued', 'uploading', 'submitting', 'joining', 'checking']
+export function publicationUploadProgress(row: any) {
+  if (!row || !['queued', 'uploading', 'paused', 'failed', 'uploaded', 'submitting', 'joining', 'checking'].includes(row.status)) return null
+  const detail = row.progress_detail || {}
+  const hasBytes = Number.isFinite(detail.loaded) && Number.isFinite(detail.total) && detail.total > 0
+  const raw = hasBytes ? 100 * detail.loaded / detail.total : Number(row.progress || 0)
+  const percentage = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : 0
+  const phases: Record<string, string> = {
+    queued: '等待发布任务', validating: '正在核对账号与投稿资料', preparing: '正在准备上传线路',
+    uploading: '正在上传视频文件', merging: 'B站正在合并上传分片', cover: '正在处理并上传封面',
+    uploaded: '文件已上传，等待确认投稿', submitting: '正在提交稿件资料', joining: '正在加入目标合集', checking: '正在查询平台状态',
+  }
+  const phase = row.status === 'paused' ? '上传已暂停，继续时复用已完成分P'
+    : row.status === 'failed' ? '上传未完成，请检查错误后继续'
+    : row.status === 'uploaded' ? phases.uploaded
+    : phases[detail.phase] || phases[row.status] || PUBLICATION_STATUS[row.status]
+  const part = detail.current_part > 0 ? `P${detail.current_part} / ${detail.total_parts}${detail.current_title ? ` · ${detail.current_title}` : ''}` : ''
+  return { percentage, hasBytes, loaded: detail.loaded, total: detail.total, phase, part,
+    complete: percentage >= 100,
+    merging: percentage >= 100 && detail.phase === 'merging',
+    active: PUBLISH_ACTIVE.includes(row.status),
+    completedParts: detail.completed_parts, totalParts: detail.total_parts }
+}
 export function publicationStage(status?: string) {
   return {
     text: PUBLICATION_STATUS[status || ''] || '待准备',

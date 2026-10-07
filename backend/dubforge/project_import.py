@@ -1,6 +1,7 @@
 """批量项目导入：只解析和创建，不联网抓标题、不下载、不启动流程。"""
 import copy
 import json
+import logging
 import os
 import re
 import threading
@@ -8,7 +9,8 @@ import uuid
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit, urlunsplit
 
-from sqlmodel import Session
+from sqlalchemy import literal_column
+from sqlmodel import Session, select
 
 from dubforge import configuration as cfg
 from dubforge.configuration_models import ConfigurationScope
@@ -22,6 +24,8 @@ SCHEMA = 'dubforge.batch.v1'
 MAX_ITEMS = 100
 MAX_BYTES = 1024 * 1024
 gate = threading.RLock()
+_running = set()
+logger = logging.getLogger(__name__)
 # 连接地址和凭据文件由环境设置管理，不接受外部 LLM 文本改写。
 ENVIRONMENT_FIELDS = {'download.proxy', 'download.cookies_path', 'translate.custom_terms_path',
                       'tts.indextts25.url', 'tts.gptsovits.url'}
@@ -133,7 +137,9 @@ def source(value, *, check_file=True):
                      or (segments[1] if len(segments) == 2 and segments[0] in {'shorts', 'embed', 'live'} else ''))
             if not video:
                 raise ImportError('请提供单个 YouTube 视频地址；暂不展开频道或播放列表')
-        normalized_host = host + (f':{port}' if port and port not in {80, 443} else '')
+        normalized_host = '[' + host + ']' if ':' in host else host
+        default_port = 443 if parts.scheme.lower() == 'https' else 80
+        normalized_host += f':{port}' if port is not None and port != default_port else ''
         identity = ('youtube:' + video if video else
                     urlunsplit((parts.scheme.lower(), normalized_host, parts.path or '/', parts.query, '')))
         title = (host + '_' + (video or parts.path.rstrip('/').rsplit('/', 1)[-1])).rstrip('_')
@@ -215,17 +221,23 @@ def preview(body):
                 selected=[r['index'] for r in rows if r['selectable'] and not r['duplicate']])
 
 
-def _result(row):
+def _result(row, existing=None):
     plan = json.loads(row.plan)
     saved = json.loads(row.results)
+    if existing is None:
+        uids = [r['uid'] for r in saved.values() if r.get('uid')]
+        from dubforge.domain.models import Project
+        with Session(get_engine()) as session:
+            existing = set(session.exec(select(Project.uid).where(Project.uid.in_(uids))).all()) if uids else set()
     items = []
     for item in plan:
         result = saved.get(str(item['index']), dict(status='pending', uid='', error=''))
-        if result['status'] == 'created' and crud.get_project(result['uid']) is None:
+        if result['status'] == 'created' and result['uid'] not in existing:
             result = {**result, 'status': 'removed', 'error': '项目后来已删除，不会因重试重新创建'}
         items.append(dict(index=item['index'], title=item['title'], source=item['source'],
                           template=item['template'], settings=item['settings'], **result))
-    return dict(request_id=row.id, items=items, created=sum(i['status'] == 'created' for i in items),
+    return dict(request_id=row.id, created_at=row.created_at, running=row.id in _running,
+                items=items, created=sum(i['status'] == 'created' for i in items),
                 complete=all(i['status'] in {'created', 'removed'} for i in items))
 
 
@@ -235,6 +247,26 @@ def status(request_id):
         if not row:
             raise ImportError('没有此批导入记录', code='PROJECT_IMPORT_NOT_FOUND')
         return _result(row)
+
+
+def history(limit=20):
+    """从数据库找回导入，不依赖某个浏览器标签页；摘要不回传完整参数。"""
+    if type(limit) is not int or not 1 <= limit <= 100:
+        raise ImportError('最近导入查询数量须为1–100')
+    from dubforge.domain.models import Project
+    with Session(get_engine()) as session:
+        # rowid 保留旧回执及同一时刻多批导入的先后顺序。
+        rows = session.exec(select(ProjectImport).order_by(literal_column('rowid').desc()).limit(limit)).all()
+        uids = {r['uid'] for row in rows for r in json.loads(row.results).values() if r.get('uid')}
+        existing = set(session.exec(select(Project.uid).where(Project.uid.in_(uids))).all()) if uids else set()
+    items = []
+    for row in rows:
+        data = _result(row, existing)
+        items.append(dict(request_id=row.id, created_at=row.created_at, title=data['items'][0]['title'],
+                          total=len(data['items']), created=data['created'], complete=data['complete'],
+                          running=data['running'], failed=sum(i['status'] == 'error' for i in data['items']),
+                          pending=sum(i['status'] == 'pending' for i in data['items'])))
+    return dict(items=items)
 
 
 def _record(request_id, index, result):
@@ -282,6 +314,26 @@ def execute(body):
                 session.add(row)
                 session.commit()
             items = json.loads(row.plan)
+        return _run_items(request_id, items)
+
+
+def resume(request_id, body):
+    """明确继续已确认的冻结清单，只补未创建项，无需找回浏览器里的原始文本。"""
+    _keys(body, {'confirmed'}, '继续导入请求')
+    if body.get('confirmed') is not True:
+        raise ImportError('请确认继续创建本批未完成的项目')
+    with gate:
+        with Session(get_engine()) as session:
+            row = session.get(ProjectImport, request_id)
+            if row is None:
+                raise ImportError('没有此批导入记录', code='PROJECT_IMPORT_NOT_FOUND')
+            items = json.loads(row.plan)
+        return _run_items(request_id, items)
+
+
+def _run_items(request_id, items):
+    _running.add(request_id)
+    try:
         for item in items:
             with Session(get_engine()) as session:
                 saved = json.loads(session.get(ProjectImport, request_id).results).get(str(item['index']))
@@ -305,6 +357,7 @@ def execute(body):
                     crud.create_project(title=item['title'], source_url=item['source'], source_kind=item['source_kind'],
                                         initialize=initialize)
             except Exception as exc:
+                logger.exception('批量导入 %s 第%d项创建失败', request_id, item['index'] + 1)
                 with Session(get_engine()) as session:
                     saved = json.loads(session.get(ProjectImport, request_id).results).get(str(item['index']))
                 if saved and saved['status'] == 'created':
@@ -312,7 +365,9 @@ def execute(body):
                 else:
                     message = exc.message if isinstance(exc, DubForgeError) else '创建失败，请检查磁盘权限或空间后重试'
                     _record(request_id, item['index'], dict(status='error', uid='', error=message))
-        return status(request_id)
+    finally:
+        _running.discard(request_id)
+    return status(request_id)
 
 
 def catalog():

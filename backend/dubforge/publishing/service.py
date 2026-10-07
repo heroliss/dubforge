@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import math
 import re
 import subprocess
 import threading
@@ -43,6 +44,50 @@ _running: dict[str, threading.Event] = {}
 _logins = {}
 _suggesting: set[str] = set()
 _creating_collections: set[str] = set()
+
+
+@contextmanager
+def _execution_gate():
+    """发布锁在外、任务启动锁在内；编辑和启动使用同一顺序。"""
+    from dubforge.runner import runner
+    from dubforge.pipeline import dubbing_session
+    with runner._start_lock, dubbing_session.gate:
+        yield
+
+
+@contextmanager
+def _publication_edit(session, key, *, allow_owned=False):
+    """关联项目的短暂编辑，自动流程仅凭已有执行身份获得写入资格。"""
+    from dubforge import runtime_edit
+    row = _get(session, Publication, key)
+    with runtime_edit.editing('project:' + row.project_uid, allow_owned=allow_owned):
+        yield
+
+
+@contextmanager
+def _publication_start(key, action):
+    """先登记准备占用，再释放全局门禁进行大文件预检；失败撤销占用。"""
+    from dubforge import runtime_edit
+    from dubforge.workflows import check_idle
+    from dubforge.publishing.studio import publication_available
+    with _execution_gate():
+        with Session(get_engine()) as session:
+            publication_available(session, key)
+        record = view(key)
+        check_idle(record['project_uid'])
+        if key in _running or record['status'] in ACTIVE:
+            raise PublishError('此稿件已有进行中的操作')
+        if action != 'check':
+            runtime_edit.assert_editable('project:' + record['project_uid'], allow_owned=True)
+        cancellation = threading.Event()
+        _running[key] = cancellation
+    try:
+        yield cancellation
+    except BaseException:
+        with _execution_gate():
+            if _running.get(key) is cancellation:
+                _running.pop(key, None)
+        raise
 
 
 def _json(value):
@@ -91,7 +136,7 @@ def validate_values(raw):
             if type(value) is not bool:
                 raise PublishError('开关必须明确选择开启或关闭')
         elif key == 'visibility':
-            if value not in {'public', 'self'}:
+            if not isinstance(value, str) or value not in {'public', 'self'}:
                 raise PublishError('请选择公开或仅自己可见')
         elif key == 'copyright':
             if type(value) is not int or value not in {1, 2, 3}:
@@ -109,8 +154,47 @@ def validate_values(raw):
 def _serialize(row):
     return dict(id=row.id, project_uid=row.project_uid, revision=row.revision, status=row.status,
                 draft=json.loads(row.draft), snapshot=json.loads(row.snapshot),
-                receipt=json.loads(row.receipt), progress=row.progress, error=row.error,
+                receipt=json.loads(row.receipt), progress=row.progress, progress_detail=_progress_detail(row), error=row.error,
                 created_at=row.created_at.isoformat(), updated_at=row.updated_at.isoformat())
+
+
+def _progress_detail(row):
+    """传输细节只输出白名单字段，不把上传地址、文件路径或凭据带到列表。"""
+    snapshot, transfers = json.loads(row.snapshot), json.loads(row.transfers)
+    parts = snapshot.get('parts', [])
+    total = sum(p.get('size', 0) for p in parts)
+    completed = sum(str(p.get('artifact_id')) in transfers for p in parts)
+    detail = transfers.get('_progress', {})
+    phase = detail.get('phase', row.status)
+    if phase not in {'queued', 'validating', 'preparing', 'uploading', 'merging', 'cover',
+                     'uploaded', 'submitting', 'joining', 'checking', 'complete'}:
+        phase = row.status
+    loaded = detail.get('loaded', total * max(0, min(100, row.progress)) / 100)
+    loaded = loaded if isinstance(loaded, (int, float)) and math.isfinite(loaded) else 0
+    current = detail.get('current_part', 0)
+    return dict(phase=phase, loaded=int(max(0, min(total, loaded))), total=total,
+                completed_parts=completed, total_parts=len(parts),
+                current_part=current if type(current) is int and 0 <= current <= len(parts) else 0,
+                current_title=str(detail.get('current_title', ''))[:80])
+
+
+def _publication_status(row):
+    return dict(id=row.id, status=row.status, progress=row.progress,
+                progress_detail=_progress_detail(row), error=row.error)
+
+
+def project_statuses(uids):
+    """项目列表批量读取本地摘要；发布仍独立于制作步骤和配置指纹。"""
+    result = {uid: dict(id=None, status='pending', progress=0) for uid in uids}
+    if not result:
+        return result
+    with Session(get_engine()) as session:
+        rows = session.exec(select(Publication).where(Publication.project_uid.in_(result))
+                            .order_by(Publication.updated_at.desc(), Publication.id.desc())).all()
+        for row in rows:
+            if result[row.project_uid]['id'] is None:
+                result[row.project_uid] = _publication_status(row)
+    return result
 
 
 def catalog():
@@ -119,7 +203,9 @@ def catalog():
                     for a in session.exec(select(PublishAccount)).all()]
         templates = []
     return dict(accounts=accounts, templates=templates, worker_ready=transport.available(),
-                defaults=DEFAULTS, engine='biliAPI 2.15.0（独立上传／投稿）')
+                defaults=DEFAULTS, engine='biliAPI 2.15.0（独立上传／投稿）',
+                studio_capabilities=dict(edit_metadata=True, reorder_parts=True, append_parts=True,
+                    replace_parts=False, review_draft_mode='new_submission'))
 
 
 def list_publications(uid=None):
@@ -133,17 +219,12 @@ def list_publications(uid=None):
 def project_status(uid):
     """导航只读本地最新稿件；不查询平台、不进入制作步骤的状态机。"""
     _project(uid)
-    with Session(get_engine()) as session:
-        row = session.exec(select(Publication).where(Publication.project_uid == uid)
-                           .order_by(Publication.updated_at.desc(), Publication.id.desc())).first()
-        if not row:
-            return dict(id=None, status='pending', progress=0)
-        return dict(id=row.id, status=row.status, progress=row.progress)
+    return project_statuses([uid])[uid]
 
 
-def suggest(key, body):
-    """生成候选文案但不保存；长网络请求不得持有发布锁或数据库事务。"""
-    from dubforge.publishing.copywriting import COPY_FIELDS, generate
+def _copy_request(body):
+    """稿件与项目候选共用有界输入白名单，不传发布账号或权限设置。"""
+    from dubforge.publishing.copywriting import COPY_FIELDS
     current = body.get('current', {})
     instruction = body.get('instruction', '')
     if not isinstance(current, dict) or set(current) - COPY_FIELDS:
@@ -156,6 +237,23 @@ def suggest(key, body):
     current = copy.deepcopy(current)
     if not isinstance(instruction, str) or len(instruction) > 1000:
         raise PublishError('文案要求请控制在1000字以内')
+    return current, instruction.strip()
+
+
+def copy_preview(uid):
+    from dubforge.publishing.project_copy import preview
+    return preview(uid)
+
+
+def suggest_project(uid, body):
+    from dubforge.publishing.project_copy import suggest
+    return suggest(uid, body)
+
+
+def suggest(key, body):
+    """生成候选文案但不保存；长网络请求不得持有发布锁或数据库事务。"""
+    from dubforge.publishing.copywriting import generate
+    current, instruction = _copy_request(body)
     with _lock, Session(get_engine()) as session:
         row = _get(session, Publication, key)
         _revision(row, body.get('revision'))
@@ -163,10 +261,11 @@ def suggest(key, body):
             raise PublishError('此稿件当前不可编辑；请等待上传完成或复制为新草稿')
         if key in _suggesting:
             raise PublishError('本稿件正在生成文案，请稍候', code='PUBLISH_AI_BUSY')
-        uid, revision = row.project_uid, row.revision
-        _suggesting.add(key)
+        with _publication_edit(session, key, allow_owned=True):
+            uid, revision = row.project_uid, row.revision
+            _suggesting.add(key)
     try:
-        result = generate(_project(uid), current, instruction.strip())
+        result = generate(_project(uid), current, instruction)
         with _lock, Session(get_engine()) as session:
             row = _get(session, Publication, key)
             _revision(row, revision)
@@ -201,6 +300,10 @@ def candidates(uid):
     root = crud.project_dir_by_project(project).resolve()
     from dubforge.pipeline.assembly_versions import artifact_metadata
     version_meta = artifact_metadata(uid)
+    from dubforge.content_review_service import candidate_states
+    review_meta = candidate_states(project, rows)
+    from dubforge.publishing.review_draft import revision_metadata
+    revision_meta = revision_metadata(project, rows)
     for row in rows:
         path = _eligible_file(row, project, root)
         if not path or row.rel_path in seen:
@@ -210,17 +313,18 @@ def candidates(uid):
                            exists=path.is_file(), sha256=row.sha256,
                            is_source=row.step_key == 'download',
                            has_dubbing=row.step_key == 'assemble' and not row.name.startswith('final_src_'),
+                           **review_meta.get(row.id, {}),
+                           **revision_meta.get(row.id, {}),
                            **{k: v for k, v in version_meta.get(row.id, {}).items() if k != 'has_dubbing'}))
         if row.id in version_meta: result[-1]['has_dubbing'] = version_meta[row.id]['has_dubbing']
-    info = video_info.view(uid).get('info') or {}
-    source_url = source_credit.source_url(project)
-    summary = info.get('summary_zh') if not info.get('summary_stale') else ''
-    description = source_credit.append_attribution(summary or '', source_credit.attribution(project, info))
-    thumbnail = (info.get('content') or {}).get('thumbnail', '')
+        if result[-1].get('is_review_revision') and not result[-1]['review_revision_current']:
+            result[-1].update(review_ready=False, review_status='审查修订已失效',
+                              review_reason=result[-1]['review_revision_reason'])
+    from dubforge.publishing.project_copy import source_content
+    base = source_content(project)
+    thumbnail = base['thumbnail']
     return dict(project=dict(uid=uid, title=project.title), files=result,
-                source_published_date=source_credit.published_date(info),
-                suggestion=dict(title=(info.get('title_zh') or info.get('title_original') or project.title),
-                                description=description, source=source_url),
+                source_published_date=base['source_published_date'], suggestion=base['content'],
                 thumbnail=thumbnail, platform_cover_available=platform_images.supported(thumbnail),
                 thumbnail_preview=(f'/api/projects/{uid}/steps/download/video-info/cover'
                                    f'?v={hashlib.sha256(thumbnail.encode()).hexdigest()}'
@@ -228,13 +332,14 @@ def candidates(uid):
 
 
 def create(uid, *, key=None):
+    from dubforge import runtime_edit
     data = candidates(uid)
     from dubforge import configuration
     settings = configuration.resolve(uid)['values']
     row = Publication(project_uid=uid, draft=_json(dict(account_id=settings['publish.account_id'], template_id='', parts=[],
                       overrides={}, cover_id='',
                       content=data['suggestion'])))
-    with _lock, Session(get_engine()) as session:
+    with _lock, runtime_edit.editing('project:' + uid, allow_owned=True), Session(get_engine()) as session:
         if key:
             existing = session.get(Publication, key)
             if existing:
@@ -280,17 +385,25 @@ def _resolve(session, row, *, include_overrides=True):
     return settings, origins, sources
 
 
+def _view(session, row):
+    """一次解析继承设置，完整详情也可直接随本地写操作返回。"""
+    result = _serialize(row)
+    if result['snapshot']:
+        result['settings'], result['origins'] = result['snapshot']['settings'], result['snapshot']['origins']
+        result['sources'] = result['snapshot'].get('sources', {})
+    else:
+        base, origins, sources = _resolve(session, row, include_overrides=False)
+        result.update(base_settings=base, base_origins=origins, base_sources=sources)
+        overrides = result['draft']['overrides']
+        result.update(settings={**copy.deepcopy(base), **copy.deepcopy(overrides)},
+                      origins={**origins, **{key: '本稿件' for key in overrides}},
+                      sources={**copy.deepcopy(sources), **{key: dict(kind='publication') for key in overrides}})
+    return result
+
+
 def view(key):
     with Session(get_engine()) as session:
-        row = _get(session, Publication, key)
-        result = _serialize(row)
-        if result['snapshot']:
-            result['settings'], result['origins'] = result['snapshot']['settings'], result['snapshot']['origins']
-            result['sources'] = result['snapshot'].get('sources', {})
-        else:
-            result['settings'], result['origins'], result['sources'] = _resolve(session, row)
-            result['base_settings'], result['base_origins'], result['base_sources'] = _resolve(session, row, include_overrides=False)
-    return result
+        return _view(session, _get(session, Publication, key))
 
 
 def check_template_selection(session, selected, previous=''):
@@ -312,7 +425,7 @@ def save(key, body):
                 or not isinstance(part['title'], str) or not part['title'].strip() or len(part['title']) > 80):
             raise PublishError('请选择不重复的成片，并填写每个分P的名称（1–80字）')
         seen.add(part['artifact_id'])
-    with _lock, Session(get_engine()) as session:
+    with _lock, Session(get_engine()) as session, _publication_edit(session, key, allow_owned=True):
         row = _get(session, Publication, key)
         publication_available(session, key)
         check_idle(row.project_uid)
@@ -350,6 +463,8 @@ def save(key, body):
         if draft['cover_id']:
             _cover_path(draft['cover_id'])
         draft.update(parts=parts, overrides=overrides)
+        from dubforge.publishing.review_draft import synchronize_source
+        synchronize_source(draft, parts, row.project_uid)
         row.draft, row.revision, row.updated_at = _json(draft), row.revision + 1, now()
         _resolve(session, row)
         session.add(row)
@@ -357,20 +472,48 @@ def save(key, body):
     return view(key)
 
 
-def copy_draft(key):
+def copy_draft(key, body=None):
+    """只复制本地资料；同一请求重试复用记录，不扫描媒体或请求平台。"""
     from dubforge.publishing.studio import publication_available
-    with _lock, Session(get_engine()) as session:
+    request_id = None
+    if body:
+        if not isinstance(body, dict) or set(body) != {'revision', 'request_id'}:
+            raise PublishError('复制请求无效，请刷新后重试', code='PUBLISH_COPY_INVALID')
+        if type(body['revision']) is not int:
+            raise PublishError('复制请求版本无效，请刷新后重试', code='PUBLISH_COPY_INVALID')
+        try:
+            request_id = str(uuid.UUID(body['request_id']))
+        except (ValueError, TypeError, AttributeError):
+            raise PublishError('复制请求标识无效，请刷新后重试', code='PUBLISH_COPY_INVALID') from None
+    elif body is not None and body != {}:
+        raise PublishError('复制请求无效，请刷新后重试', code='PUBLISH_COPY_INVALID')
+    with _lock, Session(get_engine()) as session, _publication_edit(session, key):
         publication_available(session, key)
         original = _get(session, Publication, key)
         if original.status == 'unknown' or original.status in ACTIVE:
             raise PublishError('请先核对当前投稿结果，暂不能复制重投')
         _project(original.project_uid)
+        ident = uuid.uuid5(uuid.NAMESPACE_URL, f'dubforge:copy-draft:{key}:{request_id}').hex if request_id else None
+        if ident and (existing := session.get(Publication, ident)):
+            receipt = json.loads(existing.draft).get('copy_request', {})
+            if (existing.project_uid != original.project_uid or receipt.get('source_id') != key
+                    or receipt.get('source_revision') != body['revision']):
+                raise PublishError('复制请求已经用于其他资料，请刷新后重试', code='PUBLISH_COPY_CONFLICT')
+            # 即使原稿后来改了资料，响应丢失后的重试也只能打开已成功创建的那一份。
+            return {**_view(session, existing), 'reused': True}
+        if request_id:
+            _revision(original, body['revision'])
         draft = json.loads(original.draft)
+        if request_id:
+            draft['copy_request'] = dict(source_id=key, source_revision=original.revision, request_id=request_id)
         row = Publication(project_uid=original.project_uid, draft=_json(draft))
+        if ident:
+            row.id = ident
+        # 先准备详情，配置解析失败时不留下页面打不开的半成草稿。
+        result = _view(session, row)
         session.add(row)
         session.commit()
-        session.refresh(row)
-        return _serialize(row)
+        return {**result, 'reused': False}
 
 
 def _cover_path(key):
@@ -453,6 +596,10 @@ def plan(key):
             path = _eligible_file(artifact, project, root)
             if not path or not path.is_file():
                 raise PublishError('选中成片已失效，请重新选择')
+            from dubforge.content_review_service import assert_publishable
+            assert_publishable(project, artifact)
+            from dubforge.publishing.review_draft import assert_revision_current
+            assert_revision_current(project, artifact, verify_hash=True)
             size = path.stat().st_size
             if size <= 0 or size > 16 * 1024 ** 3:
                 raise PublishError('首版按16GB上限检查，超大文件权限尚未验证')
@@ -465,6 +612,8 @@ def plan(key):
                         settings=settings, origins=origins, sources=sources, parts=files, cover_path=str(cover),
                         cover_sha256=_file_hash(cover), confirmed_revision=row.revision,
                         base_settings=base_settings, base_origins=base_origins, base_sources=base_sources)
+        from dubforge.content_review_service import assert_snapshot
+        assert_snapshot(snapshot)
         return _plan_result(snapshot, row.revision)
 
 
@@ -674,6 +823,14 @@ def login_view(key, cancel=False):
 def _update(key, **fields):
     with _lock, Session(get_engine()) as session:
         row = _get(session, Publication, key)
+        detail = fields.pop('progress_detail', None)
+        if detail is not None:
+            transfers = fields.get('transfers', json.loads(row.transfers))
+            fields['transfers'] = {**transfers, '_progress': detail}
+        elif 'transfers' in fields:
+            previous = json.loads(row.transfers).get('_progress')
+            if previous is not None:
+                fields['transfers'] = {**fields['transfers'], '_progress': previous}
         for field, value in fields.items():
             setattr(row, field, _json(value) if field in {'snapshot', 'transfers', 'receipt'} else value)
         row.updated_at = now()
@@ -682,23 +839,19 @@ def _update(key, **fields):
 
 
 def enqueue(key, body):
-    from dubforge.publishing.studio import publication_available
     action = body.get('action')
     if action not in {'upload', 'publish', 'submit', 'collection', 'check'}:
         raise PublishError('未知的发布动作')
     if 'acknowledge_ai_notice' in body and (type(body['acknowledge_ai_notice']) is not bool
                                            or action not in {'upload', 'publish', 'submit'}):
         raise PublishError('声明提醒确认参数无效')
-    with _lock:
-        with Session(get_engine()) as session:
-            publication_available(session, key)
+    with _lock, _publication_start(key, action) as cancellation:
         record = view(key)
-        from dubforge.workflows import check_idle
-        check_idle(record['project_uid'])
         if record['revision'] != body.get('revision'):
             raise PublishError('资料已变化，请重新确认', code='PUBLISH_CONFLICT')
-        if key in _running or record['status'] in ACTIVE:
-            raise PublishError('此稿件已有进行中的操作')
+        if action in {'upload', 'publish', 'submit'} and record.get('snapshot'):
+            from dubforge.content_review_service import assert_snapshot
+            assert_snapshot(record['snapshot'])
         if action in {'upload', 'publish'}:
             if action == 'publish' and body.get('confirmed') is not True:
                 raise PublishError('请先确认上传完成后正式投稿；仅上传文件不会投稿')
@@ -730,9 +883,7 @@ def enqueue(key, body):
             raise PublishError('尚无BV号，请在官方创作中心核对后填写回执')
         if not transport.available():
             raise PublishError('发布组件尚未安装，不能开始上传或投稿')
-        cancellation = threading.Event()
-        _running[key] = cancellation
-        _update(key, status='queued', error='')
+        _update(key, status='queued', error='', progress_detail=dict(phase='queued'))
         _pool.submit(_execute, key, action, cancellation)
     return view(key)
 
@@ -808,6 +959,11 @@ def _execute(key, action, cancel):
     try:
         record = view(key)
         snapshot = record['snapshot']
+        if action in {'upload', 'publish', 'submit'}:
+            from dubforge.content_review_service import assert_snapshot
+            assert_snapshot(snapshot)
+            from dubforge.publishing.review_draft import assert_snapshot_current
+            assert_snapshot_current(snapshot)
         credential = _credential(snapshot['account_id'])
         base = dict(account_id=snapshot['account_id'])
         def remote(operation, payload=None, **kwargs):
@@ -819,13 +975,16 @@ def _execute(key, action, cancel):
             with Session(get_engine()) as session:
                 transfers = json.loads(_get(session, Publication, key).transfers)
             # 账号能力不匹配时，在发送任何视频之前返回可编辑草稿。
-            upload_preflight = not bool(transfers)
+            upload_preflight = not any(str(p['artifact_id']) in transfers for p in snapshot['parts'])
+            total = sum(p['size'] for p in snapshot['parts'])
+            # 仅完整分P可复用；暂停时的部分字节不假称跨进程断点续传。
+            loaded = sum(p['size'] for p in snapshot['parts'] if str(p['artifact_id']) in transfers)
+            detail = dict(phase='validating', loaded=loaded)
+            _update(key, progress=100 * loaded / total, progress_detail=detail)
             _validate_submission(snapshot, remote('metadata'))
             upload_preflight = False
             _update(key, status='uploading')
-            total = sum(p['size'] for p in snapshot['parts'])
-            loaded = 0
-            for part in snapshot['parts']:
+            for index, part in enumerate(snapshot['parts'], 1):
                 if cancel.is_set():
                     raise PublishError('操作已暂停')
                 path = Path(part['path'])
@@ -834,13 +993,25 @@ def _execute(key, action, cancel):
                 part_key = str(part['artifact_id'])
                 # 完整分P可恢复；未完成的分P重新上传，不冒称跨进程分片续传。
                 if part_key not in transfers:
+                    detail = dict(phase='preparing', loaded=loaded, current_part=index, current_title=part['title'])
+                    _update(key, progress_detail=detail)
                     def progress(event):
                         if event.get('event') == 'progress':
-                            done = min(part['size'], max(0, float(event.get('loaded', 0))))
-                            _update(key, progress=min(99.9, 100 * (loaded + done) / total))
+                            done = event.get('loaded')
+                            if not isinstance(done, (int, float)) or not math.isfinite(done):
+                                return
+                            done = min(part['size'], max(0, done))
+                            phase = event.get('phase', 'uploading')
+                            if phase not in {'preparing', 'uploading', 'merging'}:
+                                phase = 'uploading'
+                            detail.update(phase=phase, loaded=loaded + done)
+                            _update(key, progress=100 * (loaded + done) / total, progress_detail=detail)
                     transfers[part_key] = remote('upload', part, on_event=progress, timeout=24 * 3600)
-                    _update(key, transfers=transfers)
-                loaded += part['size']
+                    loaded += part['size']
+                    detail.update(loaded=loaded)
+                    _update(key, transfers=transfers, progress=100 * loaded / total, progress_detail=detail)
+            detail = dict(phase='cover', loaded=total)
+            _update(key, progress=100, progress_detail=detail)
             if 'cover' not in transfers:
                 if _file_hash(Path(snapshot['cover_path'])) != snapshot['cover_sha256']:
                     raise PublishError('封面文件已变化')
@@ -852,9 +1023,10 @@ def _execute(key, action, cancel):
                 _update(key, progress=100)
                 action = 'submit'
             else:
-                _update(key, status='uploaded', progress=100)
+                _update(key, status='uploaded', progress=100, progress_detail=dict(phase='uploaded', loaded=total))
         if action == 'submit':
             # 首次投稿前重新读取能力；校验失败没有副作用，允许恢复待投稿。
+            _update(key, progress_detail=dict(phase='validating', loaded=sum(p['size'] for p in snapshot['parts'])))
             _validate_submission(snapshot, remote('metadata'))
             with Session(get_engine()) as session:
                 transfers = json.loads(_get(session, Publication, key).transfers)
@@ -865,18 +1037,23 @@ def _execute(key, action, cancel):
             with _lock:
                 if cancel.is_set():
                     raise PublishError('文件已上传，已停止投稿；可检查资料后再确认投稿')
-                _update(key, status='submitting')
+                # 长上传期间允许编辑规则；真正发送投稿前按当前规则再核对一次。
+                from dubforge.content_review_service import assert_snapshot
+                assert_snapshot(snapshot)
+                from dubforge.publishing.review_draft import assert_snapshot_current
+                assert_snapshot_current(snapshot)
+                _update(key, status='submitting', progress_detail=dict(phase='submitting', loaded=sum(p['size'] for p in snapshot['parts'])))
                 submit_started = True
             receipt = remote('submit', dict(confirmed=True, settings=snapshot['settings'],
                                             videos=videos, cover=transfers['cover']))
-            _update(key, receipt=receipt, status='submitted')
+            _update(key, receipt=receipt, status='submitted', progress_detail=dict(phase='complete', loaded=sum(p['size'] for p in snapshot['parts'])))
             submit_started = False
             if snapshot['settings']['season_id']:
                 action = 'collection'
         if action == 'collection':
             record = view(key)
             receipt = record['receipt']
-            _update(key, status='joining')
+            _update(key, status='joining', progress_detail=dict(phase='joining', loaded=sum(p['size'] for p in snapshot['parts'])))
             status = remote('status', dict(bvid=receipt['bvid']))
             if not status['videos']:
                 raise PublishError('B站尚未返回分P信息，请稍后重试加入合集')
@@ -885,9 +1062,9 @@ def _execute(key, action, cancel):
                 cid=status['videos'][0]['cid'], title=snapshot['settings']['title']))
             if not isinstance(joined, dict) or joined.get('joined') is not True:
                 raise PublishError('加入合集回执未确认，请稍后重试核对', code='PUBLISH_COLLECTION_JOIN_UNKNOWN')
-            _update(key, receipt={**receipt, 'collection_joined': True}, status='submitted')
+            _update(key, receipt={**receipt, 'collection_joined': True}, status='submitted', progress_detail=dict(phase='complete', loaded=sum(p['size'] for p in snapshot['parts'])))
         elif action == 'check':
-            _update(key, status='checking')
+            _update(key, status='checking', progress_detail=dict(phase='checking', loaded=sum(p['size'] for p in snapshot['parts'])))
             receipt = record['receipt']
             status = remote('status', dict(bvid=receipt['bvid']))
             state = status.get('state')

@@ -31,6 +31,15 @@ class ParamField:
 
 
 STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
+    "content_review": (
+        ParamField("content_review.enabled", "启用输出内容筛查", "bool",
+                   help="检查原文、译文和评论，隐藏命中整句；只筛查文本，需另行核对画面。"),
+        ParamField("content_review.mute_audio", "同时静音命中时段", "bool",
+                   help="应用于最终混音，包含中文配音、英文原声及背景串音；关闭后声音仍可能包含原话。"),
+        ParamField("content_review.blocked_terms", "补充屏蔽词", "text", help="每行一个，中英文均检查。"),
+        ParamField("content_review.blocked_ranges", "人工屏蔽时段", "text",
+                   help="每行 开始秒-结束秒:原因；时间按源视频轴，不会自动删改原稿或已上传文件。"),
+    ),
     "download": (
         ParamField("download.resolution", "最高分辨率", "select",
                    help="下载视频的最大高度",
@@ -79,15 +88,18 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
         ParamField("split.llm_profile", "语义整理模型", "select", editable=True, depends_on=(("split.use_llm", True),),
                    help="留空=按设置页启用顺序自动降级；也可固定某个配置组。接口地址、密钥和模型名在设置页维护"),
         ParamField("split.llm_context_tokens", "单次语义整理上下文预算", "int", depends_on=(("split.use_llm", True),), min=8000, max=1_000_000, step=10000,
-                   help="控制一次语义整理请求可容纳的正文规模；超过预算后自动分窗，系统会另外预留提示词和输出空间"),
-        ParamField("split.context_lines", "分窗前后参考句数", "int", depends_on=(("split.use_llm", True),), min=0, max=4, step=1,
-                   help="长稿分窗时，给每个窗口前后各 N 句作为理解锚点，帮助判断代词、转折和边界；只作参考，不会输出"),
-        ParamField("split.window_max_chars", "单窗输入上限（字符，0=不限制）", "int", depends_on=(("split.use_llm", True),), min=0, max=100_000, step=2000,
-                   help="控制单次响应要生成的正文规模：超长单窗输出会让模型退化（原样复述输入、行协议劣化）。超过后自动分窗，每窗独立校验与重试"),
-        ParamField("split.max_split_length", "目标单句长度（字符）", "int", min=8, max=80, step=1,
-                   help="主要作为 LLM 的阅读节奏参考；本地只兜底处理明显过长的结果，不是逐句硬性限制"),
+                   help="全文一次提交，保留完整上下文，并为提示词和输出预留空间；超过预算会提示调整容量，不自动分段"),
+        ParamField("split.thinking_mode", "整理思考强度", "select", depends_on=(("split.use_llm", True),),
+                   options=(("低思考强度（low，适配模型生效）", "low"), ("跟随自定义 JSON / 服务商默认", "follow_profile")),
+                   help="适配模型：本次请求的 low 优先于自定义 JSON 的 reasoning_effort，并移除不兼容的 thinking；其他字段保留。未适配模型保留 JSON，只由提示词要求尽快完成；不会修改全局参数"),
+        ParamField("split.target_word_count", "语义目标词数（约）", "int", min=1, max=80, step=1,
+                   depends_on=(("split.use_llm", True),),
+                   help="单句约多少个词；中文按自然语义词理解。完整意思优先，不因超过目标机械拆分"),
+        ParamField("split.max_split_length", "本地单句长度（字符）", "int", min=8, max=80, step=1,
+                   depends_on=(("split.use_llm", False),),
+                   help="仅关闭 LLM 时用于本地断句；启用 LLM 时不使用此字符设置"),
         ParamField("split.max_segment_seconds", "目标单句时长（秒）", "float", min=4, max=20, step=0.5,
-                   help="帮助 LLM 保持配音和字幕节奏；本地只会在明显超长时参考词级时间拆分"),
+                   help="LLM 的字幕与配音节奏软参考，允许适度超出以保留完整意思；关闭 LLM 时用于本地时长兜底"),
     ),
     "translate": (
         ParamField("translate.target_language", "目标语言", "select", editable=True,
@@ -101,8 +113,11 @@ STEP_PARAM_SCHEMA: dict[str, tuple[ParamField, ...]] = {
                    help="说明期望的人设、语气和表达方式；支持润色、本地化、方言、幽默或网络流行语。留空时采用贴近原语气的自然口语"),
         ParamField("translate.llm_profile", "翻译模型配置", "select", editable=True,
                    help="留空=按设置页启用顺序自动降级; 也可固定某个配置组。接口地址、密钥和模型名在设置页维护"),
+        ParamField("translate.thinking_mode", "翻译思考强度", "select",
+                   options=(("低思考强度（low，适配模型生效）", "low"), ("跟随自定义 JSON / 服务商默认", "follow_profile")),
+                   help="适配模型：本次请求的 low 优先于自定义 JSON 的 reasoning_effort，并移除不兼容的 thinking；其他字段保留。未适配模型保留 JSON，只由提示词要求尽快完成；不会修改全局参数"),
         ParamField("translate.max_context_tokens", "单次翻译上下文上限", "int", min=16000, max=1_000_000, step=10000,
-                   help="每个翻译窗口的总 token 安全预算，包含提示词、交接摘要和预留输出；正文会略小于此值。默认 200000 (约 0.2M), 最高可调到 1M"),
+                   help="尽量全文一次翻译，超过总预算才分窗口；预算包含提示词、交接摘要和完整输出预留。默认200000，需与模型真实容量匹配"),
         ParamField("translate.custom_terms_path", "术语表路径", "str",
                    help="xlsx 绝对路径 (三列: 原文/译文/备注)"),
     ),
@@ -279,30 +294,39 @@ def validate_numeric_updates(updates: dict) -> None:
     import math
     from dubforge.errors import ConfigError
 
+    def finite_number(value):
+        if type(value) not in (int, float):
+            return False
+        try:
+            return math.isfinite(value)
+        except OverflowError:
+            # JSON 的大整数仍可解析，但不能在有限浮点校验处变成内部异常。
+            return False
+
     fields = {f.path: f for group in STEP_PARAM_SCHEMA.values() for f in group
               if f.type in {"int", "float"}}
     # 时长诊断仍使用此内部阈值；不是TTS合成速度控件，不在界面展示。
     fields['tts.tolerance'] = ParamField('tts.tolerance', '时长偏差容差', 'float', min=0, max=2)
     for key, value in updates.items():
         field = fields.get(key)
-        if field and (type(value) not in (int, float) or not math.isfinite(value)):
+        if field and not finite_number(value):
             raise ConfigError(f"「{field.label}」不能为空，请填写有效数字",
                               suggestion="参数尚未保存；请填写数值，或在项目步骤页使用恢复默认。")
-        if field and (key.startswith(("tts.", "subtitles.", "assemble.subtitle_")) or key in {'assemble.voice_volume', 'assemble.bgm_volume'}):
+        if field:
             if (field.type == "int" and int(value) != value
                     or field.min is not None and value < field.min
                     or field.max is not None and value > field.max):
                 raise ConfigError(f"「{field.label}」超出允许范围或不是整数，请按控件说明填写。")
     vector = updates.get("tts.indextts25.emo_vector", [0] * 8)
     if (not isinstance(vector, list) or len(vector) != 8
-            or any(type(v) not in (float, int) or not math.isfinite(v) or not 0 <= v <= 1 for v in vector)):
+            or any(not finite_number(v) or not 0 <= v <= 1 for v in vector)):
         raise ConfigError("情感向量必须是 8 个 0～1 的有效数字。")
     for field in STEP_PARAM_SCHEMA["tts"]:
         if field.path not in updates:
             continue
         value = updates[field.path]
         if ((field.type == "bool" and type(value) is not bool)
-                or (field.type == "select" and value not in {v for _, v in field.options})
+                or (field.type == "select" and value not in [v for _, v in field.options])
                 or (field.type in {"str", "text"} and not isinstance(value, str))):
             raise ConfigError(f"「{field.label}」的值无效，请重新选择或填写。")
     retry_key = 'tts.indextts25.duration_retry_factors'
@@ -311,6 +335,8 @@ def validate_numeric_updates(updates: dict) -> None:
         parse_factors(updates[retry_key])
     from dubforge.pipeline.subtitle_style import validate_style
     validate_style(updates)
+    from dubforge.pipeline.content_redaction import validate_settings as validate_review
+    validate_review(updates)
 
 
 def language_capabilities(*, settings: dict | None = None) -> dict:
@@ -349,6 +375,12 @@ def schema_view(values: dict, caps: dict | None = None, *, settings: dict | None
         legacy = settings.get("llm", {})
         if legacy.get("base_url"):
             profile_options.append(("默认", "default"))
+    from dubforge.pipeline.text_llm import thinking_profiles
+    thinking_pool = profiles
+    if not profiles and settings.get('llm', {}).get('base_url'):
+        legacy = settings['llm']
+        thinking_pool = [dict(name='default', base_url=legacy['base_url'], model=legacy.get('model', ''))]
+    thinking_summary = thinking_profiles(thinking_pool)
     tts_names = {name for _, name in caps["tts"]["langs"]}
     out: dict[str, dict] = {}
     schemas = {**STEP_PARAM_SCHEMA, **({'comments': COMMENT_DEFAULT_FIELDS} if global_defaults else {})}
@@ -377,5 +409,7 @@ def schema_view(values: dict, caps: dict | None = None, *, settings: dict | None
             fl.append({"path": f.path, "label": f.label, "type": f.type, "help": f.help, "depends_on": [[p, v] for p, v in f.depends_on],
                        "options": options, "editable": f.editable,
                        "min": f.min, "max": f.max, "step": f.step, "group": f.group})
+            if f.path in {'split.thinking_mode', 'translate.thinking_mode'}:
+                fl[-1]['thinking_profiles'] = thinking_summary
         out[key] = {"fields": fl, "values": {f.path: values.get(f.path) for f in fields}}
     return out

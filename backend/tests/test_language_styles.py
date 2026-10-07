@@ -76,7 +76,8 @@ def test_comment_and_subtitle_validate_independent_fields(key,value):
 @pytest.mark.parametrize('dub', [False,True])
 @pytest.mark.parametrize('start', [None,1.0])
 def test_real_final_and_clip_burn_share_ass_and_cleanup(video,tmp_path,monkeypatch,dub,start):
-    settings = subtitle_settings()
+    # 本用例只验证样式与时钟，SRT 夹具不提供内容审查需要的整理稿。
+    settings = {**subtitle_settings(), 'content_review.enabled': False}
     line = bilingual_line()
     source = tmp_path / 'subtitles.srt'
     write_srt([line],source)

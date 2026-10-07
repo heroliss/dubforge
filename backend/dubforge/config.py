@@ -60,7 +60,7 @@ DEFAULTS: dict[str, Any] = {
         # OpenAI 兼容接口 (智谱/GLM 等); 翻译与分句语义切共用
         # 多组 API 配置池: 按顺序降级 (旧版单 base_url/api_key 自动兼容)
         "profiles": [],
-        "timeout": 300,            # 读超时秒数 (思考型模型单次可能 >120s)
+        "timeout": 300,            # 整理/翻译单次请求总时限；其他 LLM 请求的读超时秒数
         # temperature / thinking 属于请求参数, 不做全局配置 ——
         # 在各组 profiles 的专属参数里按模型填写 (留空 = 不发送, 用服务商默认)
         # GLM-5.3/5.3-Flash 通常只能用 reasoning_effort=low 降低思考量;
@@ -97,12 +97,19 @@ DEFAULTS: dict[str, Any] = {
     "split": {
         "use_llm": True,             # 启用 LLM 语义整理
         "llm_profile": "",           # 空=跟随全局降级链；填写配置组名称可固定该组
-        # 单次语义整理请求的上下文预算；只按 token 分窗，默认保守使用 0.2M。
+        # 模型上下文硬限；全文一次提交并为完整输出预留空间，默认使用 0.2M。
         # 界面允许按服务商能力调到最高 1M。
         "llm_context_tokens": 200_000,
-        "context_lines": 2,          # 长稿分窗时，窗口前后各带几句作为理解参考
-        "max_split_length": 22,      # 目标单句显示长度；本地只兜底明显过长结果
-        "max_segment_seconds": 8.0,  # 目标单句语音时长；本地只兜底明显过长结果
+        "thinking_mode": "low",      # 支持的模型请求低思考档位；其他模型使用简短任务引导
+        "target_word_count": 10,     # LLM 语义软目标；中文按自然语义词理解，不按字符机械切分
+        "max_split_length": 22,      # 仅关闭 LLM 时的本地字符断句设置；保留旧值含义
+        "max_segment_seconds": 7.0,  # LLM 单句时长软参考；关闭 LLM 时用于本地时长兜底
+    },
+    "content_review": {
+        "enabled": True,          # 输出前按本地规则检查中英文字，命中整句不展示
+        "mute_audio": True,       # 同时静音命中时段的完整混音，覆盖两种语言与背景串音
+        "blocked_terms": "",      # 补充屏蔽词，每行一个；不修改识别原稿或译文
+        "blocked_ranges": "",     # 人工核定时段，每行 开始秒-结束秒:原因，使用源视频时间轴
     },
     "subtitles": {
         "mode": "all",             # all/source/target/bilingual
@@ -113,6 +120,7 @@ DEFAULTS: dict[str, Any] = {
         "target_language": "简体中文",
         "style_prompt": "",          # 自定义风格提示词 (翻译人设/语气)
         "llm_profile": "",            # 空=跟随全局降级链；填写配置组名称可固定该组
+        "thinking_mode": "low",      # 仅本步骤请求低思考档位；follow_profile保留模型参数
         "max_context_tokens": 200000,  # 单次翻译总预算; 界面允许按服务商能力调到 1M
         "custom_terms_path": "",     # 术语表 xlsx (src/dst/备注 三列)
     },

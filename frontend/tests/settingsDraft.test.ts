@@ -13,7 +13,7 @@ const bundle = await build({
   stdin: { contents: descriptor.scriptSetup!.content + `
     export { profiles, form, markApplied, isDirty, rootDirty, displayDirty, concDirty,
       applySettings, applyConc, applyDisplay, delProfile, route, router, dialog, sections,
-      section, selectedScope, visited, productionDirty, productionBusy, warnUnload, loadSettings };`,
+      section, selectedScope, visited, productionDirty, productionBusy, warnUnload, loadSettings, editability, settingsLocked, applyRoot, addProfile, move };`,
     loader: 'ts', resolveDir: fileURLToPath(new URL('../src/views', import.meta.url)) },
   bundle: true, write: false, format: 'esm', platform: 'node',
   plugins: [{ name: 'page-test-boundary', setup(build) {
@@ -95,6 +95,51 @@ test('显示偏好独立保存，既不提交模型密钥，也不吞掉模型�
   assert.equal(page.displayDirty.value, false)
   assert.equal(page.isDirty.value, true)
   assert.equal(page.productionDirty.value, true)
+})
+
+test('核对中或执行中锁所有模型/运行保存和档案编辑，保留草稿；实时显示唯一可保存', async t => {
+  const { page } = await fixture(t)
+  const requests:any[]=[]
+  t.mock.method(globalThis,'fetch',async(url:any,init:any)=>{
+    requests.push({url,init})
+    return new Response(JSON.stringify(String(url).endsWith('/editability') ? {locked:true,reason:'项目正在配音'} : {}))
+  })
+  page.editability.observing.value=true
+  page.profiles.value[0].name='未保存模型';page.form.value.timeout=1800
+  page.form.value.conc.download=3;page.form.value.data_root='D:\\保留草稿'
+  assert.equal(page.settingsLocked.value,true)
+  await page.editability.refresh()
+  page.delProfile(0);page.addProfile();page.move(0,1)
+  await page.applySettings();await page.applyConc();await page.applyRoot()
+  assert.equal(page.profiles.value.length,1)
+  assert.equal(requests.filter(r=>r.init?.method==='POST').length,0)
+  assert.equal(page.form.value.timeout,1800)
+  page.form.value.stream_reference_distance=750
+  await page.applyDisplay()
+  const writes=requests.filter(r=>r.init?.method==='POST')
+  assert.equal(writes.length,1)
+  assert.deepEqual(JSON.parse(writes[0].init.body).updates,{'ui.llm_stream.reference_distance_chars':750})
+  assert.equal(page.isDirty.value,true);assert.equal(page.concDirty.value,true);assert.equal(page.rootDirty.value,true)
+})
+
+test('保存前状态从空闲变为运行即取消写入，失败后草稿仍可重试',async t=>{
+  const {page}=await fixture(t);page.editability.observing.value=true
+  t.mock.method(globalThis,'fetch',async()=>new Response(JSON.stringify({locked:false})))
+  await page.editability.refresh();assert.equal(page.settingsLocked.value,false)
+  page.profiles.value[0].name='待保存';let writes=0
+  t.mock.method(globalThis,'fetch',async(url:any,init:any)=>{if(init?.method==='POST')writes++;return new Response(JSON.stringify({locked:true,reason:'任务刚开始'}))})
+  await page.applySettings();assert.equal(writes,0);assert.equal(page.isDirty.value,true)
+  assert.equal(page.settingsLocked.value,true)
+})
+
+test('各全局保存卡共用提交锁；模型慢保存时并行度、目录和显示不再另发请求',async t=>{
+  const {page}=await fixture(t);page.profiles.value[0].name='提交';page.form.value.conc.download=4
+  let finish:any,writes=0
+  t.mock.method(globalThis,'fetch',()=>{writes++;return new Promise(resolve=>finish=()=>resolve(new Response('{}')))})
+  const saving=page.applySettings()
+  await page.applySettings();await page.applyConc();await page.applyRoot();await page.applyDisplay()
+  assert.equal(writes,1);finish();await saving
+  assert.equal(page.concDirty.value,true)
 })
 
 test('显示偏好保存失败保留草稿；慢保存不吞掉新输入，重复点击只发一次', async t => {

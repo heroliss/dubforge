@@ -108,6 +108,7 @@ def test_runtime_guards_stop_before_any_mix_or_version_encoding(prepared, monkey
     uid, project, _ = prepared
     deps = Dependencies(project)
     ctx = SimpleNamespace(project=project, cfg=deps.cfg, upstream=deps.upstream, pdir=deps.root,
+                          dependencies=lambda: deps,
                           task_data={'version_specs': versions(project)})
     monkeypatch.setattr(version_render, 'resolve_video', lambda *args: pytest.fail('配音不全不应开始编码原声版'))
     with pytest.raises(DubbingIncompleteError): version_render.run(ctx)

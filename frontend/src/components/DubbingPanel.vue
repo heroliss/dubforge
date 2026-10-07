@@ -23,8 +23,10 @@ import { useSubtitlePreview } from '../composables/useSubtitlePreview'
 import { useNavStore } from '../stores/nav'
 import ConfigurationSourceBadge from './ConfigurationSourceBadge.vue'
 import { SOURCE_STYLES } from '../utils/configurationSource'
+import { useConfigurationEditability } from '../utils/configurationEditability'
 
 const props = defineProps<{ uid: string; suspended?: boolean }>()
+const { locked: projectLocked, reason: projectLockReason, canEdit, observing } = useConfigurationEditability(() => 'project:' + props.uid)
 const emit = defineEmits<{ (e: 'busy-change', value: boolean): void; (e: 'dirty-change', value: boolean): void }>()
 const message = useMessage(), nav = useNavStore()
 const route = useRoute(), router = useRouter()
@@ -42,7 +44,10 @@ const panelStyle = computed(() => ({
 }))
 const serverState = ref<any>(null), loadError = ref(''), sel = ref<number | null>(null)
 const selectionEdits = useDubbingSelection({
-  save: (id, selection) => request(`workbench/lines/${id}/selection`, 'PUT', selection),
+  save: async (id, selection) => {
+    if (projectLocked.value || observing.value && !(await canEdit())) throw new Error(projectLockReason.value || '项目正在运行，请完成后再选择声源')
+    return request(`workbench/lines/${id}/selection`, 'PUT', selection)
+  },
   saved: () => { void load(); void nav.poll(false) },
   error: (error: any) => message.error(`${error.message || '声源保存失败'}，已恢复之前的选择`),
 })
@@ -116,7 +121,7 @@ const checkedBlocked = computed(() => state.value?.lines.some((l: any) => checke
 const someChecked = computed(() => shownLines.value.some(l => checked.value.includes(l.id)))
 const dirty = computed(() => paramsDirty.value || lineDirty.value || textDirty.value || subtitleDirty.value || editing.value)
 const busy = computed(() => submitting.value || !!task.value?.active || state.value?.active_line != null)
-const actionsDisabled = computed(() => busy.value || nav.busy || dirty.value || props.suspended)
+const actionsDisabled = computed(() => projectLocked.value || busy.value || nav.busy || dirty.value || props.suspended)
 const runDisabled = computed(() => actionsDisabled.value || selectionEdits.saving.value || mixEdits.pending.value || mixEdits.saving.value)
 // 后台合成不占用预览；只有上游媒体重建才需要释放播放器。
 const playbackDisabled = computed(() => !!props.suspended)
@@ -132,9 +137,12 @@ const { mode: followMode, locate } = useDubbingFollow({
 const mixProjectUid = props.uid
 const mixEdits = useDubbingMix({
   voice: volDub, background: volBg,
-  save: mix => request('step_params', 'PUT', { updates: {
-    'assemble.voice_volume': mix.voice, 'assemble.bgm_volume': mix.background,
-  } }, mixProjectUid),
+  save: async mix => {
+    if (projectLocked.value || observing.value && !(await canEdit())) throw new Error(projectLockReason.value || '项目正在运行，音量仍用于试听，尚未保存')
+    return request('step_params', 'PUT', { updates: {
+      'assemble.voice_volume': mix.voice, 'assemble.bgm_volume': mix.background,
+    } }, mixProjectUid)
+  },
   saved: () => { void load(); void nav.poll(false) },
 })
 watch(playbackDisabled, value => { if (value) stopAll() })
@@ -347,6 +355,7 @@ async function synthesize(ids: number[]) {
 }
 async function markSatisfied(ids: number[], confirmed: boolean) {
   if (runDisabled.value) return
+  if (observing.value && !(await canEdit()) || runDisabled.value) return
   editing.value = true
   try {
     const data = await request('workbench/confirm', 'POST', {line_ids: ids, confirmed})
@@ -364,6 +373,7 @@ function discardSettings() { lineDirty.value = false; settingsLine.value = null 
 
 <template>
   <section class="dubbing-panel" :style="panelStyle">
+    <n-alert v-if="projectLocked" type="info" :show-icon="false" class="section">{{ projectLockReason }}；播放、定位和查看字幕仍可用。</n-alert>
     <nav class="workspace-tabs" aria-label="字幕与配音工作区">
       <n-button :type="activePane === 'editor' ? 'primary' : 'default'" :secondary="activePane === 'editor'" :aria-pressed="activePane === 'editor'" @click="changePane('editor')">校对与配音</n-button>
       <n-button :type="activePane === 'subtitles' ? 'primary' : 'default'" :secondary="activePane === 'subtitles'" :aria-pressed="activePane === 'subtitles'" @click="changePane('subtitles')">字幕工作区<span v-if="subtitleDirty"> · 未保存</span></n-button>
@@ -379,7 +389,7 @@ function discardSettings() { lineDirty.value = false; settingsLine.value = null 
       <n-collapse v-model:expanded-names="parametersOpen">
         <n-collapse-item name="parameters" title="配音参数 · 步骤设置" display-directive="show">
           <template #header-extra><n-text v-if="paramsDirty" type="warning">有未保存的修改</n-text></template>
-          <ProjectParameterForm :uid="uid" step-key="tts" :disabled="busy || nav.busy || settingsLine !== null"
+          <ProjectParameterForm :uid="uid" step-key="tts" :disabled="projectLocked || busy || nav.busy || settingsLine !== null"
             @dirty-change="paramsDirty = $event" @saved="parametersSaved" />
         </n-collapse-item>
       </n-collapse>
@@ -412,15 +422,15 @@ function discardSettings() { lineDirty.value = false; settingsLine.value = null 
             <n-checkbox v-model:checked="solo" size="small">单句试听仅人声</n-checkbox>
           </div>
           <div class="mix-controls">
-            <label>人声<n-slider :value="volDub" :min="0" :max="1" :step="0.05" :disabled="busy || nav.busy || editing" aria-label="人声音量"
+            <label>人声<n-slider :value="volDub" :min="0" :max="1" :step="0.05" :disabled="projectLocked || busy || nav.busy || editing" aria-label="人声音量"
               @update:value="mixEdits.change('voice', $event)" @dragend="mixEdits.save" @keyup="mixEdits.save" /><output>{{ Math.round(volDub * 100) }}%</output></label>
-            <label>背景<n-slider :value="volBg" :min="0" :max="1" :step="0.05" :disabled="busy || nav.busy || editing" aria-label="背景音量"
+            <label>背景<n-slider :value="volBg" :min="0" :max="1" :step="0.05" :disabled="projectLocked || busy || nav.busy || editing" aria-label="背景音量"
               @update:value="mixEdits.change('background', $event)" @dragend="mixEdits.save" @keyup="mixEdits.save" /><output>{{ Math.round(volBg * 100) }}%</output></label>
           </div>
           <div class="mix-save-state" aria-live="polite">
             <template v-if="mixEdits.error.value">
               <n-text type="warning" class="hint" :title="mixEdits.error.value">音量未保存，试听已生效</n-text>
-              <n-button size="tiny" quaternary :loading="mixEdits.saving.value" @click="mixEdits.save">重试保存</n-button>
+              <n-button size="tiny" quaternary :loading="mixEdits.saving.value" :disabled="projectLocked || nav.busy || busy" @click="mixEdits.save">重试保存</n-button>
             </template>
             <n-text v-else depth="3" class="hint" :title="state.vocal?.found ? '音频跟随视频时间轴。' : '试听原声暂用完整音轨；成片使用分离人声，缺失时会提示。'">{{ mixEdits.pending.value || mixEdits.saving.value ? '正在保存音量，试听已生效…' : '当前声源、配音版本和音量同步用于成片。' }}</n-text>
           </div>
@@ -565,19 +575,19 @@ function discardSettings() { lineDirty.value = false; settingsLine.value = null 
     <SubtitleWorkspace v-if="subtitlesVisited" v-show="activePane === 'subtitles'" :uid="uid" :position="time" :duration="videoDuration"
       :active="activePane === 'subtitles'" :lines="state?.lines ?? []" :subtitle-state="state?.subtitles"
       :return-to-assembly="route.query.from === 'assemble'" :no-video="!state?.video?.found || playbackDisabled"
-      :disabled="busy || nav.busy || paramsDirty || lineDirty || textDirty || editing || selectionEdits.saving.value || mixEdits.pending.value || mixEdits.saving.value"
+      :disabled="projectLocked || busy || nav.busy || paramsDirty || lineDirty || textDirty || editing || selectionEdits.saving.value || mixEdits.pending.value || mixEdits.saving.value"
       @dirty-change="subtitleDirty = $event" @refresh="load()" @preview="previewExport"
       @return-assembly="router.push(`/projects/${uid}/steps/assemble`)" />
-    <SubtitleLineEditor v-if="textEditLine" :uid="uid" :line="textEditLine" :disabled="busy || nav.busy"
+    <SubtitleLineEditor v-if="textEditLine" :uid="uid" :line="textEditLine" :disabled="projectLocked || busy || nav.busy"
       @close="closeTextEditor" @saved="textSaved" @dirty-change="textDirty = $event" />
     <n-drawer :show="settingsLine !== null" :width="680" style="max-width: 100vw" :mask-closable="!lineDirty" @update:show="!$event && closeSettings()">
       <n-drawer-content :title="`第 ${settingsLine} 句 · 配音参数`" closable>
-        <ProjectParameterForm v-if="settingsLine !== null" :key="settingsLine" :uid="uid" step-key="tts" :line-id="settingsLine" :disabled="busy || nav.busy"
+        <ProjectParameterForm v-if="settingsLine !== null" :key="settingsLine" :uid="uid" step-key="tts" :line-id="settingsLine" :disabled="projectLocked || busy || nav.busy"
           @dirty-change="lineDirty = $event" @saved="parametersSaved">
           <template #actions="{ save, saving, loading, dirty, hasOverrides, resetAll }">
             <Teleport :to="settingsFooter || 'body'" :disabled="!settingsFooter">
               <n-space align="center" justify="end">
-                <n-button v-if="hasOverrides" quaternary :disabled="busy || nav.busy || saving || loading" @click="resetAll">填入步骤设置（待保存）</n-button>
+                <n-button v-if="hasOverrides" quaternary :disabled="projectLocked || busy || nav.busy || saving || loading" @click="resetAll">填入步骤设置（待保存）</n-button>
                 <n-text v-if="dirty" type="warning" class="hint">有未保存的修改</n-text>
                 <n-button v-if="dirty" quaternary :disabled="saving" @click="discardSettings">放弃修改</n-button>
                 <n-button type="primary" :loading="saving" :disabled="!dirty || busy || nav.busy || loading" @click="save">保存本句参数</n-button>

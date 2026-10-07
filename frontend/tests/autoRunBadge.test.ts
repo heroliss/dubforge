@@ -10,7 +10,7 @@ import { setup } from '@css-render/vue3-ssr'
 
 let server: ViteDevServer, Badge: any
 before(async () => {
-  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } })
+  server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
   Badge = (await server.ssrLoadModule('/src/components/AutoRunBadge.vue')).default
 })
 after(async () => await server.close())

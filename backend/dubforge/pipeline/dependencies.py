@@ -16,16 +16,17 @@ def selected_steps(project):
 class Dependencies:
     """一次请求共用一个快照，避免状态轮询重复读配置、数据库及递归检查。"""
 
-    def __init__(self, project, *, assemble_variants=None):
+    def __init__(self, project, *, assemble_variants=None, settings=None, overrides=None):
         self.project = project
         self.root = crud.project_dir_by_project(project).resolve()
-        self.settings = config.load_config()
+        self.settings = copy.deepcopy(settings) if settings is not None else config.load_config()
         from dubforge.pipeline.assembly_outputs import validate_variants
         self.assemble_variants = validate_variants(assemble_variants) if assemble_variants is not None else None
         self.assembly_versions = None
         self.version = None
         from dubforge.configuration import step_values
-        self.overrides = step_values(project, settings=self.settings)
+        self.overrides = (copy.deepcopy(overrides) if overrides is not None
+                          else step_values(project, settings=self.settings))
         self.steps = {s.step_key: s for s in crud.get_steps(project.id)}
         self.arts = crud.latest_artifacts(project.id, None)
         self._fresh = {}
@@ -34,6 +35,10 @@ class Dependencies:
         self._dubbing_lines = None
         self._inputs = {}
         self._assembly_state = None
+        self._paths = {}
+        self._production_cache = {}
+        self._assembly_records = None
+        self._assembly_configuration = None
 
     def with_assembly_variants(self, variants):
         """复用本次读取快照，仅重算成片组合依赖，不重复读取配置和逐句索引。"""
@@ -82,7 +87,10 @@ class Dependencies:
         return result
 
     def path(self, step, name):
-        art = self.arts.get(f"{step}/{name}")
+        key = f"{step}/{name}"
+        if key in self._paths:
+            return self._paths[key]
+        art = self.arts.get(key)
         if art is None:
             return None
         path = Path(art.rel_path)
@@ -90,6 +98,8 @@ class Dependencies:
             path = (self.root / path).resolve()
             if not path.is_relative_to(self.root):
                 return None
+        # 只复用本请求冻结登记中的路径；文件存在、大小和内容核验仍由消费者实时执行。
+        self._paths[key] = path
         return path
 
     def inputs(self, key, *, line=None):
@@ -138,8 +148,8 @@ class Dependencies:
             if not any(v['dubbing'] for v in specs):
                 return result  # 原声烧录直接使用源视频音轨，不需要配音、分离或混音。
             result.extend(self.dubbing_inputs())
-            from dubforge.pipeline.dubbing_edit import production_lines, take_name
-            lines = production_lines(self.project, self.dubbing_lines(), self.root, dependencies=self)
+            from dubforge.pipeline.dubbing_edit import take_name
+            lines = self.production_lines()
             result.extend(("tts", take_name(line['id'], line['take']), f"第 {line['id']} 句 · 配音 {line['take']}")
                           for line in lines if line['source'] == 'dub' and line['take'] is not None)
             if any(line['source'] == 'original' for line in lines):
@@ -174,6 +184,16 @@ class Dependencies:
                 raise
             return []
 
+    def production_lines(self):
+        """一个依赖快照只解析一次逐句选择；不缓存音频是否有效。"""
+        from dubforge.pipeline.dubbing_edit import production_lines
+        source = self.dubbing_lines()
+        identity = (self.project.params, tuple((row['id'], row['text'], row['start'], row['end']) for row in source))
+        if self._production_cache.get('identity') != identity:
+            self._production_cache.update(identity=identity,
+                lines=production_lines(self.project, source, self.root, dependencies=self))
+        return self._production_cache['lines']
+
     def input_view(self, key, *, line=None):
         return [self._input_view(*item) for item in self.inputs(key, line=line)]
 
@@ -204,8 +224,8 @@ class Dependencies:
 
     def dubbing_summary(self):
         """与正式合成相同的逐句就绪条件，不把缺失配音计为主动选用原声。"""
-        from dubforge.pipeline.dubbing_edit import production_lines, take_name
-        lines = production_lines(self.project, self.dubbing_lines(), self.root, dependencies=self)
+        from dubforge.pipeline.dubbing_edit import take_name
+        lines = self.production_lines()
         required = [line for line in lines if line['source'] == 'dub' and line['take'] is not None]
         pending = [line['id'] for line in required
                    if not self._input_view('tts', take_name(line['id'], line['take']), '')['ready']]
@@ -302,6 +322,25 @@ class Dependencies:
     def display_fresh(self, key):
         return self.assembly_state()['fresh'] if key == 'assemble' else self.fresh(key)
 
+    def freshness_feedback(self, key):
+        """列表与步骤页共用轻量说明；逐句待配音不冒称整步配置失效。"""
+        if key == 'assemble':
+            state = self.assembly_state()
+            return dict(freshness_label=state['label'], freshness_reason=state['reason'])
+        if key != 'tts' or self.steps[key].status in {'running', 'queued'} or self.fresh(key):
+            return {}
+        summary = self.dubbing_summary()
+        if not summary['known']:
+            return dict(freshness_label='待核对配音输入', freshness_reason='需先准备最新原文和译文，再核对配音。')
+        if summary['pending']:
+            return dict(freshness_label='仍有待配音句', freshness_reason=f"仍有 {summary['pending']} 句缺少有效的选用音频；只需核对并补齐这些句子。")
+        return {}
+
+    def explain(self, key, stored=None):
+        """只读比较上次成功输入与当前生效输入，绝不补写历史值。"""
+        from dubforge.pipeline.stale_explanation import explain
+        return explain(self, key, stored)
+
     def matches_fingerprint(self, key):
         from dubforge.runner import compute_fingerprint
         step = self.steps.get(key)
@@ -309,10 +348,16 @@ class Dependencies:
             return False
         if step.input_fingerprint == compute_fingerprint(self.project, key, dependencies=self):
             return True
+        if key == 'translate' and self.cfg('translate.custom_terms_path'):
+            return False  # 旧指纹只记录路径，无法证明术语文件内容仍匹配。
+        if key in {'split', 'translate'} and step.input_fingerprint == compute_fingerprint(
+                self.project, key, dependencies=self, legacy_config=True):
+            return True
         # 未改输出语义的旧缓存继续可用，避免升级后重新下载或识别。
         compatible = key in {"preprocess", "transcribe", "split", "translate"}
-        return compatible and step.input_fingerprint == compute_fingerprint(
-            self.project, key, dependencies=self, legacy=True)
+        return compatible and any(step.input_fingerprint == compute_fingerprint(
+            self.project, key, dependencies=self, legacy=True, legacy_config=old_config)
+            for old_config in (False, True))
 
     def require(self, key, *, line=None):
         blockers = self.unready(key, line=line)

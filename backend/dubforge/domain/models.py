@@ -41,6 +41,7 @@ class StepRun(SQLModel, table=True):
     progress: float = 0.0                              # 运行进度 0-100 (running 时上报, done=100)
     eta_seconds: float = 0.0                           # 预计剩余秒数快照 (0=无可靠预估)
     input_fingerprint: str = ""                        # 输入指纹 (配置+上游产物哈希)
+    input_snapshot: str = "{}"                         # 最近成功制作的脱敏输入快照，供更新原因比较
     error_code: str = ""
     error_message: str = ""
     error_suggestion: str = ""

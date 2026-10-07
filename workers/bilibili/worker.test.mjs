@@ -5,7 +5,7 @@ import { execute } from './worker.mjs'
 import { KNOWN_DECLARATIONS, safeError } from './protocol.mjs'
 
 // 只替换外部 SDK，实际命令调度、校验与返回整形全部执行。
-function fixture(platform = {}, mid = 123) {
+function fixture(platform = {}, mid = 123, events = [{ data: { loaded: 25, total: 100 } }], send = () => {}) {
   const calls = []
   const sdk = {
     Auth: class { setAuth() {} },
@@ -18,13 +18,13 @@ function fixture(platform = {}, mid = 123) {
       emitter = new EventEmitter()
       constructor(part, auth, options) { calls.push({ part, options }) }
       async upload() {
-        this.emitter.emit('progress', { data: { loaded: 25, total: 100 } })
+        for (const event of events) this.emitter.emit('progress', event)
         return { cid: 44, filename: 'upload-result', title: '配音版' }
       }
     },
   }
   const run = (operation, payload = {}) => execute({ operation,
-    payload: { account_id: '123', ...payload }, credential: { DedeUserID: '123', bili_jct:'fixture-csrf' } }, sdk, () => {})
+    payload: { account_id: '123', ...payload }, credential: { DedeUserID: '123', bili_jct:'fixture-csrf' } }, sdk, send)
   return { run, calls }
 }
 
@@ -33,6 +33,23 @@ test('真正执行上传分支，只返回一个分P，不调用投稿', async (
   assert.equal((await run('upload', {path:'fixture.mp4', title:'配音版'})).cid, 44)
   assert.equal(calls.length, 1)
   assert.equal(calls[0].options.bcutPreUpload, false)
+})
+
+test('上传进度保留阶段变化与最终字节，过滤SDK地址与凭据', async () => {
+  const received = []
+  const events = [
+    {event:'preupload-start',data:{loaded:0,total:100}},
+    {event:'getUploadInfo-end',data:{loaded:0,total:100,auth:'secret',endpoint:'private'}},
+    {event:'uploading',data:{loaded:25,total:100}},
+    {event:'uploading',data:{loaded:26,total:100}},
+    {event:'uploading',data:{loaded:100,total:100}},
+    {event:'merge-start',data:{loaded:100,total:100}},
+    {event:'merge-end',data:{loaded:100,total:100,auth:'secret'}},
+    {event:'uploading',data:{loaded:NaN,total:100}},
+  ]
+  await fixture({},123,events,(event,data)=>received.push({event,...data})).run('upload')
+  assert.deepEqual(received.map(e=>[e.phase,e.loaded]), [['preparing',0],['uploading',25],['uploading',100],['merging',100],['merging',100]])
+  assert.doesNotMatch(JSON.stringify(received), /secret|private|auth|endpoint/)
 })
 test('确认缺失或账号不匹配时，不触达投稿方法', async () => {
   const platform = { addMediaWebApiV3: () => assert.fail('不应提交') }

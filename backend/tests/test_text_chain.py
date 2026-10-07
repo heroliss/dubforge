@@ -56,7 +56,7 @@ def _mock_llm(monkeypatch, responder):
                             log=lambda m: None, profile=None,
                             cancel_check=None, trace=None, retry_prompt=None,
                             retry_request=None, retry_context=None,
-                            failure_label="输出"):
+                            failure_label="输出", response_guard_factory=None):
         last_error = None
         last_raw = ""
         for attempt in range(1, max_retries + 1):
@@ -83,7 +83,8 @@ def _mock_llm(monkeypatch, responder):
                 return obj
             except Exception as exc:
                 last_error = exc
-        raise AssertionError(f"连续 {max_retries} 次校验失败: {last_error}")
+        from dubforge.errors import StepFailedError
+        raise StepFailedError(f"连续 {max_retries} 次校验失败: {last_error}", code='LLM_OUTPUT_INVALID')
 
     monkeypatch.setattr(llm, "chat", fake_chat)
     monkeypatch.setattr(llm, "chat_json", fake_chat_json)
@@ -117,19 +118,19 @@ def read_translate(uid):
                       for line_id, dst in sorted(rows.items())]}
 
 
-def test_split_long_line_with_word_timestamps(make_project, isolated_env, monkeypatch, pdir):
+def test_split_long_model_line_preserves_words_and_times_without_mechanical_split(make_project, isolated_env, monkeypatch, pdir):
     uid = make_project()
-    long_text = " ".join(["word"] * 40)          # 40 词 > 默认 max_split_length=22
+    long_text = " ".join(["word"] * 40)          # 超过软目标，不代表识别内容或分句一定错误。
     _seed_transcribe(uid, [(0.0, 10.0, long_text)])
 
     def responder(prompt, system):
-        # LLM 返回单条超长行 (合法协议); 超上限的本地细分用词级时间戳完成
+        # 合法整句只作时间重锚；软长度目标不能机械改写模型的分句。
         return "1. 0.000-10.000: " + long_text
     _mock_llm(monkeypatch, responder)
     assert _run_until(uid, "split") == "done"
 
     data = read_split(uid)
-    assert data["count"] > 1
+    assert data["count"] == 1
     # 时间轴: 单调递增且覆盖原行区间
     starts = [l["start"] for l in data["lines"]]
     ends = [l["end"] for l in data["lines"]]
@@ -263,7 +264,7 @@ def test_split_uses_duration_as_secondary_boundary(make_project, isolated_env, p
 
 def test_split_llm_resegments_whole_window_once(make_project, isolated_env,
                                                 monkeypatch, pdir):
-    """词级模式下连续短语在一个 token 窗口内只请求一次，语义边界由模型判断。"""
+    """词级全文只请求一次；三条ASR可整理成两句，文字和时间仍完整对应。"""
     uid = make_project()
     _seed_transcribe(uid, [
         (0.0, 2.0, "这是第一句"),
@@ -277,9 +278,10 @@ def test_split_llm_resegments_whole_window_once(make_project, isolated_env,
         calls.append(prompt)
         assert "输入短语时间轴:" not in prompt
         assert "输入原文顺序（仅用于核对" not in prompt
-        assert "【本窗口时间轴输入】" in prompt
+        body = prompt.split("【全文时间轴输入】\n", 1)[1]
         assert "开始秒-结束秒: 原文片段" in prompt
-        assert "0.00-2.00: 这是第一句" in prompt
+        assert [row.rstrip() for row in body.splitlines()] == [
+            "0.00-2.00: 这是第一句", "2.00-4.00: 接着是第二句", "4.00-6.00: 最后一句"]
         return ("1. 0.00-4.00: 这是第一句接着是第二句\n"
                 "2. 4.00-6.00: 最后一句")
 
@@ -296,7 +298,7 @@ def test_split_llm_resegments_whole_window_once(make_project, isolated_env,
 
 def test_split_llm_phrase_mode_omits_word_timeline(make_project, isolated_env,
                                                    monkeypatch, pdir):
-    """默认短语模式只发送短语时间和停顿提示，避免无谓扩大请求。"""
+    """短语全文不重复词表，保留全部素材且允许合并ASR行。"""
     uid = make_project()
     _seed_transcribe(uid, [
         (0.0, 1.8, "这是第一句，"),
@@ -306,11 +308,11 @@ def test_split_llm_phrase_mode_omits_word_timeline(make_project, isolated_env,
 
     def responder(prompt, system):
         calls.append(prompt)
-        assert "【任务：整体语义重组】" in prompt
+        assert "【任务：全文语义整理】" in prompt
         assert "词级: " not in prompt
-        assert "【本窗口时间轴输入】" in prompt
+        body = prompt.split("【全文时间轴输入】\n", 1)[1]
         assert "输入词级时间轴:" not in prompt
-        assert "0.00-1.80: 这是第一句，" in prompt
+        assert body == "0.00-1.80: 这是第一句，\n1.80-3.50: 接着是第二句。"
         assert "词级时间轴未发送" not in prompt
         return "1. 0.00-3.50: 这是第一句，接着是第二句。"
 
@@ -319,6 +321,60 @@ def test_split_llm_phrase_mode_omits_word_timeline(make_project, isolated_env,
     cfgmod.set_key("asr.segmentation_mode", "phrase")
     assert _run_until(uid, "split") == "done"
     assert len(calls) == 1
+    assert read_split(uid)['count'] == 1
+
+
+def test_full_semantic_run_submits_all_40_phrases_once(make_project, monkeypatch, pdir):
+    """实际步骤入口不再被旧32短语上限截断，首尾素材同属一份全文输入。"""
+    uid = make_project()
+    source = [(float(i) * 2, float(i) * 2 + 1.5, f"source phrase number {i}.")
+              for i in range(40)]
+    _seed_transcribe(uid, source)
+    calls = []
+
+    def responder(prompt, system):
+        calls.append(prompt)
+        body = prompt.split('【全文时间轴输入】\n', 1)[1]
+        expected = '\n'.join(f'{start:.2f}-{end:.2f}: {text}' for start, end, text in source)
+        assert body == expected
+        return '\n'.join(f'{i}. {start:.2f}-{end:.2f}: {text}'
+                         for i, (start, end, text) in enumerate(source, 1))
+
+    _mock_llm(monkeypatch, responder)
+    assert _run_until(uid, 'split') == 'done'
+    data = read_split(uid)
+    assert len(calls) == 1 and data['count'] == 40
+    assert [row['text'] for row in data['lines']] == [text for _, _, text in source]
+    assert data['lines'][0]['start'] == 0 and data['lines'][-1]['end'] == 79.5
+
+
+def test_phrase_full_run_exposes_hidden_silence_and_preserves_it_in_output(make_project, monkeypatch, pdir):
+    """短语覆盖六秒静音时，实际模型输入可见空档，最终两句留出原有静音。"""
+    from dubforge.domain import crud
+    uid = make_project()
+    _seed_transcribe(uid, [(0., 12., 'one really cool thing')])
+    path = pdir(uid) / 'srt' / 'words.json'
+    path.write_text(json.dumps([
+        {'word': 'one ', 'start': 0., 'end': 1.2},
+        {'word': 'really ', 'start': 7.2, 'end': 8.},
+        {'word': 'cool ', 'start': 8., 'end': 9.},
+        {'word': 'thing ', 'start': 9., 'end': 12.},
+    ]), encoding='utf-8')
+    crud.add_artifact(crud.get_project(uid).id, 'transcribe', 'json', 'words.json', path, 'srt/words.json')
+    calls = []
+
+    def responder(prompt, system):
+        calls.append(prompt)
+        marker = '# 无台词区间 1.20-7.20（6.00秒，必须留空）'
+        assert prompt.count(marker) == 1
+        assert prompt.split('【全文时间轴输入】\n', 1)[1] == '0.00-12.00: one really cool thing\n' + marker
+        return '1. 0.00-1.20: one\n2. 7.20-12.00: really cool thing'
+
+    _mock_llm(monkeypatch, responder)
+    assert _run_until(uid, 'split') == 'done'
+    data = read_split(uid)
+    assert len(calls) == 1 and data['count'] == 2
+    assert data['lines'][0]['end'] == 1.2 and data['lines'][1]['start'] == 7.2
 
 
 def test_split_llm_prompt_gives_autonomous_semantic_guidance():
@@ -334,20 +390,25 @@ def test_split_llm_prompt_gives_autonomous_semantic_guidance():
         lines, 30, 8.0,
         pause_threshold=0.6, include_words=False)
 
-    assert "由你根据语义和节奏判断" in prompt
+    guidance, body = prompt.split('【全文时间轴输入】\n', 1)
+    expected = ['0.00-1.00: first part', '3.00-4.00: second part',
+                '4.10-5.00: third part']
+    assert all(body.count(line) == 1 for line in expected)
+    assert [body.index(line) for line in expected] == sorted(body.index(line) for line in expected)
     assert "保留源语言" in prompt
-    assert "结合上下文主动检查" in prompt
-    assert "证据不足时保留原意" in prompt
-    assert "`# 停顿 X.XXs` 表示真实间隔达到 0.60 秒" in prompt
-    assert "跨长停顿合句" in prompt
-    assert "把后句开头的短词挂到前句末尾" in prompt
-    assert "刻意停顿、犹豫或归属不明" in prompt
+    assert '可以改变ASR行数' in guidance
+    assert '不确定处保留原意' in guidance
+    assert '结合全文语境和常识' in guidance
+    assert '不要求逐词照抄' in guidance
+    assert '英文按单词、中文按自然语义词' in guidance
+    assert '作为软参考' in guidance
+    assert '长停顿前的半句可以保留' in guidance
+    assert '无台词区间必须留空' in guidance
     assert "序号. 开始秒-结束秒: 原文片段" in prompt
-    assert "# 停顿 2.00s" in prompt
 
 
 def test_correction_guidance_survives_structural_retry_and_translation():
-    """各阶段保留通用纠错建议，不夹带孤立词案例或禁止润色的要求。"""
+    """整理允许全文语境与常识纠错；翻译消费本次整理稿，不重分配编号。"""
     from types import SimpleNamespace
 
     from dubforge.pipeline.step_split import _split_repair_prompt
@@ -356,12 +417,13 @@ def test_correction_guidance_survives_structural_retry_and_translation():
     timeline = "0.00-2.00: Welcome to the city."
     repair = _split_repair_prompt([], timeline, ValueError("缺少序号1"))
     translated = _base_system(SimpleNamespace(cfg=lambda key, default=None: default), "")
-    assert "结合上下文主动检查" in repair
-    assert "专名、数字和单位" in repair
-    assert "证据不足时保留原意" in repair
-    assert "可纠正明显的识别错误" in translated
-    assert "尽量保留原语义" in translated
-    assert "说话人本身的口误" in translated
+    assert '结合全文语境和常识' in repair
+    assert '不要求逐词照抄' in repair
+    assert repair.split('【全文时间轴输入】\n', 1)[1] == timeline
+    assert '原文已定稿' in translated
+    assert '没有音频，不再猜改ASR' in translated
+    assert '疑似实词或专名无法确定时保留原词' in translated
+    assert '可纠正明显的识别错误' not in translated
     for prompt in (repair, translated):
         assert "yuan" not in prompt and "yen" not in prompt
         assert "不额外润色" not in prompt
@@ -413,37 +475,18 @@ def test_translation_alignment_revision_only_invalidates_translation(make_projec
 
 
 def test_split_semantic_settings_remove_manual_merge_switch():
-    """跨短语合并开关移除，参数名称直接说明分窗参考用途。"""
+    """全文整理不再展示手动跨短语或分窗旋钮，快/慢模式有明确设置。"""
     from dubforge.pipeline.step_params import STEP_PARAM_SCHEMA
 
     paths = {field.path for fields in STEP_PARAM_SCHEMA.values()
              for field in fields}
     assert "split.allow_cross_line_merge" not in paths
+    assert 'split.context_lines' not in paths
+    assert 'split.window_max_chars' not in paths
     labels = {field.path: field.label for fields in STEP_PARAM_SCHEMA.values()
               for field in fields}
-    assert labels["split.context_lines"] == "分窗前后参考句数"
-    assert labels["split.max_split_length"] == "目标单句长度（字符）"
-
-
-def test_split_long_gap_merge_warns_without_repair():
-    """长间隔由模型判断；跨长间隔只警告，不再本地拆回。"""
-    from dubforge.pipeline.step_split import (_protected_gap_warnings,
-                                              _short_gap_boundaries)
-
-    lines = [
-        SubLine(1, 0.0, 1.0, "first"),
-        SubLine(2, 10.0, 11.0, "second"),
-        SubLine(3, 11.05, 12.0, "third"),
-    ]
-    assert _short_gap_boundaries(lines, 0.6) == {2}
-    merged = [{"text": "firstsecond", "start": 0.0, "end": 11.0}]
-    warnings = _protected_gap_warnings(merged, lines, {2}, 0.6)
-    assert len(warnings) == 1
-    assert "跨越了 9.00s 长间隔" in warnings[0]
-    assert "已按模型结果保留" in warnings[0]
-    separate = [{"text": "first", "start": 0.0, "end": 1.0},
-                {"text": "second", "start": 10.0, "end": 11.0}]
-    assert _protected_gap_warnings(separate, lines, {2}, 0.6) == []
+    assert 'split.thinking_mode' in labels
+    assert labels["split.max_split_length"] == "本地单句长度（字符）"
 
 
 def test_split_timeline_format_marks_pauses_and_uses_centiseconds():
@@ -459,23 +502,9 @@ def test_split_timeline_format_marks_pauses_and_uses_centiseconds():
     assert "1.04-1.29: 乙" in text
 
 
-def test_split_stitches_artificial_window_boundary():
-    """token 分窗落在连续短语中间时，边界应在本地安全拼回。"""
-    from dubforge.pipeline.step_split import _stitch_window_edges
-
-    parts = [
-        {"text": "这是前半", "start": 0.0, "end": 1.8, "_window": 1},
-        {"text": "后半句", "start": 1.8, "end": 3.2, "_window": 2},
-    ]
-    out = _stitch_window_edges(parts, max_len=22, max_duration=8, pause=0.6)
-    assert len(out) == 1
-    assert out[0]["text"] == "这是前半后半句"
-    assert "_window" not in out[0]
-
-
-def test_split_long_gap_merge_is_preserved_with_warning(make_project, isolated_env,
+def test_split_ordinary_hesitation_merge_is_preserved(make_project, isolated_env,
                                                           monkeypatch, pdir):
-    """模型合并长间隔时任务成功，结果保留。"""
+    """1.5秒普通犹豫允许模型合句，不当作明显长静音强制拆回。"""
     uid = make_project()
     _seed_transcribe(uid, [
         (0.0, 1.0, "第一段"),
@@ -539,11 +568,11 @@ def test_translate_whole_doc_tier(make_project, isolated_env, monkeypatch, pdir)
 
 
 def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatch):
-    """正文超过单次 token 预算 → 分窗口; 二次运行命中缓存 (LLM 调用数不变)"""
+    """容量充足时全文一次翻译并复用缓存；force 仍真正重新翻译。"""
     uid = make_project()
     lines = [(float(i) * 2, float(i) * 2 + 1.5,
               f"sentence number {i} about topic")
-             for i in range(12)]
+             for i in range(81)]
     _seed_transcribe(uid, lines)
 
     calls = []
@@ -552,7 +581,7 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
         import re as _re
         ids = _re.findall(r"^(\d+)\. ", prompt, flags=_re.MULTILINE)
         output = "".join(f"{i}. 译{i}\n" for i in ids)
-        if "第 12/12 个翻译窗口" not in prompt:
+        if "译文后另起一行输出交接标记" in prompt:
             output += "###HANDOFF###\n上一窗口已完成，继续保持术语一致。"
         return output
     _mock_llm(monkeypatch, responder)
@@ -560,7 +589,7 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
     import dubforge.config as cfgmod
     cfgmod.set_key("split.use_llm", False)
     cfgmod.set_key("split.max_split_length", 80)
-    cfgmod.set_key("translate.max_context_tokens", 1_000)
+    cfgmod.set_key("translate.max_context_tokens", 200_000)
 
     from dubforge.domain import crud as _crud
     def _rr(key):
@@ -572,7 +601,7 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
     assert _rr("split") == "done"
     assert _rr("translate") == "done"
     calls_after_1 = len(calls)
-    assert calls_after_1 == 12
+    assert calls_after_1 == 1
     runner = _runner()
     r = runner.start_step(uid, "translate", force=False)
     if r["status"] == "started":
@@ -583,6 +612,40 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
     assert r["status"] == "started"
     wait_status(uid, "translate", {"done"})
     assert len(calls) == calls_after_1 * 2
+
+
+def test_same_path_term_changes_retranslate_through_nonforced_step_entry(make_project, isolated_env, monkeypatch):
+    """外层过期后，实际系统提示也改变窗口缓存，不能拿旧术语译文假装重新完成。"""
+    from openpyxl import Workbook
+    from dubforge import config
+
+    uid = make_project()
+    _seed_transcribe(uid, [(0.0, 2.0, 'station')])
+    config.set_key('split.use_llm', False)
+    path = isolated_env / 'terms.xlsx'
+    book = Workbook()
+    book.active.append(['src', 'dst', 'note'])
+    book.active.append(['station', '车站', '交通'])
+    book.save(path)
+    config.set_key('translate.custom_terms_path', str(path))
+    systems = []
+
+    def responder(prompt, system):
+        systems.append(system)
+        return '1. 站点' if '- station → 站点' in system else '1. 车站'
+
+    _mock_llm(monkeypatch, responder)
+    assert _run_until(uid, 'split') == 'done'
+    assert _run_until(uid, 'translate') == 'done'
+    assert len(systems) == 1 and '- station → 车站' in systems[0]
+    assert read_translate(uid)['lines'][0]['dst'] == '车站'
+    book.active['B2'] = '站点'
+    book.save(path)
+    started = _runner().start_step(uid, 'translate', force=False)
+    assert started['status'] == 'started'
+    assert wait_status(uid, 'translate', {'done'}) == 'done'
+    assert len(systems) == 2 and '- station → 站点' in systems[1]
+    assert read_translate(uid)['lines'][0]['dst'] == '站点'
 
 
 def test_translate_numbered_output_requires_ordered_known_ids(
@@ -622,12 +685,14 @@ def test_split_llm_garbage_fails_loudly(make_project, isolated_env, monkeypatch,
 
     def responder(prompt, system):
         return "这不是 JSON"
-    _mock_llm(monkeypatch, responder)
+    calls = _mock_llm(monkeypatch, responder)
 
     assert _run_until(uid, "split") == "failed"
     from dubforge.domain import crud as _crud
     step = _crud.get_step(_crud.get_project(uid).id, "split")
-    assert step.error_code == "SPLIT_WINDOW_UNTRUSTED"
+    assert step.error_code == "LLM_OUTPUT_INVALID"
+    assert len(calls) == 2, '全文质量失败只允许一次定向重试'
+    assert not (pdir(uid) / 'artifacts' / 'split' / 'split.txt').exists()
 
 
 def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
@@ -653,11 +718,11 @@ def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
 
 
 def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pdir):
-    """多个翻译窗口按顺序传递交接摘要, 输出按 id 正确归位"""
+    """全文超出真实容量才分窗，按顺序传递摘要且原编号正确归位。"""
     uid = make_project()
     lines = [(float(i) * 2, float(i) * 2 + 1.5,
               f"sentence number {i} about topic")
-             for i in range(12)]
+             for i in range(200)]
     _seed_transcribe(uid, lines)
 
     calls = []
@@ -669,7 +734,7 @@ def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pd
             import re as _re
             ids = _re.findall(r"^(\d+)\. ", prompt, flags=_re.MULTILINE)
             output = "".join(f"{i}. 译{i}\n" for i in ids)
-            if len(prompts) < 12:
+            if "译文后另起一行输出交接标记" in prompt:
                 output += "###HANDOFF###\n上一窗口摘要：保持 topic 术语一致。"
             return output
         return ""
@@ -678,16 +743,17 @@ def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pd
     import dubforge.config as cfgmod
     cfgmod.set_key("split.use_llm", False)
     cfgmod.set_key("split.max_split_length", 80)
-    cfgmod.set_key("translate.max_context_tokens", 1_000)
+    cfgmod.set_key("translate.max_context_tokens", 10_000)
 
     assert _run_until(uid, "split") == "done"
     assert _run_until(uid, "translate") == "done"
-    assert len(calls) == 12
+    assert len(calls) > 1
     assert "上一窗口摘要：保持 topic 术语一致。" in prompts[1]
     assert "###HANDOFF###" in prompts[0] and "###HANDOFF###" not in prompts[-1]
     data = read_translate(uid)
     dsts = {line["id"]: line["dst"] for line in data["lines"]}
-    assert dsts[3] == "译3" and dsts[11] == "译11"
+    assert list(dsts) == list(range(1, 201))
+    assert dsts[3] == "译3" and dsts[200] == "译200"
 
 
 def test_translate_chunk_planner_uses_context_budget():
@@ -731,7 +797,7 @@ def test_translation_duration_is_sent_in_initial_repair_budget_and_cache():
 
 @pytest.mark.parametrize("style", ["", "  ", "用四川方言，幽默一点，多用网络流行语"])
 def test_translate_prompt_prefers_autonomous_natural_translation(style):
-    """简短提示保留原意、时长、标点和逐句约定，自定义风格按原文传入。"""
+    """定稿保真优先于自然风格，时长/标点/术语约定继续生效。"""
     from dubforge.pipeline.step_translate import _base_system, _window_prompt
 
     class Ctx:
@@ -744,7 +810,10 @@ def test_translate_prompt_prefers_autonomous_natural_translation(style):
     system = _base_system(Ctx(), "hello = 你好")
     prompt = _window_prompt([{"id": 1, "text": "hello"}], "", 1, 1)
 
-    assert "结合整体语境和常识" in system
+    assert '同编号保真' in system
+    assert '风格和网络梗不能添加笑点' in system
+    assert '不能为了流畅搬动信息' in system
+    assert '结合整体语境和常识' not in system
     assert "用于字幕和配音" in system
     assert "按每句标注的时长控制长度" in system
     assert "短句优先简洁表达" in system
@@ -951,7 +1020,7 @@ def test_translate_local_retry_uses_fresh_small_request(monkeypatch):
 
 @pytest.mark.parametrize("last_line", ["", "100. \t"])
 def test_translate_window_chooses_local_fresh_retry(monkeypatch, tmp_path, last_line):
-    """局部重试不携带完整对话，但继续携带用户风格和通用纠错建议。"""
+    """局部重试不携带完整对话，但继续保留用户风格与定稿保真约束。"""
     from dubforge.pipeline import step_translate as st
     from dubforge.backends import llm
 
@@ -995,7 +1064,8 @@ def test_translate_window_chooses_local_fresh_retry(monkeypatch, tmp_path, last_
     assert calls[1]["messages"] is None
     assert calls[0]["system"] == calls[1]["system"]
     assert "用四川方言，幽默一点" in calls[1]["system"]
-    assert "可纠正明显的识别错误" in calls[1]["system"]
+    assert '没有音频，不再猜改ASR' in calls[1]['system']
+    assert '事实优先' in calls[1]['system']
     assert "每句译文非空" in calls[1]["system"]
     assert "句末省略逗号、句号" in calls[1]["system"]
     assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])
@@ -1189,12 +1259,14 @@ def test_translate_repeated_empty_response_fails_without_caching(monkeypatch, tr
 
 @pytest.mark.parametrize("cached_lines", [{"1": ""}, {"1": "一", "2": "多余"}, {"2": "错误编号"}, {"1": "一\n续行"}])
 def test_translate_invalid_cached_lines_are_retranslated(monkeypatch, translation_retry_ctx, cached_lines):
+    import hashlib
     from dubforge.pipeline import step_translate as st
     from dubforge.backends import llm
 
     translation_retry_ctx.force = False
     chunk = [{"id": 1, "text": "one"}]
-    key = st._chunk_key(translation_retry_ctx, chunk, "window-v6", "1/1|")
+    key = st._chunk_key(translation_retry_ctx, chunk, "window-v6",
+                        '1/1||system:' + hashlib.sha256('系统'.encode('utf-8')).hexdigest())
     st._store(translation_retry_ctx, key, {"lines": cached_lines})
     monkeypatch.setattr(llm, "chat", lambda *args, **kwargs: "1. 新译文")
     translated, _ = st._translate_window(translation_retry_ctx, chunk, "系统", "", 1, 1)
@@ -1237,3 +1309,157 @@ def test_translate_chunk_planner_splits_by_token_budget():
     chunks = _chunk_lines(lines, token_budget=500)
     assert len(chunks) > 1
     assert [line["id"] for chunk in chunks for line in chunk] == list(range(1, 9))
+
+
+def test_split_timing_matches_word_text_instead_of_word_count():
+    """长词与多个短词的字符占比不同，切点仍必须落在对应的声学词后。"""
+    from dubforge.pipeline.step_split import _times_for_parts
+
+    text = "electromagnetic I am at home"
+    words = [
+        {"word": "electromagnetic", "start": 0.0, "end": 0.5},
+        {"word": "I", "start": 1.0, "end": 1.2},
+        {"word": "am", "start": 1.2, "end": 1.5},
+        {"word": "at", "start": 1.5, "end": 1.8},
+        {"word": "home", "start": 1.8, "end": 2.2},
+    ]
+    result = _times_for_parts(["electromagnetic", " I am at home"],
+                              SubLine(1, 0.0, 2.2, text), words)
+    assert result == [(0.0, 0.5), (1.0, 2.2)]
+
+
+def test_split_timing_never_reuses_full_window_after_words_exhausted():
+    """复现负时长根因：子句多于声学词时须整组回退，不能为尾句复用整段。"""
+    from dubforge.pipeline.step_split import _times_for_parts
+
+    parts = ["a long corrected sentence", "another part", "tail"]
+    words = [{"word": "unrelated", "start": 0.0, "end": 0.5},
+             {"word": "transcription", "start": 4.5, "end": 5.0}]
+    result = _times_for_parts(parts, SubLine(1, 0.0, 5.0, "".join(parts)), words)
+    assert len(result) == len(parts)
+    assert all(0.0 <= start < end <= 5.0 for start, end in result)
+    assert all(left[1] <= right[0] for left, right in zip(result, result[1:]))
+    assert result[0][0] == 0.0 and result[-1][1] == 5.0
+
+
+def test_split_timing_can_divide_a_multi_character_cjk_word():
+    from dubforge.pipeline.step_split import _times_for_parts
+
+    result = _times_for_parts(["甲乙", "丙丁"], SubLine(1, 1.0, 3.0, "甲乙丙丁"),
+                              [{"word": "甲乙丙丁", "start": 1.0, "end": 3.0}])
+    assert result == [(1.0, 2.0), (2.0, 3.0)]
+
+
+def test_split_timing_keeps_asr_correction_close_to_word_anchors():
+    from dubforge.pipeline.step_split import _aligned_word_times
+
+    words = [{"word": "Helo", "start": 0.0, "end": 0.4},
+             {"word": "world", "start": 2.0, "end": 2.5}]
+    assert _aligned_word_times(["Hello", "world"], SubLine(1, 0.0, 2.5, "Helo world"),
+                               words) == [(0.0, 0.4), (2.0, 2.5)]
+
+
+def test_split_rebalances_tiny_tail_without_exceeding_length():
+    from dubforge.pipeline.step_split import _rule_split, _wc
+
+    text = "This ride will probably cost about one dollar each,"
+    parts = _rule_split(text, 40)
+    assert "".join(parts) == text
+    assert len(parts) == 2
+    assert all(10 <= _wc(part) <= 40 for part in parts)
+    assert parts[-1].strip() != "each,"
+
+
+@pytest.mark.parametrize("actual", ["This is a travel video", "这是一段旅行总结"])
+def test_split_coarse_coverage_reports_low_match_without_hard_reject(actual):
+    from dubforge.pipeline.step_split import _validate_source_coverage
+
+    warnings = _validate_source_coverage([{"text": actual}],
+                                       "We arrived at the hotel. The room cost 100 dollars for two nights.")
+    assert isinstance(warnings, list) and warnings
+
+
+def test_split_source_coverage_allows_local_correction_in_long_english_text():
+    from dubforge.pipeline.step_split import _validate_source_coverage
+
+    source = " ".join(f"The city has a beautiful street number {i}." for i in range(200))
+    corrected = source.replace("beautiful street number 2.", "beautiful avenue number 2.")
+    assert _validate_source_coverage([{"text": corrected}], source) == []
+
+
+def test_split_coarse_coverage_allows_short_asr_name_correction_with_warning():
+    from dubforge.pipeline.step_split import _validate_source_coverage
+
+    warnings = _validate_source_coverage([{'text': 'Quanjude serves Peking duck'}],
+                                       'kwa jude serves pecking duck')
+    assert isinstance(warnings, list) and warnings
+
+
+def test_split_llm_timeline_is_anchored_to_actual_words(make_project, isolated_env,
+                                                       monkeypatch, pdir):
+    uid = make_project()
+    _seed_transcribe(uid, [(0.0, 1.0, "Hello"), (2.0, 3.0, "world")])
+    _mock_llm(monkeypatch, lambda prompt, system:
+              "1. 0.00-2.50: Hello\n2. 2.50-3.00: world")
+    assert _run_until(uid, "split") == "done"
+    assert [(line["start"], line["end"]) for line in read_split(uid)["lines"]] == [
+        (0.0, 1.0), (2.0, 3.0)]
+
+
+def test_translate_run_passes_duration_to_model(make_project, isolated_env, monkeypatch, pdir):
+    """避免提示词声称按时长翻译，但 run() 丢掉 start/end 后根本没有发送时长。"""
+    uid = make_project()
+    _seed_transcribe(uid, [(1.0, 3.0, "Hello world")])
+
+    def responder(prompt, system):
+        if "【待翻译原文】" in prompt:
+            assert "1. Hello world [时长 2.00 秒]" in prompt
+            assert '每行只表达同编号原文' in system
+            assert '不把信息提前、延后' in system
+            assert "币种、单位" in system
+            return "1. 你好世界"
+        return "1. 1.00-3.00: Hello world"
+
+    _mock_llm(monkeypatch, responder)
+    for step in ("split", "translate"):
+        assert _run_until(uid, step) == "done"
+
+
+@pytest.mark.parametrize("start,end", [(2.0, 1.0), (1.0, 1.0), (float('nan'), 2.0)])
+def test_split_final_time_guard_rejects_non_positive_or_non_finite(start, end):
+    from dubforge.errors import StepFailedError
+    from dubforge.pipeline.step_split import _normalized_split_lines
+
+    with pytest.raises(StepFailedError, match="时间无效") as exc:
+        _normalized_split_lines([{"id": 1, "text": "test", "start": start, "end": end}])
+    assert exc.value.code == "SPLIT_TIMELINE_INVALID"
+
+
+def test_text_source_rejects_legacy_negative_duration(tmp_path):
+    from types import SimpleNamespace
+    from dubforge.errors import DubForgeError
+    from dubforge.pipeline.text_source import source_lines
+
+    path = tmp_path / "split.txt"
+    path.write_text("1. 327.130-325.640: crackers,\n", encoding="utf-8")
+    with pytest.raises(DubForgeError, match="时间无效") as exc:
+        source_lines(SimpleNamespace(upstream=lambda *args: path))
+    assert exc.value.code == "TEXT_TIMELINE"
+
+
+def test_long_repeated_text_uses_bounded_coverage_and_alignment(monkeypatch):
+    """高重复长稿不能进入字符/词的平方级 diff；回退仍覆盖整个正时间窗。"""
+    from dubforge.pipeline import step_split as ss
+
+    source = "word " * 5_000
+    changed = "corrected " + "word " * 4_999
+    monkeypatch.setattr(ss.difflib, "SequenceMatcher",
+                        lambda *args, **kwargs: pytest.fail("长稿不应调用无界 diff"))
+    ss._validate_source_coverage([{"text": changed}], source)
+    words = [{"word": "word", "start": i / 10, "end": (i + 1) / 10}
+             for i in range(5_000)]
+    parts = [changed[:len(changed) // 2], changed[len(changed) // 2:]]
+    result = ss._times_for_parts(parts, SubLine(1, 0.0, 500.0, changed), words)
+    assert result[0][0] == 0.0 and result[-1][1] == 500.0
+    assert all(start < end for start, end in result)
+    assert result[0][1] == result[1][0]

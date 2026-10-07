@@ -3,7 +3,8 @@
 import { computed } from 'vue'
 import { NButton, NInput, NInputNumber, NSelect, NSwitch, NSlider, NColorPicker } from 'naive-ui'
 import FilePathLink from './FilePathLink.vue'
-const props = defineProps<{ field: any, modelValue: any, disabled?: boolean }>()
+import LlmThinkingDetails from './LlmThinkingDetails.vue'
+const props = defineProps<{ field: any, modelValue: any, disabled?: boolean, values?: Record<string, any> }>()
 const emit = defineEmits<{ (e: 'update:modelValue', v: any): void }>()
 const val = computed({
   get: () => props.modelValue,
@@ -42,6 +43,10 @@ function setEmotion(index: number, value: number | null) {
     <n-input-number v-model:value="val" :min="0" :max="100" :show-button="false" :disabled="disabled" :input-props="{ 'aria-label': field.label }"><template #suffix>%</template></n-input-number>
     <n-button size="tiny" quaternary :disabled="disabled || val === 0" @click="val = 0">透明</n-button>
   </div>
+  <div v-else-if="field.path?.endsWith('.thinking_mode')" class="thinking-control">
+    <n-select v-model:value="val" :options="field.options" :disabled="disabled" :aria-label="field.label" />
+    <LlmThinkingDetails :mode="val" :profile="values?.[field.path.replace('thinking_mode', 'llm_profile')] || ''" :profiles="field.thinking_profiles || []" />
+  </div>
   <n-select v-else-if="field.type === 'select'" v-model:value="val" :options="field.options" :disabled="disabled"
             filterable :tag="!!field.editable" :aria-label="field.label" />
   <n-input-number v-else-if="field.type === 'int' || field.type === 'float'" :disabled="disabled"
@@ -59,6 +64,7 @@ function setEmotion(index: number, value: number | null) {
 </template>
 
 <style scoped>
+.thinking-control { width:100%; min-width:0; }
 .path-control { display:flex; align-items:center; gap:10px; min-width:0; }.path-control :deep(.n-input) { flex:1; min-width:0; }.path-control :deep(.file-path-link) { flex-shrink:0; font-size:12px; }
 .emotion-vector { width: 100%; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(250px, 100%), 1fr)); gap: 12px 24px; }
 .emotion-item { display: flex; align-items: center; gap: 12px; min-width: 0; }

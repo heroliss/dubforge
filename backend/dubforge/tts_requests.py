@@ -96,7 +96,11 @@ class Request:
             try:
                 # 后台只等待服务回执，不转换/登记迟到音频，不能覆盖正式结果。
                 job.result()
-            except Exception:
+            except Exception as exc:
+                from gradio_client.exceptions import AppError
+                if isinstance(exc, AppError):
+                    self.finish()  # 服务明确回执失败也代表计算已结束，允许修复后重试。
+                    return
                 # 断线或客户端取消并不证明远端已停止；持久记录留到服务重启。
                 with _lock:
                     _active.pop(self.token, None)

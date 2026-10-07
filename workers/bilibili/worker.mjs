@@ -145,11 +145,18 @@ export async function execute({ operation, payload, credential }, sdk = { Auth, 
     const uploader = new WebVideoUploader({ path: payload.path, title: payload.title }, auth,
       { concurrency: 3, retryTimes: 2, retryDelay: 3000, bcutPreUpload: false })
     let previous = 0
+    let previousPhase = ''
     uploader.emitter.on('error', () => {})
     uploader.emitter.on('progress', progress => {
-      if (Date.now() - previous < 500) return
+      // SDK 的事件区分线路准备、字节传输和远端合并；阶段变化不能被节流吞掉。
+      const phase = progress.event?.startsWith('merge-') ? 'merging'
+        : progress.event === 'uploading' || !progress.event ? 'uploading' : 'preparing'
+      const { loaded, total } = progress.data || {}
+      if (!Number.isFinite(loaded) || !Number.isFinite(total) || total <= 0) return
+      if (phase === previousPhase && loaded < total && Date.now() - previous < 500) return
       previous = Date.now()
-      send('progress', { loaded: progress.data.loaded, total: progress.data.total })
+      previousPhase = phase
+      send('progress', { phase, loaded: Math.min(total, Math.max(0, loaded)), total })
     })
     const part = await uploader.upload()
     if (!part?.filename || !part.cid) throw new Error('上传结果不完整')

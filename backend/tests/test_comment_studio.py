@@ -75,6 +75,145 @@ def plan_body(uid, **settings):
             'settings': {**cs.DEFAULT_SETTINGS, 'start': .5, 'interval': 2, 'duration': 1, **settings}}
 
 
+def replace_comment_text(uid, ident, text):
+    path = crud.project_dir(uid) / 'artifacts/download/video_info.json'
+    info = json.loads(path.read_text(encoding='utf-8'))
+    next(row for row in info['comments']['items'] if row['id'] == ident)['text'] = text
+    atomic_write_bytes(path, json.dumps(info, ensure_ascii=False).encode())
+    return path
+
+
+def test_review_checks_authoritative_original_even_after_display_is_sanitized(uid):
+    path = replace_comment_text(uid, '0', 'The Tiananmen Square massacre')
+    original_bytes = path.read_bytes()
+    body = plan_body(uid)
+    body['items'][0].update(text='伪造安全原文', source_text='Short original', display_text='普通中文评论')
+    draft = cs.draft(uid, body)
+    assert [row['id'] for row in draft['items']] == ['1', '2']
+    assert draft['review_excluded'][0]['id'] == '0'
+    saved = cs.save(uid, body)
+    assert [row['id'] for row in saved['overlay']['items']] == ['1', '2']
+    assert saved['rows'][0]['review_blocked'] and saved['rows'][0]['review_reasons']
+    assert not saved['rows'][1]['review_blocked'] and saved['rows'][1]['review_reasons'] == []
+    assert path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize('mode,field,text', [
+    ('original', 'display_text', '天安门广场的悲剧'),
+    ('translated', 'source_text', 'The Tiananmen Square massacre'),
+    ('bilingual', 'source_text', '天安门广场的悲剧'),
+])
+def test_review_checks_both_edited_languages_even_when_one_is_hidden(uid, mode, field, text):
+    body = plan_body(uid, language_mode=mode)
+    body['items'][0][field] = text
+    draft = cs.draft(uid, body)
+    assert [row['id'] for row in draft['items']] == ['1', '2']
+    assert draft['review_excluded'][0]['review_reasons']
+
+
+def test_review_all_excluded_manual_save_is_explicit_and_keeps_previous_plan(uid):
+    saved = cs.save(uid, plan_body(uid))
+    before = cs._path(crud.get_project(uid)).read_bytes()
+    body = plan_body(uid)
+    for item in body['items']:
+        item['display_text'] = '天安门广场的悲剧'
+    with pytest.raises(cs.CommentError) as exc:
+        cs.save(uid, body)
+    assert exc.value.code == 'COMMENTS_REVIEW_EMPTY'
+    assert len(exc.value.detail['review_excluded']) == 3
+    assert cs._path(crud.get_project(uid)).read_bytes() == before
+    assert cs.confirmed(uid)['items'] == saved['overlay']['items']
+
+
+def test_view_flags_blocked_translation_without_modifying_source_or_cache(uid):
+    project = crud.get_project(uid)
+    rows = cs.view(uid)['rows']
+    cs._write(project, {'translations': {'1': dict(source_hash=rows[1]['source_hash'],
+                                                  text_zh='天安门广场的悲剧')}})
+    before = cs._path(project).read_bytes()
+    state = cs.view(uid)
+    assert state['rows'][1]['review_blocked'] and state['rows'][1]['review_reasons']
+    assert not state['rows'][0]['review_blocked']
+    assert state['rows'][1]['text'] == 'Original opinion 1'
+    assert state['rows'][1]['text_zh'] == '天安门广场的悲剧'
+    assert cs._path(project).read_bytes() == before
+
+
+def test_local_review_overrides_perfect_llm_rating_before_limit_and_preserves_raw_rating(uid, monkeypatch):
+    replace_comment_text(uid, '0', 'The Tiananmen Square massacre')
+    def trusting_rating(prompt, **kwargs):
+        system = kwargs['system']
+        for phrase in ('国家制度', '主权统一', '国家象征', '过度宣教', '恐怖主义', '引用新闻',
+                       '历史学习', '普通宗教祝福', '正常地名', '关键词直接否决', '不能宣称该内容违法'):
+            assert phrase in system
+        return validated_result({'assessments': [dict(id=row['id'], eligible=True, score=100-i,
+            reason='模型未识别风险') for i, row in enumerate(request_payload(prompt)['comments'])]}, kwargs)
+    monkeypatch.setattr(cs, 'chat_validated', trusting_rating)
+    state = cs.run(uid, 'filter', prompt=cs.FILTER_PROMPT, limit=1)
+    assert [row['id'] for row in state['filter']['items']] == ['1']
+    blocked = next(row for row in state['filter']['assessments'] if row['id'] == '0')
+    assert blocked['eligible'] and blocked['review_blocked'] and blocked['outcome'] == 'review_blocked'
+    raw = cs._read(crud.get_project(uid))['rating_cache']['assessments'][0]
+    assert raw['eligible'] and 'review_blocked' not in raw
+
+
+def test_historical_confirmed_plan_is_rescreened_without_rewriting_document(uid):
+    from test_configuration import save as conf_save
+    conf_save('project:' + uid, {'content_review.enabled': False})
+    body = plan_body(uid)
+    body['items'][0]['source_text'] = 'The Tiananmen Square massacre'
+    saved = cs.save(uid, body)
+    assert len(saved['overlay']['items']) == 3
+    conf_save('project:' + uid, {'content_review.enabled': True})
+    before = cs._path(crud.get_project(uid)).read_bytes()
+    state = cs.view(uid)
+    assert state['rows'][0]['review_blocked']
+    assert state['overlay']['items'][0]['review_blocked']
+    checked = cs.confirmed(uid, state['overlay_revision'])
+    assert [row['id'] for row in checked['items']] == ['1', '2']
+    assert checked['review_excluded'][0]['id'] == '0'
+    from dubforge.comments_auto import current_overlay
+    assert current_overlay(uid)['items'] == checked['items']
+    assert cs._path(crud.get_project(uid)).read_bytes() == before
+
+
+def test_historical_all_blocked_snapshot_cannot_fall_back_to_auto_or_missing_source(uid):
+    from test_configuration import save as conf_save
+    conf_save('project:' + uid, {'content_review.enabled': False, 'comments.mode': 'auto'})
+    replace_comment_text(uid, '0', 'The Tiananmen Square massacre')
+    body = plan_body(uid); body['items'] = body['items'][:1]
+    cs.save(uid, body)
+    seed(uid, 0)
+    conf_save('project:' + uid, {'content_review.enabled': True})
+    before = cs._path(crud.get_project(uid)).read_bytes()
+    from dubforge.comments_auto import confirmed_or_auto, current_overlay
+    for operation in (cs.confirmed, confirmed_or_auto, current_overlay):
+        with pytest.raises(DubForgeError) as exc:
+            operation(uid)
+        assert exc.value.code == 'COMMENTS_REVIEW_EMPTY'
+    assert cs._path(crud.get_project(uid)).read_bytes() == before
+
+
+def test_review_uses_project_resolved_custom_terms_and_new_authoritative_text(uid):
+    from test_configuration import save as conf_save
+    conf_save('global', {'content_review.blocked_terms': 'Original'})
+    conf_save('project:' + uid, {'content_review.blocked_terms': 'opinion 0'})
+    state = cs.view(uid)
+    assert state['rows'][0]['review_blocked'] and not state['rows'][1]['review_blocked']
+    saved = cs.save(uid, plan_body(uid))
+    assert [row['id'] for row in saved['overlay']['items']] == ['1', '2']
+    replace_comment_text(uid, '1', 'The Tiananmen Square massacre')
+    assert [row['id'] for row in cs.confirmed(uid)['items']] == ['2']
+
+
+def test_filter_policy_version_invalidates_failed_rating_cache_only():
+    profiles = [{'name': 'fixture'}]
+    old_translation = cs._hash(['comment-lines-v1', 'translate', '', {}, profiles])
+    old_filter = cs._hash(['comment-lines-v1', 'filter', cs.FILTER_PROMPT, {}, profiles])
+    assert cs._processing_key('translate', cs.FILTER_PROMPT, {}, profiles) == old_translation
+    assert cs._processing_key('filter', cs.FILTER_PROMPT, {}, profiles) != old_filter
+
+
 def test_outline_saved_with_revision_and_frozen_in_task_snapshot(uid):
     saved = cs.save(uid, plan_body(uid, outline_color='#12AB34', outline=4.5))
     first = cs.for_task(uid, enabled=True, revision=saved['overlay_revision'])

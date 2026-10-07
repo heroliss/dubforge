@@ -28,7 +28,7 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
     零条可用时抛 COMMENTS_AUTO_EMPTY。
     """
     cancel = cancel_check or (lambda: None)
-    from dubforge import comment_studio, video_info
+    from dubforge import comment_studio, video_info, configuration
     cancel()
     video_info.update(uid, 'comments', comment_limit=spec['comment_limit'])
     cancel()
@@ -41,6 +41,8 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
         if warning:
             warnings.append(('评分：' if action == 'filter' else '翻译：') + warning)
     state = comment_studio.view(uid)
+    cfg = state.get('configuration') or configuration.resolve(uid)
+    review_settings = comment_studio._review_settings(uid, cfg['values'])
     rows = {r['id']: r for r in state['rows']}
     assessments = state['filter'].get('assessments')
     candidates = sorted((item for item in assessments if item['eligible']), key=lambda item: -item['score']) \
@@ -50,13 +52,14 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
 
     def usable(ident):
         row = rows.get(ident)
-        return bool(row and all(not comment_studio.overlay_text_issues(
+        return bool(row and not comment_studio.review_reasons(row, review_settings)
+                    and all(not comment_studio.overlay_text_issues(
             {'display_text': row.get('text_zh', ''), 'source_text': row['text']}, current) for current in display_settings))
 
     usable_ids = [item['id'] for item in candidates if usable(item['id'])]
     excluded = len(candidates) - len(usable_ids)
     if excluded:
-        warnings.append(f'已自动排除{excluded}条不满足评论方案或本次分P语言要求的候选（缺字或超长），按评分递补；完整评论与译文仍保留。')
+        warnings.append(f'已自动排除{excluded}条命中内容检查或不满足本次语言要求的候选（缺字或超长），按评分递补；完整评论与译文仍保留。')
     ids = usable_ids[:spec['comment_count']]
     from dubforge.pipeline.video_source import resolve_video
     from dubforge.publishing.service import _probe
@@ -65,14 +68,15 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
     fitting = max(0, int((duration - settings['start'] - settings['duration']) // settings['interval']) + 1)
     ids = ids[:fitting]
     if not ids:
-        raise DubForgeError('没有可上屏评论：需满足当前语言、文字长度及时间设置；请检查逐条失败原因或手动确认评论方案',
+        raise DubForgeError('没有可上屏评论：需通过内容检查并满足当前语言、文字长度及时间设置；请检查逐条原因或重新选择评论',
                             code='COMMENTS_AUTO_EMPTY')
     if len(ids) < spec['comment_count']:
         warnings.append(f'本片实际使用{len(ids)}条评论：受有效评分、可用译文、文字长度或视频时长限制。')
     items = [dict(id=k, source_hash=rows[k]['source_hash'], display_text=rows[k]['text_zh'], source_text=rows[k]['text'])
              for k in ids]
     cancel()
-    comment_studio.save(uid, dict(revision=state['overlay_revision'], settings=settings, items=items))
+    comment_studio.save(uid, dict(revision=state['overlay_revision'],
+        configuration_fingerprint=cfg['fingerprint'], settings=settings, items=items))
     return warnings, len(items)
 
 
@@ -101,8 +105,12 @@ def current_overlay(uid):
     project = crud.get_project(uid)
     if project is None:
         return None
-    overlay = comment_studio.effective_overlay(uid, comment_studio._read(project).get('overlay'))
-    return overlay or None
+    try:
+        return comment_studio.confirmed(uid)
+    except DubForgeError as exc:
+        if exc.code == 'COMMENTS_NOT_CONFIRMED':
+            return None
+        raise
 
 
 def ensure_render_specs(ctx, deps, specs) -> list:
@@ -118,7 +126,9 @@ def ensure_render_specs(ctx, deps, specs) -> list:
         extra = [{**base, 'language_mode': s['values'].get('comments.language_mode', base['language_mode'])}
                  for s in specs if s['include_comments']]
         ctx.log('评论准备为自动采集：正在采集、评分并翻译上屏评论…')
-        warnings, count = prepare_overlay(uid, spec, cancel_check=ctx.check_cancel, extra_settings=extra)
+        from dubforge import runtime_edit
+        with runtime_edit.pipeline_writes(ctx):
+            warnings, count = prepare_overlay(uid, spec, cancel_check=ctx.check_cancel, extra_settings=extra)
         for warning in warnings:
             ctx.log(f'⚠ {warning}')
         ctx.log(f'已自动确认 {count} 条上屏评论')

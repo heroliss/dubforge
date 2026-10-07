@@ -101,7 +101,8 @@ def test_burn_uses_same_filter(make_project, video, monkeypatch, tmp_path):
     srt = tmp_path / 'srt/trans.srt'
     write_srt([SubLine(1, 1, 2, '画面字幕')], srt)
     settings = {**STYLE_DEFAULTS, 'assemble.burn_subtitles': True,
-                'assemble.bgm_volume': 0, 'assemble.subtitle_color': '#12AB34'}
+                'assemble.bgm_volume': 0, 'assemble.subtitle_color': '#12AB34',
+                'content_review.enabled': False}  # 此用例单独验证未启用内容处理时的原有样式滤镜。
     commands = []
     def run(cmd, cwd=None, **_):
         commands.append(cmd)

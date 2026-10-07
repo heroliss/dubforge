@@ -11,6 +11,11 @@ def catalog():
     return project_import.catalog()
 
 
+@router.get('/history')
+def history(limit: int = 20):
+    return project_import.history(limit)
+
+
 @router.post('/preview')
 def preview(body: dict):
     return project_import.preview(body)
@@ -24,3 +29,8 @@ def create(body: dict):
 @router.get('/{request_id}')
 def status(request_id: str):
     return project_import.status(request_id)
+
+
+@router.post('/{request_id}/resume')
+def resume(request_id: str, body: dict):
+    return project_import.resume(request_id, body)

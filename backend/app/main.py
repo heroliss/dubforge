@@ -35,6 +35,10 @@ async def lifespan(app: FastAPI):
     # 崩溃恢复: 上次运行残留的 running 状态判中断 (原子写保证无半成品)
     from dubforge.runner import runner
     runner.recover()
+    from dubforge.pipeline.config_fingerprint import promote_compatible_fingerprints
+    promoted = promote_compatible_fingerprints()
+    if promoted:
+        logger.info("已兼容迁移 %d 个制作指纹；连接凭据和超时不再使文字结果过期", promoted)
     from dubforge.publishing import service as publishing
     publishing.recover()
     from dubforge import workflows
@@ -89,6 +93,8 @@ app.include_router(api_workflows.router)
 app.include_router(api_assembly_versions.router)
 app.include_router(api_configuration.router)
 app.include_router(api_project_import.router)
+from app.api import content_review as api_content_review
+app.include_router(api_content_review.router)
 
 
 # ---- 前端静态托管 (frontend/dist 存在时; 开发期走 vite dev server) ----

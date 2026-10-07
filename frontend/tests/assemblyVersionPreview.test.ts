@@ -9,7 +9,7 @@ const {descriptor}=parse(await readFile(new URL('../src/components/AssemblyVersi
 const result=await build({stdin:{contents:`import { reactive, unmountHooks } from 'vue';
  const fixtureProps=reactive(__PROPS__),defineProps=()=>fixtureProps;
  ${descriptor.scriptSetup!.content}
- export {fixtureProps,context,seconds,image,outdated,error,loading,render,beginScrub,endScrub,unmountHooks};`,loader:'ts',resolveDir:`${root}/src/components`},bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'boundaries',setup(b){
+ export {fixtureProps,context,seconds,image,outdated,error,loading,render,loadContext,beginScrub,endScrub,unmountHooks};`,loader:'ts',resolveDir:`${root}/src/components`},bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'boundaries',setup(b){
  b.onResolve({filter:/^(vue|naive-ui)$|\.vue$|\/stores\/nav$/},a=>({path:a.path,namespace:'test'}))
  b.onLoad({filter:/.*/,namespace:'test'},a=>({contents:a.path==='vue'?`export {ref,computed,watch,reactive} from '@vue/reactivity';export const unmountHooks=[],onMounted=()=>{},onBeforeUnmount=f=>unmountHooks.push(f);`:
   a.path==='naive-ui'?`export const useMessage=()=>({success(){}});`:a.path.endsWith('/stores/nav')?`export const useNavStore=()=>({stepMap:{assemble:{artifacts:[]}}});`:'export default {};',resolveDir:root}))
@@ -40,4 +40,22 @@ test('拖动期间不编码；松开只预览最终位置，失败不循环重�
  const p=await fixture(t);p.beginScrub();p.seconds.value=4;t.mock.timers.tick(1000);await flush();assert.equal(calls.length,0)
  p.seconds.value=12;p.endScrub();t.mock.timers.tick(500);await flush();assert.equal(calls.length,1);assert.equal(calls[0].seconds,12);assert.match(p.error.value,/预览失败/)
  t.mock.timers.tick(5000);await flush();assert.equal(calls.length,1)
+})
+
+test('时间轴慢请求合并，版本变化取消旧请求，离开不再产生预览',async t=>{
+ const calls:any[]=[],replies:any[]=[]
+ t.mock.method(globalThis,'fetch',(_url:any,init:any)=>{calls.push(init);return new Promise(resolve=>replies.push(resolve))})
+ const p=await fixture(t)
+ const first=p.loadContext();void p.loadContext();void p.loadContext()
+ assert.equal(calls.length,1)
+ p.fixtureProps.overlayRevision='r2'
+ assert.equal(calls[0].signal.aborted,true)
+ assert.equal(calls.length,2)
+ replies[0](new Response(JSON.stringify({duration:999})));await first
+ assert.equal(p.context.value.duration,60)
+ p.unmountHooks.forEach((fn:()=>void)=>fn())
+ assert.equal(calls[1].signal.aborted,true)
+ replies[1](new Response(JSON.stringify({duration:888})));await flush()
+ t.mock.timers.tick(500);await flush()
+ assert.equal(p.context.value.duration,60);assert.equal(calls.length,2)
 })

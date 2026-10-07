@@ -10,6 +10,60 @@ def _client():
     return TestClient(app)
 
 
+def test_navigation_reads_small_local_snapshot_without_full_params_or_production_checks(make_project, monkeypatch):
+    from dubforge.domain import crud
+    from dubforge.pipeline import dependencies
+    from dubforge.publishing import service
+    from dubforge import configuration, video_info
+    uid = make_project(title='大型隔离项目', params={
+        'auto_steps': ['split', '未知步骤', 'translate'], '_chain': ['split', 'translate'],
+        '_chain_state': 'held', '_chain_hold': {'step': 'split', 'code': 'LLM_RETRY', 'message': '等待重试', 'private': '不返回'},
+        'legacy_transcript': '测试文字' * 100000,
+    })
+    project = crud.get_project(uid)
+    project.status = 'done'
+    crud.save_project(project)
+    before = crud.get_project(uid).model_dump()
+    manifest = crud.project_dir(uid) / 'manifest.json'
+    saved_manifest = manifest.read_bytes()
+    client = _client()
+    full = client.get(f'/api/projects/{uid}').json()
+    assert 'params' in full and 'steps' in full
+
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError('导航摘要不能解析制作配置、扫描输入或请求外部资料')
+
+    monkeypatch.setattr(dependencies, 'Dependencies', forbidden)
+    monkeypatch.setattr(configuration, 'resolve', forbidden)
+    monkeypatch.setattr(service, 'project_status', forbidden)
+    monkeypatch.setattr(video_info, 'view', forbidden)
+    for _ in range(3):
+        response = client.get(f'/api/projects/{uid}/navigation')
+        assert response.status_code == 200
+        assert response.headers['cache-control'] == 'no-store'
+        assert len(response.content) < 600
+        assert response.json() == dict(title='大型隔离项目', status='done', dir_exists=True,
+            auto_steps=['split', 'translate'], chain=dict(remaining=['split', 'translate'], state='held',
+                hold=dict(step='split', code='LLM_RETRY', message='等待重试')))
+    assert crud.get_project(uid).model_dump() == before
+    assert manifest.read_bytes() == saved_manifest
+
+
+def test_navigation_missing_project_or_directory_has_stable_result(make_project, monkeypatch, tmp_path):
+    from dubforge.domain import crud
+    uid = make_project()
+    client = _client()
+    monkeypatch.setattr(crud, 'project_dir_by_project', lambda _project: tmp_path / 'missing-project-directory')
+    response = client.get(f'/api/projects/{uid}/navigation')
+    assert response.status_code == 200
+    assert response.json()['dir_exists'] is False
+    assert response.json()['auto_steps'] is None
+    assert response.json()['chain'] is None
+    response = client.get('/api/projects/nonexistent/navigation')
+    assert response.status_code == 400
+    assert response.json()['code'] == 'PROJECT_NOT_FOUND'
+
+
 def test_rename_project(isolated_env):
     with _client() as client:
         uid = client.post("/api/projects", json={"title": "旧标题"}).json()["uid"]

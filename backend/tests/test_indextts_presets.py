@@ -188,7 +188,8 @@ def test_gradio_receives_explicit_current_parameters(preset_env, monkeypatch, tm
     import gradio_client
     from dubforge.backends import tts_indextts25 as backend
     output = tmp_path / "returned.wav"
-    output.write_bytes(b"audio")
+    import soundfile as sf
+    sf.write(output, [0.1] * 3200, 32000)
     client = Mock()
     client.submit.return_value.status.return_value.progress_data = None
     client.submit.return_value.result.return_value = str(output)

@@ -345,7 +345,10 @@ def operation(uid: str, action: str):
     """内容资料相关操作共用占用保护；网络等待期间不持锁。"""
     from dubforge.workflows import check_idle as workflow_idle
     from dubforge.runner import runner
-    with gate:
+    from dubforge.pipeline import dubbing_session
+    from dubforge import runtime_edit
+    with runner._start_lock, dubbing_session.gate, gate:
+        runtime_edit.check_idle(uid, allow_owned=True)
         workflow_idle(uid)
         check_idle(uid)
         project = crud.get_project(uid)
@@ -397,7 +400,10 @@ def update(uid: str, action: str, *, comment_limit: int = 50) -> dict:
         raise VideoInfoError('热门评论数量必须是 1–500 的整数', code='VIDEO_INFO_COMMENT_LIMIT')
     from dubforge.runner import runner
     from dubforge.workflows import check_idle as workflow_idle
-    with gate:
+    from dubforge.pipeline import dubbing_session
+    from dubforge import runtime_edit
+    with runner._start_lock, dubbing_session.gate, gate:
+        runtime_edit.check_idle(uid, allow_owned=True)
         workflow_idle(uid)
         check_idle(uid)
         state = view(uid)

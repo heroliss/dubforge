@@ -10,6 +10,7 @@ import json
 import re
 import threading
 import uuid
+from contextlib import contextmanager
 
 import httpx
 
@@ -47,12 +48,22 @@ def _mark_rate_limited(provider: dict) -> None:
             __import__("time").monotonic() + _RATE_LIMIT_COOLDOWN_SEC)
 
 
-def _client(base: str) -> httpx.Client:
+def _client(base: str):
     read_to = float(config.get("llm.timeout", 300))
-    return httpx.Client(base_url=base.rstrip("/"),
+    from dubforge.backends.llm_transport import CancellableClient
+    return CancellableClient(base_url=base.rstrip("/"),
                         timeout=httpx.Timeout(connect=10, read=read_to,
                                               write=60, pool=10),
                         trust_env=False)  # 本地代理由 Clash 规则管, 不读环境代理
+
+
+def _request_client(base: str, cancel_check):
+    """将步骤取消检查绑定到网络等待；兼容现有测试传输替身。"""
+    from dubforge.backends.llm_transport import CancellableClient
+    client = _client(base)
+    if isinstance(client, CancellableClient):
+        client.cancel_check = cancel_check
+    return client
 
 
 def _profiles(selected: str | list[dict] | dict | None = None) -> list[dict]:
@@ -214,166 +225,303 @@ def _checked_content(content, *, finish_reason=None, reasoning_chars=0, refusal=
     return content
 
 
-def _content_text(value) -> str:
-    """兼容字符串和文本块，不把非文本对象强转成伪正文。"""
+def _text_channels(value) -> tuple[str, str]:
+    """按块类型分离正文和思考；未知对象不能强转成伪正文。"""
     if value is None:
-        return ''
+        return '', ''
     if isinstance(value, str):
-        return value
-    if isinstance(value, list) and all(isinstance(item, dict) and isinstance(item.get('text'), str) for item in value):
-        return ''.join(item['text'] for item in value)
+        return value, ''
+    if isinstance(value, list):
+        content, reasoning = [], []
+        for item in value:
+            if not isinstance(item, dict):
+                break
+            kind = item.get('type')
+            if kind is not None and not isinstance(kind, str):
+                break
+            text = item.get('text')
+            if kind in {'reasoning', 'thinking'}:
+                text = text if text is not None else item.get('thinking')
+                target = reasoning
+            elif kind in {None, 'text', 'output_text'}:
+                target = content
+            else:
+                break
+            if not isinstance(text, str):
+                break
+            target.append(text)
+        else:
+            return ''.join(content), ''.join(reasoning)
     raise StepFailedError('服务商返回了无法识别的正文结构', code='LLM_RESPONSE_INVALID',
         suggestion='请检查接口是否兼容文本聊天响应。')
 
 
-def _plain_content(data, *, trace=None, request_id='', name='') -> str:
+def _content_text(value) -> str:
+    return _text_channels(value)[0]
+
+
+def _message_channels(message, *, delta=False):
+    value = message.get('content')
+    if value is None and delta:
+        value = message.get('text')
+    content, block_reasoning = _text_channels(value)
+    reasoning = message.get('reasoning_content')
+    if reasoning is None:
+        reasoning = message.get('reasoning')
+    thinking_text, thinking_blocks = _text_channels(reasoning)
+    return content, block_reasoning + thinking_text + thinking_blocks
+
+
+def _select_choice(choices):
+    """单个文本请求只消费候选0，不能把交错候选拼成一份台词。"""
+    if not isinstance(choices, list) or any(not isinstance(item, dict) for item in choices):
+        raise StepFailedError('服务商返回了无法识别的 choices 结构', code='LLM_RESPONSE_INVALID')
+    if not choices:
+        return None
+    if all('index' not in item for item in choices):
+        if len(choices) == 1:
+            return choices[0]
+        raise StepFailedError('服务商返回多个未编号的候选，无法安全选择正文', code='LLM_RESPONSE_INVALID')
+    indices = [item.get('index') for item in choices]
+    if (any(not isinstance(index, int) or isinstance(index, bool) or index < 0 for index in indices)
+            or len(set(indices)) != len(indices)):
+        raise StepFailedError('服务商返回了无法识别的候选编号', code='LLM_RESPONSE_INVALID')
+    return next((item for item in choices if item['index'] == 0), None)
+
+
+_GUARD_RETRY_CODES = {'LLM_OUTPUT_CONTRACT', 'LLM_OUTPUT_DEGENERATED', 'LLM_OUTPUT_BUDGET'}
+_GUARD_ABORT_CODES = _GUARD_RETRY_CODES | {'LLM_REQUEST_DEADLINE'}
+
+
+def _response_check(cancel_check, guard):
+    if guard is None:
+        return cancel_check
+    def check():
+        if cancel_check:
+            cancel_check()
+        guard.check()
+    return check
+
+
+@contextmanager
+def _guarded_client(base, cancel_check, response_guard_factory, *, trace, request_id, name):
+    """每次真实请求有独立守卫；包含响应头等待及连接关闭。"""
+    guard = response_guard_factory() if response_guard_factory else None
+    check = _response_check(cancel_check, guard)
+    try:
+        if check:
+            check()
+        with _request_client(base, check) as client:
+            yield client, guard, check
+    except StepFailedError as error:
+        if error.code in _GUARD_ABORT_CODES and trace:
+            trace('request_aborted', error.message, request_id=request_id, profile=name,
+                  code=error.code, detail=error.detail, server_confirmed=False)
+        raise
+
+
+def _guard_feed(guard, piece, *, channel='content', prefix=''):
+    if guard is None or not piece:
+        return
+    try:
+        guard.feed(piece, channel=channel)
+    except StepFailedError as error:
+        if error.code in _GUARD_ABORT_CODES:
+            detail = dict(error.detail) if isinstance(error.detail, dict) else {}
+            detail['content_excerpt'] = (prefix + piece)[:240] if channel == 'content' else prefix[:240]
+            detail['channel'] = channel
+            error.detail = detail
+        raise
+
+
+def _plain_content(data, *, trace=None, request_id='', name='', guard=None) -> str:
     error = _provider_error(data)
     if error:
         raise error
     try:
-        choice = data['choices'][0]
+        choice = _select_choice(data['choices'])
         message = choice['message']
-        content = message.get('content')
-        reasoning = message.get('reasoning_content') or message.get('reasoning') or ''
+        content, reasoning = _message_channels(message)
         finish = choice.get('finish_reason')
     except (TypeError, KeyError, IndexError, AttributeError) as exc:
         raise StepFailedError('服务商响应缺少 choices/message', code='LLM_RESPONSE_INVALID',
             suggestion='请检查接口响应格式或服务商状态。') from exc
-    content = _content_text(content)
+    if finish is not None and not isinstance(finish, str):
+        raise StepFailedError('服务商返回了无效的结束原因', code='LLM_RESPONSE_INVALID')
     if trace:
         trace('response_metadata', f'响应结束：{finish or "未提供结束原因"}', request_id=request_id,
-              profile=name, finish_reason=finish, reasoning_chars=len(str(reasoning)), usage=data.get('usage'))
-    return _checked_content(content, finish_reason=finish, reasoning_chars=len(str(reasoning)), refusal=bool(message.get('refusal')))
+              profile=name, finish_reason=finish, reasoning_chars=len(reasoning), usage=data.get('usage'),
+              stream_mode='plain', selected_choice=choice.get('index', 0), choice_count=len(data['choices']))
+    content = _checked_content(content, finish_reason=finish, reasoning_chars=len(reasoning), refusal=bool(message.get('refusal')))
+    if guard:
+        guard.check()
+    _guard_feed(guard, reasoning, channel='reasoning')
+    _guard_feed(guard, content)
+    if trace and reasoning:
+        trace('reasoning_delta', reasoning, request_id=request_id, profile=name, received_chars=len(reasoning))
+    if guard:
+        guard.finish()
+    return content
+
+
+def _plain_response(response, **options):
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise StepFailedError('服务商响应不是有效的 JSON 信封', code='LLM_RESPONSE_INVALID',
+            suggestion='请检查兼容接口是否返回标准聊天响应。') from exc
+    return _plain_content(data, **options)
+
+
+class _StreamChannel:
+    """delta是真增量；message是全量快照，只接受相同或前缀扩展。"""
+    def __init__(self):
+        self.pieces = []
+        self.chars = 0
+        self.prefix = ''
+
+    def text(self):
+        return ''.join(self.pieces)
+
+    def snapshot_increment(self, snapshot):
+        previous = self.text()
+        if not snapshot.startswith(previous):
+            raise StepFailedError('服务商流式消息快照与已收到内容不一致', code='LLM_RESPONSE_INVALID',
+                suggestion='未猜测去重或改写正文，请检查接口流协议。')
+        return snapshot[len(previous):]
+
+    def append(self, piece):
+        if piece:
+            self.pieces.append(piece)
+            self.chars += len(piece)
+            if len(self.prefix) < 240:
+                self.prefix = (self.prefix + piece)[:240]
 
 
 def _stream_content(response, *, name: str, request_id: str,
                     log=lambda m: None, trace=None, cancel_check=None,
-                    started_at: float | None = None) -> str:
-    """读取 OpenAI 兼容 SSE 流，并把增量交给实时预览回调。"""
-    pieces: list[str] = []
-    trace_buffer: list[str] = []
-    reasoning_buffer: list[str] = []
-    trace_chars = 0
-    reasoning_chars = 0
-    last_reasoning_report = 0
-    reasoning_trace_chars = 0
-    reasoning_trace_time = 0.0
+                    started_at: float | None = None, guard=None) -> str:
+    """归一单候选SSE协议后再向日志和响应守卫交付真实增量。"""
     import time as _time
-    reasoning_trace_time = _time.monotonic()
-    trace_time = _time.monotonic()
-    last_report = 0
-    finish_reason, refusal, usage = None, False, None
-    received = 0
-    for raw_line in response.iter_lines():
-        if cancel_check:
-            cancel_check()
-        line = str(raw_line or "").strip()
-        if not line:
-            continue
-        data_text = line[5:].strip() if line.startswith("data:") else line
-        if data_text == "[DONE]":
-            break
-        try:
-            data = json.loads(data_text)
-        except json.JSONDecodeError:
-            # 兼容服务商偶尔发出的 event/keep-alive 文本。
-            continue
-        error = _provider_error(data)
-        if error:
-            raise error
-        if not isinstance(data, dict):
-            continue
-        usage = data.get('usage') or usage
-        choices = data.get("choices") or []
-        if not choices:
-            continue
-        if not isinstance(choices, list) or not isinstance(choices[0], dict):
-            raise StepFailedError('服务商返回了无法识别的 choices 结构', code='LLM_RESPONSE_INVALID',
-                suggestion='请检查兼容接口响应格式。')
-        choice = choices[0] or {}
-        delta = choice.get("delta") or {}
-        message = choice.get("message") or {}
-        if not isinstance(delta, dict) or not isinstance(message, dict):
-            raise StepFailedError('服务商返回了无法识别的 delta/message 结构', code='LLM_RESPONSE_INVALID',
-                suggestion='请检查兼容接口响应格式。')
-        finish_reason = choice.get('finish_reason') or finish_reason
-        refusal = refusal or bool(delta.get('refusal') or message.get('refusal'))
-        # 思考型模型常把内部推理放在 reasoning_content 中, 在最终 content
-        # 之前可能持续很久。保存为独立的可折叠实时事件，绝不混入最终 content。
-        reasoning_piece = delta.get("reasoning_content")
-        if reasoning_piece is None:
-            reasoning_piece = delta.get("reasoning")
-        if reasoning_piece is None:
-            reasoning_piece = message.get("reasoning_content")
-        if reasoning_piece is None:
-            reasoning_piece = message.get("reasoning")
-        if reasoning_piece:
-            if isinstance(reasoning_piece, list):
-                reasoning_piece = "".join(
-                    str(x.get("text", "")) if isinstance(x, dict) else str(x)
-                    for x in reasoning_piece)
-            reasoning_chars += len(str(reasoning_piece))
-            if trace:
-                reasoning_buffer.append(str(reasoning_piece))
-                now = _time.monotonic()
-                if (reasoning_chars - reasoning_trace_chars >= 100
-                        or now - reasoning_trace_time >= 0.15):
-                    trace("reasoning_delta", "".join(reasoning_buffer),
-                          request_id=request_id, profile=name,
-                          received_chars=reasoning_chars)
-                    reasoning_buffer.clear()
-                    reasoning_trace_chars = reasoning_chars
-                    reasoning_trace_time = now
-            if reasoning_chars - last_reasoning_report >= 200 or last_reasoning_report == 0:
-                last_reasoning_report = reasoning_chars
-                log(f"LLM 模型思考中: 已收到内部进度约 {reasoning_chars:,} 字符"
-                    f"{'，已写入实时面板' if trace else ''}")
-                if trace:
-                    trace("status", f"模型思考中…已收到内部进度约 {reasoning_chars:,} 字符",
-                          request_id=request_id, profile=name)
-        piece = delta.get("content")
-        if piece is None:
-            piece = delta.get("text", "")
-        if piece in (None, ""):
-            # 有些兼容接口忽略 stream=true，仍返回一次普通 chat 响应。
-            piece = message.get("content", "")
-        piece = _content_text(piece)
+    channels = {'content': _StreamChannel(), 'reasoning': _StreamChannel()}
+    buffers = {'content': [], 'reasoning': []}
+    flushed = {'content': 0, 'reasoning': 0}
+    times = {'content': _time.monotonic(), 'reasoning': _time.monotonic()}
+    reports = {'content': 0, 'reasoning': 0}
+    finish_reason, refusal, usage, done = None, False, None, False
+    delta_frames = message_frames = choice_count = 0
+    check = _response_check(cancel_check, guard)
+
+    def deliver(piece, channel):
         if not piece:
-            continue
-        pieces.append(piece)
-        received += len(piece)
-        if received == len(piece) and started_at is not None:
-            log(f"LLM 首个可见 token: 配置={name}, 请求编号={request_id}, "
-                f"等待 {_time.time() - started_at:.1f}s")
+            return
+        if finish_reason is not None:
+            raise StepFailedError('服务商在响应结束后继续返回内容', code='LLM_RESPONSE_INVALID')
+        state = channels[channel]
+        _guard_feed(guard, piece, channel=channel, prefix=channels['content'].prefix)
+        state.append(piece)
+        if channel == 'content' and state.chars == len(piece):
+            if started_at is not None:
+                log(f'LLM 首个可见 token: 配置={name}, 请求编号={request_id}, 等待 {_time.time() - started_at:.1f}s')
+            if trace:
+                trace('status', '已收到模型首字节，正在流式生成…', request_id=request_id, profile=name)
         if trace:
-            if received == len(piece):
-                trace("status", "已收到模型首字节，正在流式生成…",
-                      request_id=request_id, profile=name)
-            trace_buffer.append(piece)
-            now = _time.monotonic()
-            if received - trace_chars >= 100 or now - trace_time >= 0.15:
-                trace("assistant_delta", "".join(trace_buffer), request_id=request_id,
-                      profile=name, received_chars=received)
-                trace_buffer.clear()
-                trace_chars, trace_time = received, now
-        if received - last_report >= 200:
-            last_report = received
-            log(f"LLM 流式接收: 配置={name}, 已收到 {received:,} 字符")
-    if trace and trace_buffer:
-        trace("assistant_delta", "".join(trace_buffer), request_id=request_id,
-              profile=name, received_chars=sum(map(len, pieces)))
-    if trace and reasoning_buffer:
-        trace("reasoning_delta", "".join(reasoning_buffer), request_id=request_id,
-              profile=name, received_chars=reasoning_chars)
-    if trace:
-        trace('response_metadata', f'响应结束：{finish_reason or "未提供结束原因"}', request_id=request_id,
-              profile=name, finish_reason=finish_reason, reasoning_chars=reasoning_chars, usage=usage)
-    return _checked_content(''.join(pieces), finish_reason=finish_reason,
-                            reasoning_chars=reasoning_chars, refusal=refusal)
+            buffers[channel].append(piece)
+        now = _time.monotonic()
+        if trace and (state.chars - flushed[channel] >= 100 or now - times[channel] >= .15):
+            trace('assistant_delta' if channel == 'content' else 'reasoning_delta', ''.join(buffers[channel]),
+                  request_id=request_id, profile=name, received_chars=state.chars)
+            buffers[channel].clear()
+            flushed[channel], times[channel] = state.chars, now
+        if state.chars - reports[channel] >= 200 or channel == 'reasoning' and reports[channel] == 0:
+            reports[channel] = state.chars
+            if channel == 'reasoning':
+                log(f'LLM 模型思考中: 已收到内部进度约 {state.chars:,} 字符' + ('，已写入实时面板' if trace else ''))
+                if trace:
+                    trace('status', f'模型思考中…已收到内部进度约 {state.chars:,} 字符', request_id=request_id, profile=name)
+            else:
+                log(f'LLM 流式接收: 配置={name}, 已收到 {state.chars:,} 字符')
+
+    try:
+        for raw_line in response.iter_lines():
+            if check:
+                check()
+            line = str(raw_line or '').strip()
+            if not line or line.startswith((':', 'event:', 'id:', 'retry:')):
+                continue
+            data_text = line[5:].strip() if line.startswith('data:') else line
+            if data_text == '[DONE]':
+                done = True
+                break
+            try:
+                data = json.loads(data_text)
+            except json.JSONDecodeError as exc:
+                if line.startswith('data:'):
+                    raise StepFailedError('服务商返回了无效的SSE数据', code='LLM_RESPONSE_INVALID') from exc
+                continue
+            error = _provider_error(data)
+            if error:
+                raise error
+            if not isinstance(data, dict):
+                raise StepFailedError('服务商返回了无效的SSE信封', code='LLM_RESPONSE_INVALID')
+            usage = data.get('usage') or usage
+            choices = data.get('choices') or []
+            if isinstance(choices, list):
+                choice_count = max(choice_count, len(choices))
+            choice = _select_choice(choices)
+            if choice is None:
+                continue
+            delta, message = choice.get('delta') or {}, choice.get('message') or {}
+            if not isinstance(delta, dict) or not isinstance(message, dict):
+                raise StepFailedError('服务商返回了无法识别的 delta/message 结构', code='LLM_RESPONSE_INVALID')
+            delta_frames += bool(delta)
+            message_frames += bool(message)
+            refusal = refusal or bool(delta.get('refusal') or message.get('refusal'))
+            delta_content, delta_reasoning = _message_channels(delta, delta=True)
+            message_content, message_reasoning = _message_channels(message)
+            for channel, increment, snapshot in (
+                    ('reasoning', delta_reasoning, message_reasoning),
+                    ('content', delta_content, message_content)):
+                deliver(increment, channel)
+                if snapshot:
+                    deliver(channels[channel].snapshot_increment(snapshot), channel)
+            next_finish = choice.get('finish_reason')
+            if next_finish is not None:
+                if not isinstance(next_finish, str):
+                    raise StepFailedError('服务商返回了无效的结束原因', code='LLM_RESPONSE_INVALID')
+                if finish_reason is not None and finish_reason != next_finish:
+                    raise StepFailedError('服务商返回了冲突的响应结束原因', code='LLM_RESPONSE_INVALID')
+                finish_reason = next_finish
+                if next_finish in {'length', 'max_tokens', 'content_filter', 'safety', 'sensitive'}:
+                    _checked_content(channels['content'].text(), finish_reason=finish_reason,
+                                     reasoning_chars=channels['reasoning'].chars, refusal=refusal)
+        if check:
+            check()
+        if not done and finish_reason is None:
+            raise StepFailedError('服务商流式连接提前结束，未确认完整响应', code='LLM_RESPONSE_INCOMPLETE',
+                suggestion='未将已收到的片段当作完整正文使用，请检查服务或重试。')
+        content = _checked_content(channels['content'].text(), finish_reason=finish_reason,
+                                   reasoning_chars=channels['reasoning'].chars, refusal=refusal)
+        if guard:
+            guard.finish()
+        return content
+    finally:
+        if trace:
+            for channel in ('content', 'reasoning'):
+                if buffers[channel]:
+                    trace('assistant_delta' if channel == 'content' else 'reasoning_delta', ''.join(buffers[channel]),
+                          request_id=request_id, profile=name, received_chars=channels[channel].chars)
+            mode = 'mixed' if delta_frames and message_frames else 'message' if message_frames else 'delta'
+            trace('response_metadata', f'响应结束：{finish_reason or "未提供结束原因"}', request_id=request_id,
+                  profile=name, finish_reason=finish_reason, reasoning_chars=channels['reasoning'].chars,
+                  content_chars=channels['content'].chars, usage=usage, stream_mode=mode,
+                  delta_frames=delta_frames, message_frames=message_frames,
+                  choice_count=choice_count, selected_choice=0, done_received=done,
+                  terminal_received=finish_reason is not None)
 
 
 def _post(provider: dict, body: dict, log=lambda m: None,
-          cancel_check=None, trace=None) -> str:
+           cancel_check=None, trace=None, response_guard_factory=None) -> str:
     """向单个 profile 发请求; 5xx/读超时重试, 429 立即切换配置组。
 
     限流不是本次请求内容的瞬时错误，继续重试只会浪费等待时间并扩大日志噪声；
@@ -426,7 +574,8 @@ def _post(provider: dict, body: dict, log=lambda m: None,
         if cancel_check:
             cancel_check()
         try:
-            with _client(provider.get("base_url", "")) as c:
+            with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
+                                 trace=trace, request_id=request_id, name=name) as (c, guard, check):
                 stream_body = {**body, "stream": True}
                 if hasattr(c, "stream"):
                     with c.stream("POST", "/chat/completions", json=stream_body,
@@ -449,12 +598,12 @@ def _post(provider: dict, body: dict, log=lambda m: None,
                                 except ValueError as exc:
                                     raise StepFailedError('服务商响应不是有效的 JSON 信封', code='LLM_RESPONSE_INVALID',
                                         suggestion='请检查兼容接口是否返回标准聊天响应。') from exc
-                                content = _plain_content(data, trace=trace, request_id=request_id, name=name)
+                                content = _plain_content(data, trace=trace, request_id=request_id, name=name, guard=guard)
                             else:
                                 content = _stream_content(
                                     r, name=name, request_id=request_id, log=log,
                                     trace=trace, cancel_check=cancel_check,
-                                    started_at=started)
+                                    started_at=started, guard=guard)
                         else:
                             response_body = r.read().decode("utf-8", errors="replace")
                 else:
@@ -462,10 +611,16 @@ def _post(provider: dict, body: dict, log=lambda m: None,
                     # 兼容路径，不让观测能力改变既有调用契约。
                     r = c.post("/chat/completions", json=body, headers=headers)
                     response_body = str(getattr(r, "text", "") or "")
+                    if check:
+                        check()
+                    if r.status_code == 200:
+                        content = _plain_response(r, trace=trace, request_id=request_id, name=name, guard=guard)
             if cancel_check:
                 cancel_check()
             last_exc = None
         except httpx.TransportError as e:
+            if cancel_check:
+                cancel_check()
             last_exc = e
             if isinstance(e, httpx.ConnectError):
                 raise ServiceOfflineError(
@@ -526,12 +681,16 @@ def _post(provider: dict, body: dict, log=lambda m: None,
             trace("retry", "流式请求被拒绝，回退普通响应", request_id=request_id)
         if cancel_check:
             cancel_check()
-        with _client(provider.get("base_url", "")) as c:
+        with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
+                             trace=trace, request_id=request_id, name=name) as (c, guard, check):
             r = c.post("/chat/completions", json=body, headers=headers)
+            if check:
+                check()
+            content = (_plain_response(r, trace=trace, request_id=request_id, name=name, guard=guard)
+                       if r.status_code == 200 else None)
         if cancel_check:
             cancel_check()
         response_body = r.text
-        content = None
     response_error = _body_error(response_body, r.status_code)
     if response_error and response_error.code == 'LLM_CONTENT_REJECTED':
         raise response_error
@@ -544,8 +703,13 @@ def _post(provider: dict, body: dict, log=lambda m: None,
         if cancel_check:
             cancel_check()
         core = {k: v for k, v in body.items() if k not in unsupported}
-        with _client(provider.get("base_url", "")) as c:
+        with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
+                             trace=trace, request_id=request_id, name=name) as (c, guard, check):
             r = c.post("/chat/completions", json=core, headers=headers)
+            if check:
+                check()
+            content = (_plain_response(r, trace=trace, request_id=request_id, name=name, guard=guard)
+                       if r.status_code == 200 else None)
         if cancel_check:
             cancel_check()
         response_body = r.text
@@ -627,7 +791,7 @@ def check_online() -> bool:
 
 
 def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
-                         cancel_check=None, trace=None) -> str:
+                          cancel_check=None, trace=None, response_guard_factory=None) -> str:
     """带静默心跳的请求: 服务商长时间不吐数据(思考不回传流、首 token 空白期)
     时, 每 4s 发一条心跳日志, 让上层进度按时间推进而不是整段冻结。
 
@@ -636,10 +800,17 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
     import time as _time
     last_activity = [_time.monotonic()]
     stop = threading.Event()
+    active_request = ['']
 
     def _log_ts(msg: str) -> None:
         last_activity[0] = _time.monotonic()
         log(msg)
+
+    def _trace(event, content='', **meta):
+        if meta.get('request_id'):
+            active_request[0] = meta['request_id']
+        if trace:
+            trace(event, content, **meta)
 
     def _watchdog() -> None:
         while not stop.wait(4.0):
@@ -651,16 +822,25 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
     watcher.start()
     try:
         return _post(provider, body, log=_log_ts,
-                     cancel_check=cancel_check, trace=trace)
+                      cancel_check=cancel_check, trace=_trace if trace else None,
+                      **({'response_guard_factory': response_guard_factory} if response_guard_factory else {}))
+    except DubForgeError as error:
+        if error.code in {'STEP_CANCELLED', 'STEP_TIMEOUT'}:
+            notice = 'LLM 本地请求已取消，连接已关闭；未收到服务端停止计算确认。'
+            log(notice)
+            if trace:
+                trace('request_cancelled', notice, request_id=active_request[0], server_confirmed=False)
+        raise
     finally:
         stop.set()
+        watcher.join(timeout=.5)
 
 
 def chat(prompt: str = "", system: str | None = None,
          temperature: float | None = None,
          log=lambda m: None, profile: str | None = None,
          cancel_check=None, trace=None,
-         messages: list[dict] | None = None) -> str:
+          messages: list[dict] | None = None, response_guard_factory=None) -> str:
     """文本补全: 按启用的配置池顺序尝试, 单个失败自动切换下一个。
 
     messages 用于需要保留多轮上下文的重试；未提供时保持原来的单轮调用。
@@ -695,8 +875,12 @@ def chat(prompt: str = "", system: str | None = None,
             return _post_with_heartbeat(
                 provider, _payload(provider, messages, temperature,
                                    json_mode=False),
-                log=log, cancel_check=cancel_check, trace=trace)
+                log=log, cancel_check=cancel_check, trace=trace,
+                **({'response_guard_factory': response_guard_factory} if response_guard_factory else {}))
         except (ServiceOfflineError, StepFailedError) as e:
+            if e.code in _GUARD_ABORT_CODES:
+                # 响应契约/退化只能在调用方同一重试预算内处理；不能暗中换模型重算。
+                raise
             errors.append(f"「{provider.get('name')}」: {e.message}")
             error_codes.append(e.code)
             causes.append(dict(profile=provider.get('name'), code=e.code, message=e.message,
@@ -868,7 +1052,7 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
                    log=lambda m: None, profile: str | None = None,
                    cancel_check=None, trace=None, retry_prompt=None,
                    retry_request=None, retry_context=None,
-                   failure_label: str = "输出"):
+                   failure_label: str = "输出", response_guard_factory=None):
     """通用文本协议补全 + 解析 + 校验 + 重试。
 
     ``parser`` 负责把原始文本转成领域对象；返回 ``(对象, 修复说明)`` 时会
@@ -877,6 +1061,7 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
     """
     last_err: Exception | None = None
     last_raw = ""
+    guard_validation_failures = 0
     retry_group = uuid.uuid4().hex[:10]
     conversation: list[dict] | None = None
     for attempt in range(1, max_retries + 1):
@@ -885,6 +1070,7 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
         retry_hint = ""
         attempt_prompt = prompt
         context_mode = "conversation"
+        guard_retry = isinstance(last_err, StepFailedError) and last_err.code in _GUARD_RETRY_CODES
         if last_err is not None:
             # 先让调用方选择本轮上下文形态，再构造修复消息；二者可能依赖同一
             # 个判定结果（例如“少量缺行 → 独立补行请求”）。
@@ -898,33 +1084,54 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
             else:
                 retry_hint = (f"\n\n【重试提示】上一次输出解析或校验失败: {last_err}\n"
                               f"请严格按要求的输出格式重新输出，不要输出任何解释文字。")
+            if guard_retry:
+                # 调用方先重置局部补行/编号契约；异常流始终重新建对话，不携带退化候选。
+                context_mode = 'fresh'
         attempt_trace = trace
         if trace:
             def attempt_trace(event, content="", _attempt=attempt, **meta):
                 trace(event, content, retry_group=retry_group,
                       retry_attempt=_attempt, retry_total=max_retries, **meta)
         user_content = attempt_prompt + retry_hint
-        if conversation is None or context_mode == "fresh":
-            # fresh 是一次新的无状态请求：只带稳定 system 和本轮修复输入，
-            # 不把原始窗口、历史输出重复发给服务商。
-            raw = chat(user_content, system=system, temperature=temperature,
-                       log=log, profile=profile, cancel_check=cancel_check,
-                       trace=attempt_trace)
-            if conversation is None:
-                conversation = ([{"role": "system", "content": system}] if system else [])
-                conversation.extend([
-                    {"role": "user", "content": user_content},
-                    {"role": "assistant", "content": raw},
-                ])
-        else:
-            # conversation 校验重试使用真正的多轮消息：系统提示、原始窗口、
-            # 模型上次输出、本轮修复要求全部保留。服务商仍会收到一次完整请求，
-            # 但模型不需要猜测“上次输出”是什么。
-            conversation.append({"role": "user", "content": user_content})
-            raw = chat(system=None, temperature=temperature, log=log,
-                       profile=profile, cancel_check=cancel_check,
-                       trace=attempt_trace, messages=conversation)
-            conversation.append({"role": "assistant", "content": raw})
+        guard_options = {'response_guard_factory': response_guard_factory} if response_guard_factory else {}
+        try:
+            if conversation is None or context_mode == "fresh":
+                # fresh 是一次新的无状态请求：只带稳定 system 和本轮修复输入，
+                # 不把原始窗口、历史输出重复发给服务商。
+                raw = chat(user_content, system=system, temperature=temperature,
+                           log=log, profile=profile, cancel_check=cancel_check,
+                           trace=attempt_trace, **guard_options)
+                if conversation is None:
+                    conversation = ([{"role": "system", "content": system}] if system else [])
+                    conversation.extend([
+                        {"role": "user", "content": user_content},
+                        {"role": "assistant", "content": raw},
+                    ])
+            else:
+                # conversation 校验重试使用真正的多轮消息：系统提示、原始窗口、
+                # 模型上次输出、本轮修复要求全部保留。服务商仍会收到一次完整请求，
+                # 但模型不需要猜测“上次输出”是什么。
+                conversation.append({"role": "user", "content": user_content})
+                raw = chat(system=None, temperature=temperature, log=log,
+                           profile=profile, cancel_check=cancel_check,
+                           trace=attempt_trace, messages=conversation, **guard_options)
+                conversation.append({"role": "assistant", "content": raw})
+        except StepFailedError as error:
+            if error.code not in _GUARD_RETRY_CODES:
+                raise
+            guard_validation_failures += 1
+            last_err, last_raw, conversation = error, '', None
+            log(f'LLM {failure_label} 第 {attempt}/{max_retries} 次响应已中止: {error.message}')
+            if trace:
+                trace('validation_error', error.message[:300], retry_group=retry_group,
+                      retry_attempt=attempt, retry_total=max_retries, code=error.code)
+            if attempt == max_retries:
+                error.detail = {**(error.detail if isinstance(error.detail, dict) else {}),
+                                'validation_attempts': max_retries,
+                                'guard_validation_failures': guard_validation_failures}
+                error.guard_validation_failures = guard_validation_failures
+                raise
+            continue
         last_raw = raw
         if cancel_check:
             cancel_check()
@@ -957,18 +1164,20 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
             if trace:
                 trace("validation_error", str(e), retry_group=retry_group,
                       retry_attempt=attempt, retry_total=max_retries)
-    raise StepFailedError(
+    failure = StepFailedError(
         f"LLM 输出连续 {max_retries} 次无法通过{failure_label}校验: {last_err}",
         code='LLM_OUTPUT_INVALID',
         detail=last_raw[:1200],
         suggestion="可重试本步骤; 若反复失败, 换更强的模型 (config llm.model)。")
+    failure.guard_validation_failures = guard_validation_failures
+    raise failure
 
 
 def chat_json(prompt: str, validator=None, system: str | None = None,
               max_retries: int = 3, temperature: float | None = None,
               log=lambda m: None, profile: str | None = None,
               cancel_check=None, trace=None, retry_prompt=None,
-              retry_request=None, retry_context=None):
+              retry_request=None, retry_context=None, response_guard_factory=None):
     """JSON 补全 + 校验 + 重试；通用 validated 调用的 JSON 专用入口。"""
     def json_parser(raw: str):
         return _extract_json(raw, return_repair=True)
@@ -978,4 +1187,4 @@ def chat_json(prompt: str, validator=None, system: str | None = None,
         max_retries=max_retries, temperature=temperature, log=log,
         profile=profile, cancel_check=cancel_check, trace=trace,
         retry_prompt=retry_prompt, retry_request=retry_request,
-        retry_context=retry_context, failure_label="JSON")
+        retry_context=retry_context, failure_label="JSON", response_guard_factory=response_guard_factory)

@@ -26,12 +26,8 @@ def check_idle(uid):
 @contextmanager
 def edit(project):
     """短暂编辑不显示为合成中，避免轮询导致播放器被卸载和复位。"""
-    with gate:
-        from dubforge.workflows import check_idle as workflow_idle
-        workflow_idle(project.uid)
-        check_idle(project.uid)
-        if any(s.status in {'running', 'queued'} for s in crud.get_steps(project.id)):
-            raise DubForgeError('项目正在运行，请结束后再修改编辑结果', code='PIPELINE_BUSY')
+    from dubforge import runtime_edit
+    with runtime_edit.editing('project:' + project.uid):
         yield
 
 
@@ -39,10 +35,12 @@ def edit(project):
 def use(project, line_id, *, from_pipeline=False):
     """正式步骤已经持有运行资格，与逐句合成共用当前句和进度记录。"""
     session = {'active_line': line_id, 'active_progress': None}
-    with gate:
+    from dubforge.runner import runner
+    from dubforge import runtime_edit
+    with runner._start_lock, gate:
         check_idle(project.uid)
-        if not from_pipeline and any(s.status in {'running', 'queued'} for s in crud.get_steps(project.id)):
-            raise DubForgeError('项目正在运行，请结束后再修改参数或逐句合成', code='PIPELINE_BUSY')
+        if not from_pipeline:
+            runtime_edit.check_idle(project.uid)
         _active[project.uid] = session
 
     def progress(value, *, attempt=None, factor=None):

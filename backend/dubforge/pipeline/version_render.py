@@ -87,16 +87,32 @@ def preview_context(uid):
                           for i, _ in enumerate(overlay.get('items', []))])
 
 
+def capture_prepared_inputs(ctx, deps, specs):
+    """记录编码实际使用的版本方案；准备评论后仍使用本轮冻结的配置。"""
+    if ctx.task_data.get('scope') == 'preview':
+        return
+    from dubforge.pipeline.stale_explanation import capture
+    actual = deps.with_versions(specs)
+    stamp = 'versions:' + versions.digest([versions.fingerprint(actual, v) for v in specs])
+    ctx._completed_input_snapshot = capture(actual, 'assemble', fingerprint=stamp, scope='versions')
+
+
 def run(ctx):
     from dubforge.pipeline.step_assemble import _ffprobe_duration, _task_range, _mix_timeline, _mux, _mux_original_sub
     from dubforge.publishing.service import output_replacement
-    deps = Dependencies(ctx.project)
+    deps = ctx.dependencies()
     specs = ctx.task_data['version_specs']
     if ctx.task_data.get('comments_auto'):
         # 评论准备=auto 且无已确认方案: 合成前自动采集/评分/翻译并保存, 再带方案重解析。
         from dubforge import comments_auto
         specs = comments_auto.ensure_render_specs(ctx, deps, specs)
         ctx.task_data['version_specs'] = specs
+    from dubforge.pipeline.content_redaction import safe_overlay
+    # 先确定实际烧录的评论，再记录生成输入；不能把自动准备前的空方案
+    # 或筛查前会被排除的评论记作成片实际内容。
+    specs = [{**v, 'comment_overlay': safe_overlay(VersionContext(ctx, v), v['comment_overlay'])}
+             if v['comment_overlay'] else v for v in specs]
+    capture_prepared_inputs(ctx, deps, specs)
     if any(version['dubbing'] for version in specs):
         # 整批开始前检查，避免先编码原声版，再因后面的配音版不完整失败。
         from dubforge.pipeline.step_assemble import _require_dubbing
@@ -113,7 +129,11 @@ def run(ctx):
     try:
         for index, version in enumerate(specs):
             ctx.check_cancel(); ctx.check_pause()
-            if not any(version[k] for k in ('dubbing', 'burn_subtitles', 'include_comments')):
+            from dubforge.pipeline.content_redaction import plan as review_plan, receipt as review_receipt
+            scoped = VersionContext(ctx, version)
+            review = review_plan(scoped)
+            if not any(version[k] for k in ('dubbing', 'burn_subtitles', 'include_comments')) and not (
+                    review['ranges'] and scoped.cfg('content_review.mute_audio', True)):
                 ctx.log(f'「{version["name"]}」直接使用原片，不创建重复文件')
                 continue
             if not preview and versions.is_current(deps, version, verify_hash=True):
@@ -124,7 +144,8 @@ def run(ctx):
                 raise versions.VersionError('此版本需要已确认的评论方案')
             if overlay and overlay['settings']['start'] >= total:
                 raise versions.VersionError('评论首次出现时间超过视频时长')
-            scoped = VersionContext(ctx, version)
+            if review['ranges']:
+                ctx.log(f'内容审查：隐藏 {len(review["blocked_ids"])} 句字幕，处理 {len(review["ranges"])} 个时段；需另行核对画面')
             input_fingerprint = versions.fingerprint(deps, version)
             previous = versions.result_artifact(deps, version)
             out = out_dir / (f'preview_version_{version["id"]}_{uuid.uuid4().hex}.mp4' if preview else
@@ -152,7 +173,9 @@ def run(ctx):
                     ctx.check_cancel()
                     atomic_replace(pending, out)
                     ctx.register_file(out.name, out, 'video', replace_existing=not preview)
-                    if not preview: versions.record_result(ctx, version, out.name, input_fingerprint)
+                    if not preview:
+                        version['content_review_receipt'] = review_receipt(scoped)
+                        versions.record_result(ctx, version, out.name, input_fingerprint)
                 ctx.log(f'「{version["name"]}」{"试片" if preview else "成品"}已生成')
             finally:
                 pending.unlink(missing_ok=True)

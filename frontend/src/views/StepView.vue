@@ -2,6 +2,9 @@
 import FilePathLink from '../components/FilePathLink.vue'
 import ProgressActivity from '../components/ProgressActivity.vue'
 import CommentDiagnostics from '../components/CommentDiagnostics.vue'
+import ContentReviewPanel from '../components/ContentReviewPanel.vue'
+import FreshnessDetails from '../components/FreshnessDetails.vue'
+import BatchWorkflowResume from '../components/BatchWorkflowResume.vue'
 import { stoppingLabel } from '../utils/progressActivity'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 import { dependencyActionLabel, runPlannedSteps } from '../utils/runPlan'
@@ -10,13 +13,14 @@ import { WORKFLOW_BUSY } from '../utils/workflow'
 // 步骤专属页: 说明 / 状态 / 依赖门禁 / 本步配置 / 完整日志 / 产物清单 / 运行操作
 // 由左侧流程导航进入, 一页只专注一个步骤; 依赖未就绪时明确指出并禁用运行
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
 import {
   NAlert, NButton, NCard, NCheckbox, NDescriptions, NDescriptionsItem, NEmpty, NForm, NFormItem,
   NGrid, NGridItem as NGi, NH1, NLayoutContent, NPopover, NProgress, NSpace, NSpin, NTag, NText,
   NTooltip, NSelect, useDialog, useMessage,
 } from 'naive-ui'
 import MediaInfo from '../components/MediaInfo.vue'
+import VideoPreview from '../components/VideoPreview.vue'
 import AudioTracksPlayer from '../components/AudioTracksPlayer.vue'
 import AssemblyVersionWorkspace from '../components/AssemblyVersionWorkspace.vue'
 import AssembleOutputsPanel from '../components/AssembleOutputsPanel.vue'
@@ -43,6 +47,7 @@ const nav = useNavStore()
 const uid = route.params.uid as string
 const key = route.params.key as string
 const detailSection = ref(key === 'tts' ? 'logs' : 'parameters')
+const pageVisible = ref(typeof document === 'undefined' || document.visibilityState !== 'hidden')
 const llmSection = ref<HTMLElement|null>(null)
 async function showLlmDiagnostics(){detailSection.value='llm';await nextTick();llmSection.value?.scrollIntoView({behavior:'smooth',block:'start'})}
 watch(()=>route.hash,value=>{if(value==='#llm-conversation')detailSection.value='llm'},{immediate:true})
@@ -52,6 +57,17 @@ const displayStatus = computed(() => step.value ? stepDisplayStatus(step.value) 
 const stepIdx = STEP_ORDER.indexOf(key as any)
 const dubbingBusy = ref(false), dubbingDirty = ref(false)
 const parametersDirty = ref(false)
+const reviewDirty = ref(false), reviewBusy = ref(false)
+function reviewBeforeUnload(event: BeforeUnloadEvent) {
+  if (reviewDirty.value || reviewBusy.value) { event.preventDefault(); event.returnValue = '' }
+}
+onMounted(() => window.addEventListener('beforeunload', reviewBeforeUnload))
+onUnmounted(() => window.removeEventListener('beforeunload', reviewBeforeUnload))
+onBeforeRouteLeave(() => {
+  if (reviewBusy.value) { message.warning('正在保存或刷新内容审查，请稍候再离开'); return false }
+  if (!reviewDirty.value) return true
+  return new Promise<boolean>(resolve => dialog.warning({ title: '审查设置尚未保存', content: '离开会放弃当前审查设置修改。', positiveText: '放弃修改并离开', negativeText: '继续编辑', onPositiveClick: () => resolve(true), onNegativeClick: () => resolve(false), onClose: () => resolve(false), onMaskClick: () => resolve(false) }))
+})
 const outputsArea = ref<HTMLElement | null>(null)
 const assemblyChoice = ref<AssemblyChoice>(outputChoice('src'))
 function chooseOutputs() {
@@ -84,7 +100,7 @@ const editorBlockers = computed(() => {
 const actionBlockers = computed(() => key === 'tts' ? editorBlockers.value : blockers.value)
 async function runWithDependencies() {
   if (nav.busy) return
-  if (parametersDirty.value || dubbingDirty.value) { message.warning('请先保存参数，再确认运行范围'); return }
+  if (parametersDirty.value || dubbingDirty.value || reviewDirty.value || reviewBusy.value) { message.warning('请先保存参数和审查设置，再确认运行范围'); return }
   const targets = key === 'tts' ? ['subtitles', 'tts'] : [key]
   await runPlannedSteps(uid, targets, true, message, dialog,
     async (steps) => {
@@ -96,7 +112,7 @@ async function runWithDependencies() {
 }
 const running = computed(() => step.value?.status === 'running' || step.value?.status === 'queued')
 const canRun = computed(() => !!step.value && !running.value
-  && blockers.value.length === 0 && !dirMissing.value && !dubbingBusy.value && !dubbingDirty.value && !parametersDirty.value)
+  && blockers.value.length === 0 && !dirMissing.value && !dubbingBusy.value && !dubbingDirty.value && !parametersDirty.value && !reviewDirty.value && !reviewBusy.value)
 
 // 项目目录不在磁盘上 (被移走/删除) → 禁用运行, 从回收站还原后恢复
 const dirMissing = computed(() => nav.dirMissing)
@@ -116,9 +132,9 @@ const actionMode = computed<
 >(() => {
   if (running.value && (step.value?.cancelling || cancelPending.value)) return 'cancelling'
   if (running.value) return 'running'
-  if (key === 'tts' ? editorBlockers.value.length : blockers.value.length) return 'deps'
   // 链挂起在本步 (失败/停止/中断): 重试默认续跑剩余计划 (ADR-0072)。
   if (nav.chainHeldAt(key)) return 'chain-hold'
+  if (key === 'tts' ? editorBlockers.value.length : blockers.value.length) return 'deps'
   if (key === 'tts' && step.value?.status === 'done' && !step.value.fresh) return 'fill-voice'
   if (step.value?.status === 'done' && step.value.fresh) return 'fresh-done'
   return 'run'
@@ -134,7 +150,7 @@ watch(() => [step.value?.status, step.value?.cancelling] as const, ([status, can
 
 async function run(force = false, resumeChain = false) {
   if (nav.busy) return
-  if (busy.value || cancelPending.value || forceBusy.value || dubbingBusy.value || dubbingDirty.value || parametersDirty.value) return
+  if (busy.value || cancelPending.value || forceBusy.value || dubbingBusy.value || dubbingDirty.value || parametersDirty.value || reviewDirty.value || reviewBusy.value) return
   if (key === 'assemble') { chooseOutputs(); return }
   busy.value = true
   if (key !== 'tts') {
@@ -194,7 +210,8 @@ function stopDialog() {
   dialogAction.value = 'stop'
   dialog.warning({
     title: `停止「${step.value.label}」？`,
-    content: '正在运行的子进程 (下载/ffmpeg 等) 将立即终止；进程内计算会在当前单元结束后退出。'
+    content: '正在等待的 LLM 请求会主动中断并关闭本地连接；服务端是否停止计算取决于服务商。'
+      + '下载/ffmpeg 等子进程将终止；进程内计算会在当前单元结束后退出。'
       + '过程临时文件自动清理，已完成的正式产物保留。',
     positiveText: '确认停止',
     negativeText: '继续运行',
@@ -228,7 +245,7 @@ async function doCancel(expectedJobId: number | null = null) {
       return
     }
   } catch { cancelPending.value = false; message.error('停止信号发送失败（后端可能正在重启），请稍候重试'); return }
-  message.info('停止信号已发送, 等待步骤退出；长时间无响应可用「强制结束」')
+  message.info('已请求停止，将取消当前网络请求并安全收尾；长时间无响应可用「强制结束」')
 }
 
 function forceDialog() {
@@ -238,7 +255,7 @@ function forceDialog() {
   dialog.error({
     title: `强制结束「${step.value.label}」？`,
     content: '仅建议在「取消中」长时间无响应时使用：子进程立即终止，状态立刻按已取消呈现；'
-      + '进程内计算若仍在后台收尾，其结果将被自动丢弃。',
+      + 'LLM 网络请求也会取消，但这不代表服务端已确认停止；进程内计算若仍在后台收尾，其结果将被自动丢弃。',
     positiveText: '强制结束',
     negativeText: '返回',
     onPositiveClick: async () => {
@@ -295,14 +312,6 @@ async function setPause(p: boolean) {
 async function revealStep() {
   const r = await fetch(`/api/projects/${uid}/steps/${key}/reveal`, { method: 'POST' })
   if (!r.ok) message.error('打开目录失败')
-}
-
-// 元数据到达: 用真实宽高比替换 16/9 兜底 —— 视频盒与内容比例一致, 不出黑边
-function onMeta(e: Event) {
-  const v = e.target as HTMLVideoElement
-  if (v.videoWidth && v.videoHeight) {
-    v.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`
-  }
 }
 
 async function revealArt(stepKey: string, name: string) {
@@ -410,7 +419,7 @@ function syncLogAnimation(lines: string[]) {
   const previousTarget = logTargetText
   logTargetText = target
   stopLogAnimation()
-  if (!logHistoryLoaded) {
+  if (!logHistoryLoaded || !running.value || !pageVisible.value || detailSection.value !== 'logs') {
     logHistoryLoaded = true
     logDisplayText.value = target
     logAnimationPosition = target.length
@@ -471,26 +480,56 @@ const LLM_TRACE_POLL_MS = 400
 const llmStep = computed(() => key === 'split' || key === 'translate')
 const llmReferenceDistance = ref(500)
 const llmReferenceSpeed = ref(360)
+let llmDisplayRevision = 0
+function applyLlmDisplayChange(value: unknown) {
+  if (!llmStep.value || llmDisposed || typeof value !== 'number' || !Number.isFinite(value)) return
+  llmDisplayRevision++
+  llmReferenceDistance.value = Math.max(50, Math.min(5000, Math.round(value)))
+}
+function onLlmDisplayChanged(event: Event) {
+  applyLlmDisplayChange((event as CustomEvent)?.detail?.reference_distance_chars)
+}
+function onLlmDisplayStorage(event: StorageEvent) {
+  if (event.key !== 'dubforge:llm-display-changed' || !event.newValue) return
+  try { applyLlmDisplayChange(JSON.parse(event.newValue)?.reference_distance_chars) }
+  catch { /* 其它窗口的无效存储数据不改变显示参数 */ }
+}
 async function loadLlmDisplayConfig() {
   if (!llmStep.value) return
+  const revision = llmDisplayRevision
   try {
     const r = await fetch('/api/settings/llm_display', { cache: 'no-store' })
     if (!r.ok || llmDisposed) return
     const data = await r.json()
+    if (llmDisposed || revision !== llmDisplayRevision) return
     llmReferenceDistance.value = Math.max(50, Math.min(5000,
       Number(data.reference_distance_chars) || 500))
     llmReferenceSpeed.value = Math.max(60, Math.min(1000,
       Number(data.reference_speed_chars_per_second) || 360))
   } catch { /* 显示参数读取失败时使用内置默认值 */ }
 }
-onMounted(() => { void loadLlmDisplayConfig() })
+onMounted(() => {
+  window.addEventListener('dubforge:llm-display-changed', onLlmDisplayChanged)
+  window.addEventListener('storage', onLlmDisplayStorage)
+  void loadLlmDisplayConfig()
+})
+onUnmounted(() => {
+  window.removeEventListener('dubforge:llm-display-changed', onLlmDisplayChanged)
+  window.removeEventListener('storage', onLlmDisplayStorage)
+})
 const llmEvents = ref<any[]>([])
 let llmCursor = 0
 let llmTraceId = ''
 let llmLoading = false
 let llmTimer: number | undefined
-let llmRestoringHistory = true
+const llmRestoringHistory = ref(true)
+const llmTraceActive = ref<boolean | null>(null)
 let llmDisposed = false
+let llmCatchupTimer: number | undefined
+let llmAbortController: AbortController | undefined
+let llmRefreshPending = false
+const llmCanAnimate = computed(() => running.value && llmTraceActive.value !== false
+  && pageVisible.value && detailSection.value === 'llm' && !llmRestoringHistory.value)
 const llmOutputEls = new Map<string, HTMLElement>()
 const llmOutputFollow = new Map<string, boolean>()
 const llmAnimatedContent = ref<Record<string, string>>({})
@@ -525,9 +564,18 @@ function followLlmOutput() {
 }
 function displayLlmContent(row: any): string {
   if (!['assistant', 'reasoning'].includes(row.role)) return row.content
+  if (!llmCanAnimate.value || !llmRowStreaming(row)) return row.content
   // 动画缓存是渐进显示层；若 watcher/历史恢复没有及时填充，则直接回退真实
   // 内容，绝不能让已经完成的思考或输出一直显示“等待内容”。
   return llmAnimatedContent.value[row.id] ?? row.content
+}
+function llmRowStreaming(row: any): boolean {
+  return !row.aborted && row.elapsedMs == null && (row.role === 'assistant'
+    ? row.status === '生成中' : row.role === 'reasoning' && row.status === '思考中')
+}
+function showLlmRowImmediately(row: any) {
+  stopLlmAnimation(row.id)
+  llmAnimatedContent.value[row.id] = String(row.content || '')
 }
 function stopLlmAnimation(id?: string) {
   if (id) {
@@ -549,6 +597,10 @@ function animateLlmRow(id: string) {
   const row = llmMessages.value.find((item: any) => item.id === id)
   if (!row || !['assistant', 'reasoning'].includes(row.role)) {
     stopLlmAnimation(id)
+    return
+  }
+  if (!llmCanAnimate.value || !llmRowStreaming(row)) {
+    showLlmRowImmediately(row)
     return
   }
   const target = String(row.content || '')
@@ -577,8 +629,8 @@ function animateLlmRow(id: string) {
   //   v_target = referenceSpeed × sqrt(distance / referenceDistance)
   //   a = response × (v_target - v)
   // 距离达到设置值时，追赶速度目标正好等于参考生成速度；平方根曲线让
-  // 接近末尾时不会像线性弹簧那样拖得太久。所有思考/输出、进行中/已完成
-  // 内容都用同一套参数，避免切换阶段时变速。
+  // 接近末尾时不会像线性弹簧那样拖得太久；只平滑显示正在生成的新内容。
+  // 历史、完成和页面重新可见时直接同步，不能假装模型还在输出。
   const referenceDistance = llmReferenceDistance.value
   const referenceSpeed = llmReferenceSpeed.value
   const response = 8
@@ -612,6 +664,10 @@ function syncLlmAnimations() {
   for (const row of llmMessages.value) {
     if (!['assistant', 'reasoning'].includes(row.role)) continue
     active.add(row.id)
+    if (!llmCanAnimate.value || !llmRowStreaming(row)) {
+      showLlmRowImmediately(row)
+      continue
+    }
     const shown = llmAnimatedContent.value[row.id] || ''
     if (shown.length > row.content.length) {
       llmAnimatedContent.value[row.id] = ''
@@ -623,12 +679,15 @@ function syncLlmAnimations() {
     }
   }
   for (const id of Object.keys(llmAnimatedContent.value)) {
-    if (!active.has(id)) delete llmAnimatedContent.value[id]
+    if (!active.has(id)) {
+      stopLlmAnimation(id)
+      delete llmAnimatedContent.value[id]
+    }
   }
 }
 const LLM_VALIDATION_METHODS: Record<string, string> = {
   translate: '校验方法：逐行匹配“行号. 译文” → 行号必须是已知且顺序一致的子序列 → 缺行/空译文可保留有效行并局部重译 → 结构性格式错误不猜续行 → 校验并截断交接摘要',
-  split: '校验方法：逐行匹配“序号. 开始秒-结束秒: 片段” → 序号必须从 1 连续 → 禁止空行、注释和无前缀行 → 开始时间有序且在窗口内（允许少量重叠） → 允许修正明显 ASR 错词',
+  split: '校验方法：逐行匹配“序号. 开始秒-结束秒: 片段” → 连续编号、非空片段，兼容无害空白与注释 → 检查最终有效时间与真实长静音 → 检查明显大段遗漏、台词搬移或重复抄写 → 内容纠错变化提示复核',
 }
 const llmValidationMethod = () => LLM_VALIDATION_METHODS[key] || '校验方法：提取 JSON → 检查结构、字段与步骤业务规则'
 const formatLlmTime = (ts: unknown) => {
@@ -782,6 +841,29 @@ const llmMessageState = computed(() => {
         retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
         retryTotal: retry?.total || 1,
       })
+    } else if (event.event === 'request_aborted') {
+      for (const row of rows) {
+        if (row.requestId === requestId) {
+          row.aborted = true
+          row.status = '本次候选未采用'
+        }
+      }
+      const reason = String(event.content || '响应偏离任务要求或超过请求时限，已关闭本地连接。')
+      const code = event.code ? `\n错误码：${String(event.code)}` : ''
+      const confirmation = event.server_confirmed === false
+        ? '\n已关闭本地连接；服务端停止计算或计费尚未确认。' : ''
+      rows.push({ id: `aborted-${rows.length}`, requestId, role: 'aborted', kind: 'error', aborted: true,
+        content: `${reason}${code}\n本次候选未采用。${confirmation}`,
+        status: '本次候选未采用', ts: event.ts, code: event.code, detail: event.detail,
+        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
+        retryTotal: retry?.total || 1 })
+    } else if (event.event === 'request_cancelled') {
+      for (const row of rows) {
+        if (row.requestId === requestId) row.status = '本地已取消'
+      }
+      rows.push({ id: `cancelled-${rows.length}`, requestId, role: 'cancellation', kind: 'warning',
+        content: String(event.content || '本地请求已取消；服务端停止计算尚未确认'),
+        status: '本地已取消 · 服务端未确认', ts: event.ts })
     } else if (event.event === 'status') {
       for (const row of rows) {
         if (row.requestId === requestId
@@ -803,7 +885,7 @@ const llmMessageState = computed(() => {
   return { allRows: rows, visibleRows: rows, retryInfo }
 })
 const llmMessages = computed(() => llmMessageState.value.visibleRows)
-watch(llmMessages, syncLlmAnimations, { deep: true })
+watch([llmMessages, llmCanAnimate], syncLlmAnimations)
 const llmRetryCount = computed(() =>
   Array.from(llmMessageState.value.retryInfo.values())
     .filter((info: any) => info.maxAttempt > 1).length)
@@ -814,6 +896,8 @@ const llmRoleLabel = (row: any) => ({
   reasoning: '模型思考',
   assistant: '模型输出',
   strategy: '请求策略',
+  aborted: '本地已中止响应',
+  cancellation: '取消请求',
   json_repair: 'JSON 自修复',
   validation: row.kind === 'error'
     ? (String(row.content || '').startsWith('JSON 解析失败') ? 'JSON 解析失败' : '校验失败')
@@ -824,6 +908,7 @@ const llmRoleLabel = (row: any) => ({
 const llmRoleTagType = (row: any) => ({
   system: 'default', user: 'info', reasoning: 'warning', assistant: 'success',
   strategy: row.kind === 'fresh' ? 'warning' : 'info',
+  aborted: 'error',
   json_repair: 'info',
   validation: row.kind === 'error' ? 'error' : 'success',
   merge: 'success',
@@ -832,60 +917,97 @@ const llmRoleTagType = (row: any) => ({
 
 // 行头状态只用固定短标签，不直接显示后端 status 事件原文，避免闪烁和结束后残留。
 const llmRowState = (row: any) => {
-  if (row.role === 'assistant') return row.elapsedMs != null ? '已完成' : '生成中'
-  if (row.role === 'reasoning') return row.elapsedMs != null ? '思考完成' : '思考中'
+  if (row.aborted) return '本次候选未采用'
+  if (row.status === '本地已取消') return row.status
+  if (row.role === 'assistant') return row.status === '已完成' || row.elapsedMs != null
+    ? '已完成' : running.value && llmTraceActive.value !== false ? '生成中' : '本轮已结束'
+  if (row.role === 'reasoning') return row.status === '思考完成' || row.elapsedMs != null
+    ? '思考完成' : running.value && llmTraceActive.value !== false ? '思考中' : '本轮已结束'
   return row.status || ''
 }
 const llmStatus = computed(() => {
   const assistant = [...llmMessages.value].reverse().find(
-    (x: any) => x.role === 'assistant' && x.status === '生成中')
+    (x: any) => !x.aborted && x.role === 'assistant' && x.status === '生成中')
   const reasoning = [...llmMessages.value].reverse().find(
-    (x: any) => x.role === 'reasoning' && x.status === '思考中')
+    (x: any) => !x.aborted && x.role === 'reasoning' && x.status === '思考中')
   if (assistant) return `生成中 · ${(assistant.content || '').length.toLocaleString()} 字符`
   if (reasoning) return `思考中 · ${(reasoning.content || '').length.toLocaleString()} 字符`
+  const latestRequest = [...llmMessages.value].reverse().find((x: any) =>
+    x.requestId && ['system', 'user', 'assistant', 'reasoning', 'aborted', 'cancellation'].includes(x.role))
+  if (latestRequest?.aborted) return '本次候选未采用'
   if (running.value) return '正在准备…'
   return ''
 })
 async function loadLlmTrace() {
-  if (!llmStep.value || llmLoading || llmDisposed) return
+  if (!llmStep.value || llmDisposed || !pageVisible.value || detailSection.value !== 'llm') return
+  if (llmLoading) { llmRefreshPending = true; return }
   llmLoading = true
+  llmRefreshPending = false
+  const controller = new AbortController()
+  llmAbortController = controller
+  let continueHistory = false
   try {
+    const previousCursor = llmCursor
     const query = new URLSearchParams({ tail: '500', after: String(llmCursor), trace_id: llmTraceId })
     const r = await fetch(`/api/projects/${uid}/steps/${key}/llm_trace?${query}`,
-      { cache: 'no-store' })
+      { cache: 'no-store', signal: controller.signal })
     if (!r.ok) return
     const j = await r.json()
-    if (llmDisposed) return
+    if (llmDisposed || controller.signal.aborted) return
     if (j.retry) return
     if (j.reset || !j.exists) {
-      llmRestoringHistory = true
+      llmRestoringHistory.value = true
       llmEvents.value = []
       llmOutputFollow.clear()
       stopLlmAnimation()
       llmAnimatedContent.value = {}
     }
+    if (typeof j.active === 'boolean') llmTraceActive.value = j.active
+    else if (!j.exists) llmTraceActive.value = false
     llmCursor = j.cursor || 0
     llmTraceId = j.trace_id || ''
     if (Array.isArray(j.events) && j.events.length) llmEvents.value.push(...j.events)
     // 首次进入/刷新后的全部历史分页直接显示，不重新播放打字动画。
     // 在 Vue 刷新视图及动画监听执行前填好已显示内容；追完历史后，
     // 后续轮询才从这个位置平滑追加新字符。
-    if (llmRestoringHistory) {
+    const more = typeof j.more === 'boolean' ? j.more : j.events?.length === 500
+    if (llmRestoringHistory.value || !llmCanAnimate.value) {
       for (const row of llmMessages.value) {
         if (row.role === 'assistant' || row.role === 'reasoning') {
-          stopLlmAnimation(row.id)
-          llmAnimatedContent.value[row.id] = row.content
+          showLlmRowImmediately(row)
         }
       }
-      if (j.events?.length !== 500) llmRestoringHistory = false
     }
+    if (!more) llmRestoringHistory.value = false
     // 页面初次打开或任务刚结束时也要读完积压的所有页。
-    if (j.events?.length === 500) window.setTimeout(loadLlmTrace, 0)
+    // more 由字节游标决定，不能按有效事件数量猜测。半行尚未写完时不空转。
+    continueHistory = more && (j.reset || llmCursor > previousCursor)
   } catch { /* 后端瞬断: 下轮轮询再取 */ }
-  finally { llmLoading = false }
+  finally {
+    llmLoading = false
+    if (llmAbortController === controller) llmAbortController = undefined
+    if (!llmDisposed && pageVisible.value && detailSection.value === 'llm'
+        && (continueHistory || llmRefreshPending) && llmCatchupTimer === undefined) {
+      llmRefreshPending = false
+      llmCatchupTimer = window.setTimeout(() => {
+        llmCatchupTimer = undefined
+        void loadLlmTrace()
+      }, 0)
+    }
+  }
 }
 function syncLlmPolling() {
   if (!llmStep.value) return
+  if (!pageVisible.value || detailSection.value !== 'llm' || llmDisposed) {
+    if (llmTimer !== undefined) window.clearInterval(llmTimer)
+    llmTimer = undefined
+    if (llmCatchupTimer !== undefined) window.clearTimeout(llmCatchupTimer)
+    llmCatchupTimer = undefined
+    llmRefreshPending = false
+    llmAbortController?.abort()
+    stopLlmAnimation()
+    return
+  }
   if (running.value && !llmTimer) {
     loadLlmTrace()
     // 轮询间隔适中，避免过密读取让每一批模型内容的到达节奏更明显；
@@ -900,14 +1022,42 @@ function syncLlmPolling() {
   }
 }
 watch(running, syncLlmPolling, { immediate: true })
-onUnmounted(() => {
+function onTraceVisibilityChanged() {
+  if (llmDisposed) return
+  pageVisible.value = typeof document === 'undefined' || document.visibilityState !== 'hidden'
+  llmRestoringHistory.value = true
+  syncLlmAnimations()
+  syncLogAnimation(logLines.value)
+  syncLlmPolling()
+}
+watch(detailSection, (section, previous) => {
+  if (section === 'llm' && previous !== 'llm') {
+    llmRestoringHistory.value = true
+    syncLlmAnimations()
+  }
+  if (section === 'logs') {
+    logHistoryLoaded = false
+    syncLogAnimation(logLines.value)
+  }
+  syncLlmPolling()
+})
+onMounted(() => {
+  document.addEventListener('visibilitychange', onTraceVisibilityChanged)
+})
+function disposeLlmTrace() {
   llmDisposed = true
   if (logTimer) clearInterval(logTimer)
   stopLogAnimation()
   if (llmTimer) clearInterval(llmTimer)
+  if (llmCatchupTimer !== undefined) window.clearTimeout(llmCatchupTimer)
+  llmCatchupTimer = undefined
+  llmRefreshPending = false
+  llmAbortController?.abort()
   if (llmFollowTimer !== undefined) window.clearTimeout(llmFollowTimer)
   stopLlmAnimation()
-})
+  if (typeof document !== 'undefined') document.removeEventListener('visibilitychange', onTraceVisibilityChanged)
+}
+onUnmounted(disposeLlmTrace)
 
 // ---- 本步配置快照 (展平一层) ----
 const cfgRows = computed(() => {
@@ -1398,7 +1548,7 @@ onUnmounted(() => {
         <template #status>
           <span class="header-badges">
             <!-- 按状态切换整个提示组件，trigger 必须始终有一个实际元素。 -->
-            <n-tooltip v-if="step.status !== 'done'" trigger="hover" :delay="200" placement="top">
+            <n-tooltip v-if="!['done','stale'].includes(step.status)" trigger="hover" :delay="200" placement="top">
               <template #trigger>
                 <n-tag size="small" :type="STATUS_TAG[displayStatus] || 'default'"
                        :bordered="step.status !== 'pending'">
@@ -1413,12 +1563,9 @@ onUnmounted(() => {
               </template>
               {{ step.freshness_reason || FRESHNESS_HINTS.fresh }}
             </n-tooltip>
-            <n-tooltip v-else trigger="hover" :delay="200" placement="top">
-              <template #trigger>
-                <n-tag size="small" type="warning" :bordered="false">{{ step.freshness_label || (key === 'tts' ? '仍有待配音句' : '需重跑') }}</n-tag>
-              </template>
-              {{ step.freshness_reason || (key === 'tts' ? '本次任务已完成；还有选用配音的句子缺少有效音频，可继续合成所选或补齐配音。' : FRESHNESS_HINTS.stale) }}
-            </n-tooltip>
+            <FreshnessDetails v-else :uid="uid" :step-key="key" :label="step.label"
+                              :status-text="step.freshness_label || (key === 'tts' ? '仍有待配音句' : '需更新')"
+                              :summary="step.freshness_reason || (key === 'tts' ? '还有选用配音的句子缺少有效音频，可继续合成所选或补齐配音。' : FRESHNESS_HINTS.stale)" />
             <AutoRunBadge :workflow-status="nav.workflow?.run?.status || null"
                           :chain="nav.chain" :running-label="null" />
           </span>
@@ -1445,26 +1592,26 @@ onUnmounted(() => {
           <n-button v-else-if="key === 'tts' && route.query.panel === 'subtitles'" secondary
                     @click="router.replace({ query: { ...route.query, panel: undefined } })">返回校对与配音</n-button>
           <n-button v-else-if="actionMode === 'deps'" type="primary"
-                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty"
+                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
                     @click="runWithDependencies">
             {{ key === 'tts' ? '同步全项目字幕与配音…' : dependencyActionLabel(actionBlockers) + '…' }}
           </n-button>
-          <n-button v-else-if="key === 'assemble'" type="primary" @click="chooseOutputs">选择成品方案</n-button>
           <template v-else-if="actionMode === 'chain-hold'">
             <n-tag size="small" type="warning" :bordered="false"
                    :title="'自动运行计划已挂起, 剩余 ' + (nav.chain?.remaining.length || 0) + ' 步'">⛓ 计划挂起</n-tag>
-            <n-button type="primary" :loading="busy" :disabled="nav.busy || !canRun || dirMissing"
-                      title="重试本步; 成功后自动继续剩余计划, 再失败则再次挂起"
-                      @click="run(false, true)">重试并继续剩余步骤…</n-button>
+            <BatchWorkflowResume :projects="[{ uid, title: nav.title || uid }]" kind="chain" label="检查恢复方案…"
+              :disabled="busy || nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
+              @resumed="nav.poll()" />
             <n-button secondary :loading="busy" :disabled="nav.busy || !canRun || dirMissing"
                       title="只重跑本步, 不继续剩余计划 (计划保留挂起)"
                       @click="run(false)">仅重试本步</n-button>
           </template>
+          <n-button v-else-if="key === 'assemble'" type="primary" @click="chooseOutputs">选择成品方案</n-button>
           <n-button v-else-if="actionMode === 'fill-voice'" type="primary" :loading="busy"
-                    :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty"
+                    :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
                     @click="run(false)">补齐全项目配音</n-button>
           <n-button v-else-if="actionMode === 'fresh-done'" secondary
-                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty"
+                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
                     :title="key === 'tts'
                       ? '重做全项目中选用配音的句子，与下方勾选无关；执行前再次确认'
                       : '忽略缓存并重新生成本步产物'"
@@ -1519,13 +1666,11 @@ onUnmounted(() => {
       </n-alert>
 
       <!-- 依赖门禁: 明确指出缺哪些上游；字幕与配音合并展示一次 -->
-      <DependencyNotice v-if="key !== 'assemble' && !(key === 'tts' && route.query.panel === 'subtitles')" :uid="uid" :items="actionBlockers">
-        <n-button size="small" type="primary"
-                  :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty"
-                  @click="runWithDependencies">
-          {{ key === 'tts' ? '同步全项目字幕与配音…' : dependencyActionLabel(actionBlockers) + '…' }}
-        </n-button>
-      </DependencyNotice>
+      <details v-if="actionBlockers.length && key !== 'assemble' && !(key === 'tts' && route.query.panel === 'subtitles')"
+               class="dependency-context" :open="!['done','stale'].includes(step.status)">
+        <summary><span>{{ actionBlockers.length }} 项输入待准备</span><small>展开查看来源与原因；运行操作在顶部</small></summary>
+        <DependencyNotice :uid="uid" :items="actionBlockers" />
+      </details>
 
       <!-- 错误三件套 -->
       <n-alert v-if="showStepError(step)" type="error" :show-icon="false" style="margin-top: 14px">
@@ -1537,18 +1682,23 @@ onUnmounted(() => {
         </n-text>
       </n-alert>
 
+      <ContentReviewPanel v-if="key === 'tts' || key === 'assemble'" :key="uid" :uid="uid"
+                          :disabled="dirMissing || nav.busy || dubbingBusy"
+                          @dirty-change="reviewDirty = $event" @busy-change="reviewBusy = $event"
+                          @saved="refreshInBackground(() => nav.poll())" />
+
       <!-- 产出预览: 有对应产物时直接展示 -->
       <div ref="previewRoot">
       <DubbingPanel v-if="key === 'tts'" :key="uid" :uid="uid" :suspended="previewSuspended || mediaRebuilding"
                     @busy-change="dubbingBusy = $event" @dirty-change="dubbingDirty = $event" />
       <section v-if="key === 'assemble'" ref="outputsArea" tabindex="-1" aria-label="正式成品方案">
-      <AssemblyVersionWorkspace :key="uid" :uid="uid" :disabled="nav.busy || dirMissing || parametersDirty" />
+      <AssemblyVersionWorkspace :key="uid" :uid="uid" :disabled="nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy" />
       <AssembleOutputsPanel :uid="uid" history-only
                             :artifacts="step.artifacts ?? []"
                             :source-path="assembleSourcePath"
                             :subtitle-path="assembleSubtitlePath"
                             :subtitle-name="assembleSubtitleName"
-                            :disabled="nav.busy || dirMissing || parametersDirty" @choice-change="assemblyChoice = $event"
+                            :disabled="nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy" @choice-change="assemblyChoice = $event"
                             @recycle-active="value => { if (value) releaseMediaIn(previewRoot); previewSuspended = value }" />
       </section>
       <n-card v-if="key !== 'tts' && preview && !previewSuspended && !mediaRebuilding" size="small" title="产出预览" style="margin-top: 14px">
@@ -1565,12 +1715,11 @@ onUnmounted(() => {
           {{ (step.artifacts ?? []).find((a: any) => a.name === subtitleArtifactName)?.path }}
         </button>
         <template v-if="subtitleVideo">
-          <video v-release-media :key="subtitleVideo" class="vid" :src="subtitleVideo" controls preload="metadata"
-                 @loadedmetadata="onMeta">
+          <VideoPreview :key="subtitleVideo" class="vid" :src="subtitleVideo">
             <track v-if="subtitlePreviewUrl" :key="subtitlePreviewUrl"
                    kind="subtitles" label="当前步骤字幕"
                    srclang="und" :src="subtitlePreviewUrl" @load="onSubtitleLoaded" default />
-          </video>
+          </VideoPreview>
           <n-text depth="3" style="display:block; margin-top:8px; font-size:12px">
             语音转文字、语义整理、翻译和字幕导出页面会叠加当前步骤生成的字幕；可拖动进度检查文字与时间轴是否同步。
             <template v-if="key === 'transcribe' && transcribePreviewMode === 'word'">当前为词级预览：视频字幕和下方时间轴均来自 words.json，按词级时间戳逐个显示；正式的 src.srt 短语产物仍保留在产物清单中。</template>
@@ -1584,8 +1733,7 @@ onUnmounted(() => {
         <template v-if="key === 'download' && media.found">
           <div class="prev-row">
             <div class="vid-col">
-              <video v-if="preview.url" v-release-media :key="preview.version || preview.url" class="vid" :src="preview.url" controls
-                     preload="metadata" @loadedmetadata="onMeta" />
+              <VideoPreview v-if="preview.url" :key="preview.version || preview.url" class="vid" :src="preview.url" />
             </div>
             <div class="info">
               <MediaInfo :media="media" />
@@ -1594,9 +1742,8 @@ onUnmounted(() => {
         </template>
         <AudioTracksPlayer v-else-if="preview.kind === 'tracks'"
                            :tracks="preview.audios" :video-url="preview.videoUrl" />
-        <video v-else-if="preview.kind === 'video' && preview.url" v-release-media :key="preview.version || preview.url" class="vid"
-               :src="preview.url" controls preload="metadata"
-               @loadedmetadata="onMeta" />
+        <VideoPreview v-else-if="preview.kind === 'video' && preview.url" :key="preview.version || preview.url" class="vid"
+                      :src="preview.url" />
         <template v-if="preview.kind === 'audio'">
           <div v-for="a in preview.audios ?? []" :key="`${a.name}:${a.version || ''}`" class="audio-row">
             <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
@@ -1630,18 +1777,17 @@ onUnmounted(() => {
               title="LLM 实时对话" style="margin-top: 14px">
         <template #header-extra>
           <n-tag v-if="running" size="small" type="info" :bordered="false">{{ llmStatus || '处理中…' }}</n-tag>
-          <n-tag v-else size="small" :bordered="false">本轮已结束</n-tag>
+          <n-tag v-else size="small" :bordered="false">{{ llmStatus === '本次候选未采用' ? llmStatus : '本轮已结束' }}</n-tag>
         </template>
         <n-alert v-if="key === 'split' && step?.cfg?.split?.use_llm !== false"
                  type="info" :show-icon="false" style="margin-bottom: 10px">
-          已启用<strong>整体语义重组</strong>：每个 token 窗口会按“时间轴粒度”设置发送短语级或词级时间、
-          长停顿提示和相邻上下文，由模型完成纠错、合并、拆分和时间轴整理；结果采用“序号. 开始秒-结束秒: 原文片段”，便于字幕对齐。
+          已启用<strong>全文语义整理</strong>：一次提供整段原文、时间轴和真实长静音，保留完整上下文。
+          思考参数的实际生效值见下方设置预览；程序校正词级时间并保留静音空档，质量问题最多定向重试一次。
         </n-alert>
         <n-alert v-if="key === 'translate'" type="info" :show-icon="false" style="margin-bottom: 10px">
-          当前采用<strong>串行滚动窗口翻译</strong>：在上下文预算内尽量整篇交给所选模型；
-          超过预算时按顺序分窗口，每个窗口返回译文和交接摘要，下一窗口自动接收上一窗口摘要后继续翻译。
-          正常情况下每个窗口只请求一次；只有格式或缺行校验失败时，才在同一窗口内针对性补齐，
-          不再额外执行“两步直译”或“全局审校”；下方视频会叠加当前翻译产物。
+          当前优先<strong>全文一次翻译</strong>：保留完整上下文，逐句沿用整理稿的编号、数量和时间。
+          全文超过模型上下文预算时才分窗口，保留边界参考与术语交接；格式或缺行问题按范围恢复。
+          思考参数的实际生效值见下方设置预览，下方视频会叠加当前翻译产物。
         </n-alert>
         <n-alert v-if="running && !llmMessages.length" type="info" :show-icon="false" style="margin-bottom: 10px">
           正在建立 LLM 请求；如果服务商尚未返回首字节，日志会显示等待状态。这里会实时显示返回内容。
@@ -1781,6 +1927,7 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.header-badges{display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px}.dependency-context{margin:14px 0;border:1px solid var(--df-border);border-radius:8px;padding:10px 14px;background:var(--df-panel)}.dependency-context>summary{cursor:pointer;color:var(--df-text);font-size:12px;line-height:1.8}.dependency-context>summary::marker{color:var(--df-muted)}.dependency-context>summary small{font-size:11px;color:var(--df-muted);margin-left:14px}.dependency-context :deep(.dependency-notice){margin-top:10px}
 .step-detail-nav { margin-top: 24px; margin-bottom: 16px; }
 .step-detail-content { min-width: 0; }
 .live-dot { width: 6px; height: 6px; background: var(--df-accent); border-radius: 50%; }
@@ -1796,13 +1943,9 @@ onUnmounted(() => {
 /* 视频按自身宽高比呈现, 最大高度封顶 (绝不信箱式拉伸出黑边) */
 .vid {
   display: block;
-  width: auto;
-  height: auto;
+  width: 604px;
   max-width: 100%;
-  max-height: 340px;
-  aspect-ratio: 16 / 9;
-  border-radius: 8px;
-  background: #000;
+  --df-preview-height: 340px;
 }
 .logbox {
   background: #0d1117;

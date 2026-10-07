@@ -12,7 +12,7 @@ import { NMessageProvider, NDialogProvider } from 'naive-ui'
 let server: ViteDevServer, Settings: any, Binding: any
 before(async () => {
   server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)), configFile: false,
-    plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } })
+    plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
   Settings = (await server.ssrLoadModule('/src/views/SettingsView.vue')).default
   Binding = (await server.ssrLoadModule('/src/components/ProjectTemplateBinding.vue')).default
 })
@@ -58,7 +58,9 @@ test('真实设置页默认只渲染统一制作工作区，不读取模型密�
   assert.deepEqual(scopes, ['global'])
   assert.match(html, /制作与发布/)
   assert.match(html, /配置范围/)
-  assert.match(html, /获取视频/)
+  assert.match(html, /画质/)
+  assert.match(html, /1080p/)
+  assert.doesNotMatch(html, /aria-label="设置类别"/)
   assert.doesNotMatch(html, /步骤默认参数|应用全局步骤参数|大模型连接/)
   assert.equal(reads.includes('/api/settings'), false)
 })

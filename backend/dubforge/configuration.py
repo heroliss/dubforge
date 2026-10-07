@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+import logging
 import threading
 import uuid
 
@@ -13,6 +14,7 @@ from dubforge.db import get_engine
 from dubforge.errors import DubForgeError
 
 gate = threading.RLock()
+logger = logging.getLogger(__name__)
 
 
 class ConfigurationError(DubForgeError):
@@ -122,7 +124,7 @@ def schema():
     data = defaults()
     sections = schema_view(data)
     for key, section in sections.items():
-        section['label'] = STEP_MAP[key].label if key in STEP_MAP else key
+        section['label'] = STEP_MAP[key].label if key in STEP_MAP else '内容审查' if key == 'content_review' else key
     comment_fields = [dict(f) for f in fields() if f['path'].startswith('comments.')]
     def field(path, label, type='str', **extra):
         return dict(path=path, label=label, type=type, **extra)
@@ -140,7 +142,8 @@ def schema():
     sections['publication'] = dict(label='发布规则', fields=[
         field('run.mode', '执行终点', 'select', options=[option('仅制作成片', 'produce'), option('准备发布草稿', 'draft'), option('自动投稿', 'publish')]),
         field('publish.account_id', 'B站账号', 'select', options=[]),
-        field('publish.ai_copy', 'AI 自动填充文案', 'bool'),
+        field('publish.ai_copy', '自动流程补全文案', 'bool',
+              help='仅补充未单独设置的标题、简介、标签和动态；项目或模板中已明确设置的值（包括空值）保持不变。全部四项已设置时不调用 AI。'),
         field('publish.cover_source', '封面来源', 'select', options=[option('平台封面', 'platform'), option('指定封面', 'custom')])])
     return sections
 
@@ -172,15 +175,23 @@ def _validate(patch, base):
     from dubforge.publishing.service import validate_values, DEFAULTS
     if not isinstance(patch, dict) or set(patch) - set(defaults()):
         raise ConfigurationError('包含不支持的设置字段')
+    try:
+        _json(patch).encode('utf-8')
+    except (ValueError, UnicodeEncodeError) as exc:
+        raise ConfigurationError('设置包含无效字符或非有限数值') from exc
     values = {**base, **patch}
     steps = {f.path: f for fields in STEP_PARAM_SCHEMA.values() for f in fields}
     validate_numeric_updates({k: v for k, v in patch.items() if k in steps or k == 'tts.tolerance'})
+    from dubforge.pipeline.content_redaction import validate_settings as validate_review
+    validate_review(patch)
     for k, v in patch.items():
         f = steps.get(k)
         if f and ((f.type == 'bool' and type(v) is not bool) or (f.type in {'str', 'text', 'password'} and not isinstance(v, str))):
             raise ConfigurationError(f'{f.label}的类型不正确')
         if f and f.type == 'select' and f.options and not f.editable and v not in [o[1] for o in f.options]:
             raise ConfigurationError(f'{f.label}请选择有效选项')
+        if f and f.type == 'select' and f.editable and not isinstance(v, str):
+            raise ConfigurationError(f'{f.label}请填写文字或选择有效选项')
     validate_settings({k: values['comments.' + k] for k in DEFAULT_SETTINGS})
     validate_values({k: values['publish.' + k] for k in DEFAULTS})
     validate_list(values['assembly.versions'])
@@ -200,24 +211,20 @@ def _validate(patch, base):
             raise ConfigurationError('发布标识或评论要求格式无效')
     ids = values['publish.version_ids']
     available = {v['id'] for v in values['assembly.versions']}
-    if ids is not None and (not isinstance(ids, list) or any(not isinstance(v, str) for v in ids) or len(ids) != len(set(ids)) or not set(ids) <= available):
+    if ids is not None and (not isinstance(ids, list) or not ids or any(not isinstance(v, str) for v in ids) or len(ids) != len(set(ids)) or not set(ids) <= available):
         raise ConfigurationError('发布分P引用了不存在或重复的成片版本')
     titles = values['publish.part_titles']
-    if not isinstance(titles, dict) or any(not isinstance(v, str) or not v.strip() or len(v) > 80 for v in titles.values()):
+    if not isinstance(titles, dict) or set(titles) - available:
+        raise ConfigurationError('分P名称引用了不存在的成片版本')
+    if any(not isinstance(v, str) or not v.strip() or len(v.encode('utf-16-le')) // 2 > 80 for v in titles.values()):
         raise ConfigurationError('分P名称须为1–80个字符')
     _json(patch)
 
 
 def _check_idle(session, key):
-    """编辑门禁只保留配音会话互斥。运行中的步骤使用启动时冻结的配置快照,
-    中途修改不影响正在执行的部分; 全流程在下一步边界按「剩余步骤消费的键」
-    对比指纹, 有变化即暂停等待重新确认 (ADR-0075), 因此不再按运行状态拦截编辑。"""
-    from dubforge.pipeline import dubbing_session
-    from dubforge.domain.models import Project
-    uids = [key[8:]] if key.startswith('project:') else [r.key[8:] for r in session.exec(
-        select(ConfigurationScope).where(ConfigurationScope.parent == key)).all()] if key.startswith('series:') else [p.uid for p in session.exec(select(Project)).all()]
-    for uid in uids:
-        dubbing_session.check_idle(uid)
+    """运行期间禁止外部编辑；冻结快照与步骤边界指纹仍作为恢复保护。"""
+    from dubforge import runtime_edit
+    runtime_edit.assert_editable(key, allow_owned=True)
 
 
 def _write_manifests(key):
@@ -295,10 +302,13 @@ def create_template(name):
 def archive(key, body):
     if not key.startswith('series:') or type(body.get('archived')) is not bool:
         raise ConfigurationError('只能归档或恢复系列模板')
-    with gate, Session(get_engine()) as session:
+    from dubforge.runner import runner
+    from dubforge.pipeline import dubbing_session
+    with runner._start_lock, dubbing_session.gate, gate, Session(get_engine()) as session:
         row = _row(session, key)
         if body.get('revision') != row.revision:
             raise ConfigurationError('模板已变化，请刷新后重试', code='CONFIGURATION_CONFLICT')
+        _check_idle(session, key)
         row.archived = body['archived']; row.revision += 1
         session.add(row); session.commit()
     return view(key)
@@ -389,7 +399,7 @@ def batch_start(body):
         raise ConfigurationError('请先检查批量运行范围并确认')
     try:
         request = uuid.UUID(body['request_id'])
-    except (KeyError, ValueError, TypeError):
+    except (KeyError, ValueError, TypeError, AttributeError):
         raise ConfigurationError('批量请求标识无效')
     results = []
     seen = set()
@@ -406,4 +416,8 @@ def batch_start(body):
             results.append(dict(uid=uid, run_id=run['id'], error=''))
         except DubForgeError as exc:
             results.append(dict(uid=uid, error=exc.message))
+        except Exception:
+            logger.exception('批量运行项目 %s 启动失败', uid)
+            error = ConfigurationError('项目启动失败，请查看后台日志后重试', code='BATCH_START_FAILED')
+            results.append(dict(uid=uid, error=error.message, code=error.code))
     return dict(items=results)

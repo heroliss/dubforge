@@ -15,7 +15,7 @@ import { createPinia } from 'pinia'
 // 不监听端口、不读写用户配置；真实组件事件链 + HTML 结构共同覆盖 label 默认激活回归。
 let server: ViteDevServer
 before(async () => { server = await createServer({ root: fileURLToPath(new URL('..', import.meta.url)),
-  configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null } }) })
+  configFile: false, plugins: [vue()], appType: 'custom', server: { middlewareMode: true, hmr: false, watch: null, ws: false } }) })
 after(() => server.close())
 
 const prefix = 'comments.', enabled = prefix+'source_style_enabled'

@@ -328,12 +328,13 @@ def test_download_aggregates_video_and_audio_and_excludes_resumed_bytes(monkeypa
     assert ctx.eta is None
 
 
-def test_split_stream_progress_does_not_abort_a_valid_llm_response(monkeypatch):
+def test_split_stream_progress_does_not_abort_a_valid_llm_response(monkeypatch, tmp_path):
     from dubforge.backends import llm
     from dubforge.pipeline.step_split import _llm_resegment
     from dubforge.utils.srt import SubLine
 
     ctx = Ctx()
+    ctx.pdir = tmp_path
     logs = []
     ctx.log = logs.append
     ctx.cfg = lambda key, default=None: default

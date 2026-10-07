@@ -77,6 +77,139 @@ def upload(row):
     return finish(row['id'])
 
 
+def test_combined_publish_rechecks_review_settings_changed_during_upload(setup_publish, monkeypatch):
+    from dubforge import config
+    _, row, artifacts, calls = setup_publish
+    original = transport.call
+
+    def change_policy(operation, payload=None, **kwargs):
+        result = original(operation, payload, **kwargs)
+        if operation == 'upload':
+            config.set_key('content_review.blocked_terms', '河内')
+        return result
+
+    monkeypatch.setattr(transport, 'call', change_policy)
+    preview = service.plan(row['id'])
+    service.enqueue(row['id'], dict(action='publish', confirmed=True, revision=row['revision'],
+                                   fingerprint=preview['fingerprint']))
+    result = finish(row['id'])
+    assert result['status'] == 'uploaded' and '标题命中' in result['error']
+    with Session(get_engine()) as session:
+        stored = session.get(Publication, row['id'])
+        transfers = json.loads(stored.transfers)
+        assert all(str(artifact.id) in transfers for artifact in artifacts) and transfers.get('cover')
+    assert not any(operation == 'submit' for operation, _ in calls)
+
+
+def test_upload_progress_tracks_bytes_parts_cover_and_local_project_list(setup_publish, monkeypatch):
+    """进度来自真实回调和已完成文件；合并与封面阶段不能冒充正在传视频。"""
+    from app.api.projects import list_projects
+    uid, row, _, calls = setup_publish
+    original = transport.call
+    observations = []
+
+    def tracked(operation, payload=None, **kwargs):
+        if operation == 'upload':
+            completed_bytes = sum(p['size'] for p in service.view(row['id'])['snapshot']['parts']
+                                  if p['artifact_id'] != payload['artifact_id'] and p['artifact_id'] < payload['artifact_id'])
+            kwargs['on_event'](dict(event='progress', phase='preparing', loaded=0))
+            assert service.view(row['id'])['progress_detail']['loaded'] == completed_bytes
+            kwargs['on_event'](dict(event='progress', phase='uploading', loaded=float('nan')))
+            kwargs['on_event'](dict(event='progress', phase='uploading', loaded=payload['size'] / 2))
+            current = service.view(row['id'])
+            observations.append(current)
+            summary = next(p for p in list_projects() if p['uid'] == uid)['publication']
+            assert summary['progress_detail'] == current['progress_detail']
+            assert summary['status'] == 'uploading'
+            kwargs['on_event'](dict(event='progress', phase='merging', loaded=payload['size']))
+            assert service.view(row['id'])['progress_detail']['phase'] == 'merging'
+        if operation == 'cover':
+            detail = service.project_status(uid)['progress_detail']
+            assert detail['phase'] == 'cover'
+            assert detail['loaded'] == detail['total']
+            assert detail['completed_parts'] == 2
+        return original(operation, payload, **kwargs)
+
+    monkeypatch.setattr(transport, 'call', tracked)
+    result = upload(row)
+    assert [r['progress_detail']['current_part'] for r in observations] == [1, 2]
+    first, second = observations
+    assert first['progress_detail']['completed_parts'] == 0
+    assert second['progress_detail']['completed_parts'] == 1
+    assert 0 < first['progress'] < second['progress'] < 100
+    assert result['progress_detail']['phase'] == 'uploaded'
+    assert result['progress_detail']['loaded'] == result['progress_detail']['total']
+    assert result['progress'] == 100
+    assert not any(op == 'submit' for op, _ in calls)
+    assert 'path' not in service.project_status(uid)['progress_detail']
+
+
+def test_resume_progress_discards_incomplete_bytes_and_reuses_completed_parts(setup_publish, monkeypatch):
+    _, row, artifacts, _ = setup_publish
+    original = transport.call
+    fail_once = True
+    uploads = []
+    starting_bytes = []
+
+    def interrupted(operation, payload=None, **kwargs):
+        nonlocal fail_once
+        if operation == 'upload':
+            uploads.append(payload['artifact_id'])
+            starting_bytes.append(service.view(row['id'])['progress_detail']['loaded'])
+            kwargs['on_event'](dict(event='progress', phase='uploading', loaded=5))
+            if payload['artifact_id'] == artifacts[1].id and fail_once:
+                fail_once = False
+                kwargs['cancel'].set()
+                raise service.PublishError('操作已暂停')
+        return original(operation, payload, **kwargs)
+
+    monkeypatch.setattr(transport, 'call', interrupted)
+    paused = upload(row)
+    first_size = paused['snapshot']['parts'][0]['size']
+    assert paused['status'] == 'paused'
+    assert paused['progress_detail']['loaded'] == first_size + 5
+    assert paused['progress_detail']['completed_parts'] == 1
+    result = upload(paused)
+    assert result['status'] == 'uploaded'
+    assert uploads == [artifacts[0].id, artifacts[1].id, artifacts[1].id]
+    assert starting_bytes == [0, first_size, first_size]
+
+
+def test_publish_reports_submission_stage_without_changing_production_state(setup_publish, monkeypatch):
+    uid, row, _, _ = setup_publish
+    original = transport.call
+    stages = []
+
+    def tracked(operation, payload=None, **kwargs):
+        if operation in {'submit', 'collection'}:
+            current = service.project_status(uid)
+            stages.append(current['progress_detail']['phase'])
+            assert current['progress'] == 100
+        return original(operation, payload, **kwargs)
+
+    monkeypatch.setattr(transport, 'call', tracked)
+    result = publish(row)
+    assert result['status'] == 'submitted'
+    assert stages == ['submitting', 'joining']
+    assert result['progress_detail']['phase'] == 'complete'
+
+
+def test_project_detail_and_list_api_keep_production_and_publication_status_separate(setup_publish):
+    from app.main import app
+    uid, row, _, calls = setup_publish
+    client = TestClient(app)
+    detail = client.get(f'/api/projects/{uid}')
+    assert detail.status_code == 200
+    assert detail.json()['status'] == 'created'
+    assert detail.json()['publication']['id'] == row['id']
+    assert detail.json()['publication']['status'] == 'draft'
+    listing = client.get('/api/projects')
+    assert listing.status_code == 200
+    project = next(p for p in listing.json() if p['uid'] == uid)
+    assert project['publication'] == detail.json()['publication']
+    assert calls == []
+
+
 def test_publication_sources_keep_frozen_template_identity_and_restore_inheritance(setup_publish):
     from dubforge import configuration as cfg
     uid, row, _, _ = setup_publish
@@ -116,6 +249,120 @@ def test_preflight_and_draft_copy_need_no_rights_checkbox(setup_publish):
     copied = service.copy_draft(row['id'])
     assert 'rights_confirmed' not in copied['draft']
     assert copied['status'] == 'draft'
+    assert calls == []
+
+
+def test_draft_details_and_copy_resolve_inheritance_once_without_media_or_network(setup_publish, monkeypatch):
+    from dubforge import configuration
+    import uuid
+    _, row, _, calls = setup_publish
+    resolved = []
+    resolve = configuration.resolve
+
+    def once(uid=None, **kwargs):
+        resolved.append(uid)
+        return resolve(uid, **kwargs)
+
+    monkeypatch.setattr(configuration, 'resolve', once)
+    expected = service.view(row['id'])
+    assert resolved == [row['project_uid']]
+    resolved.clear()
+    monkeypatch.setattr(service, 'candidates', lambda *_: pytest.fail('复制草稿不扫描候选媒体'))
+    monkeypatch.setattr(service, '_file_hash', lambda *_: pytest.fail('复制草稿不读取视频内容'))
+    monkeypatch.setattr(service, '_probe', lambda *_: pytest.fail('复制草稿不探测视频'))
+    copied = service.copy_draft(row['id'], dict(revision=row['revision'], request_id=str(uuid.uuid4())))
+    assert resolved == [row['project_uid']]
+    for field in ('settings', 'origins', 'sources', 'base_settings', 'base_origins', 'base_sources'):
+        assert copied[field] == expected[field]
+    assert copied['settings']['title'] == '河内街头美食'
+    assert copied['base_settings']['title'] != copied['settings']['title']
+    assert copied['sources']['title'] == {'kind': 'publication'}
+    assert copied['reused'] is False
+    assert copied['status'] == 'draft'
+    assert copied['snapshot'] == copied['receipt'] == {}
+    assert calls == []
+
+
+def test_copy_request_concurrent_retry_preserves_one_draft_and_user_edits(setup_publish):
+    from concurrent.futures import ThreadPoolExecutor
+    import uuid
+    _, row, _, calls = setup_publish
+    body = dict(revision=row['revision'], request_id=str(uuid.uuid4()))
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        results = list(pool.map(lambda _: service.copy_draft(row['id'], body), range(4)))
+    assert len({result['id'] for result in results}) == 1
+    assert sum(not result['reused'] for result in results) == 1
+    ident = results[0]['id']
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(Publication)).all()) == 2
+        copied = session.get(Publication, ident)
+        draft = json.loads(copied.draft)
+        draft['overrides']['title'] = '复制后人工改过的标题'
+        copied.draft = service._json(draft)
+        copied.revision += 1
+        source = session.get(Publication, row['id'])
+        source.revision += 1
+        session.add(copied); session.add(source); session.commit()
+    # 回执丢失后的重试只找已持久保存的请求，不覆盖编辑，也不按原稿新版本再插入。
+    replay = service.copy_draft(row['id'], body)
+    assert replay['reused'] is True
+    assert replay['id'] == ident
+    assert replay['settings']['title'] == '复制后人工改过的标题'
+    assert replay['revision'] == 2
+    with pytest.raises(DubForgeError) as caught:
+        service.copy_draft(row['id'], {**body, 'revision': row['revision'] + 1})
+    assert caught.value.code == 'PUBLISH_COPY_CONFLICT'
+    distinct = service.copy_draft(row['id'], dict(revision=row['revision'] + 1, request_id=str(uuid.uuid4())))
+    assert distinct['id'] != ident
+    assert distinct['reused'] is False
+    assert calls == []
+
+
+def test_copy_conflict_and_failed_details_leave_no_partial_draft(setup_publish, monkeypatch):
+    from dubforge import configuration
+    import uuid
+    _, row, _, calls = setup_publish
+    body = dict(revision=row['revision'] - 1, request_id=str(uuid.uuid4()))
+    with pytest.raises(DubForgeError) as caught:
+        service.copy_draft(row['id'], body)
+    assert caught.value.code == 'PUBLISH_CONFLICT'
+    monkeypatch.setattr(configuration, 'resolve', lambda *_: (_ for _ in ()).throw(DubForgeError('隔离配置错误')))
+    with pytest.raises(DubForgeError, match='隔离配置错误'):
+        service.copy_draft(row['id'], {**body, 'revision': row['revision']})
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(Publication)).all()) == 1
+    assert calls == []
+
+
+@pytest.mark.parametrize('body', [False, [], '复制', {'revision': 1},
+    {'revision': True, 'request_id': '6b65b1a8-4bdb-4857-93d9-64107752ee30'},
+    {'revision': 1, 'request_id': '无效'}, {'revision': 1, 'request_id': 42}])
+def test_copy_rejects_malformed_request_without_writing(setup_publish, body):
+    _, row, _, calls = setup_publish
+    with pytest.raises(DubForgeError) as caught:
+        service.copy_draft(row['id'], body)
+    assert caught.value.code == 'PUBLISH_COPY_INVALID'
+    with Session(get_engine()) as session:
+        assert len(session.exec(select(Publication)).all()) == 1
+    assert calls == []
+
+
+def test_copy_api_returns_complete_editable_details_and_reuses_request(setup_publish):
+    from app.main import app
+    import uuid
+    _, row, _, calls = setup_publish
+    client = TestClient(app)
+    body = dict(revision=row['revision'], request_id=str(uuid.uuid4()))
+    url = f'/api/publishing/publications/{row["id"]}/copy'
+    first = client.post(url, json=body)
+    assert first.status_code == 200
+    assert first.json()['base_settings']
+    assert first.json()['settings']['title'] == '河内街头美食'
+    second = client.post(url, json=body)
+    assert second.status_code == 200
+    assert second.json()['id'] == first.json()['id']
+    assert second.json()['reused'] is True
+    assert first.json()['reused'] is False
     assert calls == []
 
 

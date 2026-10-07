@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { useConfigurationEditability } from '../utils/configurationEditability'
 import { showStepError, stepDisplayStatus } from '../utils/stepFeedback'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 import { dependencyActionLabel, runPlannedSteps } from '../utils/runPlan'
@@ -17,6 +18,9 @@ import {
 import MediaInfo from '../components/MediaInfo.vue'
 import FilePathLink from '../components/FilePathLink.vue'
 import ProgressActivity from '../components/ProgressActivity.vue'
+import PublicationProgress from '../components/PublicationProgress.vue'
+import FreshnessDetails from '../components/FreshnessDetails.vue'
+import { freshnessStatus, needsFreshnessDetails } from '../utils/freshness'
 import { stoppingLabel } from '../utils/progressActivity'
 import WorkflowPanel from '../components/WorkflowPanel.vue'
 import ChainStatus from '../components/ChainStatus.vue'
@@ -32,6 +36,8 @@ const message = useMessage()
 const dialog = useDialog()
 const nav = useNavStore()
 const uid = route.params.uid as string
+const editability = useConfigurationEditability(() => `project:${uid}`)
+const selectionLocked = computed(() => nav.busy || nav.autoStepsSaving || editability.locked.value)
 // 后端与前端共用完整管线定义，工作台位于配音计划与批量配音之间。
 const orderedSteps = computed(() => STEP_ORDER.map(k => nav.stepMap[k]).filter(Boolean))
 const displayedSteps = computed(() => NAV_STEP_ORDER.map(k => nav.stepMap[k]).filter(Boolean))
@@ -47,21 +53,30 @@ const formatProgress = (value: unknown) => {
 
 const isAuto = (key: string) => (nav.autoSteps ? nav.autoSteps.includes(key) : true)
 async function toggleAuto(key: string, val: boolean) {
-  const prev = nav.autoSteps
+  if (selectionLocked.value) return
+  const prev = nav.autoSteps ? [...nav.autoSteps] : null
   const set = new Set(nav.autoSteps ?? [...STEP_ORDER])
   if (val) set.add(key)
   else set.delete(key)
-  nav.autoSteps = STEP_ORDER.filter(k => set.has(k))
+  const submitted = STEP_ORDER.filter(k => set.has(k))
+  const ticket = ++nav.autoStepsVersion
+  nav.autoStepsSaving = true
   try {
+    if (editability.observing.value && !await editability.canEdit()) {
+      message.info(editability.reason.value || '运行中不能修改步骤勾选'); return
+    }
+    if (nav.uid !== uid || nav.autoStepsVersion !== ticket || nav.busy) return
+    nav.autoSteps = submitted
     const r = await fetch(`/api/projects/${uid}/auto_steps`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steps: nav.autoSteps }),
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ steps: submitted }),
     })
-    if (!r.ok) throw new Error(String(r.status))
-  } catch {
-    // 保存失败: 回滚本地勾选并提示, 否则 2.5s 后被轮询静默弹回, 像闹鬼
-    nav.autoSteps = prev ?? null
-    message.error('勾选保存失败 (网络异常)')
+    if (!r.ok) { const value = await r.json(); throw new Error(value.message || '勾选保存失败') }
+    if (nav.uid === uid && nav.autoStepsVersion === ticket) nav.steps = nav.steps.map(step => ({ ...step, selected: submitted.includes(step.key) }))
+  } catch (error: any) {
+    if (nav.uid === uid && nav.autoStepsVersion === ticket) nav.autoSteps = prev
+    message.error(error.message || '勾选保存失败，请重新读取确认当前勾选')
+  } finally {
+    if (nav.uid === uid && nav.autoStepsVersion === ticket) { nav.autoStepsVersion++; nav.autoStepsSaving = false }
   }
 }
 
@@ -171,7 +186,8 @@ function blockersOf(key: string): any[] {
 
 // 状态文案合并“完成”与“是否最新”，总览不再并排显示两个标签。
 function statusText(step: any): string {
-  if (step?.status === 'done') return step.freshness_label || (step.fresh ? '已是最新' : '需更新')
+  const freshness=freshnessStatus(step)
+  if(freshness)return freshness
   return STATUS_TEXT[stepDisplayStatus(step)] || step?.status || '待运行'
 }
 function statusTagType(step: any): 'default' | 'success' | 'error' | 'warning' | 'info' {
@@ -184,7 +200,7 @@ function runTitle(step: any): string {
   return '运行'
 }
 function editorTaskText(step: any): string {
-  return step?.status === 'done' && !step.fresh ? '需更新' : statusText(step)
+  return statusText(step)
 }
 function editorTaskType(step: any): 'default' | 'success' | 'error' | 'warning' | 'info' {
   return statusTagType(step)
@@ -225,7 +241,7 @@ async function run(step: any, force = false) {
 }
 
 async function runSelection(includeDependencies = false, onlyKey?: string) {
-  if (nav.busy || dirMissing.value) return
+  if (nav.busy || nav.autoStepsSaving || dirMissing.value) return
   const steps = onlyKey ? [onlyKey] : STEP_ORDER.filter(k => k !== 'dubtask' && isAuto(k))
   if (!steps.length) { message.info('请先勾选步骤'); return }
   await runPlannedSteps(uid, [...steps], includeDependencies, message, dialog,
@@ -377,10 +393,11 @@ const headerStatus = computed(() => {
     <n-card size="small" style="margin-top: 14px"
             title="步骤进度与手动制作">
       <template #header-extra>
-        <n-button secondary :disabled="nav.busy || dirMissing || !nav.requiredStepCount" @click="runSelection(!!selectedBlockers.length)">仅运行勾选制作步骤（{{ nav.requiredStepCount }}）…</n-button>
+        <n-button secondary :disabled="nav.busy || nav.autoStepsSaving || dirMissing || !nav.requiredStepCount" @click="runSelection(!!selectedBlockers.length)">仅运行勾选制作步骤（{{ nav.requiredStepCount }}）…</n-button>
       </template>
       <n-text depth="3" style="display:block; margin-bottom:12px; font-size:12px; line-height:1.8">
-        勾选立即保存但不启动；手动制作不上传、不投稿。完整流程使用上方「自动运行」，不受此处勾选影响。
+        运行中不能修改勾选；空闲时勾选立即保存但不启动；手动制作不上传、不投稿。完整流程使用上方「自动运行」，不受此处勾选影响。
+        <span v-if="editability.locked.value" role="status">{{ editability.reason.value }}</span>
       </n-text>
       <div class="project-progress-summary"><span>手动勾选</span><n-progress type="line" :percentage="nav.requiredStepCount ? Math.round(nav.requiredDoneCount / nav.requiredStepCount * 100) : 0" :show-indicator="false"/><strong>{{ nav.requiredDoneCount }} / {{ nav.requiredStepCount }}</strong><span>项制作任务已就绪</span></div>
       <ProgressActivity :activity="nav.currentActivity" />
@@ -392,11 +409,13 @@ const headerStatus = computed(() => {
             <span class="editor-tasks">
               <span v-for="task in ['subtitles', 'tts']" :key="task" class="editor-task">
                 <n-checkbox size="small" :checked="isAuto(task)"
-                            :disabled="WORKFLOW_BUSY.includes(nav.workflow?.run?.status)"
+                            :disabled="selectionLocked"
                             @update:checked="(v: boolean) => toggleAuto(task, v)">
                   {{ task === 'tts' ? '合成配音' : '导出字幕' }}
                 </n-checkbox>
-                <n-tag v-if="nav.stepMap[task]" size="small"
+                <FreshnessDetails v-if="needsFreshnessDetails(nav.stepMap[task])" :uid="uid" :step-key="task" :label="nav.stepMap[task].label"
+                                  :status-text="editorTaskText(nav.stepMap[task])" :summary="nav.stepMap[task].freshness_reason" />
+                <n-tag v-else-if="nav.stepMap[task]" size="small"
                        :type="editorTaskType(nav.stepMap[task])">
                   {{ editorTaskText(nav.stepMap[task]) }}
                 </n-tag>
@@ -408,11 +427,13 @@ const headerStatus = computed(() => {
           </template>
           <template v-else>
             <n-checkbox size="small" class="select-box" :checked="isAuto(s.key)"
-                        :disabled="WORKFLOW_BUSY.includes(nav.workflow?.run?.status)"
+                        :disabled="selectionLocked"
                         :aria-label="`选择${s.label}`"
                         @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
             <router-link class="lbl steplink" title="进入该步骤页" :to="`/projects/${uid}/steps/${s.key}`">{{ s.label }}</router-link>
-            <n-tag size="small" class="status-tag"
+            <FreshnessDetails v-if="needsFreshnessDetails(s)" :uid="uid" :step-key="s.key" :label="s.label"
+                              :status-text="statusText(s)" :summary="s.freshness_reason" />
+            <n-tag v-else size="small" class="status-tag"
                    :type="statusTagType(s)" :title="statusText(s)">
               {{ statusText(s) }}
             </n-tag>
@@ -462,6 +483,7 @@ const headerStatus = computed(() => {
           <n-tag size="small" :type="nav.publicationDisplay.tone" :title="nav.publicationDisplay.note">{{ nav.publicationDisplay.text }}</n-tag>
           <span class="publish-note">{{ nav.publicationDisplay.note }}</span>
           <span class="ops"><n-button size="small" secondary @click="router.push(`/projects/${uid}/publish`)">{{ nav.publication?.id ? '查看稿件 →' : '发布设置 →' }}</n-button></span>
+          <PublicationProgress class="row-activity" :publication="nav.publication" compact />
         </div>
       </div>
       <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 8px">

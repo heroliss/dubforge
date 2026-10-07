@@ -12,13 +12,16 @@ from dubforge.pipeline.dependencies import Dependencies
 from dubforge.pipeline.dubbing_edit import record_take
 from dubforge.pipeline.registry import PIPELINE_KEYS, STEP_KEYS, STEP_MAP
 from dubforge.pipeline.step_tts import line_fingerprint
-from dubforge.pipeline.text_prompts import ASR_CORRECTION_VERSION, TRANSLATION_PROMPT_VERSION
+from dubforge.pipeline.text_prompts import (
+    ASR_CORRECTION_VERSION, TRANSLATION_PROMPT_VERSION, SEMANTIC_SEGMENTATION_VERSION,
+    TRANSLATION_WINDOW_VERSION,
+)
 from dubforge.runner import compute_fingerprint, runner
 from dubforge.utils.fs import atomic_write_bytes
 
 
 def historical_fingerprint(project, key):
-    """独立复原旧算法，不能调用待测兼容分支生成期望值。"""
+    """独立复原旧输入布局；同质量规则才兼容，不把旧整理策略模拟为有效。"""
     deps = Dependencies(project)
     cfg = {name: deps.cfg(name) for name in STEP_MAP[key].cfg_keys}
     if key == 'transcribe':
@@ -30,8 +33,14 @@ def historical_fingerprint(project, key):
         if art.step_key in STEP_KEYS[:STEP_KEYS.index(key)])}
     if key in {'split', 'translate'}:
         payload['correction_prompt'] = ASR_CORRECTION_VERSION
+    if key == 'split':
+        # 本夹具测试输入布局兼容；缺少新质量规则的真实旧产物应保持过期，
+        # 已由 test_semantic_segmentation_version 独立覆盖，不能放宽生产门禁。
+        payload['semantic_segmentation'] = SEMANTIC_SEGMENTATION_VERSION
     if key == 'translate':
         payload['translation_prompt'] = TRANSLATION_PROMPT_VERSION
+        # 与整理一样，仅模拟旧存储布局，实际翻译策略必须相同。
+        payload['translation_windows'] = TRANSLATION_WINDOW_VERSION
     return hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 

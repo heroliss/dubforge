@@ -5,7 +5,7 @@ from fastapi import APIRouter, Depends, Request, Response, UploadFile
 from fastapi.responses import FileResponse
 
 from dubforge.errors import DubForgeError
-from dubforge.publishing import service, studio
+from dubforge.publishing import service, studio, review_draft
 
 
 def same_origin(request: Request, response: Response):
@@ -45,6 +45,16 @@ def create(uid: str):
     return service.create(uid)
 
 
+@router.get('/projects/{uid}/copy-preview')
+def copy_preview(uid: str):
+    return service.copy_preview(uid)
+
+
+@router.post('/projects/{uid}/suggest')
+def suggest_project(uid: str, body: dict):
+    return service.suggest_project(uid, body)
+
+
 @router.get('/publications/{key}')
 def view(key: str):
     return service.view(key)
@@ -61,8 +71,18 @@ def suggest(key: str, body: dict):
 
 
 @router.post('/publications/{key}/copy')
-def copy(key: str):
-    return service.copy_draft(key)
+def copy(key: str, body: dict | None = None):
+    return service.copy_draft(key, body)
+
+
+@router.post('/publications/{key}/review-draft/plan')
+def review_draft_plan(key: str):
+    return review_draft.plan(key)
+
+
+@router.post('/publications/{key}/review-draft')
+def create_review_draft(key: str, body: dict):
+    return review_draft.create(key, body)
 
 
 @router.post('/publications/{key}/plan')

@@ -166,7 +166,7 @@ def test_conflict_and_active_synthesis_block_edit(prepared):
         assert edit(client, uid, {'text': '改过了'}).status_code == 200
         assert edit(client, uid, {'text': '旧页面'}, revision=revision).json()['code'] == 'SUBTITLE_EDIT_CONFLICT'
         with dubbing_session.use(project, 2):
-            assert edit(client, uid, {'text': '不能覆盖'}).json()['code'] == 'PIPELINE_BUSY'
+            assert edit(client, uid, {'text': '不能覆盖'}).json()['code'] == 'CONFIGURATION_BUSY'
         assert state(client, uid)['lines'][0]['text'] == '改过了'
 
 
@@ -215,4 +215,6 @@ def test_source_edit_does_not_invalidate_voice_or_translation_and_expires_legacy
         assert edit(client, uid, {'source_text': 'Corrected source'}).status_code == 200
         assert not state(client, uid)['subtitles']['fresh']
         after = crud.get_project(uid)
-        assert all(compute_fingerprint(after, k) == fp for k, fp in before.items())
+        assert all(compute_fingerprint(after, k) == before[k] for k in ('tts', 'translate'))
+        # 原文编辑改变发布审查输入，因此成片必须重新核对；不重新生成声音和翻译。
+        assert compute_fingerprint(after, 'assemble') != before['assemble']

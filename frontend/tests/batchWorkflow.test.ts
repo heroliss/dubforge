@@ -11,7 +11,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 
 let server:ViteDevServer, Panel:any
 before(async()=>{
-  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null}})
+  server=await createServer({root:fileURLToPath(new URL('..',import.meta.url)),configFile:false,plugins:[vue()],appType:'custom',server:{middlewareMode:true,hmr:false,watch:null,ws:false}})
   Panel=(await server.ssrLoadModule('/src/components/BatchWorkflow.vue')).default
   mock.method(globalThis,'fetch',()=>{throw new Error('不允许未声明网络请求')})
 })
@@ -66,7 +66,32 @@ test('点击后才确认冻结清单，跳过受阻项目，双击不会重复�
   assert.equal(writes[0].items[0].recipe.part_titles.a,'原声版')
   assert.equal(writes[0].items[0].fingerprint,'fingerprint-one')
   resolve();await starting
-  assert.equal(page.ready.length,0);assert.equal(page.results[0].run_id,'run-one')
+  assert.equal(page.ready.length,1);assert.equal(page.results[0].run_id,'run-one')
+})
+test('部分项目启动失败保留失败项，重试不再提交成功项且保留请求标识',async t=>{
+  const {page}=await render(p=>p.items=[item('one','produce'),item('two','produce')])
+  const writes:any[]=[];let first=true
+  t.mock.method(globalThis,'fetch',async(_url,options)=>{
+    writes.push(JSON.parse(String(options?.body)))
+    const items=first?[{uid:'one',run_id:'run-one'},{uid:'two',error:'临时失败'}]:[{uid:'two',run_id:'run-two'}]
+    first=false;return {ok:true,json:async()=>({items})}
+  })
+  await page.start();assert.deepEqual(page.ready.map((r:any)=>r.uid),['two'])
+  await page.start()
+  assert.deepEqual(writes[1].items.map((r:any)=>r.uid),['two'])
+  assert.equal(writes[1].request_id,writes[0].request_id)
+  assert.equal(page.ready.length,0);assert.equal(page.results.filter((r:any)=>r.run_id).length,2)
+})
+test('网络失败重试仍使用最初冻结的运行参数',async t=>{
+  const {page}=await render(p=>p.items=[item('one','produce')])
+  const writes:any[]=[];let first=true
+  t.mock.method(globalThis,'fetch',async(_url,options)=>{
+    writes.push(JSON.parse(String(options?.body)))
+    if(first){first=false;throw new Error('断线')}
+    return {ok:true,json:async()=>({items:[{uid:'one',run_id:'run-one'}]})}
+  })
+  await page.start();page.items[0].plan.recipe.part_titles.a='请求后改变'
+  await page.start();assert.deepEqual(writes[1],writes[0])
 })
 test('预检失败清空旧结果，不允许用过期清单启动',async t=>{
   const {page}=await render(p=>p.items=[item('one','publish')])

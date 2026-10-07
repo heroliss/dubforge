@@ -118,3 +118,48 @@ def test_auto_mode_run_plan_does_not_block_on_unconfirmed_comments(isolated_env,
         r = client.post(f'/api/projects/{uid2}/run_plan',
                         json={'steps': ['assemble'], 'include_dependencies': False})
         assert r.status_code == 400 and '评论精选' in (r.json()['message'] or '')
+
+
+def test_auto_replenishes_after_original_and_hidden_translation_are_blocked(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id='c1', text='The Tiananmen Square massacre', author='One'),
+        dict(id='c2', text='A lovely trip', author='Two'),
+        dict(id='c3', text='God bless your family', author='Three'),
+        dict(id='c4', text='Wonderful trip to Tiananmen Square', author='Four')]))
+    def trusting_ai(prompt, **kwargs):
+        rows = request_payload(prompt)['comments']
+        if '【评分要求】' in prompt:
+            return validated_result({'assessments': [dict(id=r['id'], eligible=True, score=100-i,
+                reason='模型全部允许') for i, r in enumerate(rows)]}, kwargs)
+        return validated_result({'translations': [dict(id=r['id'], text_zh=
+            '天安门广场的悲剧' if r['text'] == 'A lovely trip' else '祝家庭幸福，旅程美好') for r in rows]}, kwargs)
+    monkeypatch.setattr(comment_studio, 'chat_validated', trusting_ai)
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    # 原文版也不能借隐藏中文来绕过审查；地名及宗教祝福仍正常递补。
+    spec['comment_settings']['language_mode'] = 'original'
+    warnings, count = comments_auto.prepare_overlay(uid, spec)
+    state = comment_studio.view(uid)
+    assert count == 2 and [r['id'] for r in state['overlay']['items']] == ['c3', 'c4']
+    assert state['rows'][0]['review_blocked'] and state['rows'][1]['review_blocked']
+    assert not state['rows'][2]['review_blocked'] and not state['rows'][3]['review_blocked']
+    assert any('内容检查' in warning and '递补' in warning for warning in warnings)
+
+
+def test_auto_all_locally_blocked_is_explicit_even_when_llm_accepts(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id='c1', text='The Tiananmen Square massacre', author='One')]))
+    def trusting_ai(prompt, **kwargs):
+        rows = request_payload(prompt)['comments']
+        if '【评分要求】' in prompt:
+            return validated_result({'assessments': [dict(id=r['id'], eligible=True, score=100,
+                reason='模型未识别风险') for r in rows]}, kwargs)
+        return validated_result({'translations': [dict(id=r['id'], text_zh='安全文字') for r in rows]}, kwargs)
+    monkeypatch.setattr(comment_studio, 'chat_validated', trusting_ai)
+    from dubforge import comments_auto
+    with pytest.raises(DubForgeError) as exc:
+        comments_auto.prepare_overlay(uid, comments_auto.spec_from_config(uid))
+    assert exc.value.code == 'COMMENTS_AUTO_EMPTY' and '内容检查' in exc.value.message
+    assert not (comment_studio.view(uid)['overlay'] or {}).get('items')

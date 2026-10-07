@@ -276,25 +276,31 @@ def test_parent_cannot_remove_versions_referenced_by_project(make_project):
     assert cfg.resolve(key=template['key'])==before
 
 
-def test_edit_and_binding_allowed_while_dependent_project_runs(make_project):
-    """运行中的项目不再拦截设置编辑与模板绑定 (ADR-0075): 正在执行的步骤
-    使用启动时冻结的快照, 全流程在下一步边界按剩余键对比并暂停等待确认。"""
+def test_edit_and_binding_blocked_while_dependent_project_runs(make_project):
+    """配置快照仍冻结，但外部编辑须等待运行结束；范围修改也不得绕过。"""
     uid=make_project();template=cfg.create_template('系列');bind([uid],template)
     step=crud.get_step(crud.get_project(uid).id,'download');step.status='running';crud.save_step(step)
     for key in ['global',template['key'],'project:'+uid]:
-        save(key,{'assemble.crf':19})          # 不再抛 CONFIGURATION_BUSY / WORKFLOW_BUSY
+        before = cfg.resolve(key=key)
+        with pytest.raises(DubForgeError) as caught:
+            save(key,{'assemble.crf':19})
+        assert caught.value.code == 'CONFIGURATION_BUSY'
+        assert cfg.resolve(key=key) == before
     plan=cfg.binding_plan([uid],'')
-    cfg.bind(dict(uids=[uid],template_id='',confirmed=True,fingerprint=plan['fingerprint']))
-    assert cfg.resolve(uid)['parent']==''
-    assert cfg.resolve(uid)['values']['assemble.crf']==19
+    with pytest.raises(DubForgeError) as caught:
+        cfg.bind(dict(uids=[uid],template_id='',confirmed=True,fingerprint=plan['fingerprint']))
+    assert caught.value.code == 'CONFIGURATION_BUSY'
+    assert cfg.resolve(uid)['parent']==template['key']
 
 
-def test_batch_binding_applies_to_projects_with_queued_steps(make_project):
+def test_batch_binding_rejects_queued_project_without_partially_binding(make_project):
     first,second=make_project(),make_project();template=cfg.create_template('系列')
     plan=cfg.binding_plan([first,second],template['key'][7:])
     step=crud.get_step(crud.get_project(second).id,'download');step.status='queued';crud.save_step(step)
-    cfg.bind(dict(uids=[first,second],template_id=template['key'][7:],confirmed=True,fingerprint=plan['fingerprint']))
-    assert cfg.resolve(first)['parent']==cfg.resolve(second)['parent']==template['key']
+    with pytest.raises(DubForgeError) as caught:
+        cfg.bind(dict(uids=[first,second],template_id=template['key'][7:],confirmed=True,fingerprint=plan['fingerprint']))
+    assert caught.value.code == 'CONFIGURATION_BUSY'
+    assert cfg.resolve(first)['parent']==cfg.resolve(second)['parent']==''
 
 
 def test_batch_plan_has_individual_blockers_and_start_has_stable_ids(make_project,monkeypatch):
@@ -316,6 +322,42 @@ def test_batch_plan_has_individual_blockers_and_start_has_stable_ids(make_projec
     assert captured[0][1]['confirmed'] is True
     with pytest.raises(DubForgeError):cfg.batch_start({**body,'confirmed':False})
     assert len(captured)==2
+
+
+@pytest.mark.parametrize('updates', [
+    {'tts.backend':{}}, {'publish.visibility':{}}, {'translate.target_language':[]},
+    {'separate.overlap':8}, {'separate.shifts':1.5}, {'split.max_split_length':0},
+    {'runner.step_timeout_seconds.download':-1}, {'publish.version_ids':[]},
+    {'publish.part_titles':{'missing':'无效分P'}}, {'publish.part_titles':{'dub':'😀'*41}},
+    {'comments.prompt':'\ud800'}, {'split.max_split_length':10**400},
+    {'tts.indextts25.emo_vector':[10**400,0,0,0,0,0,0,0]},
+])
+def test_invalid_values_report_business_errors_without_saving(make_project,updates):
+    uid = make_project();before = cfg.resolve(uid)
+    response = TestClient(app).put('/api/configuration/project:'+uid,
+        content=json.dumps({'revision':before['revision'], 'updates':updates}),headers={'Content-Type':'application/json'})
+    assert response.status_code == 400, response.text
+    assert response.json()['code'] and response.json()['message']
+    assert cfg.resolve(uid) == before
+
+
+def test_batch_start_unexpected_failure_is_per_project_and_retry_id_is_stable(monkeypatch):
+    from dubforge import workflows
+    calls = []
+    def start(uid, body):
+        calls.append((uid,body['request_id']))
+        if uid == 'broken':
+            raise RuntimeError('模拟临时错误')
+        return {'id':'run-'+uid}
+    monkeypatch.setattr(workflows, 'start', start)
+    body = {'confirmed':True, 'request_id':'12345678-1234-1234-1234-123456789abc',
+            'items':[{'uid':'broken'}, {'uid':'good'}]}
+    result = cfg.batch_start(body)
+    assert result['items'][0]['code'] == 'BATCH_START_FAILED' and result['items'][1]['run_id'] == 'run-good'
+    cfg.batch_start({**body, 'items':[{'uid':'broken'}]})
+    assert calls[0] == calls[-1]
+    with pytest.raises(DubForgeError):
+        cfg.batch_start({**body, 'request_id':{}})
 
 
 def test_manifest_restores_template_and_project_values_without_old_tables(make_project):

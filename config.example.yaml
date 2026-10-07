@@ -13,7 +13,7 @@ llm:
     api_key: "YOUR_API_KEY_2"
     model: "deepseek-chat"
     enabled: true
-  timeout: 300          # 读超时秒数 (思考型模型建议 >=300)
+  timeout: 300          # 秒：整理/翻译单次请求总时限；其他 LLM 请求的读超时
   # temperature / thinking 属于请求参数, 不做全局配置:
   # 在各组 profiles 的 params 里按模型填写, 留空 = 不发送 (用服务商默认)
   # 例: params: {"temperature": 1, "top_p": 0.95, "reasoning_effort": "max"}
@@ -49,18 +49,26 @@ asr:
   max_segment_seconds: 2.0
 
 split:
-  # 语义边界由 LLM 根据上下文自主判断；程序只保护长停顿的时间对齐
+  # 全文一次整理，语义边界由 LLM 判断；程序检查信息、碎片与真实长停顿
   use_llm: true
   # 留空=按设置页启用顺序自动降级；也可填写某个配置组名称固定模型
   llm_profile: ""
-  # 单次语义整理请求的总上下文预算；只按 token 分窗，系统会预留提示词和输出空间
+  # 单次请求总上下文硬限；为全文提示词和完整输出预留空间，不自动分段
   llm_context_tokens: 200000
-  # 长稿分窗时，每个窗口前后各带几句作为理解参考；只参考，不输出
-  context_lines: 2
-  # 给 LLM 的阅读节奏参考；本地只拆回明显过长的结果
+  # low=火山方舟 Plan 模型请求低思考强度；follow_profile=保留模型参数
+  thinking_mode: low
+  # LLM 单句约 10 个词；中文按自然语义词理解，完整意思优先，不机械卡词数
+  target_word_count: 10
+  # 仅关闭 LLM 时用于本地字符断句；已有字符设置保留原意
   max_split_length: 22
-  # 给 LLM 的配音/字幕节奏参考；本地只拆回明显超长的结果
-  max_segment_seconds: 8.0
+  # LLM 单句约 7 秒的软参考；关闭 LLM 时用于本地时长兜底
+  max_segment_seconds: 7.0
+
+content_review:
+  enabled: true               # 中英文原稿、译文和评论的本地规则筛查
+  mute_audio: true            # 命中时段同时静音原声/配音最终混音，避免只隐藏字幕
+  blocked_terms: ''           # 补充屏蔽词，每行一个
+  blocked_ranges: ''          # 人工核定时段，每行 开始秒-结束秒:原因（源视频时间轴）
 
 subtitles:
   mode: all                     # all/source/target/bilingual
@@ -71,7 +79,9 @@ translate:
   style_prompt: ""
   # 留空=按设置页启用顺序自动降级；也可填写某个配置组名称固定模型
   llm_profile: ""
-  # 单次翻译窗口的总上下文预算；包含提示词、交接摘要和预留输出，默认 200k，最高可调到 1M
+  # low=支持的火山方舟 Plan 模型请求低思考档位；follow_profile=保留全局模型参数
+  thinking_mode: low
+  # 尽量全文一次翻译，超过预算才分窗；包含提示词、交接摘要和预留输出，默认 200k
   max_context_tokens: 200000
   custom_terms_path: ""
 

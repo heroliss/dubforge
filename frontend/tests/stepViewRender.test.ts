@@ -28,7 +28,7 @@ before(async () => {
   server = await createServer({
     root: fileURLToPath(new URL('..', import.meta.url)),
     configFile: false, plugins: [vue()], appType: 'custom',
-    server: { middlewareMode: true, hmr: false, watch: null },
+    server: { middlewareMode: true, hmr: false, watch: null, ws: false },
   })
   ;({ default: StepView } = await server.ssrLoadModule('/src/views/StepView.vue'))
   ;({ useNavStore, STEP_LABELS } = await server.ssrLoadModule('/src/stores/nav.ts'))
@@ -56,9 +56,415 @@ after(async () => {
 
 const states = [
   { name: '已完成且最新', status: 'done', fresh: true, label: '已是最新' },
-  { name: '已完成但过期', status: 'done', fresh: false, label: '需重跑' },
+  { name: '已完成但过期', status: 'done', fresh: false, label: '需更新' },
   { name: '尚未运行', status: 'pending', fresh: false, label: '待运行' },
 ]
+
+test('LLM 取消事件显示本地连接已关闭和服务端未确认，不继续显示模型思考中', async () => {
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+  await router.push('/projects/cancel-preview/steps/split')
+  nav.$patch({ uid: 'cancel-preview', title: '取消预览', stepsLoaded: true, steps: [{
+    key: 'split', label: '语义整理', status: 'running', cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+  }] })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+  app.use(pinia); app.use(router); setup(app)
+  app.mixin({ created() {
+    if (this.$options.__name === 'StepView') this.$.setupState.llmEvents = [
+      { event: 'request', request_id: 'r1', role: 'user', content: '字幕素材' },
+      { event: 'reasoning_delta', request_id: 'r1', content: '思考片段' },
+      { event: 'status', request_id: 'r1', content: '模型正在思考' },
+      { event: 'request_cancelled', request_id: 'r1', server_confirmed: false, content: 'LLM 本地请求已取消，连接已关闭；未收到服务端停止计算确认。' },
+    ]
+  } })
+  try {
+    const html = await renderToString(app)
+    assert.match(html, /本地已取消 · 服务端未确认/)
+    assert.match(html, /连接已关闭；未收到服务端停止计算确认/)
+    assert.doesNotMatch(html, /模型正在思考/)
+  } finally { nav.reset(); disposePinia(pinia) }
+})
+
+test('LLM 本地中止显示候选未采用与错误码，正常 stop 元数据不表示失败', async () => {
+  for (const aborted of [true, false]) {
+    const pinia = createPinia(), nav = useNavStore(pinia)
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+    await router.push('/projects/abort-preview/steps/split')
+    nav.$patch({ uid: 'abort-preview', title: '中止预览', stepsLoaded: true, steps: [{
+      key: 'split', label: '语义整理', status: aborted ? 'failed' : 'done', cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+    }] })
+    const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+    app.use(pinia); app.use(router); setup(app)
+    let page: any
+    app.mixin({ created() {
+      if (this.$options.__name !== 'StepView') return
+      page = this.$.setupState
+      page.llmEvents = [
+        { event: 'request', request_id: 'r1', role: 'user', content: '字幕素材' },
+        { event: 'reasoning_delta', request_id: 'r1', content: '已收到的思考' },
+        { event: 'assistant_delta', request_id: 'r1', content: '已收到的候选片段' },
+        { event: 'response_metadata', request_id: 'r1', finish_reason: 'stop', content: '响应结束：stop' },
+        ...(aborted ? [
+          { event: 'request_aborted', request_id: 'r1', code: 'LLM_OUTPUT_CONTRACT', server_confirmed: false,
+            content: 'LLM 正文偏离输出格式：序号重复', detail: { channel: 'content', received_chars: { content: 9, reasoning: 7 } } },
+          { event: 'validation_error', code: 'LLM_OUTPUT_CONTRACT', content: '序号重复', retry_attempt: 2, retry_total: 2 },
+        ] : [{ event: 'assistant_response', request_id: 'r1', content: '1. 0.00-1.00: 正常完成' }]),
+      ]
+    } })
+    try {
+      const html = await renderToString(app)
+      const output = page.llmMessages.find((row: any) => row.role === 'assistant')
+      const thinking = page.llmMessages.find((row: any) => row.role === 'reasoning')
+      if (aborted) {
+        assert.match(html, /本地已中止响应/)
+        assert.match(html, /本次候选未采用/)
+        assert.match(html, /LLM_OUTPUT_CONTRACT/)
+        assert.match(html, /正文偏离输出格式：序号重复/)
+        assert.match(html, /服务端停止计算或计费尚未确认/)
+        assert.equal(page.llmStatus, '本次候选未采用', '后续校验事件不能把中止显示为正常完成')
+        assert.equal(page.llmRowState(output), '本次候选未采用')
+        assert.equal(page.llmRowState(thinking), '本次候选未采用')
+        assert.equal(page.llmRowStreaming(output), false)
+      } else {
+        assert.doesNotMatch(html, /本地已中止响应|本次候选未采用/)
+        assert.equal(page.llmRowState(output), '已完成')
+        assert.equal(page.llmRowState(thinking), '思考完成')
+      }
+    } finally { nav.reset(); disposePinia(pinia) }
+  }
+})
+
+// 复用本文件的实际步骤组件；只驱动内存里的请求、动画和可见状态，不连服务。
+async function llmDisplayHarness(t: any, status = 'running') {
+  const reads: any[] = [], frames = new Map<number, FrameRequestCallback>()
+  const timers = new Map<number, { callback: () => void; delay: number }>()
+  let sequence = 0, animationRequests = 0, page: any
+  const documentDescriptor = Object.getOwnPropertyDescriptor(globalThis, 'document')
+  const removedListeners: any[] = []
+  const visibility = { hidden: false, visibilityState: 'visible',
+    addEventListener: () => {}, removeEventListener: (...args: any[]) => removedListeners.push(args) }
+  Object.defineProperty(globalThis, 'document', { configurable: true, value: visibility })
+  t.mock.method(window, 'requestAnimationFrame', (callback: FrameRequestCallback) => {
+    animationRequests++; frames.set(++sequence, callback); return sequence
+  })
+  t.mock.method(window, 'cancelAnimationFrame', (id: number) => { frames.delete(id) })
+  t.mock.method(window, 'setTimeout', (callback: () => void, delay = 0) => {
+    timers.set(++sequence, { callback, delay }); return sequence
+  })
+  t.mock.method(window, 'clearTimeout', (id: number) => { timers.delete(id) })
+  t.mock.method(globalThis, 'fetch', (url: any, options: any) => {
+    if (!String(url).includes('/llm_trace?')) return new Promise(() => {})
+    return new Promise(resolve => reads.push({ url: String(url), options, resolve }))
+  })
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: '/projects/:uid/steps/:key', component: StepView },
+  ] })
+  await router.push('/projects/llm-display-fixture/steps/translate')
+  nav.$patch({ uid: 'llm-display-fixture', title: '输出显示回归', stepsLoaded: true, steps: [{
+    key: 'translate', label: '翻译', status, cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+  }] })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, {
+    default: () => h(NDialogProvider, null, { default: () => h(RouterView) }),
+  }) })
+  app.use(pinia); app.use(router); setup(app)
+  app.mixin({ created() { if (this.$options.__name === 'StepView') page = this.$.setupState } })
+  await renderToString(app)
+  page.detailSection = 'llm'
+  // SSR不执行普通watch或挂载钩子，明确调用真实轮询入口模拟打开对话面板。
+  page.syncLlmPolling()
+  const settle = async () => { for (let i = 0; i < 12; i++) await Promise.resolve(); await nextTick() }
+  const reply = async (index: number, value: any) => {
+    assert.ok(reads[index], `应存在第${index + 1}次只读会话请求`)
+    reads[index].resolve({ ok: true, json: async () => ({ exists: true, trace_id: 'fixture-trace', ...value }) })
+    await settle()
+    page.syncLlmAnimations()
+  }
+  const row = (role = 'assistant') => page.llmMessages.find((item: any) => item.role === role)
+  const shown = (role = 'assistant') => page.displayLlmContent(row(role))
+  const close = () => {
+    page.disposeLlmTrace(); nav.reset(); disposePinia(pinia)
+    if (documentDescriptor) Object.defineProperty(globalThis, 'document', documentDescriptor)
+    else Reflect.deleteProperty(globalThis, 'document')
+  }
+  t.after(close)
+  return { page, nav, reads, frames, timers, visibility, removedListeners, reply, row, shown, settle,
+    animationRequests: () => animationRequests }
+}
+
+test('首次加载已完成的一万五千字输出直接显示，缺少时间戳也判为完成', async t => {
+  const h = await llmDisplayHarness(t, 'done'), output = '完整输出。'.repeat(3000)
+  const before = h.animationRequests()
+  await h.reply(0, { cursor: 100, active: false, more: false, events: [
+    { event: 'reasoning_delta', request_id: 'r1', content: '已结束的思考' },
+    { event: 'assistant_response', request_id: 'r1', content: output },
+  ] })
+  assert.equal(h.shown(), output)
+  assert.equal(h.shown('reasoning'), '已结束的思考')
+  assert.equal(h.page.llmRowState(h.row()), '已完成')
+  assert.equal(h.page.llmRowState(h.row('reasoning')), '思考完成')
+  assert.equal(h.animationRequests(), before, '恢复历史不能重播已完成内容')
+})
+
+test('运行中先读到空会话，再收到完整完成响应，不从零播放输出', async t => {
+  const h = await llmDisplayHarness(t), output = '一次返回的完整译文。'.repeat(2000)
+  await h.reply(0, { cursor: 0, active: true, more: false, events: [] })
+  assert.equal(h.page.llmRestoringHistory, false)
+  const pending = h.page.loadLlmTrace(), before = h.animationRequests()
+  await h.reply(1, { cursor: 100, active: true, more: false, events: [
+    { event: 'assistant_response', request_id: 'r1', content: output },
+  ] })
+  await pending
+  assert.equal(h.page.running, true, '逐请求完成时整步还可能在校验或准备后续请求')
+  assert.equal(h.shown(), output)
+  assert.equal(h.animationRequests(), before)
+})
+
+test('后台累计内容及切回后的历史立即同步，仅随后新增的实时字符使用动画', async t => {
+  const h = await llmDisplayHarness(t), first = '已读前缀'.repeat(30), next = '实时追加'.repeat(30)
+  await h.reply(0, { cursor: 10, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: first },
+  ] })
+  let pending = h.page.loadLlmTrace()
+  await h.reply(1, { cursor: 20, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: next },
+  ] })
+  await pending
+  assert.ok(h.frames.size > 0, '可见的实时追加仍有平滑显示')
+  assert.ok(h.shown().length < first.length + next.length)
+  h.visibility.hidden = true; h.visibility.visibilityState = 'hidden'
+  h.page.onTraceVisibilityChanged()
+  assert.equal(h.shown(), first + next)
+  assert.equal(h.frames.size, 0)
+  const hiddenText = '后台收到'.repeat(1000)
+  await h.page.loadLlmTrace()
+  assert.equal(h.reads.length, 2, '隐藏期间不轮询，累计内容在回来后补齐')
+  const before = h.animationRequests()
+  h.visibility.hidden = false; h.visibility.visibilityState = 'visible'
+  h.page.onTraceVisibilityChanged()
+  const caughtUp = '恢复读取'.repeat(40)
+  await h.reply(2, { cursor: 40, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: hiddenText },
+    { event: 'assistant_delta', request_id: 'r1', content: caughtUp },
+  ] })
+  assert.equal(h.shown(), first + next + hiddenText + caughtUp)
+  assert.equal(h.animationRequests(), before, '重新可见时同步前缀，不能追播放后台内容')
+  pending = h.page.loadLlmTrace()
+  await h.reply(3, { cursor: 50, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: next },
+  ] })
+  await pending
+  assert.ok(h.animationRequests() > before)
+  assert.ok(h.shown().length < h.row().content.length)
+})
+
+test('历史分页少于500条但more为真仍继续读取，整个恢复过程不播放动画', async t => {
+  const h = await llmDisplayHarness(t, 'done'), output = '最终完整译文'.repeat(2000)
+  const before = h.animationRequests()
+  await h.reply(0, { cursor: 10, active: false, more: true, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: '已有前缀' },
+  ] })
+  assert.equal(h.page.llmRestoringHistory, true)
+  const catchup = [...h.timers.entries()].find(([, item]) => item.delay === 0)
+  assert.ok(catchup, '不能用events.length===500代替服务端more标志')
+  h.timers.delete(catchup[0]); catchup[1].callback()
+  await h.reply(1, { cursor: 20, active: false, more: false, events: [
+    { event: 'assistant_response', request_id: 'r1', content: output },
+  ] })
+  assert.match(h.reads[1].url, /after=10/)
+  assert.equal(h.page.llmRestoringHistory, false)
+  assert.equal(h.shown(), output)
+  assert.equal(h.animationRequests(), before)
+})
+
+test('历史游标不前进时不安排零延时无限读取，取消行显示明确终态', async t => {
+  const h = await llmDisplayHarness(t)
+  await h.reply(0, { cursor: 0, active: false, more: true, events: [
+    { event: 'reasoning_delta', request_id: 'r1', content: '已收到的思考' },
+    { event: 'assistant_delta', request_id: 'r1', content: '已收到的译文' },
+    { event: 'request_cancelled', request_id: 'r1', content: '本地连接已关闭' },
+  ] })
+  assert.ok([...h.timers.values()].every(item => item.delay !== 0))
+  assert.equal(h.reads.length, 1)
+  assert.match(h.page.llmRowState(h.row()), /取消/)
+  assert.match(h.page.llmRowState(h.row('reasoning')), /取消/)
+  assert.equal(h.shown(), '已收到的译文')
+  assert.equal(h.frames.size, 0)
+})
+
+test('响应中止立即同步已收候选并停止追字，新的独立请求仍可正常生成', async t => {
+  const h = await llmDisplayHarness(t), first = '已收到的候选开头', suffix = '候选继续输出。'.repeat(100)
+  await h.reply(0, { cursor: 10, active: true, more: false, events: [
+    { event: 'request', request_id: 'r1', role: 'user', content: '原始素材' },
+    { event: 'assistant_delta', request_id: 'r1', content: first },
+  ] })
+  let pending = h.page.loadLlmTrace()
+  await h.reply(1, { cursor: 20, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: suffix },
+  ] })
+  await pending
+  assert.ok(h.frames.size > 0)
+  assert.ok(h.shown().length < first.length + suffix.length)
+  const animations = h.animationRequests()
+  pending = h.page.loadLlmTrace()
+  await h.reply(2, { cursor: 30, active: true, more: false, events: [
+    { event: 'request_aborted', request_id: 'r1', code: 'LLM_OUTPUT_DEGENERATED', server_confirmed: false,
+      content: 'LLM 连续生成大量相同片段，已中止退化输出' },
+    { event: 'validation_error', content: '候选响应已中止', code: 'LLM_OUTPUT_DEGENERATED' },
+  ] })
+  await pending
+  assert.equal(h.shown(), first + suffix)
+  assert.equal(h.frames.size, 0, '已拒绝候选不能继续播放积压字符')
+  assert.equal(h.animationRequests(), animations)
+  assert.equal(h.page.llmRowState(h.row()), '本次候选未采用')
+  assert.equal(h.page.llmStatus, '本次候选未采用')
+  pending = h.page.loadLlmTrace()
+  await h.reply(3, { cursor: 40, active: true, more: false, events: [
+    { event: 'request', request_id: 'r2', role: 'user', content: '独立重试素材' },
+    { event: 'assistant_delta', request_id: 'r2', content: '新请求的合法输出。'.repeat(30) },
+  ] })
+  await pending
+  const freshOutput = h.page.llmMessages.find((row: any) => row.requestId === 'r2' && row.role === 'assistant')
+  assert.equal(h.page.llmRowState(h.row()), '本次候选未采用')
+  assert.equal(h.page.llmRowStreaming(freshOutput), true)
+  assert.match(h.page.llmStatus, /^生成中/)
+})
+
+for (const status of ['done', 'failed']) test(`步骤变为${status}后立即显示已收齐内容，关闭对话面板也不留追赶动画`, async t => {
+  const h = await llmDisplayHarness(t), content = '模型已收到的完整内容'.repeat(200)
+  await h.reply(0, { cursor: 10, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: content.slice(0, 20) },
+  ] })
+  const pending = h.page.loadLlmTrace()
+  await h.reply(1, { cursor: 20, active: true, more: false, events: [
+    { event: 'assistant_delta', request_id: 'r1', content: content.slice(20) },
+  ] })
+  await pending
+  assert.ok(h.frames.size > 0)
+  h.page.detailSection = 'parameters'; h.page.syncLlmAnimations()
+  assert.equal(h.shown(), content)
+  assert.equal(h.frames.size, 0, '未展开的对话不需要逐字渲染')
+  h.page.detailSection = 'llm'
+  h.page.llmAnimatedContent = { 'r1-assistant': content.slice(0, 10) }
+  h.nav.steps[0].status = status
+  h.page.syncLlmAnimations()
+  assert.equal(h.shown(), content)
+  assert.equal(h.frames.size, 0)
+  assert.doesNotMatch(h.page.llmRowState(h.row()), /生成中/)
+})
+
+test('离开步骤页关闭未完成读取和历史补齐计时器，迟到响应不再修改对话', async t => {
+  const h = await llmDisplayHarness(t), content = '当前已收到的内容'.repeat(100)
+  await h.reply(0, { cursor: 10, active: true, more: true, events: [
+    { event: 'assistant_delta', request_id: 'r1', content },
+  ] })
+  assert.ok([...h.timers.values()].some(item => item.delay === 0))
+  h.page.llmRestoringHistory = false
+  h.page.llmAnimatedContent = { 'r1-assistant': content.slice(0, 10) }
+  h.page.syncLlmAnimations()
+  assert.ok(h.frames.size > 0)
+  const pending = h.page.loadLlmTrace(), signal = h.reads[1].options.signal
+  h.page.disposeLlmTrace()
+  assert.equal(signal.aborted, true)
+  assert.equal(h.frames.size, 0)
+  assert.ok([...h.timers.values()].every(item => item.delay !== 0))
+  assert.ok(h.removedListeners.some(([event, listener]) =>
+    event === 'visibilitychange' && listener === h.page.onTraceVisibilityChanged))
+  await h.reply(1, { cursor: 20, active: false, more: false, events: [
+    { event: 'assistant_response', request_id: 'r1', content: '离开后才返回的旧响应' },
+  ] })
+  await pending
+  assert.equal(h.row().content, content)
+  await h.page.loadLlmTrace()
+  assert.equal(h.reads.length, 2)
+})
+
+test('只显示成品历史时不读取生成所用的评论方案', async t => {
+  const { default: Panel } = await server.ssrLoadModule('/src/components/AssembleOutputsPanel.vue')
+  const calls: string[] = []
+  t.mock.method(globalThis, 'fetch', async url => {
+    calls.push(String(url)); return {ok:true,json:async()=>({overlay:{items:[]}})}
+  })
+  const pinia = createPinia()
+  const app = createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{
+    default:()=>h(Panel,{uid:'history-only',historyOnly:true,artifacts:[],sourcePath:'',subtitlePath:'',subtitleName:''}),
+  })})})
+  app.use(pinia);app.use(createRouter({history:createMemoryHistory(),routes:[]}));setup(app)
+  try {
+    await renderToString(app)
+    assert.ok(calls.every(url=>!url.endsWith('/comments')))
+  } finally {disposePinia(pinia)}
+})
+
+test('项目列表慢刷新合并；人工刷新取消旧读，旧响应不能覆盖列表', async t => {
+  const {default: Projects} = await server.ssrLoadModule('/src/views/ProjectsView.vue')
+  const reads:any[]=[]
+  t.mock.method(globalThis,'fetch',(url,options)=> {
+    if(String(url)!=='/api/projects') return new Promise(()=>{})
+    return new Promise(resolve=>reads.push({signal:options?.signal,resolve}))
+  })
+  let page:any
+  const pinia=createPinia()
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(Projects)})})})
+  app.use(pinia);app.use(createRouter({history:createMemoryHistory(),routes:[]}));setup(app)
+  app.mixin({created(){if(this.$options.__name==='ProjectsView')page=this.$.setupState}})
+  try {
+    await renderToString(app)
+    const first=page.load();void page.load();void page.load()
+    assert.equal(reads.length,1)
+    reads[0].resolve({ok:true,json:async()=>[{uid:'initial',title:'首次结果',steps:[]}]})
+    await first
+    assert.equal(reads.length,2)
+    const manual=page.load(true)
+    assert.equal(reads[1].signal.aborted,true)
+    assert.equal(reads.length,3)
+    reads[2].resolve({ok:true,json:async()=>[{uid:'latest',title:'最新结果',steps:[]}]})
+    await manual
+    reads[1].resolve({ok:true,json:async()=>[{uid:'old',title:'迟到旧结果',steps:[]}]})
+    for(let i=0;i<12;i++)await Promise.resolve()
+    assert.equal(page.projects[0].uid,'latest');assert.equal(page.loading,false)
+  } finally {disposePinia(pinia)}
+})
+
+test('恢复入口真实传入所选项目，筛选隐藏的选择不被当前列表替代',async()=>{
+  const {default:Projects}=await server.ssrLoadModule('/src/views/ProjectsView.vue')
+  const pinia=createPinia(),nav=useNavStore(pinia),scopes:any[]=[];let page:any
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(Projects)})})})
+  app.use(pinia);app.use(createRouter({history:createMemoryHistory(),routes:[]}));setup(app)
+  app.mixin({created(){
+    if(this.$options.__name==='ProjectsView'){
+      page=this.$.setupState;page.projects=[{uid:'visible',title:'visible 项目',status:'created',steps:[]},{uid:'hidden',title:'hidden 项目',status:'created',steps:[]}]
+      page.sel=new Set(['hidden']);page.searchText='visible'
+    }
+    if(this.$options.__name==='BatchWorkflowResume')scopes.push(this.$.props)
+  }})
+  try{
+    const html=await renderToString(app)
+    assert.deepEqual(page.sortedProjects.map((p:any)=>p.uid),['visible'])
+    assert.deepEqual(scopes[0].projects.map((p:any)=>p.uid),['hidden'])
+    assert.match(scopes[0].scopeLabel,/所选 1 个项目/);assert.match(scopes[0].scopeLabel,/隐藏/)
+    assert.match(html,/检查恢复所选项目（1）/)
+    assert.doesNotMatch(html,/继续全部已挂起/)
+  }finally{nav.reset();disposePinia(pinia)}
+})
+
+for(const key of ['translate','assemble'])test(`${key}挂起且上游需更新仍提供恢复预检，不直接重试或改成品范围`,async()=>{
+  const pinia=createPinia(),nav=useNavStore(pinia),panels:any[]=[]
+  const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+  await router.push(`/projects/recovery-entry/steps/${key}`)
+  nav.$patch({uid:'recovery-entry',title:'恢复回归',stepsLoaded:true,chain:{remaining:[key],state:'held',hold:{step:key,code:'STEP_FAILED',message:'失败'}},steps:[{
+    key,label:STEP_LABELS[key],status:'failed',fresh:false,selected:true,cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[],
+    unready_inputs:[{step:'split',name:'split.txt',label:'语义整理',state:'stale',reason:'输入已变化'}],
+  }]})
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+  app.use(pinia);app.use(router);setup(app)
+  app.mixin({created(){if(this.$options.__name==='BatchWorkflowResume')panels.push(this.$.props)}})
+  try{
+    const html=await renderToString(app);assert.equal(panels.length,1);assert.equal(panels[0].kind,'chain')
+    assert.equal(panels[0].disabled,false);assert.match(html,/检查恢复方案/)
+    assert.doesNotMatch(html,/重试并继续剩余步骤/)
+  }finally{nav.reset();disposePinia(pinia)}
+})
 
 for (const state of [
   { name: '当前阶段剩余时间', status: 'running', eta_seconds: 180, eta_scope: 'phase', eta: '当前阶段预计剩余约 3 分钟' },
@@ -273,6 +679,8 @@ for (const key of keys) {
         const label = key === 'tts' && state.status === 'done' && !state.fresh
           ? '仍有待配音句' : state.label
         assert.ok(html.includes(label), `必须显示正确状态：${label}`)
+        if(state.status==='done' && !state.fresh)assert.match(html,/freshness-badge/)
+        else assert.doesNotMatch(html,/freshness-badge/)
         if (key === 'assemble') {
           assert.match(html, /选择成品方案/)
           assert.match(html, /成片版本/)
@@ -289,6 +697,81 @@ for (const key of keys) {
     })
   }
 }
+
+test('语义整理真实运行页说明全文和low思考强度，关闭LLM时不宣称全文模型整理',async t=>{
+  const requests:any[]=[]
+  t.mock.method(globalThis,'fetch',(url,options)=>{requests.push({url:String(url),method:options?.method||'GET'});return new Promise(()=>{})})
+  for(const useLlm of [true,false]){
+    const pinia=createPinia(),nav=useNavStore(pinia)
+    const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+    await router.push('/projects/full-semantic-fixture/steps/split')
+    nav.$patch({uid:'full-semantic-fixture',title:'全文整理回归',stepsLoaded:true,steps:[{
+      key:'split',label:STEP_LABELS.split,status:'running',fresh:false,selected:true,
+      cfg:{split:{use_llm:useLlm,thinking_mode:'low'}},artifacts:[],inputs:[],outputs:[],unready_inputs:[],affected_steps:[],
+    }]})
+    const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+    app.use(pinia);app.use(router);setup(app)
+    try{
+      const html=await renderToString(app)
+      if(useLlm){
+        assert.match(html,/全文语义整理/)
+        assert.match(html,/一次提供整段原文、时间轴和真实长静音/)
+        assert.match(html,/思考参数的实际生效值见下方设置预览/)
+        assert.doesNotMatch(html,/在支持的模型上关闭思考/)
+        assert.match(html,/质量问题最多定向重试一次/)
+        assert.doesNotMatch(html,/主动小窗|逐块缓存|局部缩窗/)
+      }else{
+        assert.doesNotMatch(html,/全文语义整理|思考参数的实际生效值见下方设置预览/)
+      }
+    }finally{nav.reset();disposePinia(pinia)}
+  }
+  assert.ok(requests.every(row=>row.method==='GET'),'渲染说明不能触发制作或配置写入')
+})
+
+test('总览逐步开放更新原因，字幕与配音保留后端待补齐标签，不把有效音频列为需更新',async()=>{
+  const {default:Pipeline}=await server.ssrLoadModule('/src/views/PipelineView.vue')
+  const pinia=createPinia(),nav=useNavStore(pinia)
+  const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid',component:Pipeline}]})
+  await router.push('/projects/freshness-fixture')
+  const entries=[{key:'split',fresh:false},{key:'subtitles',fresh:false},{key:'tts',status:'stale',fresh:false,freshness_label:'仍有2句待配音'},
+    {key:'assemble',status:'stale',fresh:true,freshness_label:'审查修订有效（复用旧文字与音轨）'}]
+  nav.$patch({uid:'freshness-fixture',stepsLoaded:true,steps:entries.map(row=>({label:STEP_LABELS[row.key],status:'done',selected:true,cfg:{},artifacts:[],unready_inputs:[],...row}))})
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+  app.use(pinia);app.use(router);setup(app)
+  try {
+    const html=await renderToString(app)
+    assert.equal((html.match(/class="freshness-badge"/g)||[]).length,3)
+    assert.match(html,/仍有2句待配音/)
+    assert.match(html,/aria-label="字幕与配音 · 查看更新原因"/)
+    assert.doesNotMatch(html,/为什么需更新/)
+    assert.equal((html.replace(/<[^>]*>/g,'').match(/仍有2句待配音/g)||[]).length,1,'任务状态只显示一次，不另加重复标签')
+    assert.match(html,/审查修订有效（复用旧文字与音轨）/)
+    assert.doesNotMatch(html,/aria-label="合成成片 · 查看更新原因"/)
+  } finally {nav.reset();disposePinia(pinia)}
+})
+
+test('旧结果步骤页只保留可点击状态及一个更新动作，依赖说明默认收起',async()=>{
+  const pinia=createPinia(),nav=useNavStore(pinia)
+  const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+  await router.push('/projects/update-layout/steps/split')
+  nav.$patch({uid:'update-layout',stepsLoaded:true,steps:[{key:'split',label:'语义整理',status:'done',fresh:false,
+    freshness_label:'需更新',freshness_reason:'语音识别文字已变化',description:'整理句子',selected:true,cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[],
+    unready_inputs:[{step:'transcribe',name:'transcribe.json',label:'语音转文字',desc:'识别文字',state:'stale',reason:'上游文字已变化'}]}]})
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+  app.use(pinia);app.use(router);setup(app)
+  const triggers:any[]=[]
+  app.mixin({created(){if(this.$options.__name==='FreshnessDetails')triggers.push(this.$.props)}})
+  try {
+    const html=await renderToString(app)
+    assert.equal(triggers.length,1);assert.equal(triggers[0].statusText,'需更新');assert.equal(triggers[0].summary,'语音识别文字已变化')
+    assert.match(html,/aria-label="语义整理 · 查看更新原因"/);assert.doesNotMatch(html,/为什么需更新/)
+    const details=html.match(/<details\b[^>]*class="dependency-context"[^>]*>/)?.[0]
+    assert.ok(details);assert.doesNotMatch(details,/\bopen\b/)
+    assert.match(html,/1 项输入待准备/)
+    const buttons=[...html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(match=>match[0].replace(/<[^>]*>/g,''))
+    assert.equal(buttons.filter(text=>text.includes('更新依赖并运行')).length,1,'保留顶部确认入口，不重复放进黄色说明')
+  } finally {nav.reset();disposePinia(pinia)}
+})
 
 test('下载失败页展示具体超时原因，不笼统承诺历史文件一定存在', async () => {
   const pinia = createPinia(), nav = useNavStore(pinia)

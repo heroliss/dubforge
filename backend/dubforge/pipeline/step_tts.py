@@ -23,6 +23,21 @@ from dubforge.pipeline.line_settings import effective_config
 from dubforge.pipeline import dubbing_edit, dubbing_session
 
 
+class DubbingTimingError(DubForgeError):
+    code = 'TTS_TIMING_INVALID'
+    suggestion = '请在字幕/配音工作台修正本句的起止时间，或重新整理语义时间轴后再补齐配音。'
+
+
+def _validate_line_timing(line):
+    try:
+        start, end = float(line['start']), float(line['end'])
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise DubbingTimingError(
+            f"句 {line.get('id', '?')} 时间轴无效：开始 {line.get('start')} 秒，结束 {line.get('end')} 秒；结束必须晚于开始且时间必须有效。") from None
+
+
 def line_fingerprint(project, line, cfg_get=None, *, dependencies=None, _legacy=False):
     """句级缓存绑定实际文本、时间和合成设置，工作台与批量配音共用。"""
     from dubforge.pipeline.dependencies import Dependencies
@@ -76,16 +91,27 @@ def line_cache_valid(project, line, pdir, cfg_get=None, *, dependencies=None, ta
 
 
 def _cut(src: Path, dst: Path, start: float, dur: float) -> Path:
-    """ffmpeg 切片; 目标存在即复用"""
+    """只复用有音频帧的切片，空切片不作为正式参考保存。"""
+    if not math.isfinite(start) or not math.isfinite(dur) or start < 0 or dur <= 0:
+        raise tts_indextts25.ReferenceAudioError(f'参考切片范围无效：开始 {start} 秒，时长 {dur} 秒')
     if dst.exists() and dst.stat().st_size > 1024:
-        return dst
+        try:
+            tts_indextts25.validate_reference(dst, '缓存')
+        except tts_indextts25.ReferenceAudioError:
+            pass  # 无效旧缓存只在成功生成新参考后原子替换。
+        else:
+            return dst
     dst.parent.mkdir(parents=True, exist_ok=True)
     tmp = dst.with_suffix(".wav.tmp")
     try:
-        subprocess.run(["ffmpeg", "-y", "-i", str(src), "-ss", f"{start:.2f}",
-                        "-t", f"{dur:.2f}", "-ar", "32000", "-ac", "1",
+        subprocess.run(["ffmpeg", "-y", "-i", str(src), "-ss", f"{start:.6f}",
+                        "-t", f"{dur:.6f}", "-ar", "32000", "-ac", "1",
                         "-f", "wav", str(tmp)], check=True, capture_output=True)
+        tts_indextts25.validate_reference(tmp, '切片')
         atomic_replace(tmp, dst)
+    except subprocess.CalledProcessError as exc:
+        raise tts_indextts25.ReferenceAudioError('无法从原声中读取有效参考切片',
+            detail=exc.stderr.decode('utf-8', errors='replace') if exc.stderr else str(exc)) from exc
     finally:
         tmp.unlink(missing_ok=True)
     return dst
@@ -98,7 +124,7 @@ def _resolve_ref(ctx, mode: str, custom: str, line: dict,
         p = Path(custom or "")
         if not p.is_file():
             raise DubForgeError(
-                f"{tag} 参考音频不存在: {p}", code="REF_MISSING",
+                f"{label}参考音频不存在: {p}", code="REF_MISSING",
                 suggestion="请在设置页填写有效的参考音频路径, 或切换 stable/dynamic 模式。")
         log(f"句 {line['id']} {label}参考：自定义音频 {p}")
         return p
@@ -107,7 +133,8 @@ def _resolve_ref(ctx, mode: str, custom: str, line: dict,
         log(f"句 {line['id']} {label}参考：开头 0.00–8.00 秒 → {path}")
         return path
     if mode == "dynamic":
-        dur = max(0.0, line["end"] - line["start"])
+        _validate_line_timing(line)
+        dur = line["end"] - line["start"]
         path = _cut(vocal, cache_dir / f"ref_{tag}_{line['id']}.wav", line["start"], dur)
         log(f"句 {line['id']} {label}参考：本句 {line['start']:.2f}–{line['end']:.2f} 秒 → {path}"
             + ('；参考不足 2 秒，若音色不稳可为本句指定同一说话人的较长参考' if dur < 2 else ''))
@@ -144,6 +171,7 @@ def _synth_line(project, line, pdir, force, log, cfg_get, take, progress, on_att
                               out, str(out.relative_to(pdir)))
         return {"status": "skipped", "file": out}
 
+    _validate_line_timing(line)
     fingerprint = line_fingerprint(project, line, cfg_get)
     backend = cfg_get("tts.backend", "indextts25")
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -252,6 +280,9 @@ def _run(ctx) -> None:
         ctx.task_data = {'scope': 'all', 'lines': [
             {'id': line['id'], 'take': line.get('take') or 1, 'status': 'queued'} for line in lines]}
         targets = {row['id']: row for row in ctx.task_data['lines']}
+    # 整批先核对时间轴，避免合成数百句后才发现某句原声切片为空。
+    for line in lines:
+        _validate_line_timing(line)
     ctx.save_task_data()
     ctx.log(f"本次配音范围：{len(lines)} 句" + ('（列表所选）' if selected else '（选用配音）'))
     from dubforge.pipeline.step_dubtask import estimate_seconds

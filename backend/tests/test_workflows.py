@@ -331,32 +331,49 @@ def test_restart_pauses_without_post(make_project, monkeypatch):
     assert all(row['status'] == 'paused' for row in workflows.view(uid)['runs'])
 
 
-def test_runtime_edit_of_finished_step_does_not_pause(flow, monkeypatch):
-    """与剩余步骤无关的修改 (已完成步骤的键) 不打断流程, 自然作用于下次重跑。"""
+def test_runtime_edit_of_finished_step_is_rejected_without_interrupting_the_workflow(flow, monkeypatch):
+    """已完成步骤的设置也锁定；拒绝编辑不改变快照，制作结束后才可保存。"""
     from dubforge.runner import runner
+    from dubforge import configuration, runtime_edit
     from app.api.projects import StepParamsUpdate, update_project_step_params
     uid, spec, calls, _ = flow
     waiting, release = threading.Event(), threading.Event()
-    original = runner.start_step
-    def wait(uid, key):
-        if key == 'download':
-            waiting.set(); release.wait(3)
-        return original(uid, key)
-    monkeypatch.setattr(runner, 'start_step', wait)
+    original = runner.start_versions
+    def wait(uid, body, *, frozen):
+        waiting.set()
+        assert release.wait(10)
+        return original(uid, body, frozen=frozen)
+    monkeypatch.setattr(runner, 'start_versions', wait)
     row, _ = start(uid, spec)
-    assert waiting.wait(3)
     try:
-        # download 已在执行, 其参数变化不影响剩余步骤的指纹对比。
-        update_project_step_params(uid, StepParamsUpdate(updates={'download.resolution': 480}))
+        assert waiting.wait(5)
+        assert crud.get_step(crud.get_project(uid).id, 'download').status == 'done'
+        before = configuration.resolve(uid)
+        params_before = crud.get_project(uid).params
+        snapshot = workflows.get(row['id'])['plan']['configuration_snapshot']
+        with pytest.raises(runtime_edit.RuntimeEditError) as error:
+            update_project_step_params(uid, StepParamsUpdate(updates={'download.resolution': 480}))
+        assert error.value.code == 'CONFIGURATION_BUSY'
+        assert configuration.resolve(uid) == before
+        assert crud.get_project(uid).params == params_before
+        active = workflows.get(row['id'])
+        assert active['status'] == 'running' and not active['error']
+        assert active['plan']['configuration_snapshot'] == snapshot
     finally:
         release.set()
     result = finish(row['id'])
     assert result['status'] == 'monitoring', result
+    assert result['plan']['configuration_snapshot'] == snapshot
     assert sum(op == 'submit' for op, _ in calls) == 1
+    # 远程审核等待没有本地制作写入，允许设置下一次重跑的值。
+    assert not runtime_edit.editability('project:' + uid)['locked']
+    update_project_step_params(uid, StepParamsUpdate(updates={'download.resolution': 480}))
+    assert configuration.resolve(uid)['values']['download.resolution'] == 480
+    assert workflows.get(row['id'])['plan']['configuration_snapshot'] == snapshot
 
 
 def test_lease_still_blocks_manual_step_start(flow):
-    """编辑放开后, 租约仍保证全流程运行中不能插入手动单步。"""
+    """流程租约同时禁止外部编辑和插入手动单步。"""
     uid, spec, calls, _ = flow
     row, _ = start(uid, spec)
     with pytest.raises(DubForgeError, match='全流程'):
@@ -640,3 +657,205 @@ def test_resume_preflight_checks_project_and_publication_boundary(flow, make_pro
         workflows._availability(make_project(), 'publish', key)
     workflows._update(key,publication_id='existing')
     assert any('现有稿件' in issue for issue in workflows.preview(uid, {**spec,'resume_id':key})['blockers'])
+
+
+def paused_recovery(flow, monkeypatch, *, steps, cursor, fresh_steps):
+    """只登记隔离的暂停流程，用固定产物状态核对预检与入队，不执行任务。"""
+    from dubforge.pipeline import recovery
+    from dubforge.pipeline.registry import STEP_MAP
+    uid, spec, _, _ = flow
+    spec['mode'] = 'produce'
+    configure(uid, spec)
+    candidate = workflows._plan(uid, spec, online=False)
+    candidate.update(steps=list(steps), labels={key: step.label for key, step in STEP_MAP.items()})
+    with Session(get_engine()) as session:
+        row = WorkflowRun(project_uid=uid, request_id=str(uuid.uuid4()), status='failed', cursor=cursor,
+            recipe=json.dumps(candidate['recipe']), plan=json.dumps(candidate))
+        session.add(row); session.commit(); session.refresh(row); key = row.id
+    state = dict(fresh_steps)
+    monkeypatch.setattr(recovery, 'fresh', lambda _deps, step: state.get(step, True))
+    monkeypatch.setattr(workflows, '_plan', lambda *args, **kwargs: json.loads(json.dumps(candidate)))
+    launched = []
+    monkeypatch.setattr(workflows, '_launch', lambda key, uid: launched.append(workflows.get(key)))
+    return uid, spec, key, candidate, state, launched
+
+
+def recovery_body(preview, *, request_id=None):
+    result = dict(confirmed=True, recipe=preview['recipe'], fingerprint=preview['fingerprint'],
+                  recovery_fingerprint=preview['recovery_fingerprint'])
+    if request_id is not None:
+        result['request_id'] = request_id
+    return result
+
+
+def test_recovery_preview_and_resume_share_earlier_stale_start(flow, monkeypatch):
+    uid, spec, key, candidate, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'split', 'translate', 'assemble'], cursor=2,
+        fresh_steps={'download': True, 'split': False, 'translate': False, 'assemble': False})
+    # 新计划不再含有效下载，恢复仍使用与原游标对应的步骤表。
+    candidate['steps'] = ['split', 'translate', 'assemble']
+    row = crud.get_step(crud.get_project(uid).id, 'split')
+    row.status = 'stale'; crud.save_step(row)
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    assert preview['recovery']['previous_step'] == 'translate'
+    assert preview['recovery']['start_step'] == 'split'
+    assert preview['recovery']['cursor'] == 1
+    assert 'download' in preview['recovery']['reusable_steps']
+    result = workflows.resume(key, recovery_body(preview))
+    assert result['cursor'] == 1 and len(launched) == 1
+    assert result['plan']['steps'] == ['download', 'split', 'translate', 'assemble']
+    assert result['plan']['recovery'] == preview['recovery']
+
+
+def test_recovery_new_missing_dependency_replaces_old_step_table(flow, monkeypatch):
+    uid, spec, key, candidate, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1,
+        fresh_steps={'download': True, 'preprocess': False, 'assemble': False})
+    candidate['steps'] = ['download', 'preprocess', 'assemble']
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    assert preview['recovery']['start_step'] == 'preprocess'
+    assert preview['recovery']['cursor'] == 0
+    result = workflows.resume(key, recovery_body(preview))
+    assert result['cursor'] == 0 and len(launched) == 1
+    assert result['plan']['steps'] == candidate['steps']
+    assert result['plan']['recovery_fingerprint'] == preview['recovery_fingerprint']
+
+
+def test_recovery_changed_configuration_replans_and_reuses_valid_outputs(flow, monkeypatch):
+    uid, spec, key, candidate, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1,
+        fresh_steps={'download': False, 'assemble': True})
+    candidate['fingerprint'] = 'new-confirmed-configuration'
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    assert not preview['blockers']
+    assert preview['recovery']['changed'] is True
+    assert preview['recovery']['start_step'] == 'download'
+    assert preview['recovery']['execute_steps'] == ['download']
+    assert 'assemble' in preview['recovery']['reusable_steps']
+    result = workflows.resume(key, recovery_body(preview))
+    assert result['cursor'] == 0 and len(launched) == 1
+    assert result['plan']['recovery'] == preview['recovery']
+
+
+@pytest.mark.parametrize('change', ['missing_dependency', 'earlier_stale'])
+def test_recovery_fingerprint_rejects_changed_scope_with_same_configuration(flow, monkeypatch, change):
+    uid, spec, key, candidate, state, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'split', 'assemble'], cursor=2,
+        fresh_steps={'download': True, 'split': True, 'assemble': False})
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    old_configuration = preview['fingerprint']
+    if change == 'missing_dependency':
+        candidate['steps'].insert(1, 'preprocess')
+        state['preprocess'] = False
+    else:
+        state['split'] = False
+    refreshed = workflows.preview(uid, {**spec, 'resume_id': key})
+    assert refreshed['fingerprint'] == old_configuration
+    assert refreshed['recovery_fingerprint'] != preview['recovery_fingerprint']
+    with pytest.raises(DubForgeError) as error:
+        workflows.resume(key, recovery_body(preview))
+    assert error.value.code == 'WORKFLOW_PLAN_CHANGED'
+    assert not launched and workflows.get(key)['status'] == 'failed'
+    assert not workflows.get(key)['plan'].get('_resume_requests')
+
+
+def test_recovery_guard_rechecks_scope_inside_start_locks(flow, monkeypatch):
+    uid, spec, key, candidate, state, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'split', 'assemble'], cursor=2,
+        fresh_steps={'download': True, 'split': True, 'assemble': False})
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    def changing_plan(*args, online=True, **kwargs):
+        if not online:
+            state['split'] = False
+        return json.loads(json.dumps(candidate))
+    monkeypatch.setattr(workflows, '_plan', changing_plan)
+    with pytest.raises(DubForgeError) as error:
+        workflows.resume(key, recovery_body(preview))
+    assert error.value.code == 'WORKFLOW_PLAN_CHANGED'
+    assert not launched and workflows.get(key)['cursor'] == 2
+
+
+def test_recovery_guard_rechecks_new_blockers_inside_start_locks(flow, monkeypatch):
+    uid, spec, key, candidate, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1, fresh_steps={'download': True, 'assemble': False})
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    def blocked_plan(*args, online=True, **kwargs):
+        result = json.loads(json.dumps(candidate))
+        if not online:
+            result['blockers'] = ['本地原视频不存在']
+        return result
+    monkeypatch.setattr(workflows, '_plan', blocked_plan)
+    with pytest.raises(DubForgeError) as error:
+        workflows.resume(key, recovery_body(preview))
+    assert error.value.code == 'WORKFLOW_PLAN_CHANGED'
+    assert '本地原视频不存在' in error.value.message
+    assert not launched and workflows.get(key)['cursor'] == 1
+
+
+def test_recovery_request_replay_after_failure_is_persistently_idempotent(flow, monkeypatch):
+    uid, spec, key, _, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1, fresh_steps={'download': True, 'assemble': False})
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    body = recovery_body(preview, request_id=str(uuid.uuid4()))
+    accepted = workflows.resume(key, body)
+    assert len(launched) == 1
+    assert workflows.resume(key, body)['status'] == 'queued'
+    workflows._update(key, status='failed', error='新的失败')
+    # 请求已被接受的记录不会因为新计划或再次失败而丢失；重送直接返回已有结果。
+    monkeypatch.setattr(workflows, '_plan', lambda *args, **kwargs: pytest.fail('重送不应重新预检'))
+    replayed = workflows.resume(key, body)
+    assert replayed['status'] == 'failed' and len(launched) == 1
+    record = accepted['plan']['_resume_requests'][body['request_id']]
+    assert record['accepted_state']['status'] == 'failed'
+    assert record['accepted_state']['cursor'] == 1
+    with pytest.raises(DubForgeError) as error:
+        workflows.resume(key, {**body, 'fingerprint': 'different-plan'})
+    assert error.value.code == 'WORKFLOW_CONFLICT'
+    assert len(launched) == 1
+
+
+def test_recovery_preserves_all_request_receipts_across_new_attempts(flow, monkeypatch):
+    uid, spec, key, _, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1, fresh_steps={'download': True, 'assemble': False})
+    first = recovery_body(workflows.preview(uid, {**spec, 'resume_id': key}), request_id=str(uuid.uuid4()))
+    workflows.resume(key, first)
+    workflows._update(key, status='failed')
+    second = recovery_body(workflows.preview(uid, {**spec, 'resume_id': key}), request_id=str(uuid.uuid4()))
+    workflows.resume(key, second)
+    workflows._update(key, status='failed')
+    result = workflows.resume(key, first)
+    assert len(launched) == 2
+    assert set(result['plan']['_resume_requests']) == {first['request_id'], second['request_id']}
+    assert '_resume_requests' not in workflows.preview(uid, {**spec, 'resume_id': key})
+
+
+@pytest.mark.parametrize('request_id', [None, '', 'invalid', 'x' * 36, 1, {}])
+def test_recovery_rejects_invalid_provided_request_id(flow, monkeypatch, request_id):
+    uid, spec, key, _, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1, fresh_steps={'download': True, 'assemble': False})
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    with pytest.raises(DubForgeError, match='请求标识无效'):
+        workflows.resume(key, {**recovery_body(preview), 'request_id': request_id})
+    assert not launched
+
+
+@pytest.mark.parametrize('publication_status', ['draft', 'unknown', 'published'])
+def test_recovery_publication_boundary_never_restarts_production(flow, setup_publish, monkeypatch, publication_status):
+    uid, spec, key, _, _, launched = paused_recovery(flow, monkeypatch,
+        steps=['download', 'assemble'], cursor=1, fresh_steps={'download': True, 'assemble': False})
+    pub = setup_publish[1]
+    service._update(pub['id'], status=publication_status,
+        receipt={'bvid': 'BV1234567890'} if publication_status == 'published' else {})
+    workflows._update(key, publication_id=pub['id'])
+    preview = workflows.preview(uid, {**spec, 'resume_id': key})
+    assert any('现有稿件' in item for item in preview['blockers'])
+    assert 'recovery_fingerprint' not in preview
+    body = dict(confirmed=True, request_id=str(uuid.uuid4()))
+    if publication_status == 'published':
+        assert workflows.resume(key, body)['status'] == 'monitoring'
+        assert workflows.resume(key, body)['status'] == 'monitoring'
+    else:
+        with pytest.raises(DubForgeError, match='核对'):
+            workflows.resume(key, body)
+    assert not launched
+    assert not any(op in {'upload', 'submit'} for op, _payload in setup_publish[3])
