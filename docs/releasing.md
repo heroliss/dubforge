@@ -16,18 +16,23 @@
 在隔离配置/数据环境中执行，具体安装与运行纪律见[开发与维护](development.md)。全量后端测试需安装识别和分离可选依赖；默认安装不等于完整测试环境已齐备。
 
 ```powershell
+# 后端也有 Vite 生命周期与发布工作者离线探测，先装齐三个运行环境
 uv sync --locked --directory backend --extra asr --extra separation
+Push-Location frontend
+npm ci
+Pop-Location
+Push-Location workers/bilibili
+npm ci --ignore-scripts
+Pop-Location
 uv run --locked --directory backend --extra asr --extra separation pytest
 
 Push-Location frontend
-npm ci
 npm test
 npm run typecheck
 npm run build
 Pop-Location
 
 Push-Location workers/bilibili
-npm ci --ignore-scripts
 npm test
 Pop-Location
 

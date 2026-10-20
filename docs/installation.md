@@ -4,9 +4,9 @@ DubForge 主程序与配音服务使用独立 Python 环境。按所需能力安
 
 ## 首次安装（Windows）
 
-1. 下载或克隆仓库，解压到可写目录。
+1. 下载或克隆仓库，解压到可写且较短的目录，例如 `D:\Apps\DubForge`。工作目录也建议使用较短路径，为外部工具的 Windows 路径长度限制预留空间。
 2. 安装 [uv](https://docs.astral.sh/uv/getting-started/installation/) 和 [Node.js LTS](https://nodejs.org/)。uv 会按项目要求准备 Python 3.13；Node.js 用于构建前端，启用 B站发布后也用于运行发布通信组件。
-3. 安装 [FFmpeg](https://ffmpeg.org/download.html)，将包含 `ffmpeg.exe` 和 `ffprobe.exe` 的目录添加到 PATH，然后重新打开 PowerShell。
+3. 安装 [FFmpeg](https://ffmpeg.org/download.html)（建议 7.1 或更新版），将包含 `ffmpeg.exe` 和 `ffprobe.exe` 的目录添加到 PATH，然后重新打开 PowerShell。
 4. 在 DubForge 根目录执行所需命令：
 
 ```powershell

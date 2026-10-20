@@ -69,13 +69,17 @@ jobs:
           ffmpeg -version
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           ffprobe -version
-      - name: Installation and smoke safety tests (no services)
-        run: uv run --locked --directory backend --extra asr --extra separation python -m unittest discover -s ../scripts/tests -p 'test_*.py' -v
-      - name: Backend tests
-        run: uv run --locked --directory backend --extra asr --extra separation pytest -q
+      # 后端集成回归也会调用真实 Vite 生命周期与工作者离线探测，先装齐三端依赖。
       - name: Install frontend
         working-directory: frontend
         run: npm ci
+      - name: Install publishing worker
+        working-directory: workers/bilibili
+        run: npm ci --ignore-scripts
+      - name: Installation and smoke safety tests (no services)
+        run: uv run --locked --directory backend --extra asr --extra separation python -m unittest discover -s ../scripts/tests -p 'test_*.py' -v
+      - name: Backend tests
+        run: uv run --locked --directory backend --extra asr --extra separation pytest -v --tb=short -ra
       - name: Frontend tests
         working-directory: frontend
         run: npm test
@@ -85,9 +89,6 @@ jobs:
       - name: Frontend build
         working-directory: frontend
         run: npm run build
-      - name: Install publishing worker
-        working-directory: workers/bilibili
-        run: npm ci --ignore-scripts
       - name: Publishing worker tests
         working-directory: workers/bilibili
         run: npm test

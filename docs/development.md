@@ -81,13 +81,20 @@ Remove-Item Env:DUBFORGE_DEBUG_DATADIR -ErrorAction SilentlyContinue
 uv run --project backend --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8611 --loop app.event_loop:create_event_loop
 ```
 
-另一个终端可只读检查 `http://127.0.0.1:8611/api/health`。健康响应证明 API 已启动，不证明模型可用、前端构建完整或真实视频交付成功。发行冒烟还核对源码版本、同一子进程的监听归属和空项目列表。真实模型、媒体和平台联调应另外明确范围，不能沿用生产账号、真实目录或付费服务做默认测试。
+另一个终端可只读检查 `http://127.0.0.1:8611/api/health`。健康响应证明 API 已启动，不证明模型可用、前端构建完整或真实视频交付成功。发行冒烟还核对源码版本、同一子进程的监听归属和空项目列表。真实模型、媒体和平台联调应另外明确范围，不能沿用生产账号、真实目录或付费服务做默认测试。 Windows 上请把报告标签与实际测试临时根分开：较长的测试名还会追加项目和渲染子目录，临时根过长可能在创建进程前触及工作目录限制。
 
 ## 测试与构建
 
 ```powershell
-# 全量后端测试需要识别与分离可选依赖；夹具隔离配置与数据
+# 后端集成测试还会用到 Vite 与发布工作者，先装齐三个环境
+# 测试夹具隔离配置与数据；识别和分离依赖也用于完整测试集合
 uv sync --locked --directory backend --extra asr --extra separation
+Push-Location frontend
+npm ci
+Pop-Location
+Push-Location workers/bilibili
+npm ci --ignore-scripts
+Pop-Location
 Push-Location backend
 uv run --locked --extra asr --extra separation pytest
 Pop-Location

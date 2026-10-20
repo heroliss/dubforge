@@ -25,7 +25,7 @@ def test_long_filter_utf8_no_bom_and_cleanup(isolated_env):
     graph = '[0:v]null[v];' * 2500 + '# 中文内容\n'
     command = ['ffmpeg', '-filter_complex', graph]
     with complex_filter_command(command, isolated_env) as prepared:
-        assert prepared[1] == '-filter_complex_script'
+        assert prepared[1] == '-/filter_complex'
         path = Path(prepared[2])
         assert path.parent == isolated_env
         assert path.read_bytes() == graph.encode('utf-8')
@@ -97,7 +97,7 @@ def test_concurrent_commands_use_distinct_script_names(isolated_env):
 def test_threshold_counts_utf16_units(isolated_env):
     # 非 BMP 字符在 Windows 命令行中占两个 UTF-16 单元。
     with complex_filter_command(['ffmpeg', '-filter_complex', '\U0001f600' * 13000], isolated_env) as command:
-        assert command[1] == '-filter_complex_script'
+        assert command[1] == '-/filter_complex'
 
 
 @pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='本机未安装 FFmpeg')
@@ -110,8 +110,43 @@ def test_real_ffmpeg_200_cuts_long_command_starts_and_finishes(isolated_env):
                '-filter_complex', graph, '-map', video, '-map', audio, '-f', 'null', '-']
     assert len(subprocess.list2cmdline(command)) > 32767
     with complex_filter_command(command, isolated_env) as prepared:
-        path = Path(prepared[prepared.index('-filter_complex_script') + 1])
+        path = Path(prepared[prepared.index('-/filter_complex') + 1])
         result = subprocess.run(prepared, capture_output=True, timeout=30, check=False)
         assert result.returncode == 0, result.stderr.decode(errors='replace')
         assert path.is_file()
     assert not path.exists()
+
+
+@pytest.mark.skipif(shutil.which('ffmpeg') is None, reason='本机未安装 FFmpeg')
+def test_real_argument_file_keeps_video_and_audio_output(isolated_env, monkeypatch):
+    from dubforge.utils import ffmpeg
+
+    folder = isolated_env / "滤镜 文件 ' 有空格"
+    folder.mkdir()
+    graph = '[0:v]hflip[v];[1:a]volume=0.5[a]'
+    command = ['ffmpeg', '-hide_banner', '-v', 'error', '-threads', '1',
+               '-filter_complex_threads', '1', '-f', 'lavfi', '-i',
+               'testsrc2=s=64x64:r=10:d=0.4', '-f', 'lavfi', '-i', 'sine=r=8000:d=0.4',
+               '-filter_complex', graph, '-map', '[v]', '-map', '[a]',
+               '-c:v', 'rawvideo', '-c:a', 'pcm_s16le', '-f', 'framemd5', '-']
+
+    def render(prepared):
+        result = subprocess.run(prepared, cwd=folder, capture_output=True, timeout=30, check=False)
+        assert result.returncode == 0, result.stderr.decode(errors='replace')
+        return result.stdout
+
+    reference = render(command)
+    monkeypatch.setattr(ffmpeg, '_SCRIPT_THRESHOLD', 0)
+    with complex_filter_command(command, folder) as prepared:
+        assert '-filter_complex' not in prepared
+        assert '-filter_complex_script' not in prepared
+        path = Path(prepared[prepared.index('-/filter_complex') + 1])
+        assert path.read_bytes() == graph.encode('utf-8')
+        assert render(prepared) == reference
+    assert not path.exists()
+
+    unchanged = list(command)
+    unchanged[unchanged.index('-filter_complex') + 1] = '[0:v]null[v];[1:a]anull[a]'
+    assert render(unchanged) != reference
+    rows = [line for line in reference.splitlines() if line and not line.startswith(b'#')]
+    assert {line.split(b',', 1)[0].strip() for line in rows} == {b'0', b'1'}

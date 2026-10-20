@@ -54,7 +54,7 @@ DubForge 是独立开发的视频译制工作台。输入视频链接或本地�
 
 ### 1. 准备环境并安装
 
-当前正式验证平台为 **Windows**，建议使用 **Node.js 24 LTS**。先安装 [Git](https://git-scm.com/downloads)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Node.js](https://nodejs.org/) 和 [FFmpeg](https://ffmpeg.org/download.html)，确认 ffmpeg、ffprobe 可在终端中运行。uv 会按项目要求准备 Python 3.13。
+当前正式验证平台为 **Windows**，建议使用 **Node.js 24 LTS**。先安装 [Git](https://git-scm.com/downloads)、[uv](https://docs.astral.sh/uv/getting-started/installation/)、[Node.js](https://nodejs.org/) 和 [FFmpeg](https://ffmpeg.org/download.html)（建议 7.1 或更新版），确认 ffmpeg、ffprobe 可在终端中运行。uv 会按项目要求准备 Python 3.13。
 
 在 PowerShell 中执行：
 

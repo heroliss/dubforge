@@ -60,7 +60,8 @@ def complex_filter_command(cmd, cwd):
                     path = Path(handle.name)
                     scripts.append(path)
                     handle.write(prepared[index + 1])
-                prepared[index:index + 2] = ['-filter_complex_script', str(path)]
+                # 通用文件参数语法由选项自身读取 UTF-8 值，不依赖已弃用的专用脚本选项。
+                prepared[index:index + 2] = ['-/filter_complex', str(path)]
             except OSError as exc:
                 raise DubForgeError('无法写入 FFmpeg 临时滤镜脚本，请检查合成目录的空间和权限后重试',
                                    code='FFMPEG_FILTER_SCRIPT_WRITE_FAILED') from exc

@@ -10,8 +10,12 @@ from dubforge import __version__, config
 from dubforge.db import init_db
 from dubforge.errors import DubForgeError
 from fastapi import FastAPI, Request
+from fastapi.exception_handlers import http_exception_handler
 from fastapi.responses import FileResponse, JSONResponse
+from fastapi.routing import APIRoute
 from fastapi.staticfiles import StaticFiles
+from starlette.exceptions import HTTPException
+from starlette.routing import Match
 
 FRONTEND_DIST = config.REPO_ROOT / "frontend" / "dist"
 logger = logging.getLogger(__name__)
@@ -95,6 +99,35 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="DubForge", version=__version__, lifespan=lifespan)
 
 
+def _is_api_path(path: str):
+    path = path.lstrip('/')
+    return path == 'api' or path.startswith('api/')
+
+
+class _SPARoute(APIRoute):
+    """页面兜底不参与 API 匹配，保留真实接口的 405 与 Allow。"""
+
+    def matches(self, scope):
+        match, child_scope = super().matches(scope)
+        if _is_api_path(child_scope.get('path_params', {}).get('full_path', '')):
+            return Match.NONE, {}
+        return match, child_scope
+
+
+@app.exception_handler(HTTPException)
+async def http_error_handler(request: Request, exc: HTTPException):
+    # API 404 与是否构建网页无关；其他 HTTP 错误沿用框架响应及原有头部。
+    path = request.scope['path']
+    root_path = request.scope.get('root_path', '')
+    if root_path and (path == root_path or path.startswith(root_path + '/')):
+        path = path[len(root_path):]
+    if exc.status_code == 404 and _is_api_path(path):
+        return JSONResponse(status_code=404, content={
+            'code': 'API_NOT_FOUND', 'message': '请求的接口不存在，请刷新页面后重试',
+        }, headers={**(exc.headers or {}), 'Cache-Control': 'no-store'})
+    return await http_exception_handler(request, exc)
+
+
 @app.exception_handler(DubForgeError)
 async def dubforge_error_handler(request: Request, exc: DubForgeError):
     """统一业务错误出口: {code, message, suggestion, detail}"""
@@ -156,12 +189,7 @@ app.include_router(api_audio_processing.router)
 if FRONTEND_DIST.is_dir():
     app.mount("/assets", StaticFiles(directory=FRONTEND_DIST / "assets"), name="assets")
 
-    @app.get("/{full_path:path}")
     def spa(full_path: str):
-        if full_path == 'api' or full_path.startswith('api/'):
-            return JSONResponse(status_code=404, content={
-                'code': 'API_NOT_FOUND', 'message': '请求的接口不存在，请刷新页面后重试',
-            }, headers={'Cache-Control': 'no-store'})
         # API 之外的路径全部回退到 index.html; index 禁缓存 (防旧资源清单)。
         # 候选路径必须仍在 dist 内 (resolve 后校验) —— 挡住 /..%2F..%2Fconfig.yaml
         # 这类路径穿越, 防止把仓库里的密钥文件当静态资源吐出去。
@@ -171,3 +199,5 @@ if FRONTEND_DIST.is_dir():
             if candidate.is_relative_to(FRONTEND_DIST) and candidate.is_file():
                 return FileResponse(candidate, headers=headers)
         return FileResponse(FRONTEND_DIST / "index.html", headers=headers)
+
+    app.router.add_api_route("/{full_path:path}", spa, methods=['GET'], route_class_override=_SPARoute)

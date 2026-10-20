@@ -1,4 +1,7 @@
 """本地文件 API: 目录浏览 + 拖入导入 (ingest)"""
+import importlib.util
+
+import pytest
 from fastapi.testclient import TestClient
 
 
@@ -182,14 +185,112 @@ def test_spa_blocks_path_traversal(isolated_env):
 
 
 def test_unknown_api_returns_json_404_instead_of_spa_html(isolated_env):
-    from app.main import app
+    from app.main import FRONTEND_DIST, app
     from fastapi.testclient import TestClient
     client = TestClient(app)
     for url in ('/api', '/api/nonexistent-audit-route'):
         response = client.get(url)
         assert response.status_code == 404
         assert response.json()['code'] == 'API_NOT_FOUND'
-    assert client.get('/projects/missing-audit-project').headers['content-type'].startswith('text/html')
+    page = client.get('/projects/missing-audit-project')
+    if FRONTEND_DIST.is_dir():
+        assert page.status_code == 200 and page.headers['content-type'].startswith('text/html')
+    else:
+        assert page.status_code == 404 and page.headers['content-type'].startswith('application/json')
+
+
+@pytest.fixture(params=[False, True], ids=['without-dist', 'with-dist'])
+def frontend_mode_client(isolated_env, tmp_path, monkeypatch, request):
+    """从真实 main 重新注册路由，只改变隔离目录，不移走用户的网页产物。"""
+    from app import main as actual_main
+    from dubforge import config
+
+    repo = tmp_path / 'isolated-web-root'
+    dist = repo / 'frontend/dist'
+    if request.param:
+        (dist / 'assets').mkdir(parents=True)
+        (dist / 'index.html').write_text('<!doctype html><title>隔离前端</title>', encoding='utf-8')
+        (dist / 'assets/fixture.bin').write_bytes(b'0123456789')
+        (repo / 'private.txt').write_text('must-not-be-served', encoding='utf-8')
+    with monkeypatch.context() as patch:
+        patch.setattr(config, 'REPO_ROOT', repo)
+        spec = importlib.util.spec_from_file_location('app._api404_contract_fixture', actual_main.__file__)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    # 不进入 lifespan；数据库由 isolated_env 建立，不启动恢复或后台监控。
+    client = TestClient(module.app)
+    try:
+        yield client, bool(request.param), dist
+    finally:
+        client.close()
+
+
+def test_unknown_api_contract_does_not_depend_on_frontend_build(frontend_mode_client):
+    client, _, _ = frontend_mode_client
+    for method in ('GET', 'HEAD', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'):
+        for url in ('/api', '/api/', '/api/unknown-isolated-route', '/api%2Funknown-isolated-route'):
+            response = client.request(method, url)
+            assert response.status_code == 404, (method, url)
+            assert response.headers['content-type'].startswith('application/json')
+            assert response.headers['cache-control'] == 'no-store'
+            if method == 'HEAD':
+                assert response.content == b''
+            else:
+                assert response.json() == {
+                    'code': 'API_NOT_FOUND', 'message': '请求的接口不存在，请刷新页面后重试',
+                }
+
+
+def test_real_api_routes_keep_method_mismatch_and_allow_header(frontend_mode_client):
+    client, _, _ = frontend_mode_client
+    assert client.get('/api/health').json()['app'] == 'DubForge'
+    for method in ('POST', 'PUT', 'HEAD'):
+        response = client.request(method, '/api/health')
+        assert response.status_code == 405
+        assert response.headers['allow'] == 'GET'
+        if method == 'HEAD':
+            assert response.content == b''
+        else:
+            assert response.json() == {'detail': 'Method Not Allowed'}
+
+
+def test_api_404_keeps_root_path_segment_boundary(frontend_mode_client):
+    client, _, _ = frontend_mode_client
+    # /a 不能从 /api 中误删；真正带挂载前缀的请求仍按应用内 API 识别。
+    for root_path, url in (('/a', '/api/unknown-isolated-route'),
+                           ('/nested', '/nested/api/unknown-isolated-route')):
+        nested = TestClient(client.app, root_path=root_path)
+        try:
+            response = nested.get(url)
+            assert response.status_code == 404
+            assert response.json()['code'] == 'API_NOT_FOUND'
+            assert response.headers['cache-control'] == 'no-store'
+        finally:
+            nested.close()
+
+
+def test_only_web_paths_use_spa_and_assets_keep_range_head(frontend_mode_client):
+    client, built, _ = frontend_mode_client
+    for url in ('/projects/isolated-page', '/apiary', '/api-suffix'):
+        response = client.get(url)
+        if built:
+            assert response.status_code == 200 and '隔离前端' in response.text
+            assert response.headers['cache-control'] == 'no-store'
+        else:
+            assert response.status_code == 404
+            assert response.json() == {'detail': 'Not Found'}
+    if not built:
+        assert client.get('/assets/fixture.bin').status_code == 404
+        return
+    traversed = client.get('/..%2F..%2Fprivate.txt')
+    assert traversed.status_code == 200 and '隔离前端' in traversed.text
+    assert 'must-not-be-served' not in traversed.text
+    partial = client.get('/assets/fixture.bin', headers={'Range': 'bytes=2-5'})
+    assert partial.status_code == 206 and partial.content == b'2345'
+    assert partial.headers['content-range'] == 'bytes 2-5/10'
+    head = client.head('/assets/fixture.bin')
+    assert head.status_code == 200 and head.content == b''
+    assert head.headers['content-length'] == '10'
 
 
 def test_peaks_mixed_true_sample_sum(isolated_env):
