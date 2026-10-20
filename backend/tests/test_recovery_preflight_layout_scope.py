@@ -1,6 +1,7 @@
 """恢复预检的两个真实消费者复用请求内排布；新依赖快照仍重新核验。"""
 import copy
 import json
+import wave
 
 from dubforge import workflow_plan
 from dubforge.domain import crud
@@ -19,7 +20,9 @@ def test_recovery_consumers_share_one_layout_but_new_dependencies_read_again(mak
     for row in rows:
         path = dubbing_edit.take_path(deps.root, row['id'], 1)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_bytes(b'isolated-duration-reader-fixture')
+        with wave.open(str(path), 'wb') as stream:
+            stream.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+            stream.writeframes(b'\0\0' * 8000)
         path.with_suffix('.take.json').write_text(json.dumps(dict(identity=identity(row),
             version=dubbing_edit.file_version(path))), encoding='utf-8')
 
