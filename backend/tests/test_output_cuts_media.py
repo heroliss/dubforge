@@ -1,5 +1,6 @@
 """真实剪辑尾帧回归：保留 CFR/VFR 时间点、B 帧及完整声音终点。"""
 import json
+import struct
 from fractions import Fraction
 
 import pytest
@@ -20,6 +21,77 @@ def _packets(path):
         '-of', 'json', str(path)]).stdout)['packets']
 
 
+def _mp4_video_timing(path):
+    """直接核验 MP4 的解码、展示及 edit list 尾端，不依赖 ffprobe 是否暴露包时长。"""
+    data = path.read_bytes()
+
+    def children(start, end):
+        result = []
+        while start + 8 <= end:
+            size, name = struct.unpack_from('>I4s', data, start)
+            header = 8
+            if size == 1:
+                size = struct.unpack_from('>Q', data, start + 8)[0]
+                header = 16
+            elif size == 0:
+                size = end - start
+            assert size >= header and start + size <= end
+            result.append((name, start + header, start + size))
+            start += size
+        return result
+
+    def child(rows, name):
+        return next((left, right) for tag, left, right in rows if tag == name)
+
+    def timing(point):
+        offset = point + (20 if data[point] else 12)
+        scale = struct.unpack_from('>I', data, offset)[0]
+        ticks = struct.unpack_from('>Q' if data[point] else '>I', data, offset + 4)[0]
+        return scale, ticks
+
+    moov = children(*child(children(0, len(data)), b'moov'))
+    movie_scale, _ = timing(child(moov, b'mvhd')[0])
+    for tag, left, right in moov:
+        if tag != b'trak':
+            continue
+        trak = children(left, right)
+        mdia = children(*child(trak, b'mdia'))
+        handler = child(mdia, b'hdlr')[0]
+        if data[handler + 8:handler + 12] != b'vide':
+            continue
+        scale, duration = timing(child(mdia, b'mdhd')[0])
+        media = children(*child(mdia, b'minf'))
+        table = children(*child(media, b'stbl'))
+        stts = child(table, b'stts')[0]
+        count = struct.unpack_from('>I', data, stts + 4)[0]
+        durations = [delta for index in range(count)
+                     for length, delta in [struct.unpack_from('>II', data, stts + 8 + index * 8)]
+                     for _ in range(length)]
+        offsets = [0] * len(durations)
+        if any(name == b'ctts' for name, _, _ in table):
+            ctts = child(table, b'ctts')[0]
+            count = struct.unpack_from('>I', data, ctts + 4)[0]
+            offsets = [offset for index in range(count)
+                       for length, offset in [struct.unpack_from('>Ii' if data[ctts] else '>II',
+                                                                  data, ctts + 8 + index * 8)]
+                       for _ in range(length)]
+        assert len(offsets) == len(durations)
+        edts = children(*child(trak, b'edts'))
+        elst = child(edts, b'elst')[0]
+        assert struct.unpack_from('>I', data, elst + 4)[0] == 1
+        edit_duration, media_time, rate_i, rate_f = struct.unpack_from(
+            '>Qqhh' if data[elst] else '>Iihh', data, elst + 8)
+        assert (rate_i, rate_f) == (1, 0)
+        cursor, endpoint = 0, 0
+        for delta, offset in zip(durations, offsets):
+            endpoint = max(endpoint, cursor + offset + delta)
+            cursor += delta
+        return dict(header=duration / scale, decode=cursor / scale,
+                    presentation=(endpoint - media_time) / scale,
+                    edit=edit_duration / movie_scale, frames=len(durations))
+    pytest.fail('成片缺少视频轨')
+
+
 def _media(root, kind):
     rate = '30000/1001' if kind == 'ntsc' else '20' if kind == 'vfr' else '10'
     total = 6.006 if kind == 'ntsc' else 6.
@@ -38,9 +110,7 @@ def _media(root, kind):
     return source, total, plan
 
 
-@pytest.mark.parametrize('kind', ['cfr', 'ntsc', 'vfr'])
-@pytest.mark.parametrize('dubbed', [False, True], ids=['original', 'dubbed'])
-def test_cut_mux_preserves_all_frames_pts_and_audio_end(isolated_env, tmp_path, monkeypatch, kind, dubbed):
+def _check_cut_mux(tmp_path, monkeypatch, kind, dubbed):
     source, total, plan = _media(tmp_path, kind)
     ctx, commands, _ = _context(tmp_path, monkeypatch)
     ctx.task_data['output_cuts'] = plan
@@ -73,8 +143,35 @@ def test_cut_mux_preserves_all_frames_pts_and_audio_end(isolated_env, tmp_path, 
     assert [float(row['pts_time']) for row in actual] == pytest.approx(expected, abs=max(2 * tick, 2e-6))
     assert float(video['duration']) == pytest.approx(plan['output_duration'], abs=2 * tick)
     assert float(audio['duration']) == pytest.approx(plan['output_duration'], abs=.0011)
+    # mdhd 可能采用解码总时长，仍须单独验证展示尾端，不能让 edit list 静默截短。
+    timing = _mp4_video_timing(target)
+    assert timing['frames'] == len(expected)
+    for endpoint in ('header', 'decode', 'presentation'):
+        assert timing[endpoint] == pytest.approx(plan['output_duration'], abs=2 * tick)
+    assert timing['edit'] == pytest.approx(plan['output_duration'], abs=.0011)
     # 解码经过真实最终 MP4 的 edit list，不只数封装中的 packet。
     _run(['ffmpeg', '-v', 'error', '-i', str(target), '-f', 'null', '-'])
+
+
+@pytest.mark.parametrize('kind', ['cfr', 'ntsc', 'vfr'])
+@pytest.mark.parametrize('dubbed', [False, True], ids=['original', 'dubbed'])
+def test_cut_mux_preserves_all_frames_pts_and_audio_end(isolated_env, tmp_path, monkeypatch, kind, dubbed):
+    _check_cut_mux(tmp_path, monkeypatch, kind, dubbed)
+
+
+@pytest.mark.parametrize('dubbed', [False, True], ids=['original', 'dubbed'])
+def test_cut_mux_completes_endpoint_despite_nonzero_packet_duration(isolated_env, tmp_path, monkeypatch, dubbed):
+    # 部分 FFmpeg/编码器会给 concat 输出填入非零包时长；它不能代表计划中的尾端。
+    # 注入真实 bitstream filter，让旧版 FFmpeg 也能覆盖这一条件，而非依赖当前安装版本。
+    timing_options = output_cuts.mux_timing_options
+
+    def nonzero_packet_duration(duration):
+        options = timing_options(duration)
+        options[1] = r'setts=pts=PTS:dts=DTS:duration=max(DURATION\,round(0.05/TB)),' + options[1]
+        return options
+
+    monkeypatch.setattr(output_cuts, 'mux_timing_options', nonzero_packet_duration)
+    _check_cut_mux(tmp_path, monkeypatch, 'vfr', dubbed)
 
 
 def test_cut_timing_options_reject_invalid_endpoint():

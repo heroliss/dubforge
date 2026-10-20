@@ -16,7 +16,7 @@ from dubforge.pipeline.video_source import resolve_video
 from dubforge.utils.fs import atomic_write_bytes
 
 # 剪辑渲染合同升级只使有剪辑的旧成片失效，未剪辑版本保留缓存。
-RENDER_VERSION = 2
+RENDER_VERSION = 3
 
 _LOCK = threading.RLock()
 _EPS = .000001
@@ -482,11 +482,12 @@ def mux_timing_options(duration):
     duration = _number(duration, '剪辑成片时长')
     if duration <= 0:
         raise OutputCutsError('剪辑成片时长必须大于 0')
-    # concat 的帧率未知，x264 因而输出 duration=0；MP4 的末帧会被标成 discard。
-    # MP4 中间 sample 时长由相邻 DTS 确定；缺时长的 sample 只需给出共同终点。
-    # STARTDTS 保留 B 帧的负向解码预滚，不改变任何 PTS/DTS，也不把 VFR 重采样为 CFR。
+    # concat 后的编码包可能没有时长，也可能携带不能代表剪辑终点的非零时长。
+    # MP4 中间 sample 时长由相邻 DTS 确定，显式给出可避免 edit list 沿用编码器的短时长。
+    # NEXT_DTS 在 EOF 为 NOPTS；最后一个解码包必须按计划补到保留区间终点。
+    # STARTDTS 保留 B 帧的负向解码预滚；不改变 PTS/DTS，也不把 VFR 重采样为 CFR。
     endpoint = f'max(1,round({duration:.6f}/TB+STARTDTS-DTS))'
-    expression = f'if(gt(DURATION,0),DURATION,{endpoint})'.replace(',', r'\,')
+    expression = f'if(eq(NEXT_DTS,NOPTS),{endpoint},max(1,NEXT_DTS-DTS))'.replace(',', r'\,')
     return ['-bsf:v', 'setts=pts=PTS:dts=DTS:duration=' + expression,
             '-t', f'{duration:.6f}']
 

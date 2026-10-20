@@ -1,7 +1,12 @@
 """链内失败自动重试、资源组互斥、项目视图工作流状态 (ADR-0076)。"""
 import json
+import sys
 import threading
 import time
+import types
+from pathlib import Path
+
+import pytest
 
 from fastapi.testclient import TestClient
 from sqlmodel import Session, select
@@ -182,82 +187,167 @@ def test_download_concurrency_two_with_success_handoff(isolated_env, monkeypatch
     assert all(crud.get_step(crud.get_project(u).id, 'download').status == 'done' for u in uids)
 
 
-def test_demucs_oom_falls_back_to_cpu(isolated_env, make_project, monkeypatch):
-    """显存不足自动降级 (模块承诺): run() 捕获 CUDA OOM → 归还缓存 → CPU 重跑;
-    非 OOM 异常照常穿透。"""
-    from dubforge.pipeline import step_preprocess
-    attempts = []
+def _preprocess_case(make_project):
+    """真实隔离项目与步骤入口，只替换 FFmpeg 抽轨及产物登记边界。"""
     def _touch_out(cmd):
-        # ffmpeg 抽轨桩: 模拟产出 raw.wav (命令最后一个是输出路径)。
-        from pathlib import Path as _P
-        dst = _P(cmd[-1])
+        dst = Path(cmd[-1])
         dst.parent.mkdir(parents=True, exist_ok=True)
         dst.write_bytes(b'raw')
         return 0
-    def fake_demucs(ctx, src, out, *, device=None):
-        attempts.append(device or 'cuda')
-        if attempts[-1] == 'cuda':
-            raise RuntimeError('CUDA error: out of memory')
-        out.mkdir(parents=True, exist_ok=True)
-        (out / 'vocal.wav').write_bytes(b'v')
-        (out / 'background.wav').write_bytes(b'b')
-        return out / 'vocal.wav', out / 'background.wav'
-    monkeypatch.setattr(step_preprocess, '_run_demucs', fake_demucs)
-    monkeypatch.setattr('dubforge.utils.gpu_memory.release_unused', lambda log=None: None)
-    # 最小 ctx 桩: 只需要 log 与 run() 用到的路径/上游。
-    import types
-    from pathlib import Path
     uid = make_project()
     project = crud.get_project(uid)
     root = crud.project_dir(uid)
     (root / 'media').mkdir(parents=True, exist_ok=True)
     video = root / 'media' / 'video.mp4'
     video.write_bytes(b'x')
-    from dubforge.domain import crud as _crud
-    _crud.add_artifact(project.id, 'download', 'media', 'video.mp4', video, 'media/video.mp4')
+    crud.add_artifact(project.id, 'download', 'media', 'video.mp4', video, 'media/video.mp4')
+    saved, registered, logs = {}, [], []
     ctx = types.SimpleNamespace(
         project=project, pdir=root,
-        log=lambda m: None,
+        log=logs.append,
         run_subprocess=lambda cmd, **k: (_touch_out(cmd), '', '')[0:3],
         report_progress=lambda pct: None,
         check_pause=lambda: None,
         check_cancel=lambda: None,
         upstream=lambda step, name: root / 'media' / 'video.mp4',
-        write_json=lambda name, data: None,
-        register_file=lambda *a, **k: None,
+        write_json=lambda name, data: saved.update({name: data}),
+        register_file=lambda name, *a, **k: registered.append(name),
         cfg=lambda key, default=None: {'separate.model': 'htdemucs'}.get(key, default),
     )
-    step_preprocess.run(ctx)
-    assert attempts == ['cuda', 'cpu']
-    assert (root / 'audio' / 'vocal.wav').exists()
+    return ctx, root, saved, registered, logs
 
-    # 非 OOM 异常穿透, 不降级 (新项目, 避免首轮登记的产物导致跳过)。
-    uid2 = make_project()
-    project2 = crud.get_project(uid2)
-    root2 = crud.project_dir(uid2)
-    (root2 / 'media').mkdir(parents=True, exist_ok=True)
-    video2 = root2 / 'media' / 'video.mp4'
-    video2.write_bytes(b'x')
-    _crud.add_artifact(project2.id, 'download', 'media', 'video.mp4', video2, 'media/video.mp4')
-    attempts.clear()
-    def boom(ctx, src, out, *, device=None):
-        raise ValueError('坏音频')
-    monkeypatch.setattr(step_preprocess, '_run_demucs', boom)
-    import pytest as _pytest
-    with _pytest.raises(ValueError):
-        step_preprocess.run(types.SimpleNamespace(
-            project=project2, pdir=root2,
-            log=lambda m: None,
-            run_subprocess=lambda cmd, **k: (_touch_out(cmd), '', '')[0:3],
-            report_progress=lambda pct: None,
-            check_pause=lambda: None,
-            check_cancel=lambda: None,
-            upstream=lambda step, name: video2,
-            write_json=lambda name, data: None,
-            register_file=lambda *a, **k: None,
-            cfg=lambda key, default=None: {'separate.model': 'htdemucs'}.get(key, default),
-        ))
-    assert attempts == []
+
+def _demucs_hardware(monkeypatch, *, available):
+    """显式模拟设备和 OOM 类型，不导入真实 Torch 或初始化 CUDA。"""
+    class CudaOOM(RuntimeError):
+        pass
+    state = dict(available=available, probes=0, components=[])
+    def is_available():
+        state['probes'] += 1
+        return state['available']
+    torch = types.ModuleType('torch')
+    torch.cuda = types.SimpleNamespace(is_available=is_available, OutOfMemoryError=CudaOOM)
+    monkeypatch.setitem(sys.modules, 'torch', torch)
+    monkeypatch.setattr('dubforge.environment.require_component', state['components'].append)
+    return state, CudaOOM
+
+
+@pytest.mark.parametrize('available_after_oom', [True, False])
+@pytest.mark.parametrize('oom_kind', ['runtime_message', 'typed_oom'])
+def test_demucs_oom_falls_back_to_cpu(isolated_env, make_project, monkeypatch, available_after_oom, oom_kind):
+    """明确模拟 CUDA 首发；即使 OOM 后设备不可用，仍只归还缓存并回退 CPU 一次。"""
+    from dubforge.pipeline import step_preprocess
+    hardware, CudaOOM = _demucs_hardware(monkeypatch, available=True)
+    events = []
+    def fake_demucs(ctx, src, out, *, device=None):
+        events.append(device)
+        if device == 'cuda':
+            hardware['available'] = available_after_oom
+            raise (CudaOOM('显存分配失败') if oom_kind == 'typed_oom'
+                   else RuntimeError('CUDA error: out of memory'))
+        assert device == 'cpu'
+        (out / 'vocal.wav').write_bytes(b'v')
+        (out / 'background.wav').write_bytes(b'b')
+        return out / 'vocal.wav', out / 'background.wav'
+    monkeypatch.setattr(step_preprocess, '_run_demucs', fake_demucs)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.release_unused', lambda log=None: events.append('release'))
+    ctx, root, saved, registered, logs = _preprocess_case(make_project)
+    step_preprocess.run(ctx)
+    assert events == ['cuda', 'release', 'cpu']
+    assert hardware['probes'] == 1 and hardware['components'] == ['separation']
+    assert registered == ['raw.wav', 'vocal.wav', 'background.wav']
+    assert saved['separate.json']['separated'] is True
+    assert (root / 'audio/vocal.wav').read_bytes() == b'v'
+    assert (root / 'audio/background.wav').read_bytes() == b'b'
+    assert not (root / 'audio/.tmp_src44100.wav').exists()
+    assert any('自动降级为 CPU' in message for message in logs)
+
+
+@pytest.mark.parametrize('available_after_error', [False, True])
+def test_demucs_cpu_oom_does_not_retry(isolated_env, make_project, monkeypatch, available_after_error):
+    """CPU 内存不足不能再次重试 CPU，即使报错后显卡变得可用。"""
+    from dubforge.pipeline import step_preprocess
+    hardware, _ = _demucs_hardware(monkeypatch, available=False)
+    events = []
+    error = RuntimeError('out of memory')
+    def fail(ctx, src, out, *, device=None):
+        events.append(device)
+        hardware['available'] = available_after_error
+        raise error
+    monkeypatch.setattr(step_preprocess, '_run_demucs', fail)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.release_unused', lambda log=None: events.append('release'))
+    ctx, root, saved, registered, _ = _preprocess_case(make_project)
+    with pytest.raises(RuntimeError) as caught:
+        step_preprocess.run(ctx)
+    assert caught.value is error and events == ['cpu']
+    assert hardware['probes'] == 1
+    assert registered == ['raw.wav'] and saved == {}
+    assert not (root / 'audio/.tmp_src44100.wav').exists()
+
+
+@pytest.mark.parametrize('cuda_available', [True, False])
+def test_demucs_non_oom_does_not_retry(isolated_env, make_project, monkeypatch, cuda_available):
+    """非内存错误保留原始异常，在 CPU / CUDA 均不触发回退。"""
+    from dubforge.pipeline import step_preprocess
+    hardware, _ = _demucs_hardware(monkeypatch, available=cuda_available)
+    events = []
+    error = ValueError('坏音频')
+    def fail(ctx, src, out, *, device=None):
+        events.append(device)
+        raise error
+    monkeypatch.setattr(step_preprocess, '_run_demucs', fail)
+    monkeypatch.setattr('dubforge.utils.gpu_memory.release_unused', lambda log=None: events.append('release'))
+    ctx, root, saved, registered, _ = _preprocess_case(make_project)
+    with pytest.raises(ValueError) as caught:
+        step_preprocess.run(ctx)
+    assert caught.value is error and events == ['cuda' if cuda_available else 'cpu']
+    assert hardware['probes'] == 1
+    assert registered == ['raw.wav'] and saved == {}
+    assert not (root / 'audio/.tmp_src44100.wav').exists()
+
+
+def test_demucs_missing_optional_component_precedes_torch_import(isolated_env, make_project, monkeypatch):
+    from dubforge.errors import DubForgeError
+    from dubforge.pipeline import step_preprocess
+    monkeypatch.setitem(sys.modules, 'torch', None)
+    error = DubForgeError('尚未安装人声分离组件', code='OPTIONAL_COMPONENT_MISSING')
+    def missing(key):
+        assert key == 'separation'
+        raise error
+    monkeypatch.setattr('dubforge.environment.require_component', missing)
+    monkeypatch.setattr(step_preprocess, '_run_demucs', lambda *a, **k: pytest.fail('缺少组件时不得开始分离'))
+    ctx, root, saved, registered, _ = _preprocess_case(make_project)
+    with pytest.raises(DubForgeError) as caught:
+        step_preprocess.run(ctx)
+    assert caught.value is error and caught.value.code == 'OPTIONAL_COMPONENT_MISSING'
+    assert registered == ['raw.wav'] and saved == {}
+    assert not (root / 'audio/.tmp_src44100.wav').exists()
+
+
+@pytest.mark.parametrize('mode', ['disabled', 'cached'])
+def test_demucs_disabled_or_cached_does_not_probe_torch(isolated_env, make_project, monkeypatch, mode):
+    """关闭分离或复用已有有效音轨时，不新增可选依赖检查及硬件探测。"""
+    from dubforge.pipeline import step_preprocess
+    monkeypatch.setitem(sys.modules, 'torch', None)
+    def forbidden(*args, **kwargs):
+        pytest.fail('关闭或复用分离时不得检查组件、加载模型或探测设备')
+    monkeypatch.setattr('dubforge.environment.require_component', forbidden)
+    monkeypatch.setattr(step_preprocess, '_run_demucs', forbidden)
+    ctx, root, saved, registered, _ = _preprocess_case(make_project)
+    if mode == 'disabled':
+        ctx.cfg = lambda key, default=None: {'separate.enabled': False}.get(key, default)
+    else:
+        audio = root / 'audio'
+        audio.mkdir(exist_ok=True)
+        (audio / 'vocal.wav').write_bytes(b'old-vocal')
+        (audio / 'background.wav').write_bytes(b'old-background')
+    step_preprocess.run(ctx)
+    assert saved['separate.json']['separated'] is (mode == 'cached')
+    assert registered == (['raw.wav', 'vocal.wav', 'background.wav'] if mode == 'cached' else ['raw.wav'])
+    if mode == 'cached':
+        assert (root / 'audio/vocal.wav').read_bytes() == b'old-vocal'
+        assert (root / 'audio/background.wav').read_bytes() == b'old-background'
+    assert not (root / 'audio/.tmp_src44100.wav').exists()
 
 
 def _fake_tts_service(monkeypatch, *, managed=True, online=True, record=None):

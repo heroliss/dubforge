@@ -214,14 +214,18 @@ def run(ctx) -> None:
         try:
             ctx.check_cancel()
             ctx.log("分段分离中 —— 进度逐段上报; 暂停/取消在段间检查点生效 (数秒粒度)")
+            from dubforge.environment import require_component
+            require_component("separation")
+            import torch
+            # 记录首发设备；异常后硬件可用性可能改变，不能据此误判实际失败的设备。
+            device = "cuda" if torch.cuda.is_available() else "cpu"
             try:
-                vocal, bg = _run_demucs(ctx, src441, audio_dir)
+                vocal, bg = _run_demucs(ctx, src441, audio_dir, device=device)
             except Exception as exc:
                 # 显存不足自动降级 (模块承诺的行为, 此前缺失): CUDA OOM 时
                 # 归还缓存后用 CPU 重跑, 批量流程不因显存竞争而中断。
-                import torch
                 from dubforge.utils.gpu_memory import release_unused
-                if not (_is_cuda_oom(exc) and torch.cuda.is_available()):
+                if not (device == "cuda" and _is_cuda_oom(exc)):
                     raise
                 ctx.log(f"⚠ CUDA 显存不足，自动降级为 CPU 分离 (速度约慢一个量级；"
                         f"可在设置把分离模型换为 htdemucs、shifts 设为 0，"

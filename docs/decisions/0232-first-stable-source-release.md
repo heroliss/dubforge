@@ -26,6 +26,10 @@ DubForge 的完整工作台包含 Python 领域库与 HTTP 层、Vue 网页、No
 
 7. **干净环境与新版媒体工具纳入同一合同。** 超长滤镜图使用 FFmpeg 的 `-/filter_complex` [参数文件语法](https://ffmpeg.org/ffmpeg.html#Options)，保留图内容、阈值和清理时机，避免旧 `-filter_complex_script` 在新版工具中被移除后无法启动。API 命名空间的中文 404 不依赖网页是否已构建；SPA 兜底不能覆盖已知 API 的方法校验。完整回归先装齐 Python、Vite 和发布工作者依赖，避免把缺少依赖导致的跳过当作集成验证。
 
+8. **剪辑视频轨按保留计划结束。** 在不改变帧数、PTS、DTS 或帧率的前提下，按相邻 DTS 确定中间包时长，并按保留计划补齐编码末包；不能依赖编码器返回的缺失或过短时长。可变帧率、B 帧、原声、配音及试片都沿用同一时间轴，渲染指纹随有效剪辑的输出语义升级，未剪辑产物保持兼容。
+
+9. **分离降级依据本次实际使用的设备。** 首次分离前确定设备，仅对该次 CUDA 执行的显存不足尝试一次 CPU 回退；CPU 内存不足和其他异常不重复执行。设备选择保持在确需分离的分支内，并先核对可选组件，关闭分离或复用音轨不额外导入模型依赖。测试显式模拟硬件能力，不能依赖测试机器恰好具有显卡。
+
 ## 结果与边界
 
 - 安装、打包、健康接口和界面有统一版本约束；依赖锁文件保持可审阅。
@@ -33,4 +37,4 @@ DubForge 的完整工作台包含 Python 领域库与 HTTP 层、Vue 网页、No
 - Windows 长路径验证覆盖 ASS 文件路径超出传统长度的情况，不声明任意超长进程工作目录或真实 UNC 网络共享均已验收。
 - 用户配置、已有项目与发布回执继续保留，历史 ADR 作为维护依据保存。仓库公开性与开源许可证不由发行流程自动更改。
 
-相关实现与回归：[发行检查](../../scripts/check_release.py)、[安装回归](../../scripts/tests/test_install.py)、[冒烟执行器](../../scripts/smoke.py)、[ASS 长路径回归](../../backend/tests/test_ass_long_paths.py)。完整操作见[发行流程](../releasing.md)。
+相关实现与回归：[发行检查](../../scripts/check_release.py)、[安装回归](../../scripts/tests/test_install.py)、[冒烟执行器](../../scripts/smoke.py)、[ASS 长路径回归](../../backend/tests/test_ass_long_paths.py)、[剪辑媒体回归](../../backend/tests/test_output_cuts_media.py)、[设备回退回归](../../backend/tests/test_runner_resources.py)。完整操作见[发行流程](../releasing.md)。
