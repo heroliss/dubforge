@@ -3,6 +3,7 @@ import math
 import copy
 import hashlib
 import json
+import struct
 from functools import lru_cache
 from pathlib import Path
 
@@ -40,25 +41,99 @@ def video_seconds(project, pdir):
     return _probe_video(str(value[0]), value[1], value[2]) if value else None
 
 
-def _read_identity(root, rows):
-    """逐句只取文件身份；排布缓存不跨请求，也不掩盖请求期间文件变化。"""
+def _wav_duration_identity(path, actual_size):
+    """只核验有界 PCM WAV 容器头；遇到 data 即停，绝不读取音频载荷。"""
+    limit = 4096
+    # 禁用文件缓冲的预读，否则 read(12) 也可能提前读入后面的 PCM 数据。
+    with path.open('rb', buffering=0) as stream:
+        container = stream.read(12)
+        if len(container) != 12 or container[:4] != b'RIFF' or container[8:] != b'WAVE':
+            return None
+        end = struct.unpack_from('<I', container, 4)[0] + 8
+        if end > actual_size or end < 12:
+            return None
+        position, chunks, frame_size = 12, [], None
+        while position + 8 <= min(end, limit):
+            header = stream.read(8)
+            if len(header) != 8:
+                return None
+            kind, size = header[:4], struct.unpack_from('<I', header, 4)[0]
+            body = position + 8
+            if body + size > end:
+                return None
+            if kind == b'data':
+                if frame_size is None or size % frame_size or body + size + size % 2 > end:
+                    return None
+                return container.hex(), tuple(chunks), header.hex(), body, actual_size
+            following = body + size + size % 2
+            if following > min(end, limit):
+                return None
+            if kind == b'fmt ':
+                # 扩展、压缩或额外时长表交给真实读取器，不能猜它们的缓存身份。
+                if frame_size is not None or size not in (16, 18):
+                    return None
+                content = stream.read(size)
+                if len(content) != size:
+                    return None
+                tag, channels, rate, byte_rate, alignment, bits = struct.unpack_from('<HHIIHH', content)
+                if (tag != 1 or not channels or not rate or bits not in (8, 16, 24, 32)
+                        or alignment != channels * (bits // 8) or byte_rate != rate * alignment
+                        or (size == 18 and content[16:] != b'\0\0')):
+                    return None
+                frame_size = alignment
+                chunks.append((position, header.hex(), content.hex()))
+                stream.seek(size % 2, 1)
+            elif kind in (b'JUNK', b'PAD ', b'LIST'):
+                chunks.append((position, header.hex()))
+                stream.seek(size + size % 2, 1)
+            else:
+                return None
+            position = following
+    return None
+
+
+def _audio_read_identity(path):
+    try:
+        path.stat()
+    except FileNotFoundError:
+        return ('missing',)
+    except OSError:
+        return None
+    try:
+        version = dubbing_edit.file_read_identity(path)
+        header = _wav_duration_identity(path, version[0][0])
+    except OSError:
+        # 已存在的文件在读身份/头时消失，不能登记成稳定的缺失状态。
+        return None
+    return (version, header) if header is not None else None
+
+
+def _read_identity(root, rows, *, snapshots=None, dependencies=None):
+    """小型记录核验内容、音频只核验时长容器头；无法证明时不复用缓存。"""
     versions = []
     for row in rows:
         take = row.get('take')
-        if row.get('source') != 'dub' or take is None:
+        if row.get('source', 'dub') != 'dub' or take is None:
             continue
         path = dubbing_edit.take_path(root, row['id'], take)
-        for item in (path, path.with_suffix('.take.json')):
-            try:
-                value = dubbing_edit.file_read_identity(item)
-            except OSError:
-                value = None
-            versions.append(value)
+        audio = _audio_read_identity(path)
+        if audio is None:
+            return None
+        versions.append(audio)
+        version, snapshot = dubbing_edit.take_snapshot_identity(root, row, take, dependencies=dependencies)
+        if version is None:
+            return None
+        versions.append(version)
+        if snapshots is not None:
+            snapshots[(row['id'], take)] = snapshot
     return versions
 
 
-def _cache_key(kind, project, root, rows, options, extra=None):
-    value = [kind, str(root), project.params, rows, options, extra, _read_identity(root, rows)]
+def _cache_key(kind, project, root, rows, options, extra=None, *, snapshots=None, dependencies=None):
+    versions = _read_identity(root, rows, snapshots=snapshots, dependencies=dependencies)
+    if versions is None:
+        return None
+    value = [kind, str(root), project.params, rows, options, extra, versions]
     return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()
 
 
@@ -76,22 +151,25 @@ def fingerprint(deps):
     result['video'] = ([str(video[0]), video[1], video[2]] if video else None)
     rows = deps.production_lines()
     cache = getattr(deps, '_voice_timing_cache', None)
+    snapshots = {}
     key = _cache_key('fingerprint', deps.project, root, rows,
-                     [options, deps.cfg('tts')], result['video']) if cache is not None else None
-    if cache is not None and key in cache:
+                     [options, deps.cfg('tts')], result['video'],
+                     snapshots=snapshots, dependencies=deps) if cache is not None else None
+    if cache is not None and key is not None and key in cache:
         return copy.deepcopy(cache[key])
     result['voices'] = []
     for row in rows:
         source, take = row['source'], row.get('take')
         valid = (source == 'dub' and take is not None
-                 and dubbing_edit.playable(deps.project, row, root, take, dependencies=deps))
+                 and dubbing_edit.playable(deps.project, row, root, take, dependencies=deps,
+                                          snapshot=snapshots.get((row['id'], take))))
         result['voices'].append({
             'id': row['id'], 'start': row['start'], 'end': row['end'],
             'source': source, 'take': take,
             'version': dubbing_edit.file_version(dubbing_edit.take_path(
                 root, row['id'], take)) if valid else None,
         })
-    if cache is not None:
+    if cache is not None and key is not None:
         cache[key] = copy.deepcopy(result)
     return result
 
@@ -117,7 +195,7 @@ def settings(cfg):
     return values
 
 
-def _duration(row, root, *, project=None, cfg=None, dependencies=None):
+def _duration(row, root, *, project=None, cfg=None, dependencies=None, snapshot=None):
     """调用方已核验的时长优先；明确无效的历史文件绝不能重新变成可试听音频。"""
     source = row.get('source', 'dub')
     if source == 'original':
@@ -141,7 +219,8 @@ def _duration(row, root, *, project=None, cfg=None, dependencies=None):
     path = dubbing_edit.take_path(root, row['id'], take)
     if not path.is_file():
         return None, 'audio_missing'
-    recorded = dubbing_edit.take_snapshot(root, row, take, dependencies=dependencies)
+    recorded = (dubbing_edit.take_snapshot(root, row, take, dependencies=dependencies)
+                if snapshot is None else snapshot)
     if recorded and not dubbing_edit.snapshot_current(root, row, take, snapshot=recorded,
                                                      project=project, cfg_get=cfg, dependencies=dependencies):
         return None, 'audio_unavailable'
@@ -161,14 +240,19 @@ def plan(project, pdir, rows, cfg, video_duration=None, *, dependencies=None):
     if video_duration is None:
         video_duration = video_seconds(project, root)
     version = getattr(dependencies, 'version', None)
+    snapshots = {}
     key = _cache_key('plan', project, root, rows, [settings(cfg), cfg('tts')],
-                     [video_duration, version.get('values') if version else None])
+                     [video_duration, version.get('values') if version else None],
+                     snapshots=snapshots, dependencies=dependencies)
+    if key is None:
+        return _build_plan(project, root, rows, cfg, video_duration, dependencies=dependencies, snapshots=snapshots)
     if key not in cache:
-        cache[key] = _build_plan(project, root, rows, cfg, video_duration, dependencies=dependencies)
+        cache[key] = _build_plan(project, root, rows, cfg, video_duration,
+                                 dependencies=dependencies, snapshots=snapshots)
     return copy.deepcopy(cache[key])
 
 
-def _build_plan(project, pdir, rows, cfg, video_duration=None, *, dependencies=None):
+def _build_plan(project, pdir, rows, cfg, video_duration=None, *, dependencies=None, snapshots=None):
     """读取选用音频后计算时钟；不写产物、不读取旧铺轨文件、不调用模型。
 
     ``inputs`` 保留完整音频时长，只有可行局部窗口才应用新起点；一个窗口
@@ -187,7 +271,8 @@ def _build_plan(project, pdir, rows, cfg, video_duration=None, *, dependencies=N
             raise DubForgeError('配音台词编号重复，无法计算统一排布。', code='DUB_TIMELINE_INVALID')
         seen.add(row['id'])
         row.setdefault('source', 'dub')
-        seconds, error = _duration(row, root, project=project, cfg=cfg, dependencies=dependencies)
+        seconds, error = _duration(row, root, project=project, cfg=cfg, dependencies=dependencies,
+                                   snapshot=(snapshots or {}).get((row['id'], row.get('take'))))
         row['seconds'] = seconds
         prepared.append(row)
         take = row.get('take')

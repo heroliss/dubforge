@@ -3,6 +3,7 @@ import json
 import re
 import copy
 import os
+import hashlib
 from pathlib import Path
 
 from dubforge.domain import crud
@@ -49,17 +50,25 @@ def take_index(root):
     return {ident: sorted(takes) for ident, takes in result.items()}
 
 
+def _parse_take(content):
+    """只解析本次读到的同一份记录，不能把另一轮读取登记到旧内容身份。"""
+    try:
+        data = json.loads(content.decode('utf-8'))
+        return data if isinstance(data, dict) else {}
+    except ValueError:
+        return {}
+
+
 def read_take(root, line, take):
     path = take_path(root, line['id'], take)
     try:
-        data = json.loads(path.with_suffix('.take.json').read_text(encoding='utf-8'))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
+        return _parse_take(path.with_suffix('.take.json').read_bytes())
+    except OSError:
         return {}
 
 
 def file_read_identity(path):
-    """路径与只读句柄双身份；Windows 同大小改写后恢复 mtime 仍须失效。"""
+    """廉价的路径与只读句柄双身份；不能替代小型元数据的内容核验。"""
     before = path.stat()
     with path.open('rb') as stream:
         opened = os.fstat(stream.fileno())
@@ -72,31 +81,35 @@ def file_read_identity(path):
     return path_version, opened_version
 
 
-def take_snapshot(root, line, take, *, dependencies=None):
-    """请求内复用解析结果；改写、替换、删除记录后立即重新读取。"""
+def take_snapshot_identity(root, line, take, *, dependencies=None):
+    """同一次读取的内容身份与快照；缓存键和消费者不能各读一份记录。"""
     cache = getattr(dependencies, '_take_snapshots', None)
-    if cache is None:
-        return read_take(root, line, take)
     path = take_path(root, line['id'], take).with_suffix('.take.json')
     try:
-        version = file_read_identity(path)
-    except OSError:
-        cache.pop(str(path), None)
-        return {}
-    previous = cache.get(str(path))
-    if previous is not None and previous[0] == version:
-        return copy.deepcopy(previous[1])
-    data = read_take(root, line, take)
-    # 无效或读取中变化的记录不能登记为稳定结果。
-    try:
-        stable = version == file_read_identity(path)
-    except OSError:
-        stable = False
-    if data and stable:
-        cache[str(path)] = (version, copy.deepcopy(data))
-    else:
-        cache.pop(str(path), None)
-    return data
+        content = path.read_bytes()
+    except OSError as exc:
+        if cache is not None:
+            cache.pop(str(path), None)
+        return ('missing' if isinstance(exc, FileNotFoundError) else None), {}
+    version = hashlib.sha256(content).hexdigest()
+    previous = cache.get(str(path)) if cache is not None else None
+    if previous is not None and previous[0] == content:
+        return version, copy.deepcopy(previous[1])
+    data = _parse_take(content)
+    # 内容身份与解析来自同一次读取；即使外部原地改写，下一次读取也会失效。
+    if cache is not None:
+        if data:
+            cache[str(path)] = (content, copy.deepcopy(data))
+        else:
+            cache.pop(str(path), None)
+    return version, data
+
+
+def take_snapshot(root, line, take, *, dependencies=None):
+    """请求内复用解析结果；改写、替换、删除记录后立即重新读取。"""
+    if getattr(dependencies, '_take_snapshots', None) is None:
+        return read_take(root, line, take)
+    return take_snapshot_identity(root, line, take, dependencies=dependencies)[1]
 
 
 def _line_snapshot(line):

@@ -151,21 +151,23 @@ def test_workbench_reuses_directory_index_and_take_snapshot(prepared, monkeypatc
         for ident in (1, 2):
             assert synthesize(client, f'/api/projects/{uid}/workbench/lines/{ident}/synthesize', json={}).status_code == 200
     project = crud.get_project(uid)
-    original = dubbing_edit.read_take
+    original = dubbing_edit._parse_take
     reads = []
 
-    def tracked(root, line, take):
-        reads.append((line['id'], take))
-        return original(root, line, take)
+    def tracked(content):
+        reads.append(content)
+        return original(content)
 
     def individual_lookup_forbidden(*args):
         raise AssertionError('工作台不能逐句扫描整个配音目录')
 
-    monkeypatch.setattr(dubbing_edit, 'read_take', tracked)
+    monkeypatch.setattr(dubbing_edit, '_parse_take', tracked)
     monkeypatch.setattr(dubbing_edit, 'take_ids', individual_lookup_forbidden)
     rows = workbench._sample_lines(project, crud.project_dir(uid), Dependencies(project))
     assert len(rows) == 2 and all(row['wav']['exists'] for row in rows)
-    assert reads == [(1, 1), (2, 1)]
+    assert len(reads) == 2
+    assert set(reads) == {dubbing_edit.take_path(crud.project_dir(uid), ident).with_suffix('.take.json').read_bytes()
+                          for ident in (1, 2)}
 
 
 def test_batch_confirmation_reads_receipts_and_catalog_once(index_prepared, monkeypatch):

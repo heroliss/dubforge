@@ -1,7 +1,9 @@
 """项目空间只合并本轮读取，不以过期缓存替代真实制作状态。"""
 import asyncio
+import json
 import threading
 import time
+import wave
 from types import SimpleNamespace
 
 import pytest
@@ -12,6 +14,20 @@ from dubforge.domain import crud
 from dubforge.pipeline import dubbing_edit, voice_timing
 from dubforge.pipeline.dependencies import Dependencies
 from dubforge.utils.fs import atomic_write_bytes
+
+
+def _write_pcm_take(root, row):
+    """性能缓存必须用真实可识别的 PCM 容器验证，不能为伪 WAV 放宽门禁。"""
+    path = dubbing_edit.take_path(root, row['id'], row.get('take', 1))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with wave.open(str(path), 'wb') as stream:
+        stream.setparams((1, 2, 8000, 0, 'NONE', 'not compressed'))
+        stream.writeframes(b'\0\0' * 8000)
+    metadata = path.with_suffix('.take.json')
+    if metadata.exists():
+        value = json.loads(metadata.read_text(encoding='utf-8'))
+        value['version'] = dubbing_edit.file_version(path)
+        atomic_write_bytes(metadata, json.dumps(value).encode('utf-8'))
 
 
 def test_context_is_small_and_does_not_read_project_state(isolated_env, monkeypatch):
@@ -160,13 +176,13 @@ def test_take_snapshot_reuses_parse_but_reads_changed_or_deleted_record(make_pro
     project, root = crud.get_project(uid), crud.project_dir(uid)
     deps = Dependencies(project)
     row = deps.production_lines()[0]
-    original, reads = dubbing_edit.read_take, []
+    original, reads = dubbing_edit._parse_take, []
 
     def read(*args):
         reads.append(1)
         return original(*args)
 
-    monkeypatch.setattr(dubbing_edit, 'read_take', read)
+    monkeypatch.setattr(dubbing_edit, '_parse_take', read)
     first = dubbing_edit.take_snapshot(root, row, 1, dependencies=deps)
     first['settings']['changed_by_caller'] = True
     second = dubbing_edit.take_snapshot(root, row, 1, dependencies=deps)
@@ -184,6 +200,7 @@ def test_voice_fingerprint_shared_across_request_versions_but_file_changes_inval
     uid = make_project()
     mark_upstream_done(uid, 'assemble')
     deps = Dependencies(crud.get_project(uid))
+    _write_pcm_take(deps.root, deps.production_lines()[0])
     original, calls = dubbing_edit.playable, []
 
     def playable(*args, **kwargs):
@@ -192,6 +209,7 @@ def test_voice_fingerprint_shared_across_request_versions_but_file_changes_inval
 
     monkeypatch.setattr(dubbing_edit, 'playable', playable)
     first = voice_timing.fingerprint(deps)
+    assert first['voices'][0]['version'] is not None
     assert voice_timing.fingerprint(deps.for_version({'values': {}})) == first
     assert len(calls) == 1
     path = dubbing_edit.take_path(deps.root, 1, 1)
@@ -221,6 +239,6 @@ def test_layout_reused_only_when_version_settings_and_file_identity_match(make_p
     changed = deps.for_version({'values': {'tts.placement.max_shift_seconds': 1.}})
     voice_timing.plan(deps.project, deps.root, rows, changed.cfg, 10, dependencies=changed)
     assert len(calls) == 2
-    atomic_write_bytes(dubbing_edit.take_path(deps.root, 1), b'new audio identity')
+    _write_pcm_take(deps.root, rows[0])
     voice_timing.plan(deps.project, deps.root, rows, deps.cfg, 10, dependencies=deps)
     assert len(calls) == 3
