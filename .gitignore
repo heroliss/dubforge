@@ -24,6 +24,7 @@ desktop.ini
 # ===== 本地开发与测试缓存 =====
 .ruff_cache/
 .tmp/
+.tmp_*
 frontend/.test-vite-cache/
 *.tsbuildinfo
 scripts/docs/node_modules/
