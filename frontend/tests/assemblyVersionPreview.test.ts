@@ -9,17 +9,17 @@ const {descriptor}=parse(await readFile(new URL('../src/components/AssemblyVersi
 const result=await build({stdin:{contents:`import { reactive, unmountHooks } from 'vue';
  const fixtureProps=reactive(__PROPS__),defineProps=()=>fixtureProps;
  ${descriptor.scriptSetup!.content}
- export {fixtureProps,context,seconds,image,outdated,error,loading,render,loadContext,beginScrub,endScrub,unmountHooks};`,loader:'ts',resolveDir:`${root}/src/components`},bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'boundaries',setup(b){
+ export {fixtureProps,nav,context,seconds,image,frameOutdated,frameError,frameLoading,frameOpen,render,contextReader,beginScrub,endScrub,unmountHooks};`,loader:'ts',resolveDir:`${root}/src/components`},bundle:true,write:false,format:'esm',platform:'node',plugins:[{name:'boundaries',setup(b){
  b.onResolve({filter:/^(vue|naive-ui)$|\.vue$|\/stores\/nav$/},a=>({path:a.path,namespace:'test'}))
  b.onLoad({filter:/.*/,namespace:'test'},a=>({contents:a.path==='vue'?`export {ref,computed,watch,reactive} from '@vue/reactivity';export const unmountHooks=[],onMounted=()=>{},onBeforeUnmount=f=>unmountHooks.push(f);`:
-  a.path==='naive-ui'?`export const useMessage=()=>({success(){}});`:a.path.endsWith('/stores/nav')?`export const useNavStore=()=>({stepMap:{assemble:{artifacts:[]}}});`:'export default {};',resolveDir:root}))
+  a.path==='naive-ui'?`export const useMessage=()=>({success(){}}),useDialog=()=>({warning(){return{destroy(){}}}});`:a.path.endsWith('/stores/nav')?`import {reactive} from 'vue';export const useNavStore=()=>reactive({stepMap:{assemble:{status:'done',job_id:null,artifacts:[]}}});`:'export default {};',resolveDir:root}))
 }}]})
 let serial=0
 async function fixture(t:any){
  t.mock.timers.enable({apis:['setTimeout']})
  const props={uid:'fixture',version:{id:'p1',name:'中文字幕',dubbing:false,burn_subtitles:true,include_comments:false,overrides:{}},overlayRevision:'r1'}
  const page=await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text.replace('__PROPS__',JSON.stringify(props))+`\n//${serial++}`).toString('base64')}`)
- page.context.value={duration:60,subtitles:[],comments:[]};t.after(()=>page.unmountHooks.forEach((f:()=>void)=>f()));return page
+ page.context.value={duration:60,subtitles:[],comments:[]};page.frameOpen.value=true;t.after(()=>page.unmountHooks.forEach((f:()=>void)=>f()));return page
 }
 async function flush(){for(let i=0;i<25;i++)await Promise.resolve()}
 test('版本预览串行且丢弃旧响应，零透明度和不同字幕类型保留到请求',async t=>{
@@ -31,14 +31,14 @@ test('版本预览串行且丢弃旧响应，零透明度和不同字幕类型�
  replies[0](new Response('old'));await first;await flush();assert.equal(p.image.value,'')
  t.mock.timers.tick(500);await flush();assert.equal(calls.length,2)
  assert.equal(calls[1].version.overrides['assemble.subtitle_track'],'bilingual');assert.equal(calls[1].version.overrides['comments.background_opacity'],0)
- replies[1](new Response('new'));await flush();assert.ok(p.image.value);assert.equal(p.outdated.value,false)
- p.seconds.value=10;assert.equal(p.outdated.value,true)
+ replies[1](new Response('new'));await flush();assert.ok(p.image.value);assert.equal(p.frameOutdated.value,false)
+ p.seconds.value=10;assert.equal(p.frameOutdated.value,true)
 })
 test('拖动期间不编码；松开只预览最终位置，失败不循环重试',async t=>{
  const calls:any[]=[]
  t.mock.method(globalThis,'fetch',async(_url:any,init:any)=>{calls.push(JSON.parse(init.body));return new Response(JSON.stringify({message:'预览失败'}),{status:400})})
  const p=await fixture(t);p.beginScrub();p.seconds.value=4;t.mock.timers.tick(1000);await flush();assert.equal(calls.length,0)
- p.seconds.value=12;p.endScrub();t.mock.timers.tick(500);await flush();assert.equal(calls.length,1);assert.equal(calls[0].seconds,12);assert.match(p.error.value,/预览失败/)
+ p.seconds.value=12;p.endScrub();t.mock.timers.tick(500);await flush();assert.equal(calls.length,1);assert.equal(calls[0].seconds,12);assert.match(p.frameError.value,/预览失败/)
  t.mock.timers.tick(5000);await flush();assert.equal(calls.length,1)
 })
 
@@ -46,7 +46,7 @@ test('时间轴慢请求合并，版本变化取消旧请求，离开不再产�
  const calls:any[]=[],replies:any[]=[]
  t.mock.method(globalThis,'fetch',(_url:any,init:any)=>{calls.push(init);return new Promise(resolve=>replies.push(resolve))})
  const p=await fixture(t)
- const first=p.loadContext();void p.loadContext();void p.loadContext()
+ const first=p.contextReader.refresh();void p.contextReader.refresh();void p.contextReader.refresh()
  assert.equal(calls.length,1)
  p.fixtureProps.overlayRevision='r2'
  assert.equal(calls[0].signal.aborted,true)
@@ -58,4 +58,35 @@ test('时间轴慢请求合并，版本变化取消旧请求，离开不再产�
  replies[1](new Response(JSON.stringify({duration:888})));await flush()
  t.mock.timers.tick(500);await flush()
  assert.equal(p.context.value.duration,60);assert.equal(calls.length,2)
+})
+
+test('相同状态轮询与相同参数对象不会重复取帧或清掉历史选择',async t=>{
+ const calls:string[]=[]
+ t.mock.method(globalThis,'fetch',async(url:any)=>{calls.push(String(url));return new Response('frame')})
+ const p=await fixture(t);await p.render();await flush()
+ for(let i=0;i<5;i++){
+  p.nav.stepMap.assemble={status:'done',job_id:null,artifacts:[],progress_phase:undefined}
+  p.fixtureProps.version={...p.fixtureProps.version,overrides:{...p.fixtureProps.version.overrides}}
+  t.mock.timers.tick(500);await flush()
+ }
+ assert.equal(calls.filter(url=>url.endsWith('/frame')).length,1)
+ assert.equal(calls.filter(url=>url.includes('preview-history')).length,0)
+})
+
+test('已显示的同帧复用，手动刷新和改变取景位置仍会重新取帧',async t=>{
+ const calls:any[]=[]
+ t.mock.method(globalThis,'fetch',async(_url:any,init:any)=>{calls.push(JSON.parse(init.body));return new Response('frame')})
+ const p=await fixture(t);await p.render();await p.render();assert.equal(calls.length,1)
+ await p.render(true);assert.equal(calls.length,2)
+ p.seconds.value=15;t.mock.timers.tick(500);await flush()
+ assert.equal(calls.length,3);assert.equal(calls[2].seconds,15)
+})
+
+test('关闭预览取消待处理取帧，纯声音版本不会在后台渲染画面',async t=>{
+ const calls:any[]=[]
+ t.mock.method(globalThis,'fetch',(_url:any,init:any)=>{calls.push(init);return new Promise(()=>{})})
+ const p=await fixture(t);void p.render();assert.equal(calls.length,1)
+ p.frameOpen.value=false;assert.equal(calls[0].signal.aborted,true)
+ p.fixtureProps.version.burn_subtitles=false;p.frameOpen.value=true
+ t.mock.timers.tick(1000);await flush();assert.equal(calls.length,1)
 })

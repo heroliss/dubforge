@@ -207,3 +207,43 @@ Write-Host 'PANEL_EXITED'
     assert 'API:start/indextts25' in result.stdout and 'API:stop/indextts25' in result.stdout
     assert '日志验证内容' in result.stdout and 'PANEL_EXITED' in result.stdout
     assert '[错误]' not in result.stdout
+
+
+@pytest.mark.skipif(sys.platform != 'win32' or not shutil.which('powershell'), reason='Windows PowerShell 控制台')
+def test_powershell_console_controls_backend_and_frontend_independently(tmp_path):
+    """控制台操作应更新本地进程状态，不把前后端命令误发给配音服务 API。"""
+    repo = Path(__file__).resolve().parents[2]
+    harness = tmp_path / 'console-process-control-test.ps1'
+    script = """
+$ErrorActionPreference = 'Stop'
+$OutputEncoding = [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)
+. '%s'
+$script:nextPid = 100
+function Get-NetTCPConnection { @() }
+function Start-Sleep { param([int]$Milliseconds) }
+function Start-DevService {
+    param($Title, $WorkingDirectory, $Command, $LogName, $Environment)
+    $script:nextPid += 1
+    Write-Host ('START:' + $LogName)
+    return [pscustomobject]@{ Id=$script:nextPid; HasExited=$false }
+}
+function Stop-DevProcessTree { param($Process, $Name); Write-Host ('STOP:' + $Name + ':' + $Process.Id) }
+function Wait-DevReady { param($Target, $BackendProcess, $FrontendProcess, $BackendPort, $FrontendPort, $BackendReused); return @{ Backend=$true; Frontend=$true } }
+function Show-DevStatus { param($BackendProcess, $FrontendProcess, $BackendPort, $FrontendPort, $BackendReused); Write-Host ('STATUS:' + [bool]$BackendProcess + ':' + [bool]$FrontendProcess) }
+function Invoke-DevServiceApi { throw '不应调用配音服务 API' }
+$state = @{ BackendProcess = [pscustomobject]@{ Id=1; HasExited=$false }; FrontendProcess = $null; BackendPort=8611; FrontendPort=15273; BackendReused=$false }
+Enter-DevControlPanel -State $state -BackendPort 8611 -FrontendPort 15273 -LogDir '%s'
+Write-Host ('FINAL:' + [bool]$state.BackendProcess + ':' + [bool]$state.FrontendProcess)
+""" % (str(repo / 'scripts/dev-console.ps1').replace("'", "''"), str(tmp_path).replace("'", "''"))
+    harness.write_text(script, encoding='utf-8-sig')
+    result = subprocess.run(
+        ['powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', str(harness)],
+        input='status\nstop frontend\nstart frontend\nrestart backend\nquit\n',
+        capture_output=True, text=True, encoding='utf-8', timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert 'STATUS:True:False' in result.stdout
+    assert 'START:frontend' in result.stdout
+    assert 'STOP:backend:1' in result.stdout
+    assert 'START:backend' in result.stdout
+    assert '不应调用配音服务 API' not in result.stdout
+    assert '[错误]' not in result.stdout

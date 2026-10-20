@@ -53,6 +53,11 @@ button:focus-visible, a:focus-visible, summary:focus-visible, [tabindex="0"]:foc
 .publication-panel.n-card>.n-card-header .n-card-header__main { font-size:15px; font-weight:600; line-height:1.5; }
 .publication-panel.n-card>.n-card__content { padding:0 20px 20px; }
 .publication-panel>.field-grid:last-child { margin-bottom:0; }
+/* 参数表单按内容排布，长文本/说明不能拉伸邻项并把单行控件推到中间。 */
+.df-settings-grid { align-items:start; }
+.df-settings-grid > .df-setting { min-width:0; align-self:start; align-content:start; }
+.df-settings-grid > .df-setting.n-form-item { grid-template-rows:auto auto; }
+.df-settings-grid > .df-setting.n-form-item > .n-form-item-blank { align-items:flex-start; min-width:0; }
 @media (min-width: 1700px) { .workspace-page { padding-top: 36px; } }
 @media (max-width: 900px) { .workspace-page { padding: 22px 20px 36px; } }
 @media (max-width: 600px) {

@@ -16,9 +16,9 @@ before(async()=>{
   mock.method(globalThis,'fetch',()=>{throw new Error('不允许未声明请求')})
 })
 after(async()=>{mock.restoreAll();await server.close()})
-async function render(seed:(p:any)=>void=()=>{}){
+async function render(seed:(p:any)=>void=()=>{}, props:Record<string,unknown>={}){
   let page:any
-  const app=createSSRApp({render:()=>h(Panel,{uid:'fixture'})});setup(app)
+  const app=createSSRApp({render:()=>h(Panel,{uid:'fixture',...props})});setup(app)
   app.mixin({created(){if(this.$options.__name==='CommentDiagnostics'){page=this.$.setupState;seed(page)}}})
   return {html:await renderToString(app),page}
 }
@@ -61,11 +61,22 @@ test('真实组件并列呈现日志与对话，错误可见，模型内容按�
     p.events=[{event:'request',role:'system',content:'系统任务'},{event:'assistant_response',request_id:'r',content:'<script>危险文本</script>'}]
   })
   assert.match(html,/评论运行日志/);assert.match(html,/LLM 对话/);assert.match(html,/LLM_OUTPUT_INVALID/)
-  assert.match(html,/复用 60 条/);assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>危险文本/)
+  assert.match(html,/复用有效评分 60 条/);assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>危险文本/)
   assert.match(html,/<details/);assert.match(html,/评论评分/);assert.match(html,/评论翻译/)
   const source=readFileSync(new URL('../src/views/StepView.vue',import.meta.url),'utf8')
   assert.match(source,/detailSection === 'logs'.*运行日志/)
   assert.match(source,/detailSection === 'llm'.*LLM 对话/)
+})
+
+test('无新增译文和旧审核拦截分别统计，无对话不声称全部成功', async () => {
+  const {html}=await render(p=>{
+    p.action='translate';p.exists=true
+    p.job={status:'partial',action:'translate',processed:0,total:4,cached:31,blocked:4,blocked_cached:4,failed:0,deferred:0,skipped:4}
+  })
+  assert.match(html,/本次新增译文 0 条/);assert.match(html,/复用有效译文 31 条/)
+  assert.match(html,/审核拦截记录 4 条（其中旧记录 4 条未重发）/)
+  assert.match(html,/复用有效结果或跳过旧问题都可能不发请求/)
+  assert.doesNotMatch(html,/全部复用了缓存|已全部翻译|译文已更新/)
 })
 test('诊断请求只读，增量游标持续前进，新一轮清除旧对话',async t=>{
   const {page}=await render();const calls:any[]=[]
@@ -92,4 +103,21 @@ test('读取失败保留已展示内容，不发送任何重试任务',async t=>
   const {page}=await render(p=>p.events=[{event:'request',content:'已读内容'}])
   t.mock.method(globalThis,'fetch',async()=>({ok:false,json:async()=>({message:'暂时无法读取'})}))
   await page.load();assert.equal(page.error,'暂时无法读取');assert.equal(page.rows[0].content,'已读内容')
+})
+
+test('直接打开诊断时读取当前翻译失败动作，显式入口与用户选择优先',async t=>{
+  const {page}=await render();const calls:string[]=[]
+  t.mock.method(globalThis,'fetch',async(url)=>{calls.push(String(url));return {ok:true,json:async()=>({job:{action:'translate',status:'failed'},rows:[]})}})
+  await page.discoverAction();assert.equal(page.action,'translate')
+  assert.deepEqual(calls,['/api/projects/fixture/comments'])
+  page.selectAction('filter');await page.discoverAction();assert.equal(page.action,'filter');assert.equal(calls.length,1)
+  const explicit=await render(()=>{}, {initialAction:'translate'})
+  await explicit.page.discoverAction();assert.equal(explicit.page.action,'translate');assert.equal(calls.length,1)
+})
+
+test('自动定位迟到响应不覆盖用户刚选择的评分诊断',async t=>{
+  const {page}=await render();let resolve:any
+  t.mock.method(globalThis,'fetch',()=>new Promise(done=>resolve=()=>done({ok:true,json:async()=>({job:{action:'translate',status:'failed'}})})))
+  const discovering=page.discoverAction();page.selectAction('filter');resolve();await discovering
+  assert.equal(page.action,'filter')
 })

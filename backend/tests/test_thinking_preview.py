@@ -19,11 +19,19 @@ def test_summary_reports_effective_support_without_mutating_or_exposing_secrets(
     original = profile()
     frozen = deepcopy(original)
     summary = thinking_profiles([original])[0]
-    assert summary == dict(name='主模型', enabled=True, supports_low=True, params_valid=True,
+    assert summary == dict(name='主模型', enabled=True, supports_low=True, params_valid=True, removes_thinking=True,
                            effort='high', has_thinking=True, thinking_type='enabled')
     assert original == frozen
     assert 'fixture-private' not in json.dumps(summary)
     assert 'base_url' not in summary and 'params' not in summary
+
+
+def test_glm_low_summary_preserves_thinking_and_matches_request():
+    original = profile(model='glm-5.3-flash', base_url='https://open.bigmodel.cn/api/paas/v4',
+                       params={'reasoning_effort': 'max', 'thinking': {'type': 'enabled', 'clear_thinking': False}})
+    summary = thinking_profiles([original])[0]
+    assert summary['supports_low'] is True and summary['removes_thinking'] is False
+    assert prepare_profiles([original])[0]['params']['thinking'] == original['params']['thinking']
 
 
 def test_custom_model_override_is_used_for_support_detection():

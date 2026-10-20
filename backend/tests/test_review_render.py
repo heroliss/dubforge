@@ -136,6 +136,9 @@ def test_repair_rebuilds_source_frames_current_subtitles_and_mutes_existing_mix(
         record = session.get(AssemblyResult, f'{uid}:{item["version_id"]}')
     snapshot = json.loads(record.snapshot)
     assert snapshot['content_review_receipt'] == item['receipt']
+    assert snapshot['generated_at'] == snapshot['review_render']['created_at']
+    assert snapshot['generated_at'].endswith('+00:00')
+    assert av.artifact_metadata(uid)[item['artifact_id']]['generated_at'] == snapshot['generated_at']
     assert '未重新进行语义整理' in snapshot['review_render']['note']
     deps, version = _version(uid, item['version_id'])
     assert rr.is_current(deps, version, verify_hash=True)
@@ -151,12 +154,73 @@ def test_repair_rebuilds_source_frames_current_subtitles_and_mutes_existing_mix(
 def test_identical_repair_reuses_result_without_encoding(make_project, monkeypatch):
     uid, root, art, _ = _fixture(make_project)
     first = rr.repair(uid, [art.id])['repaired'][0]
+    recipe = json.loads(av.results(uid)[first['version_id']].snapshot)['review_render']['recipe']
+    assert 'comment_width_rule' not in recipe
     before = configuration.resolve(uid)['revision']
     monkeypatch.setattr(rr, '_render', lambda *a, **k: pytest.fail('相同输入应复用已核对修订文件'))
     second = rr.repair(uid, [art.id])['repaired'][0]
     assert second['reused'] and second['artifact_id'] == first['artifact_id']
     assert second['path'] == first['path'] and configuration.resolve(uid)['revision'] == before
     assert len(list((root / 'output').glob('final_version_review-*.mp4'))) == 1
+
+
+def _separated_background(uid, root, *, frequency=150):
+    project = crud.get_project(uid)
+    path = root / 'audio/background.wav'
+    _run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+          f'sine=frequency={frequency}:duration=3', '-ar', '32000', '-ac', '1', '-f', 'wav', str(path)])
+    crud.add_artifact(project.id, 'preprocess', 'audio', 'background.wav', path, 'audio/background.wav')
+    step = crud.get_step(project.id, 'preprocess')
+    step.status, step.input_fingerprint = 'done', ''
+    crud.save_step(step)
+    return path
+
+
+def _tone(samples, start, end, frequency, rate=16000):
+    part = samples[round(start * rate):round(end * rate)]
+    return abs(np.mean(part * np.exp(-2j * np.pi * frequency * np.arange(len(part)) / rate)))
+
+
+def test_review_revision_restores_separated_background_and_audio_mode_invalidates_cache(make_project):
+    uid, root, art, _ = _fixture(make_project)
+    _separated_background(uid, root)
+    data = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=data['revision'],
+        updates={'content_review.audio_mode': 'all_audio'}))
+    first = rr.repair(uid, [art.id])['repaired'][0]
+    assert _tone(_audio(first['path']), .8, 1.2, 150) < .001
+    data = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=data['revision'],
+        updates={'content_review.audio_mode': 'voice_only'}))
+    deps, version = _version(uid, first['version_id'])
+    assert not rr.is_current(deps, version)
+    second = rr.repair(uid, [art.id])['repaired'][0]
+    assert second['artifact_id'] != first['artifact_id'] and not second['reused']
+    audio = _audio(second['path'])
+    assert _tone(audio, .8, 1.2, 150) > .03
+    assert _tone(audio, .8, 1.2, 880) < .0003
+    assert _tone(audio, 2.2, 2.6, 880) > .03
+    assert _tone(audio, 2.2, 2.6, 150) < .0003
+    processing = second['receipt']['audio_processing']
+    assert processing['requested_mode'] == processing['effective_mode'] == 'voice_only'
+    assert processing['background_identity'] and not processing['fallback_reason']
+    stored = json.loads(av.results(uid)[second['version_id']].snapshot)['review_render']['recipe']
+    assert any(row['name'] == 'background.wav' for row in stored['inputs'])
+    assert stored['audio_processing']['background_identity']
+    assert Path(first['path']).is_file()
+
+
+def test_review_background_resource_change_invalidates_prior_revision(make_project):
+    uid, root, art, _ = _fixture(make_project)
+    _separated_background(uid, root)
+    first = rr.repair(uid, [art.id])['repaired'][0]
+    assert first['receipt']['audio_processing']['effective_mode'] == 'voice_only'
+    _separated_background(uid, root, frequency=180)
+    deps, version = _version(uid, first['version_id'])
+    assert not rr.is_current(deps, version)
+    second = rr.repair(uid, [art.id])['repaired'][0]
+    assert second['artifact_id'] != first['artifact_id']
+    assert _tone(_audio(second['path']), .8, 1.2, 180) > .03
 
 
 def test_current_review_changes_invalidate_old_revision_and_create_new_history(make_project):
@@ -167,6 +231,9 @@ def test_current_review_changes_invalidate_old_revision_and_create_new_history(m
         updates={'content_review.blocked_ranges': '0-2:人工核定'}))
     deps, version = _version(uid, first['version_id'])
     assert not rr.is_current(deps, version)
+    state = rr.revision_state(deps, version)
+    assert {'REVIEW_MANUAL_RANGES_CHANGED', 'REVIEW_EFFECT_CHANGED'} <= {r['code'] for r in state['reasons']}
+    assert '人工核定' not in json.dumps(state, ensure_ascii=False)
     second = rr.repair(uid, [art.id])['repaired'][0]
     assert second['artifact_id'] != first['artifact_id'] and second['version_id'] != first['version_id']
     assert Path(first['path']).is_file() and Path(second['path']).is_file()
@@ -183,6 +250,132 @@ def test_comment_revision_is_rescreened_and_changes_invalidate_render(make_proje
     comment_studio.save(uid, dict(revision=body['overlay_revision'], settings=body['overlay']['settings'], items=[item]))
     deps, version = _version(uid, result['version_id'])
     assert not rr.is_current(deps, version)
+    assert 'REVIEW_COMMENTS_CHANGED' in {r['code'] for r in rr.revision_state(deps, version)['reasons']}
+
+
+def test_new_comment_revision_records_width_rule_and_auto_equals_full_width(make_project):
+    uid, _, art, _ = _fixture(make_project, comments=True)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    recipe = json.loads(av.results(uid)[result['version_id']].snapshot)['review_render']['recipe']
+    assert recipe['comment_width_rule'] == 'available-area-v1'
+    full = copy.deepcopy(recipe)
+    full['comment_overlay']['settings']['width_percent'] = 100
+    full['values']['comments.width_percent'] = 100
+    assert rr._revision_recipe(recipe) == rr._revision_recipe(full)
+    deps, version = _version(uid, result['version_id'])
+    assert rr.is_current(deps, version)
+    version['values']['comments.width_percent'] = 100
+    assert rr.is_current(deps, version)
+
+
+@pytest.mark.parametrize(('width', 'fresh'), [(0, False), (100, True), (80, True)])
+def test_historical_revision_only_invalidates_changed_auto_width(make_project, width, fresh):
+    uid, _, art, _ = _fixture(make_project, comments=True)
+    with crud.session() as session:
+        record = session.get(AssemblyResult, f'{uid}:initial')
+        snapshot = json.loads(record.snapshot)
+        snapshot['comment_overlay']['settings']['width_percent'] = width
+        snapshot['values']['comments.width_percent'] = width
+        record.snapshot = json.dumps(snapshot, ensure_ascii=False)
+        session.add(record); session.commit()
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    with crud.session() as session:
+        record = session.get(AssemblyResult, f'{uid}:{result["version_id"]}')
+        snapshot = json.loads(record.snapshot)
+        info, recipe = snapshot['review_render'], snapshot['review_render']['recipe']
+        recipe.pop('comment_width_rule')
+        # 先保存真实旧配方的摘要，确保测试走有效历史兼容而非损坏记录拒绝。
+        info['fingerprint'] = record.fingerprint = av.digest(recipe)
+        record.snapshot = json.dumps(snapshot, ensure_ascii=False)
+        session.add(record); session.commit()
+    deps, version = _version(uid, result['version_id'])
+    state = rr.revision_state(deps, version)
+    assert state['current'] is fresh
+    if not fresh:
+        assert {reason['code'] for reason in state['reasons']} == {'REVIEW_RECIPE_CHANGED'}
+
+
+def test_unused_current_comment_duration_keeps_frozen_revision_current(make_project):
+    uid, _, art, _ = _fixture(make_project, comments=True)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    record = av.results(uid)[result['version_id']]
+    previous = record.snapshot, record.fingerprint
+    data = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=data['revision'],
+        updates={'comments.duration': 2, 'comments.interval': 2}))
+    deps, version = _version(uid, result['version_id'])
+    state = rr.revision_state(deps, version, verify_hash=True)
+    assert state == dict(current=True, reasons=[])
+    assert (av.results(uid)[result['version_id']].snapshot, av.results(uid)[result['version_id']].fingerprint) == previous
+
+
+def _legacy_record(uid, ident):
+    """模拟真实旧配方，保存原摘要后才允许兼容比较。"""
+    with crud.session() as session:
+        row = session.get(AssemblyResult, f'{uid}:{ident}')
+        snapshot = json.loads(row.snapshot)
+        info, recipe = snapshot['review_render'], snapshot['review_render']['recipe']
+        info['schema'] = recipe['schema'] = 'review-render-v1'
+        recipe.pop('audio_processing', None)
+        recipe['review_receipt'].pop('audio_processing', None)
+        recipe['values'].pop('content_review.audio_mode', None)
+        info['fingerprint'] = row.fingerprint = av.digest(recipe)
+        row.snapshot = json.dumps(snapshot, ensure_ascii=False)
+        session.add(row); session.commit()
+
+
+def test_legacy_all_audio_recipe_is_compatible_when_effect_is_unchanged(make_project):
+    uid, _, art, _ = _fixture(make_project)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    _legacy_record(uid, result['version_id'])
+    deps, version = _version(uid, result['version_id'])
+    # 没有可用分离背景，新的 voice_only 安全降级为原有全静音。
+    assert rr.revision_state(deps, version, verify_hash=True) == dict(current=True, reasons=[])
+
+
+def test_legacy_recipe_detects_new_effective_voice_only_audio(make_project, monkeypatch):
+    uid, _, art, _ = _fixture(make_project)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    _legacy_record(uid, result['version_id'])
+    prepare = rr._prepare
+    def voice_only(*args, **kwargs):
+        prepared = prepare(*args, **kwargs)
+        prepared['recipe']['audio_processing'] = dict(requested_mode='voice_only', effective_mode='voice_only',
+            background_identity=dict(sha256='isolated-background', size=100), bgm_volume=1)
+        return prepared
+    monkeypatch.setattr(rr, '_prepare', voice_only)
+    deps, version = _version(uid, result['version_id'])
+    state = rr.revision_state(deps, version)
+    assert not state['current']
+    reason = next(r for r in state['reasons'] if r['code'] == 'REVIEW_AUDIO_MODE_CHANGED')
+    assert reason['changes'][0]['before'] == '全部声音静音'
+    assert '仅屏蔽人声' in reason['changes'][0]['after']
+    assert 'REVIEW_VERSION_SETTINGS_CHANGED' not in {r['code'] for r in state['reasons']}
+
+
+def test_damaged_recipe_is_rejected_before_normalization_and_never_exposes_text(make_project):
+    uid, _, art, _ = _fixture(make_project)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    with crud.session() as session:
+        row = session.get(AssemblyResult, f'{uid}:{result["version_id"]}')
+        snapshot = json.loads(row.snapshot)
+        snapshot['review_render']['recipe']['current_comment_plan'] = {'private_text': '不应对外显示的正文'}
+        row.snapshot = json.dumps(snapshot)
+        session.add(row); session.commit()
+    deps, version = _version(uid, result['version_id'])
+    state = rr.revision_state(deps, version)
+    assert not state['current'] and state['reasons'][0]['code'] == 'REVIEW_HISTORY_INVALID'
+    assert '不应对外显示' not in json.dumps(state, ensure_ascii=False)
+
+
+def test_revision_file_missing_has_specific_safe_reason(make_project):
+    uid, _, art, _ = _fixture(make_project)
+    result = rr.repair(uid, [art.id])['repaired'][0]
+    Path(result['path']).unlink()
+    deps, version = _version(uid, result['version_id'])
+    state = rr.revision_state(deps, version)
+    assert not state['current'] and state['reasons'][0]['code'] == 'REVIEW_FILE_MISSING_OR_CHANGED'
+    assert str(Path(result['path']).parent) not in json.dumps(state, ensure_ascii=False)
 
 
 @pytest.mark.parametrize('fault,code', [('snapshot', 'REVIEW_RENDER_SNAPSHOT'),
@@ -248,11 +441,12 @@ def test_commit_failure_rolls_back_catalog_artifact_result_and_only_removes_new_
 
 
 def test_config_change_during_encoding_rejects_result(make_project, monkeypatch):
+    from test_publishing_studio_review import _project_setting
     uid, root, art, _ = _fixture(make_project)
     render = rr._render
     def changed(*args, **kwargs):
         out = render(*args, **kwargs)
-        config.set_key('content_review.blocked_ranges', '0-2:中途修改')
+        _project_setting(uid, 'content_review.blocked_ranges', '0-2:中途修改', external=True)
         return out
     monkeypatch.setattr(rr, '_render', changed)
     with pytest.raises(rr.ReviewRenderError) as exc:

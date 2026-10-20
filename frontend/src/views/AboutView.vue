@@ -1,16 +1,16 @@
 <script setup lang="ts">
-// 关于页：先说明产品定位，再说明管线、原则和进度。
-import { NCard, NDivider, NGi, NGrid, NH1, NLayoutContent, NSpace, NTable, NTag, NText } from 'naive-ui'
-import { NAV_STEP_ORDER } from '../stores/nav'
+// 关于页：说明当前版本的能力、使用入口和独立项目定位。
+import { NCard, NDivider, NGi, NGrid, NH1, NSpace, NTable, NTag, NText } from 'naive-ui'
+import { RouterLink } from 'vue-router'
+import { version } from '../../package.json'
+import { WORKFLOW_STAGES } from '../utils/workflowStages'
 
-const milestones = [
-  ['M0', '脚手架', '后端、前端、数据库、配置和启动脚本', true],
-  ['M1', '项目域', '项目管理、步骤执行器、中断恢复和输入指纹', true],
-  ['M2', '文本管线', '下载、分离、转录、分句、翻译和字幕', true],
-  ['M3', '配音成片', '配音计划、试配、批量配音和视频合成', true],
-  ['M4', '前端应用', '项目列表、管线页、设置和帮助', true],
-  ['M5', '试配工作台', '少量试听、调参、满意标记和缓存复用', true],
-  ['M6', '持续打磨', '错误中心、端到端验证和更多模型适配', false],
+const capabilities = [
+  ['项目与模板', '本地视频和链接导入、系列模板、项目独立设置与批量计划。'],
+  ['字幕与配音', '识别、语义整理、翻译、逐句校对、试配与多条语音选择。'],
+  ['成片版本', '原声与配音版本、字幕和评论排版、非破坏性剪辑与试片。'],
+  ['发布与回执', 'B站稿件、分P、章节和发布记录；审核结果以平台实际回执为准。'],
+  ['执行与恢复', '依赖检查、输入指纹、运行快照、日志和中断后的继续执行。'],
 ] as const
 const principles = [
   ['步骤透明', '每一步都可查看状态、进度、输入、产物和日志。'],
@@ -27,7 +27,7 @@ const principles = [
       <p class="lead">把视频翻译、配音和成片整理成一条可以观察、可以恢复、可以批量运行的本地工作流。</p>
 
       <n-grid cols="1 s:2 m:4" :x-gap="12" :y-gap="12" responsive="screen" class="stats">
-        <n-gi><n-card size="small"><n-text depth="3">制作工作区</n-text><div class="stat">{{ NAV_STEP_ORDER.length }}</div><n-text depth="3">字幕与配音统一编辑</n-text></n-card></n-gi>
+        <n-gi><n-card size="small"><n-text depth="3">工作阶段</n-text><div class="stat">{{ WORKFLOW_STAGES.length }}</div><n-text depth="3">制作、评论与发布统一编排</n-text></n-card></n-gi>
         <n-gi><n-card size="small"><n-text depth="3">默认语言</n-text><div class="stat">中文</div><n-text depth="3">同时支持多语言扩展</n-text></n-card></n-gi>
         <n-gi><n-card size="small"><n-text depth="3">运行方式</n-text><div class="stat">本地</div><n-text depth="3">模型服务按需连接</n-text></n-card></n-gi>
         <n-gi><n-card size="small"><n-text depth="3">批处理</n-text><div class="stat">支持</div><n-text depth="3">多项目自动续跑</n-text></n-card></n-gi>
@@ -35,8 +35,7 @@ const principles = [
 
       <n-card title="一条视频如何走完？" size="small" class="card">
         <div class="flow">
-          <span>获取视频</span><b>→</b><span>音轨分离</span><b>→</b><span>转录/翻译</span><b>→</b>
-          <span>字幕与配音</span><b>→</b><span>合成成片</span>
+          <template v-for="(stage,index) in WORKFLOW_STAGES" :key="stage.key"><b v-if="index">→</b><span>{{ stage.label }}</span></template>
         </div>
         <n-text depth="3" class="hint">可先试听少量句子再批量合成，也可只校对并导出字幕。每个步骤按实际输入检查依赖，最新结果自动复用。</n-text>
       </n-card>
@@ -49,13 +48,12 @@ const principles = [
         </n-grid>
       </n-card>
 
-      <n-card title="开发进度" size="small" class="card">
+      <n-card title="v1 稳定版能力" size="small" class="card">
         <n-table size="small" :single-line="false">
-          <thead><tr><th style="width:70px">里程碑</th><th style="width:130px">主题</th><th>内容</th><th style="width:80px">状态</th></tr></thead>
+          <thead><tr><th style="width:140px">工作区</th><th>当前能力</th></tr></thead>
           <tbody>
-            <tr v-for="[m, name, desc, done] in milestones" :key="m">
-              <td><n-tag size="small" :type="done ? 'success' : 'default'">{{ m }}</n-tag></td>
-              <td>{{ name }}</td><td>{{ desc }}</td><td>{{ done ? '✅ 已完成' : '⏳ 计划中' }}</td>
+            <tr v-for="[name, desc] in capabilities" :key="name">
+              <td>{{ name }}</td><td>{{ desc }}</td>
             </tr>
           </tbody>
         </n-table>
@@ -63,10 +61,11 @@ const principles = [
 
       <n-card size="small" class="card footer-card">
         <n-space vertical size="small">
-          <n-text><b>技术选型和升级建议</b></n-text>
-          <n-text depth="3">仓库中的 <code>docs/research/technology-landscape-2026.md</code> 按步骤整理了当前方案、候选模型、优缺点和升级优先级。</n-text>
+          <n-text><b>使用与开发文档</b></n-text>
+          <n-text depth="3"><RouterLink to="/help">使用指南</RouterLink> 介绍各工作区的操作；<RouterLink to="/settings">设置</RouterLink> 管理模型连接和制作参数。仓库中的 <code>docs/README.md</code> 汇总安装、架构、开发与故障排查文档。</n-text>
+          <n-text depth="3">DubForge 是独立开发的本地视频译制工作台。模型服务与平台账号由用户自行配置，项目数据和制作结果保存在自己的工作目录。</n-text>
           <n-divider style="margin: 4px 0" />
-          <n-text depth="3">版本 0.1.0 · DubForge AI · 数据默认保存在本机工作目录</n-text>
+          <n-text depth="3">版本 {{ version }} · DubForge AI · 数据默认保存在本机工作目录</n-text>
         </n-space>
       </n-card>
     </div>

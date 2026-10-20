@@ -6,6 +6,8 @@ import { NAlert, NButton, NCheckbox, NDrawer, NDrawerContent, NSpin, NTag } from
 import { STEP_ORDER, STEP_LABELS, STATUS_TEXT } from '../stores/nav'
 import { parseChain } from '../utils/chainStatus'
 import { WORKFLOW_BUSY } from '../utils/workflow'
+import DubbingRunOptions from './DubbingRunOptions.vue'
+import { defaultDubbingRunPolicy, dubbingRunPolicy, dubbingPolicyError, dubbingPlanHasWork, type DubbingRunPolicy } from '../utils/dubbingRunPolicy'
 
 type Target = { uid: string; title: string }
 type Item = Target & {
@@ -19,6 +21,7 @@ type IssueGroup = {
 }
 const emit = defineEmits<{ started: [] }>()
 const show = ref(false), checking = ref(false), busy = ref(false)
+const dubbing = ref(defaultDubbingRunPolicy())
 const items = ref<Item[]>([]), includeDependencies = ref(false), scopeName = ref('')
 const error = ref(''), checkedCount = ref(0), needsRecheck = ref(false)
 const submittedCount = ref(0)
@@ -101,6 +104,8 @@ async function inspect() {
   checking.value = true; busy.value = true; error.value = ''; items.value = []; checkedCount.value = 0
   submittedCount.value = 0
   needsRecheck.value = false; inspectedScope = ''
+  const policy = { ...dubbing.value }
+  if (dubbingPolicyError(policy)) { error.value=dubbingPolicyError(policy);checking.value=false;busy.value=false;return }
   try {
     // 逐项目读取，单项错误不丢弃其余项目的检查结果。
     for (const target of batch) {
@@ -112,22 +117,24 @@ async function inspect() {
         if (disposed || ticket !== generation) return
         item.detail = detail
         item.title = detail.title || target.title
+        if (detail.archived) item.blockers.push('项目已归档，请先恢复项目后再运行。')
         const chosen = new Set((detail.steps || []).filter((step: any) => step.selected).map((step: any) => step.key))
         item.steps = STEP_ORDER.filter(key => chosen.has(key))
         const chain = parseChain(detail.chain ?? detail.params?._chain)
         const workflowStatus = typeof detail.workflow_status === 'string'
           ? detail.workflow_status : detail.workflow_status?.status
         if (detail.dir_exists === false) item.blockers.push('项目目录缺失，请先在项目总览核对文件位置。')
-        if (detail.running_step || (detail.steps || []).some((step: any) => ['running', 'queued'].includes(step.status))
+        if (detail.running_step || ['running','pausing','stopping'].includes(detail.release_batch?.status)
+            || (detail.steps || []).some((step: any) => ['running', 'queued'].includes(step.status))
             || chain?.state === 'active' || WORKFLOW_BUSY.includes(workflowStatus)) {
           item.blockers.push('项目正在运行、排队或停止中，请先查看当前进度。')
         }
-        if (chain?.state === 'held') item.notes.push('本次使用总览勾选的新制作计划，会替换保留的制作续跑计划；需要从断点继续请使用检查恢复方案。')
-        if (['paused', 'failed', 'attention'].includes(workflowStatus)) item.notes.push('项目有未完成的自动流程；本次仅运行制作步骤。如需继续原流程，请在总览检查恢复方案。')
+        if (chain?.state === 'held') item.notes.push('本次按当前勾选创建制作计划，会替换保留的制作计划。需要继续原计划时，请关闭后选择「继续上次任务」。')
+        if (['paused', 'failed', 'attention'].includes(workflowStatus)) item.notes.push('项目有上次中断的完整流程。本次仅运行制作步骤，不继续其草稿或投稿终点。')
         if (!item.steps.length) item.blockers.push('未勾选制作步骤，请在项目总览选择要运行的步骤。')
         if (!item.blockers.length) {
           const plan = await api(`/api/projects/${encodeURIComponent(target.uid)}/run_plan`,
-            { steps: [...item.steps], include_dependencies: dependencies }, controller.signal)
+            { steps: [...item.steps], include_dependencies: dependencies, dubbing: policy }, controller.signal)
           if (disposed || ticket !== generation) return
           item.plan = JSON.parse(JSON.stringify(plan))
           item.blockers.push(...issueGroups(plan.blockers || []).map(issueSummary))
@@ -138,6 +145,7 @@ async function inspect() {
           const states = new Map((detail.steps || []).map((step: any) => [step.key, step]))
           const needsInputs = (plan.requirements || []).some((input: any) => ['missing', 'deleted', 'stale'].includes(input.state))
           item.allFresh = !item.blockers.length && !(plan.added || []).length && !needsInputs
+            && !dubbingPlanHasWork(plan.dubbing)
             && plan.steps.every((key: string) => (states.get(key) as any)?.fresh === true)
           item.selected = eligible(item)
         }
@@ -164,6 +172,7 @@ async function open(input: Target[], scopeLabel = '') {
   targets.value = next; activeScope = signature
   scopeName.value = scopeLabel || (next.length === 1 ? next[0].title : `本次 ${next.length} 个项目`)
   resettingScope = true; includeDependencies.value = false; resettingScope = false
+  dubbing.value = defaultDubbingRunPolicy()
   show.value = true; busy.value = false; checking.value = false
   inspection = inspect(); await inspection
 }
@@ -175,23 +184,53 @@ function close() {
 watch(includeDependencies, () => {
   if (!resettingScope && show.value && !(busy.value && !checking.value)) inspection = inspect()
 }, { flush: 'sync' })
+function onDubbingChange(value: DubbingRunPolicy) {
+  if (busy.value) return
+  dubbing.value=value;inspectedScope='';needsRecheck.value=true
+  inspection=inspect()
+}
 
 async function confirmStart() {
   if (!canConfirm.value) return
-  const selected = ready.value.map(item => ({ item, steps: [...item.plan.steps] }))
+  const selected = ready.value.map(item => ({ item, steps: [...item.plan.steps],
+    dubbing: dubbingRunPolicy(item.plan.dubbing?.policy || dubbing.value), fingerprint: item.plan.fingerprint }))
   const body = { uids: selected.map(({ item }) => item.uid),
-    steps_by_uid: Object.fromEntries(selected.map(({ item, steps }) => [item.uid, steps])) }
+    steps_by_uid: Object.fromEntries(selected.map(({ item, steps }) => [item.uid, steps])),
+    dubbing_by_uid: Object.fromEntries(selected.map(({ item, dubbing }) => [item.uid, dubbing])),
+    plan_fingerprints_by_uid: Object.fromEntries(selected.filter(entry=>entry.fingerprint).map(({ item, fingerprint })=>[item.uid,fingerprint])) }
   busy.value = true; needsRecheck.value = true; error.value = ''
   submittedCount.value = selected.length
   for (const { item } of selected) { item.submitted = true; item.selected = false; item.result = '正在交给后台…' }
   let accepted = 0, refreshNeeded = false
+  const current = [] as typeof selected
   try {
+    // 已打开的抽屉也可能遇到另一页面归档；确认时重新核对管理状态。
+    for (const entry of selected) {
+      try {
+        const detail = await api(`/api/projects/${encodeURIComponent(entry.item.uid)}`)
+        if (disposed) return
+        if (detail.archived) {
+          entry.item.detail = detail; entry.item.plan = null
+          entry.item.blockers = ['项目已归档，请先恢复项目后再运行。']
+          entry.item.resultKind = 'skipped'; entry.item.result = '未启动：项目已归档，请先恢复项目。'
+        } else current.push(entry)
+      } catch (failure: any) {
+        if (disposed) return
+        entry.item.plan = null; entry.item.blockers = [requestError(failure)]
+        entry.item.resultKind = 'error'; entry.item.result = '未启动：确认前未能核对项目状态，请重新检查。'
+      }
+    }
+    if (!current.length) return
+    body.uids = current.map(({ item }) => item.uid)
+    body.steps_by_uid = Object.fromEntries(current.map(({ item, steps }) => [item.uid, steps]))
+    body.dubbing_by_uid = Object.fromEntries(current.map(({ item, dubbing }) => [item.uid, dubbing]))
+    body.plan_fingerprints_by_uid = Object.fromEntries(current.filter(entry=>entry.fingerprint).map(({ item,fingerprint })=>[item.uid,fingerprint]))
     const receipt = await api('/api/projects/run_many', body)
     if (disposed) return
     refreshNeeded = Number(receipt.started) > 0
     const results = new Map((Array.isArray(receipt.results) ? receipt.results : [])
       .map((result: any) => [result.uid, result]))
-    for (const { item } of selected) {
+    for (const { item } of current) {
       const result: any = results.get(item.uid)
       if (result?.skipped) {
         item.resultKind = 'skipped'; item.result = `未启动：${result.skipped}`
@@ -210,7 +249,7 @@ async function confirmStart() {
     if (disposed) return
     refreshNeeded = true
     error.value = `启动结果未能确认，该请求可能已被后台处理。请先查看项目状态，再重新检查。${requestError(failure)}`
-    for (const { item } of selected) { item.resultKind = 'unknown'; item.result = '启动结果未确认，请查看项目状态；不会自动重复提交。' }
+    for (const { item } of current) { item.resultKind = 'unknown'; item.result = '启动结果未确认，请查看项目状态；不会自动重复提交。' }
   } finally {
     if (!disposed) busy.value = false
   }
@@ -235,6 +274,7 @@ defineExpose({ open, close, inspect, confirmStart, show, checking, busy, items,
           补齐缺失或需更新的依赖
         </n-checkbox>
         <p class="muted dependency-hint">更改此选项会重新检查，并列出补入的步骤；检查不会启动任务。</p>
+        <DubbingRunOptions :model-value="dubbing" :disabled="busy" @update:model-value="onDubbingChange" />
         <n-alert v-if="error" type="warning">{{ error }}</n-alert>
         <n-alert v-else-if="needsRecheck" type="info">本次请求已处理。再次运行前，请先查看状态并重新检查。</n-alert>
         <n-spin v-if="checking" size="small" :description="`正在检查 ${checkedCount}/${targets.length} 个项目…`" />
@@ -247,10 +287,11 @@ defineExpose({ open, close, inspect, confirmStart, show, checking, busy, items,
             <RouterLink :to="`/projects/${item.uid}`">查看项目总览 →</RouterLink>
           </div>
           <n-alert v-for="note in item.notes" :key="note" type="warning">{{ note }}
-            <RouterLink :to="`/projects/${item.uid}#automatic-workflow`">查看恢复方案 →</RouterLink>
+            <RouterLink :to="`/projects/${item.uid}#automatic-workflow`">在总览选择运行方式 →</RouterLink>
           </n-alert>
           <p v-if="item.allFresh" class="fresh-result">检查时所选步骤已是最新，无需运行。</p>
           <div v-if="item.plan" class="execution-plan">
+            <DubbingRunOptions v-if="item.plan.dubbing" :uid="item.uid" :summary="item.plan.dubbing" readonly />
             <p class="plan-caption">本次执行顺序 <small>步骤状态仅作检查时参考</small></p>
             <ol aria-label="本次制作步骤">
               <li v-for="key in item.plan.steps" :key="key" :data-step="key">

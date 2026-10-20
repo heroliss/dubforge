@@ -1,0 +1,53 @@
+{
+  "input": "project-overview.jpg",
+  "input_sha256": "0c5868383653a4cb3ce34b37016a4d43022827570d3d7b111e30793c1ad10e2f",
+  "output_sha256": "4d7ad1521668a6d7e8ed47843073c031be9adc5d1bc27f9b9a27d03adb767870",
+  "original_size": {
+    "width": 2560,
+    "height": 1215
+  },
+  "crop": {
+    "left": 620,
+    "top": 80,
+    "width": 1550,
+    "height": 435
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 620,
+      "top": 80,
+      "width": 1550,
+      "height": 435
+    },
+    "marks": [
+      {
+        "number": 1,
+        "target": {
+          "x": 46,
+          "y": 275,
+          "width": 460,
+          "height": 67
+        },
+        "label": {
+          "x": 26,
+          "y": 254
+        },
+        "arrow": false
+      },
+      {
+        "number": 2,
+        "target": {
+          "x": 1410,
+          "y": 225,
+          "width": 100,
+          "height": 43
+        },
+        "label": {
+          "x": 1350,
+          "y": 246
+        }
+      }
+    ]
+  }
+}

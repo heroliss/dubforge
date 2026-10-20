@@ -1,6 +1,8 @@
 """步骤 API: 常驻状态 + 单步运行/取消 + 日志尾读"""
 from pathlib import Path
 from datetime import timezone
+from copy import deepcopy
+from threading import Event, Lock
 
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
@@ -17,6 +19,13 @@ router = APIRouter(prefix="/api/projects/{uid}/steps", tags=["steps"])
 # 用户 config.yaml 里残留的同名键同样被过滤。快照按段嵌套 ("separate": {...}), 段内外都要滤
 _CFG_DISPLAY_HIDE = {"separate.speaker_diarization", "separate.hf_token"}
 _CFG_SENSITIVE = {"api_key", "token", "password", "secret"}
+
+# 状态页会同时被左侧导航、步骤页和预览组件读取。长片的完整 freshness
+# 核对可能需要几秒；同一时刻的重复读取不应各自重算并把线程池耗尽。
+# 只合并“正在进行中的一次计算”，不缓存完成结果，避免写操作后呈现旧状态。
+_STATUS_SINGLE_FLIGHT_WAIT = 25.0
+_status_flights: dict[str, dict] = {}
+_status_flight_guard = Lock()
 
 
 def _redact_cfg(value, key: str = ""):
@@ -45,6 +54,40 @@ def _display_cfg(snapshot: dict) -> dict:
 
 @router.get("")
 def list_steps(uid: str, response: Response):
+    with _status_flight_guard:
+        flight = _status_flights.get(uid)
+        owner = flight is None
+        if owner:
+            flight = {'event': Event(), 'value': None, 'error': None}
+            _status_flights[uid] = flight
+    if not owner:
+        # 后到请求等待同一份只读快照；如果前一个请求卡在磁盘/ffprobe，
+        # 以稳定业务错误结束等待，前端可在下一轮重试，不再各自放大负载。
+        if not flight['event'].wait(_STATUS_SINGLE_FLIGHT_WAIT):
+            raise DubForgeError('步骤状态正在核对，请稍后重试', code='STEP_STATUS_BUSY')
+        if flight['error'] is not None:
+            raise flight['error']
+        response.headers["Cache-Control"] = "no-store"
+        return deepcopy(flight['value'])
+    try:
+        value = _build_step_status(uid, response)
+    except Exception as exc:
+        with _status_flight_guard:
+            if _status_flights.get(uid) is flight:
+                flight['error'] = exc
+                _status_flights.pop(uid, None)
+                flight['event'].set()
+        raise
+    else:
+        with _status_flight_guard:
+            if _status_flights.get(uid) is flight:
+                flight['value'] = value
+                _status_flights.pop(uid, None)
+                flight['event'].set()
+        return value
+
+
+def _build_step_status(uid: str, response: Response):
     project = crud.get_project(uid)
     if not project:
         raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
@@ -53,6 +96,14 @@ def list_steps(uid: str, response: Response):
     deps = Dependencies(project)
     selected = selected_steps(project)
     steps = [s for s in deps.steps.values() if s.step_key in PIPELINE_KEYS]
+    # 正在运行的步骤只需要展示队列/进度/当前任务。完整的新鲜度核对会
+    # 解析整份逐句配音和成片版本（长片可能需要数千次小文件读取及 ffprobe），
+    # 在合成期间把状态接口拖到十几秒，前端轮询就会误报“步骤状态未更新”。
+    # 先冻结数据库中的运行状态，运行中的步骤走轻量分支；任务结束后的下一轮
+    # 再执行完整核对，确保最终的 freshness 仍然准确。
+    active_statuses = {'queued', 'running', 'stopping', 'pausing'}
+    active_keys = {s.step_key for s in steps if s.status in active_statuses}
+    executions = runner.execution_details(project.id, steps)
     arts_by_step: dict[str, list] = {}
     from dubforge.pipeline.output_files import snapshot as output_snapshot
     from dubforge.pipeline.assembly_versions import artifact_metadata
@@ -64,29 +115,46 @@ def list_steps(uid: str, response: Response):
             {"id": a.id, "name": a.name, "file": a.rel_path, "path": str(deps.path(a.step_key, a.name)), "size": a.size,
              **(output_snapshot(a, deps.root) if a.step_key == 'assemble' else {}),
              **version_meta.get(a.id, {}),
-             "sha256": a.sha256, "created_at": a.created_at.replace(tzinfo=timezone.utc).isoformat() if a.created_at else None})
-    inputs = {s.step_key: deps.input_view(s.step_key) for s in steps}
+             "sha256": a.sha256, "job_id": a.job_id,
+             "settings_snapshot_hash": a.settings_snapshot_hash or None,
+             "created_at": a.created_at.replace(tzinfo=timezone.utc).isoformat() if a.created_at else None})
+    # 运行态的输入清单不会影响执行（执行器已经完成依赖检查），避免在
+    # 请求线程里重复扫描逐句音频；页面仍保留空清单，结束后立即补齐详情。
+    inputs = {s.step_key: ([] if s.step_key in active_keys else deps.input_view(s.step_key)) for s in steps}
+    freshness = {s.step_key: (dict(settings_changed=False, upstream_changed=False, artifact_missing=False)
+                              if s.step_key in active_keys else deps.freshness_flags(s.step_key)) for s in steps}
+    # 结果字典会多次使用步骤状态；非运行步骤只核对一次，运行步骤直接
+    # 使用已冻结的数据库状态，避免 tts/assemble 的 fresh 计算被重复触发。
+    status_by_key = {s.step_key: (s.status if s.step_key in active_keys else deps.status(s.step_key))
+                     for s in steps}
     result_by_key = {s.step_key: {
         "key": s.step_key,
         "label": STEP_MAP[s.step_key].label,
         "description": STEP_MAP[s.step_key].description,
-        "status": deps.status(s.step_key),
+        "status": status_by_key[s.step_key],
         "error": ({"code": s.error_code, "message": s.error_message,
-                   "suggestion": s.error_suggestion} if s.error_code and deps.status(s.step_key) != "done" else None),
+                   "suggestion": s.error_suggestion} if s.error_code and status_by_key[s.step_key] != "done" else None),
         "input_fingerprint": s.input_fingerprint,
-        "fresh": deps.display_fresh(s.step_key),
-        "default_fresh": deps.fresh(s.step_key),
-        **deps.freshness_feedback(s.step_key),
+        "fresh": (False if s.step_key in active_keys else deps.display_fresh(s.step_key)),
+        "default_fresh": (False if s.step_key in active_keys else deps.fresh(s.step_key)),
+        # 新鲜度拆成两个互相独立的维度，步骤页可以直接展示，
+        # 不必先打开全局详情面板才能判断该重做哪一部分。
+        **freshness[s.step_key],
+        **({'freshness_label': '正在更新',
+            'freshness_reason': '任务完成后将重新核对产物与设置。'}
+           if s.step_key in active_keys else deps.freshness_feedback(s.step_key)),
         "selected": s.step_key in selected,
         "missing_inputs": [i for i in inputs[s.step_key] if i['state'] in {'missing', 'deleted'}],
         "unready_inputs": [i for i in inputs[s.step_key] if not i['ready']],
-        "affected_steps": deps.downstream(s.step_key),
+        # 设置变化不会使下游失效；只有确实替换了上游产物才展示后续影响范围。
+        "affected_steps": (deps.downstream(s.step_key) if freshness[s.step_key]['upstream_changed'] else []),
         "retry_count": s.retry_count,
         "artifacts": arts_by_step.get(s.step_key, []),
         "cfg": _redact_cfg(_display_cfg(_cfg_snapshot(STEP_MAP[s.step_key].cfg_keys, deps.overrides, settings=deps.settings))),
-        "progress": 100.0 if deps.status(s.step_key) == "done" else round(s.progress or 0, 1),
+        "progress": 100.0 if status_by_key[s.step_key] == "done" else round(s.progress or 0, 1),
         **(runner.progress_eta(project.id, s.step_key) if s.status == "running"
            else {"eta_seconds": 0.0, "eta_scope": "step"}),
+        "execution": executions.get(s.step_key),
         "cancelling": runner.is_cancelling(project.id, s.step_key),
         "stop_reason": runner.stop_reason(project.id, s.step_key),
         "pausing": runner.is_paused(project.id, s.step_key),
@@ -101,6 +169,11 @@ def list_steps(uid: str, response: Response):
                     and (s.step_key != "preprocess" or deps.cfg("separate.enabled", True)
                          or name in {"raw.wav", "separate.json"})],
     } for s in steps}
+    if 'translate' in result_by_key:
+        from dubforge.pipeline import translation_preview
+        job = crud.latest_job(project.id, 'translate')
+        result_by_key['translate']['partial_preview_job_id'] = (
+            job.id if job and job.status != 'done' and translation_preview.available(deps.root, job.id) else None)
     if 'tts' in result_by_key:
         from dubforge.pipeline.dubbing_task import view
         result_by_key['tts']['synthesis_task'] = view(project.id)
@@ -124,6 +197,19 @@ def list_steps(uid: str, response: Response):
         }
         result_by_key['assemble']['default_output_label'] = default_description(deps.cfg)
     return [result_by_key[key] for key in PIPELINE_KEYS if key in result_by_key]
+
+
+@router.get('/translate/context')
+def translation_context_view(uid: str, response: Response):
+    from dubforge import translation_context
+    response.headers['Cache-Control'] = 'no-store'
+    return translation_context.view(uid)
+
+
+@router.put('/translate/context')
+def translation_context_update(uid: str, body: dict):
+    from dubforge import translation_context
+    return translation_context.update(uid, body)
 
 
 @router.get('/download/video-info')
@@ -329,9 +415,27 @@ def forget_output(uid: str, name: str, body: dict, request: Request, response: R
     return forget_missing(uid, name, body)
 
 
-@router.api_route("/{key}/artifacts/{name}/raw", methods=["GET", "HEAD"])
-def artifact_raw(uid: str, key: str, name: str):
+@router.get("/{key}/artifacts/{name}/raw")
+@router.head("/{key}/artifacts/{name}/raw", include_in_schema=False)
+def artifact_raw(uid: str, key: str, name: str, preview: bool = False):
     """按登记产物提供原文/原文件 (预览用); 只允许本步骤已登记的名字, 不接受路径"""
+    if preview and key == 'translate' and name == 'translate.txt':
+        from dubforge.pipeline import translation_preview
+        project = crud.get_project(uid)
+        if project:
+            job = crud.latest_job(project.id, 'translate')
+            if job and job.status != 'done':
+                partial = translation_preview.read(crud.project_dir(uid), job.id)
+                if partial:
+                    return Response(partial['text'], media_type='text/plain; charset=utf-8', headers={
+                        'Cache-Control': 'no-store', 'X-DubForge-Preview': 'partial',
+                        'X-DubForge-Completed': str(partial['completed']),
+                        'X-DubForge-Total': str(partial['total']),
+                    })
+                if job.status == 'running' and not crud.latest_artifacts(project.id, ['translate']).get('translate/translate.txt'):
+                    return Response('', media_type='text/plain; charset=utf-8', headers={
+                        'Cache-Control': 'no-store', 'X-DubForge-Preview': 'waiting',
+                    })
     p = _artifact_file(uid, key, name)
     mime = _ART_MIME.get(p.suffix.lower(), "application/octet-stream")
     return MediaFileResponse(p, media_type=mime,

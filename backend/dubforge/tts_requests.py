@@ -56,6 +56,12 @@ def needs_recovery(url):
         return bool(record and (record.get('draining') or record.get('token') not in _active))
 
 
+def pending(url):
+    """自动资源交接不能忽略仍由本进程观察、尚未进入draining的请求。"""
+    with _lock:
+        return _read(_path(url)) is not None
+
+
 def reset(url):
     """仅在服务已确认停止或新进程已启动后调用；不提供盲目解除占用按钮。"""
     with _lock:

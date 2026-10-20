@@ -2,12 +2,12 @@
 管线步骤注册表
 ==============
 可执行步骤的静态定义 (顺序/中文名/说明/配置指纹键)。
-M1 起每个 key 对应 pipeline/steps.py 的实现函数;
-UI 依据此表常驻渲染步骤卡 (吸取 VideoLingo "下一步后上一步按钮消失" 的教训)。
+每个 key 对应 pipeline/steps.py 的实现函数；
+UI 依据此表常驻渲染步骤卡，便于随时查看和继续各步骤。
 
 cfg_keys: 该步骤依赖的配置键 (点分路径, 支持前缀匹配段)。
 输入指纹 = sha256(cfg_keys 对应配置快照 + 实际输入产物哈希；download 另含源输入快照)。
-配置或上游任一变化 → 指纹变化 → 重跑时不会误跳过。
+制作要求或真实上游变化会改变产物指纹；模型连接等执行设置单独用于运行合同。
 """
 from dataclasses import dataclass, field
 
@@ -54,13 +54,14 @@ STEPS: list[StepDef] = [
                     ("transcribe", "words.json", "词级时间戳")),
             outputs=(("split.txt", "编号时间轴协议文本 (序号. 开始-结束: 片段)"),)),
     StepDef("translate", "翻译",
-            "翻译语义整理后的原文；超出上下文预算才分窗口，支持术语表与风格提示词",
+            "翻译语义整理后的原文；按上下文预算与每窗行数上限连续分窗，支持术语表与风格提示词",
             ("translate", "llm"), "artifacts/translate",
             inputs=(("split", "split.txt", "语义整理后的原文与时间轴"),),
-            outputs=(("translate.txt", "编号译文协议文本 (序号. 译文)"),)),
+            outputs=(("translate.txt", "编号译文协议文本 (序号. 译文)"),
+                     ("alignment_audit.json", "译文与时间轴的时长/邻句错位审查"))),
     StepDef("subtitles", "字幕导出",
             "在字幕与配音页导出校对后的原文、译文或双语 SRT；仅原文不需要翻译，导出不需要配音",
-            ("subtitles", "content_review"), "srt",
+            ("subtitles", "content_review", "tts.placement"), "srt",
             inputs=(("split", "split.txt", "语义整理后的原文与时间轴"),
                     ("translate", "translate.txt", "与原文逐句对应的译文")),
             outputs=(("source.srt", "语义整理后的原文字幕（保留识别原稿 src.srt）"),
@@ -79,10 +80,11 @@ STEPS: list[StepDef] = [
             inputs=(("split", "split.txt", "语义时间轴"),
                     ("translate", "translate.txt", "逐句译文"),
                     ("preprocess", "vocal.wav", "音色/情感参考源 (stable/dynamic)")),
-            outputs=(("<句id>.wav", "逐句配音；更多版本为 <句id>_v<版本>.wav (artifacts/tts/)"),)),
+            outputs=(("<句id>.wav", "逐句配音；更多版本为 <句id>_v<版本>.wav (artifacts/tts/)"),
+                     ("voice_timing.json", "当前选槽的局部排布报告（原文、译文与配音共用播放时间）"))),
     StepDef("assemble", "合成成片",
             "独立成片版本：原声/配音、字幕、评论及样式可分别覆盖，成功后替换同版本",
-            ("assemble", "content_review"), "output",
+            ("assemble", "content_review", "tts.placement"), "output",
             inputs=(("split", "split.txt", "语义时间轴"),
                     ("translate", "translate.txt", "逐句译文"),
                     ("preprocess", "background.wav", "背景音 (混音)"),

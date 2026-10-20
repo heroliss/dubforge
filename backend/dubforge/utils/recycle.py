@@ -1,4 +1,4 @@
-"""成品只允许回收，不降级为永久删除；Windows 明确拒绝不可回收操作。"""
+"""文件和目录只允许回收，不降级为永久删除；Windows 明确拒绝不可回收操作。"""
 import sys
 from pathlib import Path
 
@@ -7,12 +7,12 @@ from dubforge.errors import DubForgeError
 
 class RecycleError(DubForgeError):
     code = 'RECYCLE_FAILED'
-    suggestion = '请关闭占用该成品的播放器，并检查磁盘回收站设置后重试；不会改用永久删除。'
+    suggestion = '请关闭占用文件的程序，并检查磁盘回收站设置后重试；不会改用永久删除。'
 
 
 def require_recycle(flags):
     if not flags & 0x80:  # TSF_DELETE_RECYCLE_IF_POSSIBLE
-        raise RecycleError('此文件无法进入回收站，已取消删除')
+        raise RecycleError('此文件或目录无法进入回收站，已取消删除')
 
 
 def _windows_recycle(path):

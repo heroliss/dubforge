@@ -1,0 +1,141 @@
+{
+  "schema": "dubforge.documentation-capture.v1",
+  "captured_on": "2026-10-20",
+  "version": "1.0.0",
+  "browser": "Chrome",
+  "viewport_override": false,
+  "source": "Real Vue build and isolated local API on 127.0.0.1:8611; self-authored demo projects and geometry video",
+  "boundary": {
+    "steps_pending": 27,
+    "jobs": 0,
+    "accounts": 0,
+    "publications": 0,
+    "formal_assembly_results": 0,
+    "model_calls": 0,
+    "tts_calls": 0
+  },
+  "original_pixels_preserved": true,
+  "annotations": "Local SVG overlay via Sharp; crop and resize; no UI or business-state fabrication",
+  "screens": [
+    {
+      "name": "project-space",
+      "raw": "raw/project-space.jpg",
+      "annotation": "annotations/project-space.json",
+      "image": "project-space.webp",
+      "receipt": "project-space.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1271
+      },
+      "raw_sha256": "5b33b122faf9bad9924da0e9b8c23a95688d2148abd687f6b7fd39ad2f7b2251",
+      "output_sha256": "2dc423e40600255e54bb8da94d1610725f350c3d8f5000bc38777be96a5a009e",
+      "size": {
+        "width": 1180,
+        "height": 636,
+        "bytes": 197006
+      },
+      "crop": {
+        "left": 620,
+        "top": 80,
+        "width": 1550,
+        "height": 835
+      }
+    },
+    {
+      "name": "project-overview",
+      "raw": "raw/project-overview.jpg",
+      "annotation": "annotations/project-overview.json",
+      "image": "project-overview.webp",
+      "receipt": "project-overview.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1215
+      },
+      "raw_sha256": "0c5868383653a4cb3ce34b37016a4d43022827570d3d7b111e30793c1ad10e2f",
+      "output_sha256": "4d7ad1521668a6d7e8ed47843073c031be9adc5d1bc27f9b9a27d03adb767870",
+      "size": {
+        "width": 1180,
+        "height": 331,
+        "bytes": 90400
+      },
+      "crop": {
+        "left": 620,
+        "top": 80,
+        "width": 1550,
+        "height": 435
+      }
+    },
+    {
+      "name": "subtitles-dubbing",
+      "raw": "raw/subtitles-dubbing.jpg",
+      "annotation": "annotations/subtitles-dubbing.json",
+      "image": "subtitles-dubbing.webp",
+      "receipt": "subtitles-dubbing.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1215
+      },
+      "raw_sha256": "b852dfe157493efd388b9946db1edc292c47ec9b52177305917b515d50a8b359",
+      "output_sha256": "f8efea641ebb3eafd04ac39b4a686a24baa204ac7b4345f54f921a07184b0084",
+      "size": {
+        "width": 1180,
+        "height": 746,
+        "bytes": 246154
+      },
+      "crop": {
+        "left": 620,
+        "top": 80,
+        "width": 1550,
+        "height": 980
+      }
+    },
+    {
+      "name": "assembly-versions",
+      "raw": "raw/assembly-versions.jpg",
+      "annotation": "annotations/assembly-versions.json",
+      "image": "assembly-versions.webp",
+      "receipt": "assembly-versions.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1215
+      },
+      "raw_sha256": "53d5219b375bceec2d4ed7c0bcfff61cfe4895fb2a4d85acbc49856dee4dad58",
+      "output_sha256": "1cdc61e71048d47b9fe965254decca5383bef4f1927e30ac1bb38e8492f32cb9",
+      "size": {
+        "width": 1180,
+        "height": 624,
+        "bytes": 134586
+      },
+      "crop": {
+        "left": 620,
+        "top": 300,
+        "width": 1550,
+        "height": 820
+      }
+    },
+    {
+      "name": "production-settings",
+      "raw": "raw/production-settings.jpg",
+      "annotation": "annotations/production-settings.json",
+      "image": "production-settings.webp",
+      "receipt": "production-settings.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1215
+      },
+      "raw_sha256": "29bf1ae7cf65c9ecd9d5f007f4bb7fb0c3260123b02a5e42b6a2164e0110b8c3",
+      "output_sha256": "3810db94357db06f7c84baad30e700e50340374a05e721b689f2c4a5d5dbfc88",
+      "size": {
+        "width": 1100,
+        "height": 859,
+        "bytes": 210036
+      },
+      "crop": {
+        "left": 780,
+        "top": 200,
+        "width": 1230,
+        "height": 960
+      }
+    }
+  ]
+}

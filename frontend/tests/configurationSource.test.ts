@@ -47,6 +47,28 @@ test('核心配置来源色互不重复，小字号文字在自身底色及界�
   }
 })
 
+test('本句发音默认跟随译文，不误标为项目设置或未知来源', () => {
+  const value = sourcePresentation({ kind: 'line_default' }, true)
+  assert.equal(value.label, '跟随本句译文')
+  assert.match(value.title, /直接朗读当前译文/)
+  assert.doesNotMatch(value.title, /项目设置|尚未取得/)
+})
+
+test('项目基础来源说明固定时点，不把冻结值显示为实时继承；来源色与名称保留', () => {
+  for (const source of [{kind:'global',frozen:true}, {kind:'series',name:'旅行系列',frozen:true}] as const) {
+    const shown = sourcePresentation(source, true)
+    assert.equal(shown.kind, source.kind)
+    assert.equal(shown.color, SOURCE_STYLES[source.kind].color)
+    assert.equal(shown.label, source.kind==='global'?'已存全局值':'已存模板值')
+    assert.match(shown.title, /项目基础值来自/)
+    assert.match(shown.title, /创建或上次应用/)
+    assert.match(shown.title, /不随来源自动变化/)
+    assert.match(shown.title, /不代表.*最新.*值/)
+    assert.doesNotMatch(shown.title, /继承自/)
+    assert.equal(sourcePresentation({ ...source, frozen: false }, true).label, source.kind==='global'?'全局默认':'系列模板')
+  }
+})
+
 test('标识保留中文文字和可访问说明，模板名安全转义，未知来源不误标为全局', async () => {
   const app = createSSRApp({ render: () => h('div', [
     h(Badge, { source: { kind: 'series', name: '<script>长模板</script>' }, inherited: true }),
@@ -121,7 +143,7 @@ test('步骤参数按有效整理模式显示适用长度，空开关默认LLM�
   })
   const fields=[
     {path:'split.use_llm',label:'启用 LLM 语义整理',type:'bool'},
-    {path:'split.target_word_count',label:'语义目标词数（约）',type:'int',depends_on:[['split.use_llm',true]]},
+    {path:'split.target_word_count',label:'语义目标词数（软参考）',type:'int',depends_on:[['split.use_llm',true]]},
     {path:'split.max_split_length',label:'本地单句长度（字符）',type:'int',depends_on:[['split.use_llm',false]]},
     {path:'split.llm_profile',label:'语义整理模型',type:'str',depends_on:[['split.use_llm',true]]},
   ]

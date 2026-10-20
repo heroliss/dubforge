@@ -18,14 +18,22 @@ class TransportError(DubForgeError):
 
 
 def _error_detail(value):
-    """仅允许有界、非敏感的合集诊断字段经过工作进程边界。"""
-    if not isinstance(value, dict) or value.get('stage') not in ('auth', 'input', 'cover', 'create', 'receipt',
-            'join_auth', 'join_season', 'join_section', 'join_input', 'join_add', 'join_verify'):
+    """仅允许有界、非敏感的平台诊断字段经过工作进程边界。"""
+    if not isinstance(value, dict) or value.get('stage') not in ('preflight', 'ownership', 'version', 'validate',
+            'request', 'auth', 'input', 'cover', 'create', 'receipt', 'join_auth', 'join_season', 'join_section',
+            'join_input', 'join_add', 'join_verify', 'rules', 'read', 'verify'):
         return None
     result = {'stage': value['stage']}
     for key in ('remote_code', 'http_status'):
         if type(value.get(key)) is int and abs(value[key]) < 2**31:
             result[key] = value[key]
+    for key in ('count', 'limit', 'index', 'title_length', 'max_title_length'):
+        if type(value.get(key)) is int and 0 <= value[key] <= 86400:
+            result[key] = value[key]
+    for key in ('minimum_seconds', 'actual_seconds'):
+        number = value.get(key)
+        if type(number) in (int, float) and 0 <= number <= 86400:
+            result[key] = number
     if value.get('network_code') in ('ECONNRESET', 'ETIMEDOUT', 'ECONNABORTED', 'ENOTFOUND', 'EAI_AGAIN',
             'CERT_HAS_EXPIRED', 'UNABLE_TO_VERIFY_LEAF_SIGNATURE', 'DEPTH_ZERO_SELF_SIGNED_CERT',
             'ERR_TLS_CERT_ALTNAME_INVALID', 'SELF_SIGNED_CERT_IN_CHAIN'):

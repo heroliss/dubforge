@@ -43,7 +43,9 @@ def test_navigation_reads_small_local_snapshot_without_full_params_or_production
         assert response.headers['cache-control'] == 'no-store'
         assert len(response.content) < 600
         assert response.json() == dict(title='大型隔离项目', status='done', dir_exists=True,
-            auto_steps=['split', 'translate'], chain=dict(remaining=['split', 'translate'], state='held',
+            archived=False, archived_at=None, release_batch=None,
+            auto_steps=['split', 'translate'],
+            chain=dict(remaining=['split', 'translate'], state='held',
                 hold=dict(step='split', code='LLM_RETRY', message='等待重试')))
     assert crud.get_project(uid).model_dump() == before
     assert manifest.read_bytes() == saved_manifest
@@ -90,13 +92,17 @@ def test_auto_title_local_uses_filename(isolated_env):
         client.delete(f"/api/projects/{data['uid']}")
 
 
-def test_auto_title_link_fallback_uses_site_and_id(isolated_env):
-    # 元数据取不到 (域名不存在) → 兜底「站点_ID」, 依然可读、非随机
+def test_auto_title_link_fallback_uses_site_and_id(isolated_env, monkeypatch):
+    # 模拟平台资料不可用，只从地址生成可读占位名称。
+    import yt_dlp
+    def unavailable(*args, **kwargs):
+        raise RuntimeError("模拟平台资料暂不可用")
+    monkeypatch.setattr(yt_dlp.YoutubeDL, "extract_info", unavailable)
     with _client() as client:
         data = client.post("/api/projects", json={
             "source_kind": "link",
             "source_url": "https://nonexistent.invalid/video/abc123"}).json()
-        assert data["title"] == "nonexistent.invalid_abc123"
+        assert data["title"] == "nonexistent.invalid · abc123"
         assert data["source_kind"] == "link"
         client.delete(f"/api/projects/{data['uid']}")
 

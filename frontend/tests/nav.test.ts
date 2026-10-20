@@ -11,10 +11,113 @@ const bundle = await build({ stdin: { contents: `export { useNavStore, STEP_LABE
 const { useNavStore, createPinia, setActivePinia, STEP_LABELS } = await import(
   `data:text/javascript;base64,${Buffer.from(bundle.outputFiles[0].text).toString('base64')}`)
 const flush = async () => { for (let i = 0; i < 12; i++) await Promise.resolve() }
+// 评论读取由多个消费者共用；测试结束时结清网络 mock，避免同 UID 的后续用例复用悬空 promise。
+function settleSharedComments(t:any,requests:any[]) {
+  t.after(async()=>{
+    for(const request of requests.filter(request=>request.url.endsWith('/comments/progress')))
+      request.resolve(new Response(JSON.stringify({workspace:{state:'pending',label:'尚未准备'}})))
+    await flush()
+  })
+}
+
+test('各状态来源独立恢复，其他API成功不会隐藏步骤断线或丢掉最后可信状态', async t => {
+  const requests: any[] = []
+  t.mock.method(globalThis, 'fetch', (url, options) => new Promise((resolve, reject) => requests.push({url, options, resolve, reject})))
+  settleSharedComments(t,requests)
+  setActivePinia(createPinia()); const nav = useNavStore()
+  const reply = (request: any, data: any) => request.resolve(new Response(JSON.stringify(data)))
+  try {
+    nav.enter('p')
+    reply(requests[0], {title: '已确认项目'})
+    reply(requests[1], [{key: 'tts', status: 'done', fresh: true, selected: true}])
+    reply(requests[2], {status: 'published'})
+    reply(requests[3], {run: null})
+    reply(requests.find(request=>request.url.endsWith('/comments/progress')), {workspace:{state:'pending',label:'尚未准备'}})
+    await flush()
+    const checked = nav.statusCheckedAt.steps
+    assert.ok(checked)
+    const start=requests.length,pending = nav.poll()
+    const batch = requests.slice(start)
+    batch.find(request=>request.url.endsWith('/steps')).reject(new TypeError('Failed to fetch')); await flush()
+    assert.equal(nav.connectionLost, true)
+    for (const [suffix,value] of [['/navigation',{title:'项目信息仍可用'}],['/status',{status:'published'}],['/workflow/status',{run:null}]] as const) {
+      const request=batch.find(request=>request.url.endsWith(suffix)&&(!suffix.startsWith('/status')||request.url.startsWith('/api/publishing/')))
+      reply(request,value)
+    }
+    const comments=batch.find(request=>request.url.endsWith('/comments/progress'))
+    if(comments)reply(comments,{workspace:{state:'pending',label:'尚未准备'}})
+    await pending
+    assert.equal(nav.connectionLost, true)
+    assert.equal(nav.stepMap.tts.status, 'done')
+    assert.equal(nav.statusCheckedAt.steps, checked)
+    assert.deepEqual(nav.connectionIssues.map((entry: any) => entry.source), ['steps'])
+    assert.match(nav.stepsError, /保留上次核对结果/)
+    const recovery = nav.refreshSteps()
+    reply(requests.filter(request=>request.url.endsWith('/steps')).at(-1), [{key: 'tts', status: 'done', fresh: true, selected: true}]); await recovery
+    assert.equal(nav.connectionLost, false); assert.equal(nav.stepsError, '')
+    assert.deepEqual(nav.connectionIssues, [])
+  } finally { nav.reset() }
+})
+
+test('步骤状态读取使用较宽的后端核对窗口，其他导航读取保持短超时', async t => {
+  const timeoutValues: number[] = []
+  const originalTimeout = AbortSignal.timeout
+  t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => {
+    timeoutValues.push(milliseconds)
+    return originalTimeout(milliseconds)
+  })
+  t.mock.method(globalThis, 'fetch', async url => new Response(JSON.stringify(
+    String(url).endsWith('/steps') ? [{key: 'tts', status: 'done', fresh: true, selected: true}]
+      : String(url).endsWith('/navigation') ? {title: '项目'} : {})))
+  setActivePinia(createPinia())
+  const nav = useNavStore()
+  try {
+    nav.uid = 'p'
+    await nav.refreshSteps()
+    await nav.refreshWorkflow()
+    assert.ok(timeoutValues.includes(30000))
+    assert.ok(timeoutValues.includes(15000))
+  } finally { nav.reset() }
+})
+
+for (const [name, response, expected] of [
+  ['HTTP失败', () => new Response('service temporarily unavailable', {status: 503}), /HTTP 503/],
+  ['JSON不可解析', () => new Response('<html>gateway response</html>'), /无法解析/],
+  ['状态结构错误', () => new Response(JSON.stringify({steps: []})), /格式不正确/],
+] as const) test(`${name}只提示对应来源，不宣称全站断线`, async t => {
+  t.mock.method(globalThis, 'fetch', async url => String(url).endsWith('/steps') ? response()
+    : new Response(JSON.stringify(String(url).endsWith('/navigation') ? {title: '项目'} : {})))
+  setActivePinia(createPinia()); const nav = useNavStore()
+  try {
+    nav.uid = 'p'; nav.steps = [{key: 'tts', status: 'done'}]; nav.stepsLoaded = true
+    await nav.poll()
+    assert.equal(nav.connectionLost, false)
+    assert.match(nav.stepsError, expected)
+    assert.equal(nav.projectError, ''); assert.equal(nav.workflowError, ''); assert.equal(nav.publicationError, '')
+    assert.equal(nav.stepMap.tts.status, 'done')
+  } finally { nav.reset() }
+})
+
+test('导航轻量读取批次占用，未来项目也锁编辑，暂停和切换释放旧项目状态',async t=>{
+ const requests:any[]=[]
+ t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+ settleSharedComments(t,requests)
+ setActivePinia(createPinia());const nav=useNavStore()
+ try {
+  nav.enter('queued-project')
+  requests.find(r=>r.url.endsWith('/navigation')).resolve(new Response(JSON.stringify({title:'排队项目',release_batch:{id:'batch',status:'running',position:2,total:3,phase:'等待前项完成'}})))
+  await flush();assert.equal(nav.busy,true);assert.equal(nav.releaseBatch.position,2);assert.equal(nav.steps.length,0)
+  for(const status of ['pausing','stopping']){nav.releaseBatch={...nav.releaseBatch,status};assert.equal(nav.busy,true)}
+  nav.releaseBatch={...nav.releaseBatch,status:'paused'};assert.equal(nav.busy,false)
+  nav.enter('other-project');assert.equal(nav.releaseBatch,null);assert.equal(nav.busy,false)
+  nav.releaseBatch={id:'new',status:'running'};nav.reset();assert.equal(nav.releaseBatch,null)
+ }finally{nav.reset()}
+})
 
 test('勾选保存期间及完成后的旧项目轮询不覆盖新勾选，下一轮仍能读取当前偏好',async t=>{
  const requests:any[]=[]
  t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+ settleSharedComments(t,requests)
  setActivePinia(createPinia());const nav=useNavStore()
  try {
   nav.enter('p');const old=requests.find(r=>r.url.endsWith('/navigation'))
@@ -36,11 +139,12 @@ test('慢状态请求跨过多个轮询周期也能显示，快速项目信息�
   t.mock.timers.enable({apis: ['setInterval']})
   const requests: any[] = []
   t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({url, options, resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia())
   const nav = useNavStore()
   try {
     nav.enter('a')
-    assert.equal(requests.length, 4)
+    assert.equal(requests.length, 5)
     assert.equal(requests[0].url, '/api/projects/a/navigation')
     requests[0].resolve(new Response(JSON.stringify({title: '中文工程', auto_steps: ['tts'], chain:null})))
     await flush()
@@ -58,40 +162,49 @@ test('慢状态请求跨过多个轮询周期也能显示，快速项目信息�
   } finally { nav.reset() }
 })
 
-test('全局页暂停轮询并取消所有在途读取，保留侧栏快照，返回同项目立即恢复', async t=>{
+test('全局页暂停轮询并取消独占读取与共享读取消费者，保留快照，返回同项目立即恢复', async t=>{
   t.mock.timers.enable({apis:['setInterval']})
   const requests:any[]=[]
   t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia());const nav=useNavStore()
   try {
-    nav.$patch({uid:'a',title:'已读取的项目',status:'done',steps:[{key:'tts',selected:true,status:'done',fresh:true}]})
-    nav.enter('a')
-    requests[1].resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'running',fresh:false,job_id:8}])))
-    requests[3].resolve(new Response(JSON.stringify({run:{id:'r',status:'running'}})))
+    const uid='pause-fixture'
+    nav.$patch({uid,title:'已读取的项目',status:'done',steps:[{key:'tts',selected:true,status:'done',fresh:true}]})
+    nav.enter(uid)
+    const request=(suffix:string)=>requests.find(request=>request.url.endsWith(suffix))
+    request('/steps').resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'running',fresh:false,job_id:8}])))
+    request('/workflow/status').resolve(new Response(JSON.stringify({run:{id:'r',status:'running'}})))
     await flush()
-    assert.equal(requests.length,6,'步骤日志与冻结流程计划也属于可取消的后台读取')
+    assert.equal(requests.length,7,'五类状态之外还读取步骤日志与冻结流程计划')
+    const project=request('/navigation'),publication=requests.find(request=>request.url.startsWith('/api/publishing/'))
+    const activity=requests.find(request=>request.url.includes('/log?')),plan=request('/workflow'),comments=request('/comments/progress')
     nav.suspend()
     assert.equal(nav.suspended,true);assert.equal(nav.timer,0)
-    assert.equal(nav.uid,'a');assert.equal(nav.title,'已读取的项目')
+    assert.equal(nav.uid,uid);assert.equal(nav.title,'已读取的项目')
     assert.equal(nav.stepMap.tts.status,'running');assert.equal(nav.workflow.run.id,'r')
-    for(const index of [0,2,4,5]) assert.equal(requests[index].options.signal.aborted,true)
+    for(const request of [project,publication,activity,plan]) assert.equal(request.options.signal.aborted,true)
     t.mock.timers.tick(9000)
     await nav.poll();await nav.refreshSteps();await nav.refreshWorkflow()
-    assert.equal(requests.length,6)
-    requests[0].resolve(new Response(JSON.stringify({title:'迟到项目',status:'done'})))
-    requests[2].resolve(new Response(JSON.stringify({status:'published'})))
-    requests[4].resolve(new Response(JSON.stringify({lines:['[12:00:00] [任务#8] 迟到动态']})))
-    requests[5].resolve(new Response(JSON.stringify({runs:[{id:'r',plan:{steps:['tts']}}]})))
+    assert.equal(requests.length,7)
+    project.resolve(new Response(JSON.stringify({title:'迟到项目',status:'done'})))
+    publication.resolve(new Response(JSON.stringify({status:'published'})))
+    activity.resolve(new Response(JSON.stringify({lines:['[12:00:00] [任务#8] 迟到动态']})))
+    plan.resolve(new Response(JSON.stringify({runs:[{id:'r',plan:{steps:['tts']}}]})))
+    // 网络请求可被其他评论消费者共用，暂停只须保证本消费者不接收迟到结果。
+    comments.resolve(new Response(JSON.stringify({workspace:{state:'done',label:'迟到评论结果'}})))
     await flush()
     assert.equal(nav.title,'已读取的项目');assert.equal(nav.publication,null)
-    assert.deepEqual(nav.activities,{});assert.equal(nav.workflowPlan,null)
-    nav.enter('a')
+    assert.deepEqual(nav.activities,{});assert.equal(nav.workflowPlan,null);assert.equal(nav.commentState,null)
+    const beforeReturn=requests.length
+    nav.enter(uid)
     assert.equal(nav.suspended,false);assert.ok(nav.timer)
-    assert.equal(requests.length,10,'同项目返回无需等待下个tick')
-    requests[6].resolve(new Response(JSON.stringify({title:'最新项目',status:'done',auto_steps:['tts'],chain:null})))
-    requests[7].resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'done',fresh:true}])))
-    requests[8].resolve(new Response(JSON.stringify({status:'submitted'})))
-    requests[9].resolve(new Response(JSON.stringify({run:null})))
+    const resumed=requests.slice(beforeReturn)
+    assert.equal(resumed.filter(request=>!request.url.endsWith('/comments/progress')).length,4,'同项目返回立即重读四类独占状态，评论可复用短时共享快照')
+    resumed.find(request=>request.url.endsWith('/navigation')).resolve(new Response(JSON.stringify({title:'最新项目',status:'done',auto_steps:['tts'],chain:null})))
+    resumed.find(request=>request.url.endsWith('/steps')).resolve(new Response(JSON.stringify([{key:'tts',selected:true,status:'done',fresh:true}])))
+    resumed.find(request=>request.url.startsWith('/api/publishing/')).resolve(new Response(JSON.stringify({status:'submitted'})))
+    resumed.find(request=>request.url.endsWith('/workflow/status')).resolve(new Response(JSON.stringify({run:null})))
     await flush()
     assert.equal(nav.title,'最新项目');assert.equal(nav.status,'done')
     assert.equal(nav.publication.status,'submitted')
@@ -127,6 +240,7 @@ test('项目完成状态复用步骤有效性，迟到持久状态不覆盖设�
 test('切换工程丢弃旧响应，失败提供提示且重试能够恢复', async t => {
   const requests: any[] = []
   t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({url, options, resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia())
   const nav = useNavStore()
   try {
@@ -137,7 +251,7 @@ test('切换工程丢弃旧响应，失败提供提示且重试能够恢复', as
     await flush()
     assert.equal(nav.stepsLoaded, false)
     assert.equal(nav.steps.length, 0)
-    assert.match(nav.stepsError, /读取步骤状态/)
+    assert.match(nav.stepsError, /步骤状态未更新/)
     void nav.poll()
     requests.filter(r => r.url === '/api/projects/new/steps').at(-1).resolve(new Response(JSON.stringify([{key: 'tts', label: '新数据'}])))
     await flush()
@@ -149,6 +263,7 @@ test('切换工程丢弃旧响应，失败提供提示且重试能够恢复', as
 test('发布状态独立轮询且上传锁设置，切换项目丢弃旧稿件，不参与制作完成数', async t => {
   const requests: any[] = []
   t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({url, options, resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia())
   const nav = useNavStore()
   try {
@@ -172,6 +287,7 @@ test('发布状态独立轮询且上传锁设置，切换项目丢弃旧稿件�
 test('成品刷新只读取步骤，不等待发布状态；删除回执先改列表并丢弃旧轮询', async t => {
   const requests: any[] = []
   t.mock.method(globalThis, 'fetch', (url, options) => new Promise(resolve => requests.push({url, options, resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia())
   const nav = useNavStore()
   const missing = {id:1,name:'missing.mp4',exists:false}, kept = {id:2,name:'kept.mp4',exists:true,file_revision:'v2'}
@@ -200,6 +316,7 @@ test('成品刷新只读取步骤，不等待发布状态；删除回执先改�
 test('启动回执即时锁定对应步骤，慢轮询不能覆盖；跨项目回执不污染新页', async t => {
   const requests: any[] = []
   t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia());const nav=useNavStore()
   try {
     nav.$patch({uid:'p',steps:[{key:'assemble',status:'done',progress:100}]})
@@ -218,6 +335,7 @@ test('启动回执即时锁定对应步骤，慢轮询不能覆盖；跨项目�
 test('自动流程覆盖制作间隙的忙碌状态；慢响应不回退启动回执，换项目不串状态',async t=>{
   const requests:any[]=[]
   t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia());const nav=useNavStore()
   try{
     nav.$patch({uid:'p',workflow:{mode:'publish',run:null},steps:[]})
@@ -237,6 +355,7 @@ test('自动流程覆盖制作间隙的忙碌状态；慢响应不回退启动�
 test('运行日志共享只读轮询，慢请求合并，任务切换和离开时丢弃旧动态', async t => {
   const requests:any[]=[]
   t.mock.method(globalThis,'fetch',(url,options)=>new Promise(resolve=>requests.push({url,options,resolve})))
+  settleSharedComments(t,requests)
   setActivePinia(createPinia());const nav=useNavStore()
   nav.$patch({uid:'p',steps:[]})
   const refresh = async (job:number,status='running') => {
@@ -258,6 +377,8 @@ test('运行日志共享只读轮询，慢请求合并，任务切换和离开�
     newer.resolve(new Response(JSON.stringify({lines:['[12:00:01] [任务#9] 第 25 句正在处理']})))
     await flush()
     assert.equal(nav.activityFor('tts').message,'第 25 句正在处理')
+    assert.equal(nav.currentActivity,null)
+    nav.$patch({workflow:{run:{id:'current',status:'running',cursor:0}},workflowPlan:{id:'current',steps:['tts']}})
     assert.equal(nav.currentActivity.message,'第 25 句正在处理')
     await refresh(9,'done')
     assert.equal(nav.activityFor('tts'),null)

@@ -1,4 +1,8 @@
 # DubForge 配置模板 —— 复制为 config.yaml 后填入真实值 (config.yaml 已 gitignore, 永不入库)
+run:
+  mode: draft # produce 仅保留成片；draft 本地草稿；upload 上传等待确认；publish 上传并提交
+assembly:
+  target_version_ids: null # 未明确时只兼容唯一版本或已有明确发布选择；不默认制作全部历史版本
 llm:
   # 多组 API 配置池: 按顺序依次尝试, 前面的不可用自动切换下一个 (可勾选启用)
   # 任意 OpenAI 兼容服务商均可 (智谱 / 火山方舟 / DeepSeek / OpenAI / 本地 vLLM)
@@ -53,8 +57,13 @@ split:
   use_llm: true
   # 留空=按设置页启用顺序自动降级；也可填写某个配置组名称固定模型
   llm_profile: ""
-  # 单次请求总上下文硬限；为全文提示词和完整输出预留空间，不自动分段
+  # 单次请求总上下文硬限；长文会自动按下方词数分块，不把整篇稿件塞给一次请求
   llm_context_tokens: 200000
+  # 长文每块的核心词数；块之间只发送少量前后文用于理解，不重复写入产物
+  llm_chunk_target_words: 500
+  llm_chunk_overlap_words: 80
+  # 每块最多尝试次数；单块失败只重试该块，不重做整篇
+  llm_chunk_max_retries: 3
   # low=火山方舟 Plan 模型请求低思考强度；follow_profile=保留模型参数
   thinking_mode: low
   # LLM 单句约 10 个词；中文按自然语义词理解，完整意思优先，不机械卡词数
@@ -66,7 +75,8 @@ split:
 
 content_review:
   enabled: true               # 中英文原稿、译文和评论的本地规则筛查
-  mute_audio: true            # 命中时段同时静音原声/配音最终混音，避免只隐藏字幕
+  mute_audio: true            # 对命中时段应用音频屏蔽，避免只隐藏字幕
+  audio_mode: voice_only      # voice_only=保留分离背景，缺失时整段静音；all_audio=全部静音
   blocked_terms: ''           # 补充屏蔽词，每行一个
   blocked_ranges: ''          # 人工核定时段，每行 开始秒-结束秒:原因（源视频时间轴）
 
@@ -81,28 +91,39 @@ translate:
   llm_profile: ""
   # low=支持的火山方舟 Plan 模型请求低思考档位；follow_profile=保留全局模型参数
   thinking_mode: low
-  # 尽量全文一次翻译，超过预算才分窗；包含提示词、交接摘要和预留输出，默认 200k
+  # token 预算优先；超过预算或单窗行数上限时分窗；包含提示词、交接摘要和预留输出，默认 200k
   max_context_tokens: 200000
+  # token 预算之外的单窗口字幕行数安全上限；0=仅按 token 自适应分窗，默认 100 行
+  max_window_lines: 100
   custom_terms_path: ""
 
 tts:
   backend: "indextts25"
   tolerance: 0.4              # 兼容旧任务标记，当前 UI、超长判断和重试不使用
+  placement:
+    auto_repair: true # 自动修复时间冲突：先排布，仍不足才按缩短因子有限重试；不使已有产物过期
+    enabled: true             # 先整段原速有界排布，不可行时再局部分析并缩时
+    max_shift_seconds: 2.0     # 每句相对源时间的最大前后移动；不修改源稿和参考切片
+    window_lines: 9            # 原速不可行后的局部缩时分析窗口，范围 3～15 句
+    inter_sentence_gap: 0.08   # 配音句间安全间隔（秒），原文/译文同步跟随
   indextts25:
     url: "http://127.0.0.1:7860/"
     project_dir: ""           # index-tts 项目根 (空=自动查找)
     lang: "ZH"
-    timbre_mode: "preset"     # preset / stable / dynamic
+    timbre_mode: "preset"     # preset=自定义音频 / stable=指定句原声 / dynamic=本句原声
     timbre_audio: ""          # 音色参考 wav 路径 (preset 模式)
-    emo_mode: "preset"        # preset / stable / dynamic / vector
+    timbre_reference_line_id: 1  # stable=指定句原声，默认第一句；最多读取该句前 15 秒
+    emo_mode: "preset"        # preset=自定义情感音频 / stable=指定句原声 / dynamic=本句原声 / vector=情感向量
     emo_audio: ""             # 情感参考 wav 路径 (preset 模式)
+    emo_reference_line_id: 1  # stable 情感参考源句，可与音色参考分别选择
     emo_weight: 1.0
     emo_vector: [0, 0, 0, 0, 0, 0, 0, 0]
     emo_text: ""              # 文本情感描述，需服务端加载对应情感模型
     emo_random: false         # 情感随机采样，可能降低音色稳定性
     duration_factor: 1.0
     duration_retry_factors: "0.7, 0.5"  # 超长重试因子，逗号分隔；留空关闭，只尝试更小的值
-    request_timeout_seconds: 300  # 单次模型请求上限，含服务排队；0 关闭，独立于整个步骤的超时
+    dynamic_reference_max_seconds: 5.0  # 本句原声音色/情感参考上限；建议 5 秒，范围 0.5～15 秒
+    request_timeout_seconds: 600  # 单次模型请求上限，含服务排队；0 关闭，独立于整个步骤的超时
     do_sample: true
     top_p: 0.8
     top_k: 30
@@ -123,9 +144,14 @@ assemble:
   subtitle_track: trans        # 烧录时使用 source/trans/bilingual
   subtitle_font: "Microsoft YaHei" # 已安装字体的名称
   subtitle_size: 48            # 字号、描边与边距按 1080 高画面等比例缩放
+  subtitle_auto_fit: true      # 长字幕先缩小字号，再利用宽度缓冲区；原文、译文各自排版
+  subtitle_shrink_width_percent: 80 # 占完整画面宽度的缩小目标；仅自适应开启时生效
+  subtitle_wrap_width_percent: 90 # 占完整画面宽度的换行上限，居中且保留必要安全边距
+  subtitle_min_size: 32        # 自适应最小字号；大于标准字号时按标准字号处理
   subtitle_source_style_enabled: false # 原文独立样式；关闭时跟随译文，底色与位置始终共用
   subtitle_source_font: "Microsoft YaHei"
   subtitle_source_size: 40
+  subtitle_source_min_size: 28  # 原文独立样式且开启自适应时生效；按 1080 高画面设定
   subtitle_source_color: "#FFFFFF"
   subtitle_source_outline_color: "#000000"
   subtitle_source_outline: 2
@@ -139,8 +165,15 @@ assemble:
   voice_volume: 1.0
   ducking: true
   loudnorm: true
+  final_loudness_mode: 'off'  # off 保留混音；normalize 静态调整；uniform 跨项目统一响度，必要时控制峰值
+  final_loudness_lufs: -16.0 # 保守产品预设；偏轻可试听 -14（高 2 LU），不代表 B 站官方标准
+  final_true_peak_db: -1.5   # 可设 -6 至 0 dBTP；高于 -1 时有损编码余量较小，默认仍为 -1.5
+  sentence_leveling: false # 不重新生成配音，仅保守均衡明显句间差异
+  sentence_leveling_max_db: 3.0
   burn_subtitles: false
   crf: 18
+  video_encoder: software # software=原有H.264软件编码；nvenc=明确选择NVIDIA H.264，不自动回退
+  nvenc_cq: 18             # NVENC独立画质刻度，不等同软件CRF；先试片核对实际画质
 
 comments:
   failure_policy: skip  # skip：局部失败继续；stop：严格暂停
@@ -150,8 +183,10 @@ comments:
     interval: 15.0
     duration: 6.0
     position: top_left
-    width_percent: 0           # 0 自动；1–100 为最大宽度占画面宽度的百分比，受边距限制
-    font_size: 36
+    width_percent: 0           # 0 自动同 100%，使用扣除边距后的可用宽度；1–99 进一步限制画面宽度占比
+    height_percent: 30         # 软高度（画面 %）；缩至最小字号后仍放不下时完整向下延伸
+    font_size: 36              # 通用/译文字号上限（按 1080 高画面设定）
+    min_font_size: 18          # 字号下限；不因超长文字继续缩小或截断
     margin: 60
     show_author: false
     language_mode: translated
@@ -164,7 +199,8 @@ comments:
     font: "Microsoft YaHei"
     source_style_enabled: false
     source_font: "Microsoft YaHei"
-    source_font_size: 30
+    source_font_size: 30       # 原文独立样式的字号上限
+    source_min_font_size: 18   # 原文独立样式的字号下限
     source_color: "#FFFFFF"
     source_outline_color: "#000000"
     source_outline: 2
@@ -211,8 +247,17 @@ runner:
     translate: 3600
     subtitles: 600
     dubtask: 600
-    tts: 7200
-    assemble: 3600
+    # 长视频配音和双版本编码可能跨越数小时；0=关闭兜底
+    tts: 43200
+    assemble: 43200
+
+publish:
+  project_target: null # 仅项目可设置新稿/原稿目标，不能在此保存BV或供系列模板继承
+  # 投稿审核通过后，按每个分P的实际成片时间轴同步源视频章节；没有章节则跳过。
+  chapters_enabled: true
+  chapters_translate: true     # 整理时改写为中文；关闭时用原语言，仍按平台规则合并精简，同时间轴与规则复用
+  chapters_permanent: true     # B站App默认显示章节
+  chapters_instruction: '' # 可选的标题内容、格式、表述与术语要求；不改变平台数量、时长或字数硬限制
 
 paths:
-  hf_home: ""                # 空=自动复用 VideoLingo-Workspace/vl_cache/hf
+  hf_home: ""                # 空=优先 HF_HOME，否则使用当前数据目录/hf；共享缓存请显式填写路径

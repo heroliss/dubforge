@@ -19,5 +19,7 @@ class WorkflowRun(SQLModel, table=True):
     next_check: float = 0
     collection_attempts: int = 0
     check_failures: int = 0
+    post_processing_paused: bool = False
+    execution: str = '{}'
     created_at: datetime.datetime = Field(default_factory=lambda: datetime.datetime.now(datetime.timezone.utc))
 

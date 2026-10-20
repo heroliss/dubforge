@@ -26,8 +26,8 @@ def catalog():
 
 
 @router.get('/publications')
-def publications(project_uid: str | None = None):
-    return service.list_publications(project_uid)
+def publications(project_uid: str | None = None, lifecycle: str = 'active'):
+    return service.list_publications(project_uid, lifecycle_filter=lifecycle)
 
 
 @router.get('/projects/{uid}/candidates')
@@ -55,14 +55,102 @@ def suggest_project(uid: str, body: dict):
     return service.suggest_project(uid, body)
 
 
+@router.post('/projects/{uid}/chapters/translate')
+def translate_chapters(uid: str, body: dict):
+    from dubforge.publishing import chapters
+    project = service._project(uid)
+    if not isinstance(body, dict) or 'items' not in body or set(body) - {'items', 'duration', 'translate', 'instruction'}:
+        raise service.PublishError('章节整理参数无效', code='PUBLISH_CHAPTER_INVALID')
+    # 兼容旧的纯标题调用；有时间轴的候选统一按平台约束整理。
+    if set(body) == {'items'} and isinstance(body['items'], list) and body['items'] and all(
+            isinstance(row, dict) and 'start_time' not in row for row in body['items']):
+        return chapters.translate(body['items'])
+    from dubforge import configuration, llm_conversations
+    instruction = body.get('instruction', configuration.resolve(uid)['values']['publish.chapters_instruction'])
+    with llm_conversations.context(project_uid=uid, operation='chapters', label='整理并审查项目章节'):
+        return chapters.adapt(body['items'], duration=body.get('duration'), translate=body.get('translate', True),
+                              instruction=instruction, context_title=project.title)
+
+
+@router.post('/chapters/adapt')
+def adapt_chapters(body: dict):
+    """只生成本地候选，已有稿件也可使用；不保存草稿或发送平台修改。"""
+    from dubforge.publishing.chapters import adapt
+    if not isinstance(body, dict) or 'items' not in body or set(body) - {
+            'items', 'duration', 'translate', 'instruction', 'project_uid', 'publication_id'}:
+        raise service.PublishError('章节整理参数无效', code='PUBLISH_CHAPTER_INVALID')
+    uid, owner = body.get('project_uid', ''), body.get('publication_id', '')
+    context_title = ''
+    if not isinstance(uid, str) or not isinstance(owner, str) or len(uid) > 64 or len(owner) > 64:
+        raise service.PublishError('章节对话归属参数无效', code='PUBLISH_CHAPTER_INVALID')
+    if owner:
+        record = service.view(owner)
+        if uid and record['project_uid'] != uid:
+            raise service.PublishError('章节候选与来源项目不一致', code='PUBLISH_CHAPTER_INVALID')
+        uid = record['project_uid']
+        context_title = str(record.get('snapshot', {}).get('settings', {}).get('title', ''))
+    if uid:
+        project = service._project(uid)
+        context_title = context_title or project.title
+    from dubforge import llm_conversations
+    with llm_conversations.context(project_uid=uid, operation='chapters', label='手动整理并审查视频章节', owner_id=owner):
+        return adapt(body['items'], duration=body.get('duration'), translate=body.get('translate', True),
+                     instruction=body.get('instruction', ''), context_title=context_title)
+
+
 @router.get('/publications/{key}')
 def view(key: str):
     return service.view(key)
 
 
+@router.get('/publications/{key}/updates/context')
+def update_context(key: str):
+    from dubforge.publishing import updates
+    return updates.context(key)
+
+
+@router.post('/publications/{key}/updates/plan')
+def update_plan(key: str, body: dict):
+    from dubforge.publishing import updates
+    return updates.plan(key, body)
+
+
+@router.get('/updates/{key}')
+def update_view(key: str):
+    from dubforge.publishing import updates
+    return updates.view(key)
+
+
+@router.post('/updates/{key}/actions')
+def update_action(key: str, body: dict):
+    from dubforge.publishing import updates
+    return updates.action(key, body)
+
+
+@router.post('/publications/{key}/chapters/retry')
+def retry_chapters(key: str, body: dict):
+    from dubforge.publishing import chapter_dispatch
+    return chapter_dispatch.request(key, body)
+
+
 @router.put('/publications/{key}')
 def save(key: str, body: dict):
     return service.save(key, body)
+
+
+@router.post('/publications/{key}/archive')
+def archive(key: str, body: dict):
+    return service.manage_record(key, 'archive', body)
+
+
+@router.delete('/publications/{key}')
+def recycle(key: str, body: dict):
+    return service.manage_record(key, 'delete', body)
+
+
+@router.post('/publications/{key}/restore')
+def restore(key: str, body: dict):
+    return service.manage_record(key, 'restore', body)
 
 
 @router.post('/publications/{key}/suggest')
@@ -123,6 +211,11 @@ def login_cancel(key: str):
 @router.post('/accounts/{account_id}/metadata')
 def metadata(account_id: str):
     return service.metadata(account_id)
+
+
+@router.post('/accounts/{account_id}/check')
+def check_account(account_id: str):
+    return service.check_account(account_id)
 
 
 @router.post('/accounts/{account_id}/studio/read/{action}')

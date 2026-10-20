@@ -20,6 +20,13 @@ def profile(path='/api/plan/v3', **overrides):
                         'thinking': {'type': 'enabled', 'budget_tokens': 10000}}, **overrides)
 
 
+def glm_profile(**overrides):
+    return dict(name='GLM', base_url='https://open.bigmodel.cn/api/coding/paas/v4',
+                api_key='fixture-key', model='glm-5.3-flash', enabled=True,
+                params={'reasoning_effort': 'high',
+                        'thinking': {'type': 'enabled', 'clear_thinking': False}}, **overrides)
+
+
 @pytest.mark.parametrize('path', ['/api/plan/v3', '/api/plan/v3/', '/api/coding/v3', '/api/coding/v3/'])
 def test_default_low_mode_lowers_effort_for_verified_ark_plan_endpoints(path):
     original = profile(path)
@@ -248,3 +255,32 @@ def test_legacy_fast_alias_matches_canonical_low_and_default(task):
     assert 'thinking' not in default[0]['params']
     assert default[1] == originals[1]
     assert originals == frozen
+
+
+@pytest.mark.parametrize('model', ['glm-5.3', 'glm-5.3-flash', 'glm-5.3-flashx', 'GLM-5.3-Flash'])
+@pytest.mark.parametrize('task', ['split', 'translate'])
+def test_verified_glm_5_3_low_mode_preserves_enabled_thinking_nested_fields(model, task):
+    original = dict(model=model, base_url='https://open.bigmodel.cn/api/paas/v4/',
+                    params={'reasoning_effort': 'max', 'thinking': {'type': 'enabled', 'clear_thinking': False},
+                            'temperature': 1, 'top_p': .95})
+    frozen = deepcopy(original)
+    result = prepare_profiles([original], task=task)
+    assert result[0]['params']['reasoning_effort'] == 'low'
+    assert result[0]['params']['thinking'] == frozen['params']['thinking']
+    result[0]['params']['thinking']['clear_thinking'] = True
+    assert original == frozen
+    assert prepare_profiles([original], 'follow_profile', task=task) == [original]
+
+
+@pytest.mark.parametrize('endpoint,model', [
+    ('http://open.bigmodel.cn/api/paas/v4', 'glm-5.3'),
+    ('https://open.bigmodel.cn:8443/api/paas/v4', 'glm-5.3'),
+    ('https://open.bigmodel.cn/api/paas/v4/chat/completions', 'glm-5.3-flash'),
+    ('https://open.bigmodel.cn/api/paas/v4?token=fixture', 'glm-5.3-flash'),
+    ('https://open.bigmodel.cn/api/paas/v4', 'glm-4.7'),
+    ('https://open.bigmodel.cn/api/paas/v4', 'glm-5.2'),
+    ('https://proxy.example/api/paas/v4', 'glm-5.3-flash'),
+])
+def test_glm_low_mode_does_not_guess_unverified_model_or_route(endpoint, model):
+    original = dict(model=model, base_url=endpoint, params={'reasoning_effort': 'max'})
+    assert prepare_profiles([original]) == [original]

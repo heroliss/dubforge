@@ -1,22 +1,27 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 import { NTag } from 'naive-ui'
-const props = defineProps<{ recovery: any }>()
-const hasReused = computed(() => (props.recovery.rows || []).some((row: any) => row.action === 'reuse'))
+import { STEP_LABELS } from '../stores/nav'
+const props = defineProps<{ recovery: any; pendingSteps?:string[] }>()
+const rows=computed(()=>(props.recovery.rows || []).map((row:any)=>row.action==='reuse' && props.pendingSteps?.includes(row.key)?{...row,action:'check',reason:'上游需更新，本步会使用更新后的输入重新核对；有效结果仍会复用。'}:row))
+const hasReused = computed(() => rows.value.some((row: any) => row.action === 'reuse'))
+function stepLabel(key: string, label?: string) {
+  return label && label !== key ? label : STEP_LABELS[key] || ({comments:'准备评论',publish:'发布到B站',prepare:'准备发布资料'} as Record<string,string>)[key] || '处理步骤'
+}
 const actions: Record<string, { label: string; tone: 'success' | 'warning' | 'info' }> = {
-  reuse: { label: '复用', tone: 'success' }, update: { label: '需更新', tone: 'warning' },
+  check: { label: '更新输入后核对', tone: 'info' }, reuse: { label: '复用', tone: 'success' }, update: { label: '需更新', tone: 'warning' },
   retry: { label: '重试', tone: 'warning' }, create: { label: '生成 / 补齐', tone: 'info' }, run: { label: '运行 / 补齐', tone: 'info' },
 }
 </script>
 <template>
   <section class="recovery-plan" data-testid="recovery-plan" aria-label="本次恢复方案">
-    <p v-if="recovery.previous_label || recovery.previous_step">上次停在：<strong>{{ recovery.previous_label || recovery.previous_step }}</strong></p>
-    <p class="recovery-start">本次从：<strong>{{ recovery.start_label || recovery.start_step || '制作已就绪，继续后续流程' }}</strong></p>
+    <p v-if="recovery.previous_label || recovery.previous_step">上次停在：<strong>{{ stepLabel(recovery.previous_step,recovery.previous_label) }}</strong></p>
+    <p class="recovery-start">本次从：<strong>{{ recovery.start_label || recovery.start_step ? stepLabel(recovery.start_step,recovery.start_label) : '制作已就绪，继续后续流程' }}</strong></p>
     <p v-if="recovery.reason">{{ recovery.reason }}</p>
     <p v-if="hasReused" class="reuse-hint">有效步骤直接复用。</p>
     <ol aria-label="本次恢复步骤">
-      <li v-for="row in recovery.rows || []" :key="row.key" :data-step="row.key" :data-action="row.action" :class="{ 'is-reused': row.action === 'reuse' }" :title="row.action === 'reuse' ? row.reason : undefined">
-        <div><strong>{{ row.label || row.key }}</strong><n-tag size="small" :type="actions[row.action]?.tone || 'info'">{{ actions[row.action]?.label || '运行' }}</n-tag></div>
+      <li v-for="row in rows" :key="row.key" :data-step="row.key" :data-action="row.action" :class="{ 'is-reused': row.action === 'reuse' }" :title="row.action === 'reuse' ? row.reason : undefined">
+        <div><strong>{{ stepLabel(row.key,row.label) }}</strong><n-tag size="small" :type="actions[row.action]?.tone || 'info'">{{ actions[row.action]?.label || '运行' }}</n-tag></div>
         <p v-if="row.action !== 'reuse'">{{ row.reason }}</p>
         <span v-else-if="row.reason" class="visually-hidden">{{ row.reason }}</span>
       </li>

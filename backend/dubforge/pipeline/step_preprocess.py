@@ -17,6 +17,7 @@ from pathlib import Path
 
 from dubforge.errors import DubForgeError
 from dubforge.progress import RateProgress, _bind
+from dubforge.execution_progress import report_stage
 from dubforge.utils.fs import atomic_replace
 
 
@@ -64,6 +65,9 @@ def _demucs_callback(ctx, total_sec: float, shifts: int, sr: int, stride_sec=0.0
         frac = (model_idx * passes + shift_idx
                 + min(1.0, (offset_sec + stride_sec) / max(total_sec, 1e-6))) / (passes * models)
         progress.update(frac)
+        report_stage(ctx, 'separating', '分离人声与背景音',
+                     completed=round(frac * total_sec * passes * models, 2),
+                     total=round(total_sec * passes * models, 2), unit='音频秒')
     return cb
 
 
@@ -101,10 +105,12 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path, *, device: str | None = None)
     from demucs import pretrained
     from demucs.apply import apply_model
 
+    report_stage(ctx, 'loading_separation_model', '加载人声分离模型', model=model_name, device=device)
     model = pretrained.get_model(model_name)
-    model.to(device)
+    # apply_model 按 device 搬运当前模型；不要预先把 _ft 的整组模型同时放上显卡。
     model.eval()
 
+    report_stage(ctx, 'loading_audio', '读取分离输入音轨')
     data, sr = sf.read(str(src_wav), dtype="float32", always_2d=True)
     total_sec = len(data) / sr
     seg = float(getattr(model, "segment", 0) or 0)
@@ -122,9 +128,13 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path, *, device: str | None = None)
         wav = wav.repeat(2, 1)              # htdemucs 要求立体声输入, 单声道复制
     if sr != model.samplerate:
         ctx.log(f"⚠ 输入采样率 {sr} ≠ 模型规格 {model.samplerate}, 分离质量会下降")
-    wav = wav.to(device)
+    # Demucs 的整轨输出和叠加权重跟随 mix.device；split=True 只限制前向块大小。
+    # 输入留在 CPU，传 device 让模型逐块在 GPU 推理，避免显存随视频时长增长。
     ref = wav.mean(0)
-    wav = (wav - ref.mean()) / (ref.std() + 1e-8)
+    ref_mean, ref_std = ref.mean(), ref.std()
+    wav = (wav - ref_mean) / (ref_std + 1e-8)
+    # 还原只需两个标量，及时释放原始整轨和声道均值缓冲。
+    del data, ref
 
     try:
         with th.no_grad():
@@ -140,8 +150,9 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path, *, device: str | None = None)
 
         vocal_path = tmp_out / "vocal.wav"
         bg_path = tmp_out / "background.wav"
-        sf.write(vocal_path, (vocals * ref.std() + ref.mean()).cpu().numpy().T, sr)
-        sf.write(bg_path, (background * ref.std() + ref.mean()).cpu().numpy().T, sr)
+        report_stage(ctx, 'saving_stems', '保存人声与背景音轨')
+        sf.write(vocal_path, (vocals * ref_std + ref_mean).cpu().numpy().T, sr)
+        sf.write(bg_path, (background * ref_std + ref_mean).cpu().numpy().T, sr)
 
         final_v = out_dir / "vocal.wav"
         final_b = out_dir / "background.wav"
@@ -154,6 +165,7 @@ def _run_demucs(ctx, src_wav: Path, out_dir: Path, *, device: str | None = None)
 
 
 def run(ctx) -> None:
+    report_stage(ctx, 'checking_audio', '检查视频与已有音轨')
     audio_dir = ctx.pdir / "audio"
     audio_dir.mkdir(exist_ok=True)
     video = ctx.upstream("download", "video.mp4")
@@ -165,14 +177,17 @@ def run(ctx) -> None:
             old.unlink(missing_ok=True)
 
     if raw_wav.exists() and not getattr(ctx, "rebuild", False):
+        report_stage(ctx, 'reuse_audio', '复用源音轨', reused=True)
         ctx.log("raw.wav 已存在, 跳过音轨提取")
     else:
+        report_stage(ctx, 'extracting_audio', '提取语音识别用音轨')
         ctx.log("提取 16kHz 单声道音轨...")
         _extract_audio(ctx, video, raw_wav)
     ctx.register_file("raw.wav", raw_wav, "audio")
     ctx.report_progress(20)
 
     if not ctx.cfg("separate.enabled", True):
+        report_stage(ctx, 'separation_disabled', '按设置跳过人声分离', state='skipped')
         ctx.log("配置关闭了人声分离, 跳过 demucs")
         ctx.write_json("separate.json", {"separated": False})
         return
@@ -180,6 +195,7 @@ def run(ctx) -> None:
     vocal = audio_dir / "vocal.wav"
     bg = audio_dir / "background.wav"
     if vocal.exists() and bg.exists() and not getattr(ctx, "rebuild", False):
+        report_stage(ctx, 'reuse_stems', '复用人声与背景音轨', reused=True)
         ctx.log("vocal/background 已存在, 跳过分离")
     else:
         ctx.report_progress(30)
@@ -187,6 +203,7 @@ def run(ctx) -> None:
         # htdemucs 按 44.1kHz 立体声训练 —— 喂 16k 单声道会频谱错位、严重劣化。
         # 从原视频抽全规格音轨作分离输入, 用完即删 (重跑重新提取只需几秒)。
         src441 = audio_dir / ".tmp_src44100.wav"
+        report_stage(ctx, 'extracting_separation_audio', '提取人声分离用音轨')
         cmd = ["ffmpeg", "-y", "-i", str(video), "-vn",
                "-ac", "2", "-ar", "44100", "-c:a", "pcm_s16le",
                "-f", "wav", str(src441)]
@@ -210,12 +227,14 @@ def run(ctx) -> None:
                         f"可在设置把分离模型换为 htdemucs、shifts 设为 0，"
                         f"或暂停配音服务释放显存): {exc}")
                 release_unused(ctx.log)
+                report_stage(ctx, 'separation_cpu_fallback', '显存不足，改用 CPU 分离', device='cpu')
                 vocal, bg = _run_demucs(ctx, src441, audio_dir, device="cpu")
         finally:
             src441.unlink(missing_ok=True)
         ctx.report_progress(85)
         ctx.check_cancel()
     ctx.register_file("vocal.wav", vocal, "audio")
+    report_stage(ctx, 'saving', '登记预处理音轨与结果')
     ctx.register_file("background.wav", bg, "audio")
     ctx.write_json("separate.json",
                    {"separated": True, "model": str(ctx.cfg("separate.model", "htdemucs"))})

@@ -4,20 +4,22 @@ import { NAlert, NButton, NCheckbox, NDynamicTags, NInput, NModal, NPagination, 
 import BiliContentImport from './BiliContentImport.vue'
 import { publishApi } from '../utils/publishApi'
 
-const props=defineProps<{accounts:any[];projects:any[];defaultProject?:string}>()
-const emit=defineEmits<{guard:[value:boolean];refresh:[]}>()
-const account=ref(props.accounts.length===1?props.accounts[0].id:''),keyword=ref(''),status=ref(''),page=ref(1),list=ref<any>(null)
+const props=defineProps<{accounts:any[];projects:any[];defaultProject?:string;defaultAccount?:string;defaultBvid?:string}>()
+const emit=defineEmits<{guard:[value:boolean];refresh:[];'busy-change':[value:boolean];'dirty-change':[value:boolean]}>()
+const account=ref(props.defaultAccount || (props.accounts.length===1?props.accounts[0].id:'')),keyword=ref(''),status=ref(''),page=ref(1),list=ref<any>(null)
 const busy=ref(false),importBusy=ref(false),error=ref(''),detail=ref<any>(null),edit=ref<any>({}),order=ref<number[]>([]),baseline=ref(''),bv=ref('')
 const listLoading=ref(false),templatesLoaded=ref(false)
 const meta=ref<any>({}),season=ref<number|null>(null),section=ref<number|null>(null),uploads=ref<any[]>([]),upload=ref<string|null>(null)
 const templates=ref<any[]>([]),templateFields=ref<string[]>(['tags','description']),changes=ref<any[]>([]),preview=ref<any>(null),modal=ref(false)
 const message=useMessage(),dialog=useDialog()
 const detailEl=ref<HTMLElement|null>(null)
-let generation=0,disposed=false
+let generation=0,disposed=false,requestedBvid=''
 const editState=computed(()=>JSON.stringify([edit.value,order.value]))
 const dirty=computed(()=>!!detail.value && editState.value!==baseline.value)
 const guarded=computed(()=>busy.value || importBusy.value || dirty.value || modal.value)
-watch(guarded,value=>emit('guard',value))
+watch(guarded,value=>emit('guard',value),{flush:'sync'})
+watch(()=>busy.value || importBusy.value,value=>emit('busy-change',value),{immediate:true,flush:'sync'})
+watch(()=>dirty.value || modal.value,value=>emit('dirty-change',value),{immediate:true,flush:'sync'})
 const parts=computed(()=>order.value.map(cid=>detail.value?.videos.find((p:any)=>p.cid===cid)).filter(Boolean))
 const sections=computed(()=>meta.value.seasons?.find((s:any)=>s.id===season.value)?.sections || [])
 const accountName=computed(()=>props.accounts.find(a=>a.id===account.value)?.name || account.value)
@@ -32,11 +34,46 @@ const diffs=computed(()=>{
     .map(k=>({label:fieldLabels[k],before:before.settings[k],after:after.settings[k]}))
 })
 watch(account,()=>{generation++;list.value=null;detail.value=null;baseline.value='';meta.value={};changes.value=[];templates.value=[];templatesLoaded.value=false;uploads.value=[];error.value='';bv.value='';upload.value=null})
+watch([()=>props.defaultAccount,()=>props.accounts.map(row=>row.id).join(',')],([preferredAccount],previous)=>{
+  if(guarded.value)return
+  const preferred=props.accounts.some(row=>row.id===preferredAccount)?preferredAccount:''
+  // 账号目录刷新不覆盖用户已手动选择的账号；仅新传入的默认账号作为导航指令。
+  if(preferred && (preferredAccount!==previous[0] || !account.value))account.value=preferred
+  else if(!props.accounts.some(row=>row.id===account.value))account.value=props.accounts.length===1?props.accounts[0].id:''
+})
+watch([()=>props.defaultBvid,()=>props.accounts.map(row=>row.id).join(','),()=>account.value],([candidate])=>{
+  const bvid=String(candidate || '').trim()
+  if (!/^BV[0-9A-Za-z]{10}$/.test(bvid) || requestedBvid===`${account.value}:${bvid}`
+      || detail.value || !props.accounts.some(row=>String(row.id)===String(account.value))
+      || (props.defaultAccount && String(props.defaultAccount)!==String(account.value))) return
+  requestedBvid=`${account.value}:${bvid}`;bv.value=bvid;void open(bvid)
+},{immediate:true})
 function selectSeason(value:number|null){season.value=value;const rows=meta.value.seasons?.find((s:any)=>s.id===value)?.sections || [];section.value=rows.length===1?rows[0].id:null}
 async function call(path:string,body?:any){return publishApi(`/accounts/${account.value}/studio${path}`,body)}
 async function run(action:()=>Promise<any>){if(busy.value || !account.value)return;busy.value=true;error.value='';try{await action()}catch(e:any){if(!disposed)error.value=e.message}finally{if(!disposed)busy.value=false}}
 function setDetail(value:any){detail.value=value;edit.value={...value.settings,tags:[...(value.settings.tags || [])]};order.value=value.videos.map((p:any)=>p.cid);baseline.value=JSON.stringify([edit.value,order.value]);bv.value=value.bvid;selectSeason(value.collection?.id || null)}
 function resetEdit(){if(detail.value)setDetail(detail.value)}
+// B站写入接口返回接受后，详情接口可能还在异步刷新。只有读回内容已经
+// 反映本次目标时才覆盖编辑器；否则保留用户刚确认的目标值，避免旧详情
+// 把已成功的修改显示成“未保存”或悄悄丢失。
+function remoteMatchesPlan(item:any,remote:any){
+  const expected=item?.preview?.after
+  if(!expected || !remote)return false
+  if(item.kind==='collection'){
+    const want=expected.collection?.id ?? null
+    return (remote.collection?.id ?? null)===want
+  }
+  const before=item.preview.before?.settings || {}, after=expected.settings || {}, actual=remote.settings || {}
+  for(const key of ['title','description','tags','dynamic','declaration_id']){
+    if(JSON.stringify(before[key])!==JSON.stringify(after[key]) && JSON.stringify(actual[key])!==JSON.stringify(after[key]))return false
+  }
+  if(Array.isArray(expected.videos)){
+    const a=(remote.videos || []).map((p:any)=>[p.cid,p.title])
+    const b=expected.videos.map((p:any)=>[p.cid,p.title])
+    if(JSON.stringify(a)!==JSON.stringify(b))return false
+  }
+  return true
+}
 async function loadList(p=1){const ticket=generation
   await run(async()=>{listLoading.value=true;try{const result=await call('/read/archives',{keyword:keyword.value,status:status.value,page:p});if(!disposed && ticket===generation){list.value=result;page.value=p}}finally{listLoading.value=false}})
 }
@@ -49,7 +86,7 @@ async function open(bvid=bv.value.trim()){
     const results=await Promise.allSettled([publishApi(`/accounts/${account.value}/metadata`,{}),publishApi('/publications'),call('/changes')])
     if(disposed || ticket!==generation)return
     if(results[0].status==='fulfilled'){meta.value=results[0].value;selectSeason(result.collection?.id || null)}
-    if(results[1].status==='fulfilled')uploads.value=results[1].value.filter((r:any)=>r.status==='uploaded' && r.snapshot.account_id===account.value)
+    if(results[1].status==='fulfilled')uploads.value=results[1].value.filter((r:any)=>r.status==='uploaded' && (!r.lifecycle || r.lifecycle==='active') && !r.archived_at && !r.deleted_at && r.snapshot.account_id===account.value)
     if(results[2].status==='fulfilled')changes.value=results[2].value
     if(results.some(r=>r.status==='rejected'))error.value='稿件已读取，部分辅助资料加载失败；可重新读取稿件重试。'
   })
@@ -69,8 +106,13 @@ async function prepare(kind:string){
 async function commit(){const item=preview.value;if(!item || busy.value)return
   await run(async()=>{try{
       await call(`/changes/${item.id}/commit`,{confirmed:true});modal.value=false;message.success('B站已接收修改，可能重新审核');baseline.value=editState.value;emit('refresh')
-      // 成功回执不依赖后续读取；读取失败时也不会再次提交。
-      try{setDetail(await call('/read/detail',{bvid:item.bvid}))}catch{error.value='修改已接收，但详情暂未刷新，请稍后读取。'}
+      // 成功回执不依赖后续读取；读取失败时也不会再次提交。B站详情
+      // 有短暂最终一致性窗口，旧读回不能覆盖刚确认的本地目标。
+      try{
+        const remote=await call('/read/detail',{bvid:item.bvid})
+        if(remoteMatchesPlan(item,remote))setDetail(remote)
+        else {error.value='修改已接收，但B站详情尚未刷新；当前保留已确认目标值，请稍后重新读取';message.warning(error.value)}
+      }catch{error.value='修改已接收，但详情暂未刷新；当前保留已确认目标值，请稍后重新读取';message.warning(error.value)}
     }catch(e){modal.value=false;throw e}
     finally{try{changes.value=await call('/changes')}catch{}}
   })
@@ -91,13 +133,13 @@ function importTemplate(item:any){const selected=[...templateFields.value],id=ac
     await call('/import-template',{id:item.id,fields:selected,confirmed:true});emit('refresh');message.success('已导入到默认设置与合集模板')
   })})
 }
-onBeforeUnmount(()=>{disposed=true;generation++;emit('guard',false)})
+onBeforeUnmount(()=>{disposed=true;generation++;emit('guard',false);emit('busy-change',false);emit('dirty-change',false)})
 </script>
 <template>
   <section class="studio">
     <section class="publication-panel" aria-label="查找已有稿件">
     <header class="publication-panel-heading"><h2>查找已有稿件</h2></header>
-    <div class="toolbar"><n-select v-model:value="account" :options="accounts.map(a=>({label:`${a.name} · ${a.id}`,value:a.id}))" placeholder="选择B站账号" :disabled="guarded" /><span class="muted">手动读取；不会自动修改或投稿</span></div>
+    <div class="toolbar"><n-select v-model:value="account" :options="accounts.map(a=>({label:`${a.name} · ${a.id}`,value:a.id}))" placeholder="选择B站账号" :disabled="guarded" /><span class="muted">这里管理平台稿件</span><a href="/publications" class="local-record-link">管理本地草稿与发布记录 →</a></div>
     <n-alert v-if="error" type="warning">{{ error }}</n-alert>
     <div class="toolbar"><n-input v-model:value="keyword" placeholder="按标题查找我的稿件" :disabled="busy" maxlength="100" @keyup.enter="loadList()" /><n-select v-model:value="status" :options="[{label:'全部状态',value:''},{label:'审核中',value:'is_pubing'},{label:'已通过',value:'pubed'},{label:'未通过',value:'not_pubed'}]" :disabled="busy" /><n-button :disabled="!account || busy" :loading="listLoading" @click="loadList()">读取我的投稿</n-button></div>
     <template v-if="list"><div class="stats"><span>本页 {{ list.items.length }} / 共 {{ list.total }} 条</span><span>播放 {{ totals.view }}</span><span>点赞 {{ totals.like }}</span><span>收藏 {{ totals.favorite }}</span><span>评论 {{ totals.reply }}</span></div><div class="archives">
@@ -110,10 +152,10 @@ onBeforeUnmount(()=>{disposed=true;generation++;emit('guard',false)})
       <div class="edit-grid"><label>标题<n-input v-model:value="edit.title" maxlength="80" show-count :disabled="busy" /></label><label>标签<n-dynamic-tags v-model:value="edit.tags" :max="10" :disabled="busy" /></label><label>简介<n-input v-model:value="edit.description" type="textarea" :autosize="{minRows:3,maxRows:8}" maxlength="2000" show-count :disabled="busy" /></label><label>粉丝动态<n-input v-model:value="edit.dynamic" type="textarea" maxlength="233" :disabled="busy" /></label><label v-if="detail.settings.copyright !== 2">创作声明<n-select v-model:value="edit.declaration_id" :options="meta.declarations || []" placeholder="保持原声明，或明确选择" :disabled="busy" /></label></div>
       <div class="parts"><div v-for="(part,i) in parts" :key="part.cid" class="part"><span>P{{ i+1 }}</span><div><strong>{{ part.title }}</strong><small>{{ part.state_desc || '平台未提供状态说明' }}<template v-if="part.xcode_state !== undefined"> · 转码状态码 {{ part.xcode_state }}</template></small><p v-if="part.reject_reason" class="warning">{{ part.reject_reason }}</p></div><n-button size="tiny" :disabled="busy || i===0" @click="move(i,-1)">上移</n-button><n-button size="tiny" :disabled="busy || i===parts.length-1" @click="move(i,1)">下移</n-button></div></div>
       <div class="toolbar"><n-button type="primary" :disabled="busy || !dirty" @click="prepare('edit')">预览文案 / 顺序修改</n-button><n-button :disabled="busy || !dirty" @click="resetEdit">放弃本地编辑</n-button><small>保留全部原分P，不删除、不替换</small></div>
-      <details><summary>追加已上传的配音版</summary><p class="muted">先在「新稿与发布记录」中仅上传新版本。这里将新分P追加到当前BV末尾，保留原视频、封面、文案及创作声明；需要调整声明时，请单独预览修改。追加不会替换原视频；保留原BV修订视频请到官网操作。</p><div class="toolbar"><n-select v-model:value="upload" :options="uploads.map(r=>({label:`${r.snapshot.settings.title} · ${r.snapshot.parts.length} 个新分P`,value:r.id}))" :disabled="busy || dirty" placeholder="选择本账号已上传、尚未投稿的清单" /><n-button :disabled="busy || dirty || !upload" @click="prepare('append')">预览追加分P</n-button></div></details>
+      <details><summary>追加已上传的配音版</summary><p class="muted">先在对应项目的「发布到B站」中仅上传新版本。这里将新分P追加到当前BV末尾，保留原视频、封面、文案及创作声明；需要调整声明时，请单独预览修改。追加不会替换原视频；保留原BV修订视频，请到对应项目「发布到B站」打开原发布记录，使用「更新原稿件」。</p><div class="toolbar"><n-select v-model:value="upload" :options="uploads.map(r=>({label:`${r.snapshot.settings.title} · ${r.snapshot.parts.length} 个新分P`,value:r.id}))" :disabled="busy || dirty" placeholder="选择本账号已上传、尚未投稿的清单" /><n-button :disabled="busy || dirty || !upload" @click="prepare('append')">预览追加分P</n-button></div></details>
       <details><summary>调整合集归属</summary><div class="toolbar"><n-select :value="season" :options="(meta.seasons || []).map((s:any)=>({label:s.title,value:s.id}))" clearable :disabled="busy || dirty" placeholder="不加入合集 / 移出" @update:value="selectSeason" /><n-select v-if="season" v-model:value="section" :options="sections.map((s:any)=>({label:s.title,value:s.id}))" :disabled="busy || dirty" placeholder="选择小节" /><n-button :disabled="busy || dirty || (season && !section) || !meta.seasons" @click="prepare('collection')">{{ season ? '预览转入合集' : '预览移出合集' }}</n-button></div></details>
     </section>
-    <details class="aux"><summary>官网投稿模板</summary><div class="toolbar"><n-button :disabled="!account || busy" @click="loadTemplates">读取官网模板</n-button><n-checkbox v-for="field in ['title','description','tags']" :key="field" :checked="templateFields.includes(field)" :disabled="busy" @update:checked="v=>templateFields=v?[...templateFields,field]:templateFields.filter(f=>f!==field)">{{ fieldLabels[field] }}</n-checkbox></div><p v-if="templatesLoaded && !templates.length" class="muted">当前账号暂无官网投稿模板，仍可在「默认设置与合集模板」中创建本地模板。</p><div v-for="item in templates" :key="item.id" class="template"><strong>{{ item.name }}</strong><p>{{ item.values.title }}</p><p>{{ item.values.description }}</p><small>{{ item.values.tags.join(' · ') }}</small><n-button size="small" :disabled="busy || !templateFields.length" @click="importTemplate(item)">导入所选字段为本地模板</n-button></div></details>
+    <details class="aux"><summary>官网投稿模板</summary><div class="toolbar"><n-button :disabled="!account || busy" @click="loadTemplates">读取官网模板</n-button><n-checkbox v-for="field in ['title','description','tags']" :key="field" :checked="templateFields.includes(field)" :disabled="busy" @update:checked="v=>templateFields=v?[...templateFields,field]:templateFields.filter(f=>f!==field)">{{ fieldLabels[field] }}</n-checkbox></div><p v-if="templatesLoaded && !templates.length" class="muted">当前账号暂无官网投稿模板，仍可在设置的「制作与发布」中创建本地模板。</p><div v-for="item in templates" :key="item.id" class="template"><strong>{{ item.name }}</strong><p>{{ item.values.title }}</p><p>{{ item.values.description }}</p><small>{{ item.values.tags.join(' · ') }}</small><n-button size="small" :disabled="busy || !templateFields.length" @click="importTemplate(item)">导入所选字段为本地模板</n-button></div></details>
     <details class="aux"><summary>修改记录与异常恢复</summary><div class="toolbar"><n-button :disabled="!account || busy" @click="loadChanges">刷新修改记录</n-button><a href="https://member.bilibili.com/platform/home" target="_blank" rel="noopener noreferrer">官网核对 ↗</a></div><div v-for="item in changes" :key="item.id" class="change"><strong>{{ item.bvid }} · {{ labels[item.kind] }}</strong><n-tag size="small">{{ stateLabels[item.status] }}</n-tag><small>{{ new Date(item.created_at).toLocaleString() }}</small><p v-if="item.error" class="warning">{{ item.error }}</p><div v-if="['committing','unknown'].includes(item.status)" class="toolbar"><n-button size="small" :disabled="busy || item.busy" @click="reconcile(item)">读取并核对结果</n-button><n-button size="small" :disabled="busy || item.busy" @click="reconcile(item,true)">已在官网处理，解除保护</n-button></div></div><p v-if="!changes.length" class="muted">尚无已读取的修改记录</p></details>
     <BiliContentImport :account-id="account" :projects="projects" :default-project="defaultProject" @busy="importBusy=$event" />
     <n-modal v-model:show="modal" preset="card" title="确认B站稿件变更" style="width:min(860px,calc(100vw - 32px))" :mask-closable="!busy" :closable="!busy" :close-on-esc="!busy">

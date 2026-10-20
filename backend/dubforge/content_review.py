@@ -7,7 +7,8 @@ import unicodedata
 
 from dubforge.errors import DubForgeError
 
-REVIEW_VERSION = 'local-context-v1'
+# 规则变化必须使已生成的审查报告和成片失效；发布前会重新核对当前规则。
+REVIEW_VERSION = 'local-context-v2'
 TEXT_ONLY_LIMITATION = '本次仅检查字幕和评论文字，无法判断画面或所有语义风险，也不能保证平台审核通过。'
 MAX_ADJACENT_GAP_SECONDS = 0.6
 MAX_CONTEXT_CHARACTERS = 80
@@ -26,6 +27,17 @@ _EVENT_EN = re.compile(r'(?<![a-z0-9])(?:tragedy|massacre)(?![a-z0-9])')
 _PLACE_ZH = re.compile(r'天\s*安\s*门')
 _EVENT_ZH = re.compile(r'悲\s*剧|屠\s*杀')
 _CLAUSE_END = re.compile(r'[.!?;。！？；]')
+
+# 真实退回区间与评论叠加重合：同条评论同时描述高敏感地点和暴恐事件。
+# 这种组合先保留给人工复核；单独地名、安检或新闻学习中的暴恐词不能推断
+# 为不适合上屏。规则仅作用评论，不扩大普通字幕的屏蔽范围。
+_COMMENT_SENSITIVE_LOCATION = re.compile(
+    r'(?:全国|中国|本国|该国)?\s*最敏感\s*(?:的\s*)?(?:地方|地区|区域|场所)'
+    r'|(?<![a-z0-9])(?:the\s+)?most\s+sensitive\s+(?:place|area|location)(?![a-z0-9])')
+_COMMENT_TERROR_EVENT = re.compile(
+    r'恐怖\s*(?:袭击|攻击|主义|分子)|暴\s*恐'
+    r'|(?<![a-z0-9])(?:terrorism|terrorist\s+attack)(?![a-z0-9])')
+MAX_COMMENT_RISK_DISTANCE = 600
 
 
 class ContentReviewError(DubForgeError):
@@ -284,6 +296,13 @@ def blocked_comment(original, translation='', custom_terms=(), *, enabled=True) 
             for match in _matches(text, patterns):
                 if match['reason'] not in reasons:
                     reasons.append(match['reason'])
+            locations = list(_COMMENT_SENSITIVE_LOCATION.finditer(text))
+            events = list(_COMMENT_TERROR_EVENT.finditer(text))
+            if any(min(abs(location.end() - event.start()), abs(event.end() - location.start()))
+                   <= MAX_COMMENT_RISK_DISTANCE for location in locations for event in events):
+                reason = '评论同时含高敏感地点与暴恐事件表述，需人工复核后再上屏'
+                if reason not in reasons:
+                    reasons.append(reason)
     return reasons
 
 

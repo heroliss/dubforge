@@ -12,13 +12,14 @@ import psutil
 
 from dubforge import config
 from dubforge.backends import tts_gptsovits, tts_indextts25
-from dubforge.errors import ServiceStartError, ServiceStopError
+from dubforge.errors import DubForgeError, ServiceStartError, ServiceStopError
 from dubforge.utils.fs import atomic_write_bytes
 
 _BACKENDS = {"indextts25": tts_indextts25, "gptsovits": tts_gptsovits}
 _processes: dict[int, tuple[str, subprocess.Popen, Path]] = {}
 _lock = threading.RLock()
 _users: dict[tuple[str, str], int] = {}
+_render_reservations = {}
 
 
 class _RestoredProcess:
@@ -144,11 +145,30 @@ def _service_key(cfg_get):
     return backend, url
 
 
+def _local_key(key):
+    """资源归属识别包含本机HTTPS/前缀URL，但不放宽严格进程停止权限。"""
+    value = key[1]
+    if not isinstance(value, str):
+        return False
+    if value.rsplit(':', 1)[0] in {'127.0.0.1', 'localhost', '::1'}:
+        return True
+    try:
+        return urlsplit(value).hostname in {'127.0.0.1', 'localhost', '::1'}
+    except ValueError:
+        return False
+
+
+def _render_blocks(cfg_get):
+    return bool(_render_reservations) and _local_key(_service_key(cfg_get))
+
+
 @contextmanager
 def use(cfg_get):
     """逐句与批量共用占用计数，避免另一个项目关闭正在合成的服务。"""
     key = _service_key(cfg_get)
     with _lock:
+        if _render_reservations and _local_key(key):
+            raise DubForgeError('NVIDIA成片编码正在使用本机GPU，请等本次编码结束后再配音', code='TTS_SERVICE_RENDER_BUSY')
         _users[key] = _users.get(key, 0) + 1
     try:
         yield
@@ -157,6 +177,40 @@ def use(cfg_get):
             _users[key] -= 1
             if not _users[key]:
                 del _users[key]
+
+
+@contextmanager
+def reserve_for_render(cfg_get):
+    """短锁登记硬件编码预约；不杀外部服务，不跨整个编码持锁。"""
+    backend = cfg_get('tts.backend', 'indextts25')
+    url = cfg_get(f'tts.{backend}.url', '')
+    try:
+        _, port = _local_endpoint(url)
+    except ServiceStartError:
+        # 远端不停止、不阻断其请求；本次本机NVENC仍需防新本机模型启动。
+        port = None
+    key, token = _service_key(cfg_get), object()
+    with _lock:
+        if any(count and _local_key(service_key) for service_key, count in _users.items()) or _render_reservations:
+            raise DubForgeError('本机配音服务仍在使用中，请待当前请求结束后再进行硬件编码', code='ASSEMBLE_ENCODER_BUSY')
+        _render_reservations[key] = token
+    try:
+        from dubforge import tts_requests
+        with _lock:
+            if _local_key(key) and (tts_requests.pending(url) or tts_requests.needs_recovery(url)):
+                raise DubForgeError('配音服务有未核对的请求，不能自动停止或占用硬件编码资源，请先核对服务状态',
+                                    code='ASSEMBLE_ENCODER_BUSY')
+            managed = _managed_process(port) if port is not None else None
+            if managed and managed[0] != backend:
+                raise DubForgeError('本机服务登记归属与当前配音后端不一致，不能自动释放资源', code='ASSEMBLE_ENCODER_BUSY')
+            if managed and managed[1].poll() is None and cfg_get('runner.auto_tts_vram', True):
+                # stop 再核验PID/归属和_users；不发送模型探测请求。
+                stop(cfg_get, probe=False)
+        yield
+    finally:
+        with _lock:
+            if _render_reservations.get(key) is token:
+                _render_reservations.pop(key, None)
 
 
 def _local_endpoint(url: str) -> tuple[str, int]:
@@ -186,7 +240,6 @@ def installation_root(backend: str, project_dir: str) -> Path:
                 candidates.append(base / "index-tts")
             else:
                 candidates.extend(sorted(base.glob("GPT-SoVITS*")))
-                candidates.extend(sorted((base / "VideoLingo-Workspace").glob("GPT-SoVITS*")))
     roots = list(dict.fromkeys(p.resolve() for p in candidates if (p / script).is_file()))
     if len(roots) != 1:
         reason = "找到多个安装目录" if roots else "未找到服务安装目录"
@@ -222,6 +275,10 @@ def _launch_settings(cfg_get):
 def status(cfg_get=config.get, *, probe=True) -> dict:
     from dubforge import tts_requests
     result = _status(cfg_get, probe=probe)
+    with _lock:
+        if _render_blocks(cfg_get):
+            result.update(can_start=False, render_busy=True,
+                          message='NVIDIA成片编码正在使用本机GPU，结束后可按需启动配音服务。')
     if result['backend'] == 'indextts25' and tts_requests.needs_recovery(result['url']):
         result['request_pending'] = True
         result['message'] = tts_requests.RECOVERY_HINT
@@ -279,6 +336,9 @@ def _status(cfg_get=config.get, *, probe=True) -> dict:
 
 
 def start(cfg_get=config.get) -> dict:
+    with _lock:
+        if _render_blocks(cfg_get):
+            raise ServiceStartError('NVIDIA成片编码正在使用本机GPU，请等待编码结束后再启动配音服务。')
     # 已在线直接复用；启动请求返回进程状态，由页面单独轮询就绪状态。
     current = status(cfg_get)
     if current["online"] or current["status"] == "starting":
@@ -287,6 +347,8 @@ def start(cfg_get=config.get) -> dict:
         raise ServiceStartError(current["message"])
     backend, port, host, root, command = _launch_settings(cfg_get)
     with _lock:
+        if _render_blocks(cfg_get):
+            raise ServiceStartError('NVIDIA成片编码正在使用本机GPU，请等待编码结束后再启动配音服务。')
         existing = _managed_process(port)
         if existing and existing[1].poll() is None:
             return {**current, "status": "starting", "can_start": False,
@@ -351,7 +413,7 @@ def _terminate_tree(process):
         process.wait(timeout=1)
 
 
-def stop(cfg_get=config.get) -> dict:
+def stop(cfg_get=config.get, *, probe=True) -> dict:
     backend = cfg_get("tts.backend", "indextts25")
     try:
         _, port = _local_endpoint(cfg_get(f"tts.{backend}.url", ""))
@@ -375,7 +437,7 @@ def stop(cfg_get=config.get) -> dict:
                 output.write("\n--- 已停止配音服务 ---\n".encode("utf-8"))
         except (OSError, psutil.Error, subprocess.TimeoutExpired) as exc:
             raise ServiceStopError(f"停止服务失败：{exc}") from exc
-    result = status(cfg_get)
+    result = status(cfg_get, probe=probe)
     if not result["online"]:
         result["message"] = "服务已停止；需要配音时可重新启动。"
     return result

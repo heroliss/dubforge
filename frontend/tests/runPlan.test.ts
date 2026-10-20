@@ -85,3 +85,19 @@ test('启动成功不等待慢刷新且不重复提交，刷新失败不误报�
   } finally {failedRefresh(new Error('慢刷新失败'));await done;await Promise.resolve()}
   assert.match(warnings[0],/状态刷新失败/)
 })
+
+test('制作计划确认窗口打开后项目归档，不再发送启动请求', async t => {
+  let archived=false,shown:any
+  const requests:string[]=[],warnings:string[]=[]
+  t.mock.method(globalThis,'fetch',async(url:string)=>{
+    requests.push(url);return {ok:true,json:async()=>({steps:['split'],labels:{split:'语义整理'},blockers:[]})}
+  })
+  await runPlannedSteps('p',['split'],false,{warning:(text:string)=>warnings.push(text),error:assert.fail},
+    {info:(options:any)=>{shown=options}},async()=>assert.fail('归档后不暂停预览或启动'),async()=>{},()=>archived)
+  archived=true
+  assert.equal(await shown.onPositiveClick(),false)
+  assert.deepEqual(requests,['/api/projects/p/run_plan']);assert.match(warnings[0],/已归档.*恢复/)
+  await runPlannedSteps('p',['split'],false,{warning:(text:string)=>warnings.push(text),error:assert.fail},
+    {info:assert.fail},async()=>{},async()=>{},()=>archived)
+  assert.equal(requests.length,1,'已知归档的项目不预检')
+})

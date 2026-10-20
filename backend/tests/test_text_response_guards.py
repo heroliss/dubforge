@@ -57,6 +57,14 @@ def test_split_factory_accepts_fragmented_bom_crlf_and_existing_format_compatibi
     assert guard.timeout_s == 50
 
 
+def test_split_thinking_is_not_limited_by_response_character_budget(ctx):
+    small = split._split_response_guard(ctx, source_lines(), "Hello again. Goodbye.")
+    large = split._split_response_guard(ctx, source_lines(), "x" * 400_000)
+    large.feed("r" * 100_000, channel="reasoning")
+    large.finish()
+    assert large.counts["reasoning"] == 100_000
+
+
 def test_split_checks_only_complete_line_then_stops_before_final_parser(ctx):
     guard = split._split_response_guard(ctx, source_lines(), "Hello again. Goodbye.")
     guard.feed("1. 0-1: Hello again.\n2. 1-2: Goodbye.\n")
@@ -67,18 +75,29 @@ def test_split_checks_only_complete_line_then_stops_before_final_parser(ctx):
     assert guard.counts["content"] < 200
 
 
-@pytest.mark.parametrize("bad", [
-    "2. 0-1: Hello again.\n",                 # 首行重编号
-    "1. 0-1: Hello again.\n1. 1-2: Goodbye.\n",  # 重复
-    "1. 0-1: Hello again.\n3. 1-2: Goodbye.\n",  # 缺号
-    "1. 0-1: Hello again.\n2. 1-2: Goodbye.\n1. 0-1: Second draft.\n",
-    "1. 0-1: Hello again.\n\nNotes: complete\n1. 0-1: Second draft.\n",
+@pytest.mark.parametrize("raw", [
+    "2. 0-1: Hello again.\n",                 # 模型行标记可从任意正整数开始
+    "1. 0-1: Hello again.\n1. 1-2: Goodbye.\n",  # 重复行标记可由程序重排
+    "1. 0-1: Hello again.\n3. 1-2: Goodbye.\n",  # 跳号可由程序重排
 ])
-def test_split_rejects_restarts_and_multiple_finished_drafts(ctx, bad):
+def test_split_accepts_advisory_model_numbers(ctx, raw):
     guard = split._split_response_guard(ctx, source_lines(), "Hello again. Goodbye.")
-    with pytest.raises(ResponseGuardError) as error:
-        feed_chunks(guard, bad, 1)
-    assert error.value.code == "LLM_OUTPUT_CONTRACT"
+    feed_chunks(guard, raw, 1)
+
+
+def test_split_still_rejects_second_draft_by_time_order(ctx):
+    raw = "1. 0-1: Hello again.\n2. 1-2: Goodbye.\n1. 0-1: Second draft.\n"
+    guard = split._split_response_guard(ctx, source_lines(), "Hello again. Goodbye.")
+    with pytest.raises(ResponseGuardError, match="乱序"):
+        feed_chunks(guard, raw, 1)
+
+
+def test_split_reports_and_reindexes_advisory_model_numbers(ctx):
+    raw = "2. 0-1: Hello again.\n7. 1-2: Goodbye.\n"
+    warnings = []
+    parts = split._parse_timed_protocol(raw, 0, 2, warnings)
+    assert [p["text"] for p in parts] == ["Hello again.", "Goodbye."]
+    assert any("按输出顺序重新编号" in warning for warning in warnings)
 
 
 def test_split_final_time_validation_still_runs_after_format_guard(ctx):

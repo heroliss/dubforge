@@ -28,7 +28,7 @@ test('真实字节优先于旧百分比，显示具体分P且不推测投稿进�
   const row = {status:'uploading',progress:90,progress_detail:{phase:'uploading',loaded:125,total:500,current_part:2,current_title:'配音版',completed_parts:1,total_parts:3}}
   assert.equal(publicationUploadProgress(row)!.percentage,25)
   const html = await render(row)
-  assert.match(html,/视频文件上传/); assert.match(html,/25.0%.*125 B \/ 500 B/)
+  assert.match(html,/视频文件上传/); assert.match(html,/视频文件 25%/); assert.match(html,/125 B \/ 500 B/)
   assert.match(html,/P2 \/ 3.*配音版/); assert.match(html,/已完成 1 \/ 3 个分P/)
 })
 
@@ -58,6 +58,15 @@ test('兼容历史记录，并对非有限与超范围值做边界处理', async
   assert.doesNotMatch(await render({status:'draft'}),/data-publication-progress/)
 })
 
+test('项目发布进度同时展示保留原BV的更新任务', async () => {
+  const row = { status:'rejected', progress:100, latest_update:{ id:'u1', status:'delivering', phase:'同步章节与后续设置', progress:68,
+    stages:{chapters:{status:'running',progress:68}} } }
+  const html = await render(row)
+  assert.match(html,/原稿更新/)
+  assert.match(html,/同步章节与后续设置/)
+  assert.match(html,/68%/)
+})
+
 test('项目列表显示独立发布段、真实上传进度和审核状态，制作完成不等于已发布', async () => {
   const Projects = (await server.ssrLoadModule('/src/views/ProjectsView.vue')).default
   const router = createRouter({history:createMemoryHistory(),routes:[{path:'/:pathMatch(.*)*',component:{render:()=>null}}]})
@@ -74,7 +83,7 @@ test('项目列表显示独立发布段、真实上传进度和审核状态，�
   const html = await renderToString(app)
   assert.match(html,/制作完成/);assert.match(html,/B站 · 上传文件中/)
   assert.match(html,/发布到B站：上传文件中，进入发布页/)
-  assert.match(html,/25.0%.*250 B \/ 1000 B/)
+  assert.match(html,/视频文件 25%/);assert.match(html,/250 B \/ 1000 B/)
   assert.match(html,/B站 · 已投稿 · 查看平台状态/)
   assert.match(html,/B站 · 已公开发布/);assert.match(html,/B站 · 已通过 · 仅自己可见/)
   assert.equal((html.match(/进入发布页/g)||[]).length,4)
@@ -125,4 +134,24 @@ test('项目制作状态与需更新独立显示，保留悬浮摘要和只读�
   page.searchText='失败';assert.deepEqual(page.sortedProjects.map((project:any)=>project.uid),['failed'])
   assert.equal(page.PROJECT_STATUS_OPTS.find((option:any)=>option.value==='needs_update').label,'需更新')
   for(const button of html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g))assert.equal((button[0].match(/<button\b/g)||[]).length,1,'不得嵌套状态按钮与分段导航按钮')
+})
+
+test('独立字幕导出不制造主流程进度断点', async () => {
+  const Projects = (await server.ssrLoadModule('/src/views/ProjectsView.vue')).default
+  const router = createRouter({history:createMemoryHistory(),routes:[{path:'/:pathMatch(.*)*',component:{render:()=>null}}]})
+  await router.push('/projects')
+  const main = ['download','preprocess','transcribe','split','translate','tts','assemble']
+    .map(key => ({key,label:key,status:'done',fresh:true,selected:true}))
+  const entries = [{uid:'subtitle-optional',title:'成片已完成，字幕文件尚未单独导出',status:'done',dir_exists:true,params:{},
+    steps:[...main,{key:'subtitles',label:'字幕导出',status:'pending',fresh:false,selected:true}]}]
+  const app = createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(Projects)})})})
+  app.use(createPinia()); app.use(router); setup(app)
+  app.mixin({created(){if(this.$options.__name==='ProjectsView'){this.$.setupState.projects=entries;this.$.setupState.loading=false}}})
+  const html = await renderToString(app)
+  assert.match(html,/9 个工作阶段/)
+  assert.match(html,/已完成 7 个/)
+  assert.match(html,/项目运行按目标规划/)
+  assert.equal((html.match(/data-workflow-stage=/g)||[]).length,9)
+  assert.match(html,/字幕文件未单独导出（可选）/)
+  assert.doesNotMatch(html,/aria-label="字幕导出：/)
 })

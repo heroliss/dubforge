@@ -151,6 +151,10 @@ def test_metadata_refresh_and_comment_plan_preserve_pipeline(completed_project, 
 ])
 def test_real_inputs_still_invalidate_after_metadata_refresh(completed_project, platform, change, first_stale):
     project = completed_project
+    # Capture the storage-layout variant before mutating any real input.  A
+    # post-mutation comparison would confuse a valid current project with a
+    # legacy fingerprint because the changed input is expected to differ.
+    legacy = crud.get_step(project.id, 'preprocess').input_fingerprint != compute_fingerprint(project, 'preprocess')
     video_info.update(project.uid, 'refresh')
     if change in {'video', 'audio'}:
         step, name = ('download', 'video.mp4') if change == 'video' else ('preprocess', 'raw.wav')
@@ -160,14 +164,32 @@ def test_real_inputs_still_invalidate_after_metadata_refresh(completed_project, 
         atomic_write_bytes(path, b'x' * path.stat().st_size)
         crud.add_artifact(project.id, step, 'test', name, path, str(path.relative_to(deps.root)))
     else:
-        config.set_key('separate.enabled' if change == 'separate_config' else 'asr.model',
-                       False if change == 'separate_config' else 'different-model')
+        from dubforge import configuration
+        current = configuration.resolve(project.uid)
+        configuration.save('project:' + project.uid, dict(revision=current['revision'], updates={
+            'separate.enabled' if change == 'separate_config' else 'asr.model':
+            False if change == 'separate_config' else 'large-v3'}))
     deps = Dependencies(project)
     assert deps.fresh('download')
-    if first_stale == 'transcribe':
-        assert deps.fresh('preprocess')
-    for key in PIPELINE_KEYS[PIPELINE_KEYS.index(first_stale):]:
-        assert not deps.fresh(key), key
+    # 产物依赖按实际消费边界核对：输入或设置变化先使直接消费者过期；
+    # 仅步骤状态 stale、尚未替换文件时，不把所有下游缓存一并误判为过期。
+    expected_stale = {
+        ('video', True): {'preprocess', 'transcribe', 'split', 'translate', 'subtitles', 'assemble'},
+        ('audio', True): {'transcribe', 'split', 'translate'},
+        ('separate_config', True): {'preprocess', 'assemble'},
+        # 旧项目仍可能保存旧版下游指纹，但 ASR 设置只由转写消费；
+        # split/translate 消费已登记产物，仍可复用。
+        ('asr_config', True): {'transcribe'},
+        # 当前项目同样按直接消费者限定原地替换的影响范围；
+        # transcribe/split/translate 的登记产物在自身输入替换前仍有效。
+        # 字幕消费当前配音排布；排布的片尾边界绑定源视频，因此视频替换
+        # 还需要重导字幕，但不因此重做已登记的翻译或配音声音。
+        ('video', False): {'preprocess', 'subtitles', 'assemble'},
+        ('audio', False): {'transcribe'},
+        ('separate_config', False): {'preprocess', 'assemble'},
+        ('asr_config', False): {'transcribe'},
+    }[(change, legacy)]
+    assert {key for key in PIPELINE_KEYS if not deps.fresh(key)} == expected_stale
 
 
 def test_unknown_saved_fingerprint_is_not_accepted(completed_project, platform):

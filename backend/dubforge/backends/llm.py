@@ -15,6 +15,7 @@ from contextlib import contextmanager
 import httpx
 
 from dubforge import config
+from dubforge import llm_conversations
 from dubforge.errors import DubForgeError, ServiceOfflineError, StepFailedError
 
 _offline_cache: dict = {}
@@ -121,6 +122,23 @@ def _payload(provider: dict, messages: list[dict], temperature: float | None,
     return body
 
 
+def _transport_payload(body: dict, *, stream: bool | None = None) -> dict:
+    """传输层与设置预览共用最终请求体；非流式回退不能重发流式选项。"""
+    result = dict(body)
+    if stream is None:
+        stream = body.get('stream') is not False
+        if not stream:
+            for key in ('stream_options', 'tool_stream'):
+                result.pop(key, None)
+            return result
+    if stream:
+        result['stream'] = True
+    else:
+        for key in ('stream', 'stream_options', 'tool_stream'):
+            result.pop(key, None)
+    return result
+
+
 # 常见状态码: (码义, 该场景下最可能的原因 —— 只指出问题来源, 不写修复步骤)
 _STATUS_MEANING = {
     400: ("请求格式或参数有误", "可能是模型名或专属参数不被该服务商接受"),
@@ -169,22 +187,69 @@ def _sleep_retry(seconds: float, cancel_check=None) -> None:
         _time.sleep(min(0.2, left))
 
 
+_ACCOUNT_ERROR_CODES = {'LLM_QUOTA_EXHAUSTED', 'LLM_SUBSCRIPTION_INVALID'}
+
+
+def _provider_error_detail(data) -> dict | None:
+    """只读取服务商错误信封，不递归扫描正常正文或模型输出。"""
+    if not isinstance(data, dict):
+        return None
+    error = data.get('error') or data.get('Error')
+    for key in ('ResponseMetadata', 'Response'):
+        envelope = data.get(key)
+        if not error and isinstance(envelope, dict):
+            error = envelope.get('Error') or envelope.get('error')
+    if error:
+        return error if isinstance(error, dict) else {'message': str(error)}
+    # 部分兼容接口把错误码与消息直接放在顶层；成功码与聊天正文不算错误。
+    code = data.get('code', data.get('Code'))
+    if 'choices' not in data and code is not None and str(code).lower() not in {'', '0', '200', 'ok', 'success'}:
+        return data
+    return None
+
+
 def _provider_error(data, status: int = 200) -> StepFailedError | None:
     """识别结构化服务错误，不能把内容审核或额度问题误认为参数不兼容。"""
-    if not isinstance(data, dict) or not data.get('error'):
+    detail = _provider_error_detail(data)
+    if detail is None:
         return None
-    error = data['error']
-    detail = error if isinstance(error, dict) else {'message': str(error)}
-    code = str(detail.get('code') or detail.get('type') or '')
-    message = str(detail.get('message') or '')
+    code = str(detail.get('code') or detail.get('Code') or detail.get('type') or detail.get('Type') or '')
+    message = str(detail.get('message') or detail.get('Message') or detail.get('msg') or '')
     signature = re.sub(r'[^a-z]', '', code.lower())
     blocked = any(word in signature for word in ('sensitivecontent', 'contentfilter', 'contentpolicy', 'safety', 'responsibleai'))
     blocked = blocked or any(word in message.lower() for word in
         ('sensitive content', 'sensitive information', 'content policy', 'content filter', '内容审核', '敏感内容'))
+    # 部分兼容服务把明确审核拒绝放在消息中，type/code 仍是普通 invalid_request_error。
+    # 只接受该业务原因本身或消息开头的明确短语，不能把任意 HTTP 400/参数错误归为单条内容失败。
+    blocked = blocked or signature == 'contentexistsrisk' or bool(re.match(
+        r'^\s*content\s+exists\s+risk(?:\s*$|\s*[.:：;；,，。(\[])', message, re.IGNORECASE))
     if blocked:
         return StepFailedError('服务商内容审核拒绝了本次请求' + (f'（{code}）' if code else ''),
             code='LLM_CONTENT_REJECTED', detail=detail,
             suggestion='这不是输出格式错误。请查看服务商原因并核对本批评论与视频背景；程序不会改写内容规避审核。')
+    # HTTP 429 同时可能表示临时限流和账户资源耗尽，必须优先看明确的业务错误。
+    # 不凭 quota/exceeded 等宽泛词推断余额，避免把每分钟额度误报为欠费。
+    account_code = re.sub(r'[^a-z0-9]', '', code.lower())
+    quota_empty = account_code in {'1113', 'insufficientquota', 'insufficientbalance',
+        'balanceinsufficient', 'creditsexhausted', 'outofcredits', 'billinghardlimitreached'}
+    quota_empty = quota_empty or any(word in message for word in
+        ('余额不足', '无可用资源包', '资源包耗尽', '资源包已用完', '账户欠费'))
+    quota_empty = quota_empty or bool(re.search(
+        r'\binsufficient\s+(?:balance|credits?|funds)\b|\b(?:credits?|balance)\s+(?:is\s+|are\s+)?(?:exhausted|depleted)\b',
+        message, re.IGNORECASE))
+    if quota_empty:
+        return StepFailedError('模型服务余额不足或可用资源已耗尽', code='LLM_QUOTA_EXHAUSTED', detail=detail,
+            suggestion='请在服务商控制台补充余额或资源包，或在「模型与服务」改用可用配置，再检查并继续任务。')
+    subscription_invalid = account_code in {'invalidsubscription', 'subscriptionexpired',
+        'subscriptionnotfound', 'noactivesubscription'}
+    subscription_invalid = subscription_invalid or any(word in message for word in
+        ('订阅已过期', '订阅已失效', '未开通订阅', '无有效订阅'))
+    subscription_invalid = subscription_invalid or bool(re.search(
+        r'\bsubscription\s+(?:has\s+|is\s+)?(?:expired|invalid)\b|\b(?:no|not\s+have\s+(?:a\s+)?)\s*valid\s+[^.\n]{0,40}\bsubscription\b',
+        message, re.IGNORECASE))
+    if subscription_invalid:
+        return StepFailedError('模型服务订阅未开通或已失效', code='LLM_SUBSCRIPTION_INVALID', detail=detail,
+            suggestion='请在服务商控制台核对订阅与接口权限，或在「模型与服务」改用可用配置，再检查并继续任务。')
     return StepFailedError(f'服务商返回错误：{code or status} {message[:300]}'.strip(),
         code=f'LLM_HTTP_{status}' if status != 200 else 'LLM_PROVIDER_ERROR', detail=detail,
         suggestion='请根据服务商返回的错误码和原因检查配置或服务状态。')
@@ -214,7 +279,7 @@ def _checked_content(content, *, finish_reason=None, reasoning_chars=0, refusal=
             suggestion='请核对本批输入与服务商审核结果；不会将拒绝响应作为格式问题重试。')
     if finish_reason in {'length', 'max_tokens'}:
         raise StepFailedError('模型输出被长度限制截断，未返回完整结果', code='LLM_OUTPUT_TRUNCATED', detail=detail,
-            suggestion='请检查模型输出 token 上限与思考预算；已截断结果不会当作完整正文使用。')
+            suggestion='请检查模型响应 token 上限和请求总时限；已截断结果不会当作完整正文使用。')
     if content is None or isinstance(content, str) and not content.strip():
         hint = '仅返回思考内容，没有最终正文' if reasoning_chars else '没有返回最终正文'
         raise StepFailedError(f'模型{hint}', code='LLM_EMPTY_RESPONSE', detail=detail,
@@ -522,11 +587,12 @@ def _stream_content(response, *, name: str, request_id: str,
 
 def _post(provider: dict, body: dict, log=lambda m: None,
            cancel_check=None, trace=None, response_guard_factory=None) -> str:
-    """向单个 profile 发请求; 5xx/读超时重试, 429 立即切换配置组。
+    """向单个 profile 发请求；一般 5xx/读超时重试，账户故障或 429 立即切换。
 
     限流不是本次请求内容的瞬时错误，继续重试只会浪费等待时间并扩大日志噪声；
-    429 由 chat() 记入短暂冷却，后续字幕片段会直接跳过该配置。
+    临时 429 由 chat() 记入短暂冷却，余额与订阅错误保留各自原因。
     """
+    llm_conversations.protect(provider)
     key = provider.get("api_key", "")
     name = provider.get("name", "default")
     # 空地址在 httpx 里只会报英文 UnsupportedProtocol, 提前拦下给人话
@@ -542,17 +608,19 @@ def _post(provider: dict, body: dict, log=lambda m: None,
     started = _time.time()
     params = {k: v for k, v in body.items() if k not in {"model", "messages"}}
     response_format = params.pop("response_format", None)
-    safe_params = {
-        k: ("***" if any(word in str(k).lower()
-                          for word in ("key", "token", "secret", "password")) else v)
-        for k, v in params.items()
-    }
+    # 扩展参数允许嵌套 JSON；清洗仅用于日志，实际请求仍发送原始参数。
+    secrets = llm_conversations.collect_secrets(provider)
+    safe_params = llm_conversations.redact(params, secrets=secrets)
+    safe_format = llm_conversations.redact(response_format, secrets=secrets)
     param_desc = ", ".join(f"{k}={v}" for k, v in safe_params.items()) or "服务商默认"
-    format_desc = (f", 请求格式={response_format}" if response_format else "")
+    format_desc = (f", 请求格式={safe_format}" if response_format else "")
     input_chars = sum(len(str(m.get("content", ""))) for m in body.get("messages", []))
     request_id = uuid.uuid4().hex[:10]
+    streaming = body.get('stream') is not False
+    first_body = _transport_payload(body)
+    response_desc = 'SSE流式(不支持时自动回退)' if streaming else '普通响应(stream=false)'
     log(f"LLM 请求: 配置={name}, 模型={body.get('model') or '(未填)'}, "
-        f"输入约 {input_chars:,} 字符, 参数={param_desc}{format_desc}, 响应=SSE流式(不支持时自动回退)")
+        f"输入约 {input_chars:,} 字符, 参数={param_desc}{format_desc}, 响应={response_desc}")
     base_url = str(provider.get("base_url", ""))
     if "/api/plan/" in base_url.lower():
         log("⚠ 当前配置使用计划/思考端点，模型可能先进行较长内部推理，最终文本首字节会明显变慢")
@@ -562,9 +630,10 @@ def _post(provider: dict, body: dict, log=lambda m: None,
                   request_id=request_id, role=message.get("role", "user"),
                   profile=name, model=body.get("model") or "(未填)",
                   input_chars=input_chars)
-        trace("status", "等待模型首字节…", request_id=request_id,
+        trace("status", "等待模型首字节…" if streaming else "等待模型完整响应…", request_id=request_id,
               profile=name, model=body.get("model") or "(未填)")
-    log(f"LLM 等待首字: 配置={name}, 请求编号={request_id}，服务商返回前可能需要较长时间")
+    wait_label = '首字' if streaming else '完整响应'
+    log(f"LLM 等待{wait_label}: 配置={name}, 请求编号={request_id}，服务商返回前可能需要较长时间")
     # 5xx/读超时 → 指数退避重试; 429 在上面立即切换 (避免无效等待)
     last_exc: Exception | None = None
     r = None
@@ -576,9 +645,8 @@ def _post(provider: dict, body: dict, log=lambda m: None,
         try:
             with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
                                  trace=trace, request_id=request_id, name=name) as (c, guard, check):
-                stream_body = {**body, "stream": True}
-                if hasattr(c, "stream"):
-                    with c.stream("POST", "/chat/completions", json=stream_body,
+                if streaming and hasattr(c, "stream"):
+                    with c.stream("POST", "/chat/completions", json=first_body,
                                   headers=headers) as response:
                         r = response
                         if r.status_code == 200:
@@ -609,7 +677,8 @@ def _post(provider: dict, body: dict, log=lambda m: None,
                 else:
                     # 测试替身或极简 HTTP 适配器可能只实现 post；保留非流式
                     # 兼容路径，不让观测能力改变既有调用契约。
-                    r = c.post("/chat/completions", json=body, headers=headers)
+                    request_body = _transport_payload(body, stream=False) if streaming else first_body
+                    r = c.post("/chat/completions", json=request_body, headers=headers)
                     response_body = str(getattr(r, "text", "") or "")
                     if check:
                         check()
@@ -638,6 +707,10 @@ def _post(provider: dict, body: dict, log=lambda m: None,
                     trace("retry", "传输异常，准备重试", request_id=request_id)
                 _sleep_retry(3 * attempt, cancel_check)
             continue
+        response_error = _body_error(response_body, r.status_code)
+        if response_error and response_error.code in _ACCOUNT_ERROR_CODES:
+            # 余额或订阅需要用户处理；重复请求与临时限流冷却都无法修复。
+            raise response_error
         if r.status_code == 429:
             log(f"LLM 响应: 配置={name}, HTTP 429 限流，本次立即跳过剩余重试")
             raise StepFailedError(
@@ -671,9 +744,9 @@ def _post(provider: dict, body: dict, log=lambda m: None,
             "LLM 认证失败 (401) —— 身份验证未通过（可能是 api_key 不对）",
             code="LLM_AUTH", suggestion="")
     response_error = _body_error(response_body, r.status_code)
-    if response_error and response_error.code == 'LLM_CONTENT_REJECTED':
+    if response_error and response_error.code in {'LLM_CONTENT_REJECTED', *_ACCOUNT_ERROR_CODES}:
         raise response_error
-    if r.status_code == 400 and _unsupported_params(response_body, ['stream']):
+    if streaming and r.status_code == 400 and _unsupported_params(response_body, ['stream']):
         # 少数旧的 OpenAI 兼容服务不支持 stream=true；只对明确的流式参数
         # 拒绝做一次非流式兼容回退，避免把普通 400 隐藏成第二次请求。
         log(f"⚠ 「{name}」不支持流式响应，自动回退为普通响应")
@@ -683,7 +756,7 @@ def _post(provider: dict, body: dict, log=lambda m: None,
             cancel_check()
         with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
                              trace=trace, request_id=request_id, name=name) as (c, guard, check):
-            r = c.post("/chat/completions", json=body, headers=headers)
+            r = c.post("/chat/completions", json=_transport_payload(body, stream=False), headers=headers)
             if check:
                 check()
             content = (_plain_response(r, trace=trace, request_id=request_id, name=name, guard=guard)
@@ -692,7 +765,7 @@ def _post(provider: dict, body: dict, log=lambda m: None,
             cancel_check()
         response_body = r.text
     response_error = _body_error(response_body, r.status_code)
-    if response_error and response_error.code == 'LLM_CONTENT_REJECTED':
+    if response_error and response_error.code in {'LLM_CONTENT_REJECTED', *_ACCOUNT_ERROR_CODES}:
         raise response_error
     unsupported = _unsupported_params(response_body, provider.get('params') or {})
     if r.status_code == 400 and unsupported:
@@ -705,7 +778,7 @@ def _post(provider: dict, body: dict, log=lambda m: None,
         core = {k: v for k, v in body.items() if k not in unsupported}
         with _guarded_client(provider.get('base_url', ''), cancel_check, response_guard_factory,
                              trace=trace, request_id=request_id, name=name) as (c, guard, check):
-            r = c.post("/chat/completions", json=core, headers=headers)
+            r = c.post("/chat/completions", json=_transport_payload(core, stream=False), headers=headers)
             if check:
                 check()
             content = (_plain_response(r, trace=trace, request_id=request_id, name=name, guard=guard)
@@ -738,6 +811,7 @@ def _post(provider: dict, body: dict, log=lambda m: None,
     return content
 
 
+@llm_conversations.capture
 def test_provider(provider: dict) -> dict:
     """对单个配置发最小请求 (带该 profile 的专属参数), 返回测试结果 + 请求/响应详情
 
@@ -753,7 +827,7 @@ def test_provider(provider: dict) -> dict:
                 "model": body.get("model"), "temperature": body.get("temperature"),
                 "extra_params": provider.get("params") or {}, "prompt": prompt}
     try:
-        reply = _post(provider, body, log=logs.append)
+        reply = _post(provider, body, log=logs.append, trace=llm_conversations.trace)
         return {"ok": True, "latency": round(_time.time() - t0, 1),
                 "model": provider.get("model", ""), "reply": str(reply)[:120],
                 "request": req_info, "logs": logs}
@@ -795,7 +869,8 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
     """带静默心跳的请求: 服务商长时间不吐数据(思考不回传流、首 token 空白期)
     时, 每 4s 发一条心跳日志, 让上层进度按时间推进而不是整段冻结。
 
-    任何真实日志都会刷新静默计时; 心跳本身不刷新。请求结束(含异常)立即停表。
+    真实日志和流式正文/思考都会刷新静默计时；有新数据时不输出静默心跳。
+    心跳本身不刷新计时，请求结束（含异常）立即停表。
     """
     import time as _time
     last_activity = [_time.monotonic()]
@@ -807,6 +882,8 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
         log(msg)
 
     def _trace(event, content='', **meta):
+        if event in {'assistant_delta', 'reasoning_delta', 'assistant_response', 'response_metadata'}:
+            last_activity[0] = _time.monotonic()
         if meta.get('request_id'):
             active_request[0] = meta['request_id']
         if trace:
@@ -815,6 +892,8 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
     def _watchdog() -> None:
         while not stop.wait(4.0):
             silent = _time.monotonic() - last_activity[0]
+            if silent < 4.0:
+                continue
             log(f"LLM 静默等待中: 已 {silent:.0f}s 无新数据"
                 "（请求仍在进行，可能是模型在思考）")
 
@@ -836,6 +915,7 @@ def _post_with_heartbeat(provider: dict, body: dict, *, log=lambda m: None,
         watcher.join(timeout=.5)
 
 
+@llm_conversations.capture
 def chat(prompt: str = "", system: str | None = None,
          temperature: float | None = None,
          log=lambda m: None, profile: str | None = None,
@@ -1047,11 +1127,13 @@ def _extract_json(text: str, *, return_repair: bool = False):
     raise json.JSONDecodeError(f"未找到可解析的 JSON 块{detail}", text,
                                first_error.pos if first_error else 0)
 
+@llm_conversations.capture
 def chat_validated(prompt: str, parser, validator=None, system: str | None = None,
                    max_retries: int = 3, temperature: float | None = None,
                    log=lambda m: None, profile: str | None = None,
                    cancel_check=None, trace=None, retry_prompt=None,
                    retry_request=None, retry_context=None,
+                   retry_profile=None,
                    failure_label: str = "输出", response_guard_factory=None):
     """通用文本协议补全 + 解析 + 校验 + 重试。
 
@@ -1064,6 +1146,7 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
     guard_validation_failures = 0
     retry_group = uuid.uuid4().hex[:10]
     conversation: list[dict] | None = None
+    active_profile = profile
     for attempt in range(1, max_retries + 1):
         if cancel_check:
             cancel_check()
@@ -1087,6 +1170,23 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
             if guard_retry:
                 # 调用方先重置局部补行/编号契约；异常流始终重新建对话，不携带退化候选。
                 context_mode = 'fresh'
+            if callable(retry_profile):
+                selected_profile = retry_profile(last_err, attempt, active_profile)
+                if selected_profile is not None:
+                    # 响应正文超过本地预算通常是确定性的：同一配置再次发送
+                    # 同一请求不会改变结果，只会重复等待并制造相同错误。
+                    # 允许调用方先切换到另一组快照；若快照没有变化，
+                    # 直接保留原错误交给上层，避免无界的预算错误重试。
+                    if (getattr(last_err, 'code', '') == 'LLM_OUTPUT_BUDGET'
+                            and selected_profile == active_profile):
+                        detail = dict(last_err.detail) if isinstance(last_err.detail, dict) else {}
+                        detail.update(validation_attempts=guard_validation_failures,
+                                      guard_validation_failures=guard_validation_failures)
+                        last_err.detail = detail
+                        last_err.guard_validation_failures = guard_validation_failures
+                        log(f'LLM {failure_label} 已达到响应正文预算；配置未变化，停止重复请求')
+                        raise last_err
+                    active_profile = selected_profile
         attempt_trace = trace
         if trace:
             def attempt_trace(event, content="", _attempt=attempt, **meta):
@@ -1099,7 +1199,7 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
                 # fresh 是一次新的无状态请求：只带稳定 system 和本轮修复输入，
                 # 不把原始窗口、历史输出重复发给服务商。
                 raw = chat(user_content, system=system, temperature=temperature,
-                           log=log, profile=profile, cancel_check=cancel_check,
+                           log=log, profile=active_profile, cancel_check=cancel_check,
                            trace=attempt_trace, **guard_options)
                 if conversation is None:
                     conversation = ([{"role": "system", "content": system}] if system else [])
@@ -1112,8 +1212,8 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
                 # 模型上次输出、本轮修复要求全部保留。服务商仍会收到一次完整请求，
                 # 但模型不需要猜测“上次输出”是什么。
                 conversation.append({"role": "user", "content": user_content})
-                raw = chat(system=None, temperature=temperature, log=log,
-                           profile=profile, cancel_check=cancel_check,
+                raw = chat(conversation[-1]["content"], system=None, temperature=temperature, log=log,
+                           profile=active_profile, cancel_check=cancel_check,
                            trace=attempt_trace, messages=conversation, **guard_options)
                 conversation.append({"role": "assistant", "content": raw})
         except StepFailedError as error:
@@ -1145,12 +1245,12 @@ def chat_validated(prompt: str, parser, validator=None, system: str | None = Non
                 trace("json_repair", f"本地自修复输出：{local_repair}")
             if validator:
                 normalized = validator(obj)
-                if trace and attempt > 1:
+                if trace:
                     trace("validation_success", f"第 {attempt}/{max_retries} 次校验通过",
                           retry_group=retry_group, retry_attempt=attempt,
                           retry_total=max_retries)
                 return obj if normalized is None else normalized
-            if trace and attempt > 1:
+            if trace:
                 trace("validation_success", f"第 {attempt}/{max_retries} 次校验通过",
                       retry_group=retry_group, retry_attempt=attempt,
                       retry_total=max_retries)

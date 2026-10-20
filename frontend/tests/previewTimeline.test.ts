@@ -1,9 +1,14 @@
 import assert from 'node:assert/strict'
-import test from 'node:test'
+import test, { before, after } from 'node:test'
 import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { build } from 'esbuild'
 import { parse } from '@vue/compiler-sfc'
+import { createServer, type ViteDevServer } from 'vite'
+import vue from '@vitejs/plugin-vue'
+import { createSSRApp, h } from 'vue'
+import { renderToString } from '@vue/server-renderer'
+import { setup } from '@css-render/vue3-ssr'
 import { adjacentCue, cuePosition, timelineCues } from '../src/utils/previewTimeline.ts'
 
 test('开始点排序、重叠合并、边界及非法时间不会修改原始内容', () => {
@@ -41,10 +46,10 @@ test('点击稍进入内容区间，短句和视频终点不越界；前后定�
 const root = fileURLToPath(new URL('..', import.meta.url))
 const { descriptor } = parse(await readFile(new URL('../src/components/PreviewTimeline.vue', import.meta.url), 'utf8'))
 const result = await build({ stdin: { contents: `import { reactive } from 'vue';
-  const propsFixture = reactive({ value: 0, max: 30, cues: [{ start: 5, end: 6, label: '第一条' }, { start: 20, end: 22, label: '第二条' }], disabled: false });
-  const events = [], defineProps = () => propsFixture, defineEmits = () => (...event) => events.push(event);
+  const propsFixture = reactive({ value: 0, max: 30, cues: [{ start: 5, end: 6, label: '第一条' }, { start: 20, end: 22, label: '第二条' }], kind: '字幕 / 评论', disabled: false });
+  const events = [], defineProps = () => propsFixture, withDefaults = (props, defaults) => Object.assign(props, defaults), defineEmits = () => (...event) => events.push(event);
   ${descriptor.scriptSetup!.content}
-  export { propsFixture, events, visibleCues, marks, seek, previous, next };`, loader: 'ts', resolveDir: `${root}/src/components` },
+  export { propsFixture, events, visibleCues, marks, seek, previous, next, cueDescription };`, loader: 'ts', resolveDir: `${root}/src/components` },
   bundle: true, write: false, format: 'esm', platform: 'node', plugins: [{ name: 'test-boundary', setup(b) {
     b.onResolve({ filter: /^(vue|naive-ui)$/ }, a => ({ path: a.path, namespace: 'test' }))
     b.onLoad({ filter: /.*/, namespace: 'test' }, a => ({ contents: a.path === 'vue'
@@ -68,4 +73,51 @@ test('刻度点击阻止误拖动、精确定位，禁用后不能触发；时�
   p.propsFixture.cues[0].start = 7; p.propsFixture.cues[0].end = 8
   assert.deepEqual(Object.keys(p.marks.value), ['7', '20'])
   p.propsFixture.max = 10; assert.deepEqual(Object.keys(p.marks.value), ['7'])
+})
+
+test('隐藏刻度只移除标记，前后定位与禁用保护仍然有效', async () => {
+  const p = await import(`data:text/javascript;base64,${Buffer.from(result.outputFiles[0].text + '\n// hidden-markers').toString('base64')}`)
+  assert.equal(p.propsFixture.showMarkers, true)
+  p.propsFixture.showMarkers = false
+  assert.equal(p.marks.value, undefined)
+  assert.equal(p.cueDescription.value, '字幕 / 评论共 2处 · 可逐处定位')
+  p.seek(p.next.value)
+  assert.deepEqual(p.events, [['update:value', 5.1]])
+  p.propsFixture.value = 20.1
+  p.seek(p.previous.value)
+  assert.deepEqual(p.events[1], ['update:value', 5.1])
+  p.propsFixture.disabled = true
+  p.seek(p.previous.value)
+  assert.equal(p.events.length, 2)
+  p.propsFixture.cues = []
+  assert.equal(p.cueDescription.value, '暂无可预览的字幕 / 评论开始点')
+})
+
+let server: ViteDevServer, Timeline: any
+before(async () => {
+  server = await createServer({ root, configFile: false, plugins: [vue()], appType: 'custom',
+    server: { middlewareMode: true, hmr: false, watch: null, ws: false } })
+  Timeline = (await server.ssrLoadModule('/src/components/PreviewTimeline.vue')).default
+})
+after(() => server.close())
+
+test('真实时间轴可隐藏密集竖线，保留滑块键盘和前后定位的可访问名称；默认仍显示刻度', async () => {
+  const props = { value: 10, max: 60, label: '试片开始位置', kind: '字幕 / 评论',
+    cues: [{ start: 5, end: 6, label: '第一条' }, { start: 20, end: 22, label: '第二条' }] }
+  async function render(extra = {}) {
+    const app = createSSRApp({ render: () => h(Timeline, { ...props, ...extra }) })
+    setup(app)
+    return renderToString(app)
+  }
+  const hidden = await render({ showMarkers: false })
+  assert.doesNotMatch(hidden, /cue-marker|n-slider--with-mark|点击定位/)
+  assert.match(hidden, /字幕 \/ 评论共 2处 · 可逐处定位/)
+  assert.match(hidden, /role="slider"/)
+  assert.match(hidden, /aria-label="试片开始位置"/)
+  assert.match(hidden, /aria-label="上一处字幕 \/ 评论"/)
+  assert.match(hidden, /aria-label="下一处字幕 \/ 评论"/)
+  assert.match(hidden, /tabindex="0"/)
+  const regular = await render()
+  assert.equal((regular.match(/class="cue-marker/g) || []).length, 2)
+  assert.match(regular, /刻度为字幕 \/ 评论开始点 · 点击定位/)
 })

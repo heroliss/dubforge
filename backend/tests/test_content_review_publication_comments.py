@@ -7,6 +7,7 @@ import pytest
 
 from dubforge import comment_studio, config, content_review_service
 from dubforge.domain import crud
+from test_configuration import save
 from dubforge.pipeline import assembly_versions, content_redaction, version_render
 from dubforge.pipeline.dependencies import Dependencies
 from dubforge.utils.fs import atomic_write_bytes
@@ -64,11 +65,27 @@ def test_current_filtered_overlay_cannot_clear_risk_in_old_video(make_project):
     artifact = _output(project, root, dict(include_comments=True, comment_overlay=_overlay([risky]),
         content_review_receipt=content_redaction.receipt(Dependencies(project))))
     # 旧文件生成后新增屏蔽词，并确认一个已清理的当前方案；旧文件的像素并未改变。
-    config.set_key('content_review.blocked_terms', '自定义屏蔽词')
+    save('project:' + project.uid, {'content_review.blocked_terms': '自定义屏蔽词'})
     comment_studio._write(project, {'overlay': _overlay([_item()])})
     assert not comment_studio.view(project.uid)['overlay']['items'][0].get('review_blocked')
     with pytest.raises(content_redaction.ContentRedactionError, match='修改当前评论方案不会改变旧文件'):
         content_review_service.assert_publishable(project, artifact)
+
+
+def test_sensitive_location_and_terror_event_comment_blocks_old_snapshot_and_new_overlay(make_project):
+    project, root, _ = _safe_project(make_project())
+    risky = _item(text='The square is the most sensitive place in the country; terrorism happened there.',
+                  display_text='那里是全国最敏感的地方，确实发生过恐怖袭击。')
+    safe = _item(id='safe')
+    artifact = _output(project, root, dict(include_comments=True, comment_overlay=_overlay([risky, safe])))
+    # 当前编辑区已经移除该条，仍需拒绝尚未重生成的历史视频。
+    comment_studio._write(project, {'overlay': _overlay([safe])})
+    with pytest.raises(content_redaction.ContentRedactionError, match='已烧录的评论'):
+        content_review_service.assert_publishable(project, artifact)
+    filtered = content_redaction.safe_overlay(Dependencies(project), _overlay([risky, safe]))
+    assert [item['id'] for item in filtered['items']] == ['safe']
+    # 评论专用规则不把普通字幕强制扩大为声音处理区间。
+    assert content_redaction.plan(Dependencies(project))['ranges'] == []
 
 
 def test_safe_historical_comment_does_not_require_unrelated_new_receipt(make_project):
@@ -153,7 +170,7 @@ def test_exact_no_comment_snapshot_overrides_legacy_name_and_unrelated_old_recor
 def test_explicit_review_disable_keeps_publication_choice_available(make_project):
     project, root, _ = _safe_project(make_project())
     artifact = _output(project, root, name='final_src_comments_20261005_100000_000001.mp4')
-    config.set_key('content_review.enabled', False)
+    save('project:' + project.uid, {'content_review.enabled': False})
     content_review_service.assert_publishable(project, artifact)
     assert content_review_service.candidate_states(project, [artifact])[artifact.id]['review_status'] == '审查关闭'
 

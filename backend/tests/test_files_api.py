@@ -181,6 +181,17 @@ def test_spa_blocks_path_traversal(isolated_env):
         assert r.status_code == 200
 
 
+def test_unknown_api_returns_json_404_instead_of_spa_html(isolated_env):
+    from app.main import app
+    from fastapi.testclient import TestClient
+    client = TestClient(app)
+    for url in ('/api', '/api/nonexistent-audit-route'):
+        response = client.get(url)
+        assert response.status_code == 404
+        assert response.json()['code'] == 'API_NOT_FOUND'
+    assert client.get('/projects/missing-audit-project').headers['content-type'].startswith('text/html')
+
+
 def test_peaks_mixed_true_sample_sum(isolated_env):
     """合成波形 = 逐样本真混音: 反相双轨相加应抵消到 0.1
     (峰值包络直接相加会得 0.7 —— 那是最坏情形上界, 不是混音)"""

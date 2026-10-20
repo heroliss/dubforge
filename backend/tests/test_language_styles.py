@@ -104,7 +104,7 @@ def test_real_final_and_clip_burn_share_ass_and_cleanup(video,tmp_path,monkeypat
     rgb=pixels(result.stdout).astype(int)
     assert ((rgb[:,:,0]>150)&(rgb[:,:,2]<70)).sum()>50
     assert ((rgb[:,:,2]>120)&(rgb[:,:,0]<70)).sum()>25
-    assert any('ass=.subtitle_' in arg for cmd in commands for arg in cmd)
+    assert any('ass=' in arg and '.subtitle_' in arg for cmd in commands for arg in cmd)
 
 
 def test_styles_inherit_global_series_project_and_version(make_project):

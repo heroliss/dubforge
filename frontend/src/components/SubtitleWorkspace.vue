@@ -6,6 +6,7 @@ import ProjectParameterForm from './ProjectParameterForm.vue'
 import SubtitleExport from './SubtitleExport.vue'
 import { useNavStore } from '../stores/nav'
 import { SUBTITLE_PREVIEW_PATHS, SUBTITLE_WORKSPACE_PATHS, subtitleTimelineDuration, subtitleTimeLabel } from '../utils/subtitleWorkspace'
+import { withPlaybackTime } from '../utils/dubbingPlaybackTime'
 
 const props = defineProps<{ uid: string; position: number; duration?: number; lines: any[]; subtitleState: any;
   active: boolean; disabled?: boolean; noVideo?: boolean; returnToAssembly?: boolean }>()
@@ -13,17 +14,18 @@ const emit = defineEmits<{ 'dirty-change': [value: boolean]; refresh: []; previe
 const nav = useNavStore(), dirty = ref(false), loading = ref(false)
 const seconds = ref<number | null>(null), draft = ref<Record<string, any>>({})
 const scrubbing = ref(false)
-const timelineDuration = computed(() => subtitleTimelineDuration(props.duration, props.lines))
+const playbackLines = computed(() => props.lines.map(withPlaybackTime))
+const timelineDuration = computed(() => subtitleTimelineDuration(props.duration, playbackLines.value))
 // 视频终点没有可解码的下一帧，预留 0.1 秒；元数据未就绪时暂按字幕时间轴定位。
 const previewEnd = computed(() => Math.max(0, Math.floor((timelineDuration.value - .1) * 100) / 100))
 const sliderValue = computed(() => Math.min(previewEnd.value, Math.max(0, seconds.value ?? 0)))
-const cues = computed(() => props.lines.map(line => ({ start: line.start, end: line.end,
+const cues = computed(() => playbackLines.value.map(line => ({ start: line.start, end: line.end,
   label: `第 ${line.id} 句 · ${String(line.text || line.source_text || '').slice(0, 60)}` })))
 const image = ref(''), error = ref(''), rendered = ref(''), subtitleActive = ref(true)
-const selectedLine = computed(() => props.lines.find(line => seconds.value != null && line.start <= seconds.value && seconds.value < line.end)?.id ?? null)
+const selectedLine = computed(() => playbackLines.value.find(line => seconds.value != null && line.start <= seconds.value && seconds.value < line.end)?.id ?? null)
 const lineOptions = computed(() => props.lines.map(line => ({ value: line.id,
   label: `第 ${line.id} 句 · ${String(line.text || line.source_text || '').slice(0, 45)}` })))
-const contentVersion = computed(() => JSON.stringify(props.lines.map(line => [line.id, line.start, line.end, line.source_text, line.text])))
+const contentVersion = computed(() => JSON.stringify(playbackLines.value.map(line => [line.id, line.start, line.end, line.source_text, line.text])))
 const settings = computed(() => Object.fromEntries(SUBTITLE_PREVIEW_PATHS.filter(path => path in draft.value).map(path => [path, draft.value[path]])))
 const signature = computed(() => JSON.stringify([seconds.value, settings.value, contentVersion.value]))
 const outdated = computed(() => !!image.value && rendered.value !== signature.value)
@@ -41,7 +43,7 @@ function setPosition(value: number | null) {
 function beginScrub() { scrubbing.value = true; clearTimeout(timer) }
 function endScrub() { scrubbing.value = false; schedule() }
 function chooseLine(id: number) {
-  const line = props.lines.find(item => item.id === id)
+  const line = playbackLines.value.find(item => item.id === id)
   if (line) setPosition(Math.round((line.start + (line.end - line.start) / 2) * 100) / 100)
 }
 function usePlayerPosition() { setPosition(props.position) }
@@ -78,7 +80,7 @@ async function preview() {
 }
 watch(() => [props.active, props.lines.length], () => {
   if (props.active && seconds.value == null && props.lines.length) {
-    const atPlayer = props.lines.find(line => line.start <= props.position && props.position < line.end)
+    const atPlayer = playbackLines.value.find(line => line.start <= props.position && props.position < line.end)
     if (atPlayer) usePlayerPosition()
     else chooseLine(props.lines[0].id)
   }

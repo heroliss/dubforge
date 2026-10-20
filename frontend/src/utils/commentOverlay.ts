@@ -16,3 +16,21 @@ export function commentTextIssues(item: any, mode: string, limits: CommentTextLi
     return message ? [{ field, message }] : []
   })
 }
+
+export function commentTextBlockingIssues(item: any, mode: string, limits: CommentTextLimits): CommentTextIssue[] {
+  const issues = commentTextIssues(item, mode, limits)
+  // 手动保留的长文字仅作提示；缺少当前语言正文仍不能上屏。
+  return item.selection_origin === 'manual'
+    ? issues.filter(issue => !commentTextLength(item[issue.field] ?? (issue.field === 'source_text' ? item.text : '')))
+    : issues
+}
+
+// 候选仍按建议长度筛选；用户明确保留后，长度只提示，不阻止预览和使用。
+export function commentCandidateReadiness(item: any, mode: string, limits: CommentTextLimits, eligible: boolean | null) {
+  if (eligible == null) return { status: 'pending-score' as const, issues: [] as CommentTextIssue[] }
+  if (!eligible) return { status: 'not-suggested' as const, issues: [] as CommentTextIssue[] }
+  if (mode !== 'original' && !commentTextLength(item.display_text))
+    return { status: 'pending-translation' as const, issues: [] as CommentTextIssue[] }
+  const issues = commentTextIssues(item, mode, limits)
+  return { status: commentTextBlockingIssues(item, mode, limits).length ? 'needs-text' as const : 'ready' as const, issues }
+}

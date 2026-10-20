@@ -56,7 +56,7 @@ def test_lines_preview_is_readonly_and_creation_never_runs(tmp_path):
         assert session.exec(select(Job)).all() == []
 
 
-def test_template_and_sparse_project_settings_keep_live_inheritance():
+def test_template_and_sparse_project_settings_keep_import_baseline():
     first, second = cfg.create_template('旅行'), cfg.create_template('美食')
     save('global', {'assemble.subtitle_color': '#FFFFFF'})
     save(first['key'], {'comments.count': 8, 'publish.season_id': 12})
@@ -74,7 +74,8 @@ def test_template_and_sparse_project_settings_keep_live_inheritance():
     assert one['sources']['publish.season_id']['kind'] == 'series'
     save(first['key'], {'publish.season_id': 13, 'comments.count': 9})
     after = cfg.resolve(result['items'][0]['uid'])
-    assert after['values']['publish.season_id'] == 13 and after['values']['comments.count'] == 6
+    assert after['values']['publish.season_id'] == 12 and after['values']['comments.count'] == 6
+    assert after['baseline']['configured'] == one['baseline']['configured']
 
 
 def test_row_selection_overrides_json_and_ui_default_only_fills_missing():

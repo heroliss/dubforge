@@ -1,0 +1,12 @@
+{
+  "name": "dubforge-docs-tools",
+  "private": true,
+  "type": "module",
+  "description": "DubForge 文档截图的可复现 SVG 标注工具，不参与程序运行。",
+  "scripts": {
+    "annotate": "node annotate.mjs"
+  },
+  "devDependencies": {
+    "sharp": "0.35.5"
+  }
+}

@@ -85,3 +85,23 @@ test('首次保存失败恢复原声源，离开页面后的响应不刷新或�
   assert.equal(f.saved(), 0)
   assert.equal(f.errors.length, 1)
 })
+
+test('乐观选槽使整组旧排布失效，读取保存后的权威状态才恢复播放时间', async () => {
+  const f = fixture()
+  const state = { ...f.state, placement: { schema: 1 }, timing: { enabled: true },
+    lines: f.state.lines.map((line, index) => ({ ...line, start: index * 2, end: index * 2 + 1,
+      playback_start: index * 2 + .5, playback_end: index * 2 + 1.5,
+      timing: { manual_active: true, manual_start: index * 2 + .5 } })) }
+  const changing = f.edits.choose(1, { source: 'dub', take: 2 })
+  const pending = f.edits.apply(state)
+  assert.equal(pending.placement, null); assert.equal(pending.timing, null)
+  assert.equal(pending.placement_pending, true)
+  assert.ok(pending.lines.every((line: any) => line.playback_start === undefined && line.playback_end === undefined))
+  assert.ok(pending.lines.every((line: any) => line.timing === undefined), '旧人工位置和自动建议不能与新槽混用')
+  assert.equal(state.lines[1].playback_start, 2.5, '旧响应不可被就地修改')
+  f.requests[0].resolve({ ok: true }); await changing
+  f.edits.reconcile(f.edits.revision())
+  const refreshed = f.edits.apply(state)
+  assert.equal(refreshed.lines[1].playback_start, 2.5)
+  assert.equal(refreshed.placement, state.placement)
+})

@@ -21,11 +21,11 @@ def test_running_context_keeps_config_snapshot(make_project, isolated_env, pdir)
     from dubforge import config
     from dubforge.runner import StepContext
 
-    uid = make_project()
-    project = crud.get_project(uid)
     config.set_key("split.max_split_length", 22)
     config.set_key("llm.profiles", [{"name": "旧模型", "enabled": True,
                                      "base_url": "http://old", "model": "old"}])
+    uid = make_project()
+    project = crud.get_project(uid)
     ctx = StepContext(project, "split", pdir(uid),
                       pdir(uid) / "logs" / "split.log", threading.Event())
     config.set_key("split.max_split_length", 44)
@@ -33,6 +33,43 @@ def test_running_context_keeps_config_snapshot(make_project, isolated_env, pdir)
                                      "base_url": "http://new", "model": "new"}])
     assert ctx.cfg("split.max_split_length") == 22
     assert ctx.llm_profile_snapshot()[0]["model"] == "old"
+
+
+def test_long_tts_timeout_is_frozen_for_current_step(make_project, isolated_env, pdir):
+    """长配音兜底可设 43200 秒，运行中改值不能改变当前看门狗。"""
+    import threading
+
+    from dubforge import config
+    from dubforge.runner import StepContext, runner
+
+    config.set_key("runner.step_timeout_seconds.tts", 43200)
+    uid = make_project()
+    project = crud.get_project(uid)
+    ctx = StepContext(project, "tts", pdir(uid),
+                      pdir(uid) / "logs" / "tts.log", threading.Event())
+
+    # 运行中保存的新值只应对下一次步骤生效，当前上下文和 watchdog
+    # 继续使用已冻结的 12 小时快照。
+    config.set_key("runner.step_timeout_seconds.tts", 7200)
+    assert ctx.cfg("runner.step_timeout_seconds.tts") == 43200
+    assert runner.step_timeout_seconds("tts", ctx) == 43200
+
+
+def test_tts_request_timeout_can_refresh_at_sentence_boundary(make_project, isolated_env, pdir):
+    """单句请求保持当前值；下一句可读取运行中保存的新保护时限。"""
+    import threading
+
+    from dubforge import config
+    from dubforge.runner import StepContext
+
+    config.set_key("tts.indextts25.request_timeout_seconds", 300)
+    uid = make_project()
+    project = crud.get_project(uid)
+    ctx = StepContext(project, "tts", pdir(uid),
+                      pdir(uid) / "logs" / "tts.log", threading.Event())
+    config.set_key("tts.indextts25.request_timeout_seconds", 600)
+    assert ctx.cfg("tts.indextts25.request_timeout_seconds") == 300
+    assert ctx.runtime_cfg("tts.indextts25.request_timeout_seconds") == 600
 
 
 
@@ -157,17 +194,22 @@ def test_config_change_invalidates(make_project, isolated_env, monkeypatch, stub
     runner.start_step(uid, "assemble")
     wait_status(uid, "assemble", {"done"})
 
-    # assemble 的 cfg_keys=("assemble",) —— 改其中一项 → 指纹变 → 不再跳过
+    # 全局默认仅影响新项目；已有项目继续复用完成成片。
     monkeypatch.setenv("DUBFORGE_CONFIG", str(isolated_env / "config.yaml"))
     from dubforge import config as cfgmod
     cfgmod.set_key("assemble.bgm_volume", 0.6)
+    assert runner.start_step(uid, "assemble", force=False)['status'] == 'skipped'
+    from dubforge import configuration
+    current = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=current['revision'], updates={'assemble.bgm_volume': .6}))
+    # 主动修改本项目的混音要求，下一轮必须实际重建。
     r = runner.start_step(uid, "assemble", force=False)
     assert r["status"] == "started"
     wait_status(uid, "assemble", {"done"})
 
 
-def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_heavy_steps):
-    """tts → assemble (双双桩化); force 重跑 tts → 下游置 stale"""
+def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_heavy_steps, monkeypatch):
+    """主动重跑实际改变配音内容后，旧成片需更新；不依赖本次配音策略。"""
     stub_heavy_steps("tts", "assemble")
     uid = make_project()
     from test_configuration import save
@@ -179,9 +221,25 @@ def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_hea
         runner.start_step(uid, key)
         wait_status(uid, key, {"done"})
 
-    # force 重跑 tts → 下游 assemble 置 stale
+    # 原桩每轮输出同样的字节；按 ADR-0132，只有实际产物变化才传播到下游。
+    from dubforge.pipeline import steps as steps_mod
+    original = steps_mod._RUNNERS['tts']
+    before = runner._artifact_signature(project.id, 'tts')
+
+    def changed_audio(ctx):
+        original(ctx)
+        ctx.write_bytes('1.wav', b'changed test audio', 'audio')
+        from dubforge.pipeline.dubbing_edit import record_take
+        from dubforge.pipeline.step_tts import line_fingerprint
+        line = ctx.dependencies().dubbing_lines(required=True)[0]
+        record_take(ctx.project, line, ctx.pdir, 1,
+                    line_fingerprint(ctx.project, line), {})
+
+    monkeypatch.setitem(steps_mod._RUNNERS, 'tts', changed_audio)
     runner.start_step(uid, "tts", force=True)
     wait_status(uid, "tts", {"done"})
+    assert runner._artifact_signature(project.id, 'tts') != before
+    assert 'policy' not in json.loads(crud.latest_job(project.id, 'tts').task_data)
     step_a = crud.get_step(project.id, "assemble")
     assert step_a.status == "stale"
     assert "tts" in step_a.error_message
@@ -190,6 +248,98 @@ def test_force_rerun_marks_downstream_stale(make_project, isolated_env, stub_hea
     runner.start_step(uid, "assemble", force=False)
     wait_status(uid, "assemble", {"done"})
     assert crud.get_step(project.id, "assemble").status == "done"
+
+
+def test_force_translation_failure_keeps_last_complete_artifact(make_project, stub_heavy_steps, monkeypatch):
+    from dubforge.errors import StepFailedError
+    from dubforge.pipeline import steps as steps_mod
+    stub_heavy_steps('translate')
+    uid = make_project()
+    project = crud.get_project(uid)
+    mark_upstream_done(uid, 'translate')
+    runner = _runner()
+    runner.start_step(uid, 'translate')
+    wait_status(uid, 'translate', {'done'})
+    artifact = crud.latest_artifacts(project.id, ['translate'])['translate/translate.txt']
+    path = crud.project_dir(uid) / artifact.rel_path
+    previous = path.read_bytes()
+
+    def fail(ctx):
+        assert path.read_bytes() == previous
+        raise StepFailedError('替身模拟后续窗口失败')
+
+    monkeypatch.setitem(steps_mod._RUNNERS, 'translate', fail)
+    runner.start_step(uid, 'translate', force=True)
+    wait_status(uid, 'translate', {'failed'})
+    assert path.read_bytes() == previous
+    assert crud.latest_artifacts(project.id, ['translate'])['translate/translate.txt'].id == artifact.id
+
+
+def test_force_stop_translation_cleanup_keeps_previous_complete_artifact(make_project, stub_heavy_steps, monkeypatch):
+    import threading
+    from dubforge.pipeline import steps as steps_mod
+    stub_heavy_steps('translate')
+    uid = make_project()
+    project = crud.get_project(uid)
+    mark_upstream_done(uid, 'translate')
+    runner = _runner()
+    runner.start_step(uid, 'translate')
+    wait_status(uid, 'translate', {'done'})
+    artifact = crud.latest_artifacts(project.id, ['translate'])['translate/translate.txt']
+    path = crud.project_dir(uid) / artifact.rel_path
+    previous = path.read_bytes()
+    entered, release = threading.Event(), threading.Event()
+
+    def blocked(ctx):
+        entered.set()
+        assert release.wait(5)
+        ctx.check_cancel()
+
+    monkeypatch.setitem(steps_mod._RUNNERS, 'translate', blocked)
+    runner.start_step(uid, 'translate', force=True)
+    try:
+        assert entered.wait(5)
+        assert runner.force_stop(uid, 'translate')['status'] == 'force_stopped'
+    finally:
+        release.set()
+    deadline = time.monotonic() + 5
+    while runner.current_job_id(project.id, 'translate') is not None and time.monotonic() < deadline:
+        time.sleep(.01)
+    assert runner.current_job_id(project.id, 'translate') is None
+    assert path.read_bytes() == previous
+    assert crud.latest_artifacts(project.id, ['translate'])['translate/translate.txt'].id == artifact.id
+
+
+def test_same_content_force_rerun_keeps_completed_downstream_reusable(make_project, isolated_env, stub_heavy_steps):
+    """主动重跑成功但配音摘要相同，成片无需重做，仍保留已完成结果。"""
+    stub_heavy_steps('tts', 'assemble')
+    uid = make_project()
+    from test_configuration import save
+    save('project:' + uid, {'assembly.versions': [dict(id='default', name='配音',
+        dubbing=True, burn_subtitles=False, include_comments=False, overrides={})]})
+    project = crud.get_project(uid)
+    runner = _runner()
+    mark_upstream_done(uid, 'tts')
+    for key in ('tts', 'assemble'):
+        runner.start_step(uid, key)
+        wait_status(uid, key, {'done'})
+    before = runner._artifact_signature(project.id, 'tts')
+    assembly_job = crud.latest_job(project.id, 'assemble').id
+    root = crud.project_dir(uid)
+    output = root / 'artifacts' / 'assemble' / 'final_version_default.mp4'
+    output_before = (output.read_bytes(), output.stat().st_mtime_ns)
+    original_tts_job = crud.latest_job(project.id, 'tts').id
+
+    assert runner.start_step(uid, 'tts', force=True)['status'] == 'started'
+    wait_status(uid, 'tts', {'done'})
+    assert crud.latest_job(project.id, 'tts').id != original_tts_job
+    assert runner._artifact_signature(project.id, 'tts') == before
+    assert 'policy' not in json.loads(crud.latest_job(project.id, 'tts').task_data)
+    assert crud.get_step(project.id, 'assemble').status == 'done'
+    assert not crud.get_step(project.id, 'assemble').error_message
+    assert runner.start_step(uid, 'assemble')['status'] == 'skipped'
+    assert crud.latest_job(project.id, 'assemble').id == assembly_job
+    assert (output.read_bytes(), output.stat().st_mtime_ns) == output_before
 
 
 def test_force_run_keeps_unstarted_downstream_pending(make_project, stub_heavy_steps):

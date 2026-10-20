@@ -33,7 +33,7 @@ def test_service_level_failure_stops_batch_without_submitting_remaining_sentence
     def generate(*args, **kwargs):
         calls.append(args[1])
         assert callable(kwargs['check_cancel'])
-        assert kwargs['timeout_seconds'] == 300
+        assert kwargs['timeout_seconds'] == 600
         raise DubForgeError('服务需要恢复', code=code)
     monkeypatch.setattr(tts_indextts25, 'synth', generate)
     runner.start_dubbing(uid, [1, 2])
@@ -76,8 +76,10 @@ def test_selected_queue_survives_client_close_and_reports_partial_line_progress(
         steps = client.get(base + '/steps').json()
         step = next(s for s in steps if s['key'] == 'tts')
         assert step['status'] == 'running' and step['job_id'] == job_id
-        assert step['progress'] == pytest.approx(8.2, abs=.1)  # 为最多两次缩时重试保留进度；无需重试时直接完成本句。
-        assert client.post(base + '/workbench/synthesize', json={'line_ids': [2]}).status_code == 400
+        # 两句等权，先完成自然语音合成；缩时在整窗排布后按需处理，不预留机械重试份额。
+        assert step['progress'] == pytest.approx(99 * .5 / 2, abs=.1)
+        duplicate = client.post(base + '/workbench/synthesize', json={'line_ids': [2]})
+        assert duplicate.status_code == 200 and duplicate.json()['lines'][0]['already_queued']
         release[0].set()
         assert started[1].wait(10)
         state = client.get(base + '/workbench?probe=false').json()
@@ -87,7 +89,7 @@ def test_selected_queue_survives_client_close_and_reports_partial_line_progress(
         audio = client.get(first['wav']['url'])
         assert audio.status_code == 200 and audio.content.startswith(b'RIFF')
         assert not state['lines'][1]['wav']['exists']
-        assert crud.get_step(project.id, 'tts').progress == pytest.approx(53.6, abs=.1)
+        assert crud.get_step(project.id, 'tts').progress == pytest.approx(99 * (1 + .25) / 2, abs=.1)
     finally:
         for signal in release:
             signal.set()

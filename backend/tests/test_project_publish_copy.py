@@ -106,8 +106,12 @@ def test_parent_explicit_empty_survives_project_overlap_and_reset(context):
     inherited = service.copy_preview(context.uid)
     assert inherited['values']['title'] == '系列标题'
     assert inherited['values']['description'] == '系列简介'
-    assert inherited['sources']['title'] == {'kind': 'series', 'name': '系列设置'}
+    assert inherited['sources']['title'] == {'kind': 'series', 'name': '系列设置', 'frozen': True}
     save(template['key'], reset=['publish.title'])
+    assert service.copy_preview(context.uid)['values']['title'] == '系列标题'
+    plan = configuration.binding_plan([context.uid], template['key'][7:])
+    configuration.bind(dict(uids=[context.uid], template_id=template['key'][7:],
+                            fingerprint=plan['fingerprint'], confirmed=True))
     assert service.copy_preview(context.uid)['values']['title'] == ''
 
 
@@ -175,7 +179,7 @@ def test_project_candidate_is_whitelisted_attributed_and_never_saved(context, mo
 @pytest.mark.parametrize('bad', [
     {'current': {'copyright': 1}}, {'current': {'title': False}},
     {'current': {'tags': [False]}}, {'current': {'tags': ['a' * 101]}},
-    {'current': {'title': 'a' * 10001}}, {'instruction': 'a' * 1001},
+        {'current': {'title': 'a' * 10001}}, {'instruction': 'a' * 2001},
     {'instruction': 1}, {'account_id': 'private'}, {'current': []},
 ])
 def test_invalid_requests_never_call_model(context, bad):
@@ -249,6 +253,12 @@ def test_generation_locks_its_project_but_does_not_hold_global_execution_gate(co
                 service.suggest_project(context.uid, request(context.uid))
             assert caught.value.code == 'PUBLISH_AI_BUSY'
             assert service.suggest_project(other, request(other))['project_uid'] == other
+            from dubforge import runtime_edit
+            report = runtime_edit.editability('project:' + context.uid)
+            assert 'publish' in report['locked_paths']
+            assert any(row['step_key'] == 'publish_copy' and row['label'] == '发布文案生成'
+                       for row in report['running_steps'])
+            runtime_edit.assert_editable('project:' + context.uid, paths={'assemble.crf'})
             with pytest.raises(DubForgeError) as caught:
                 save('project:' + context.uid, {'publish.title': '并发保存的手工标题'})
             assert caught.value.code == 'CONFIGURATION_BUSY'
@@ -257,6 +267,7 @@ def test_generation_locks_its_project_but_does_not_hold_global_execution_gate(co
             release.set()
         assert future.result(timeout=5)['project_uid'] == context.uid
     assert not project_copy._suggesting
+    assert 'publish' not in runtime_edit.editability('project:' + context.uid)['locked_paths']
 
 
 @pytest.mark.parametrize('code', ['PUBLISH_AI_TIMEOUT', 'PUBLISH_AI_INVALID'])

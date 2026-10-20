@@ -6,6 +6,7 @@ import unicodedata
 # 不把字幕目标长度或英文词形当作语法正确性的证明。
 _SENTENCE_END = re.compile(r"[.!?。！？…][\"'’”）)\]]*\s*$")
 _LATIN_WORDS = re.compile(r"[A-Za-z]+(?:['’][A-Za-z]+)?")
+_QUESTION_END = re.compile(r"[?？][\"'’”）)\]]*\s*$")
 _DEPENDENT_ENDS = {
     "a", "an", "the", "of", "in", "on", "at", "to", "from", "for",
     "with", "by", "about", "through", "into", "onto", "between", "among",
@@ -21,6 +22,7 @@ _SHORT_RESPONSES = {
     "wow", "huh", "thanks", "sorry", "right", "sure", "exactly", "great",
     "嗯", "哦", "啊", "好", "好的", "对", "是", "不是", "谢谢", "再见",
 }
+_ISOLATED_WORDS = _DEPENDENT_ENDS | {"i", "you", "we", "he", "she", "it", "they", "but", "so"}
 
 
 def _response_text(text: str) -> str:
@@ -73,11 +75,20 @@ def semantic_boundary_warnings(parts: list[dict], pause: float) -> list[str]:
         following = parts[i + 1] if i + 1 < len(parts) else None
         terminal = bool(_SENTENCE_END.search(text))
         response = _response_text(text)
-        short_response = response in _SHORT_RESPONSES or response.isnumeric()
+        words = _LATIN_WORDS.findall(text)
+        question_answer = (len(words) == 1 and previous is not None
+                           and bool(_QUESTION_END.search(str(previous["text"]))))
+        short_response = response in _SHORT_RESPONSES or response.isnumeric() or question_answer
         left_connected = (previous is not None and _connected(previous, part, pause)
                           and not _SENTENCE_END.search(str(previous["text"])))
         next_connected = following is not None and _connected(part, following, pause)
         reasons = []
+        # 识别残词也可能出现在长停顿前或片尾；只提示语义复核，不裁决归属或删词。
+        if (len(words) == 1 and response in _ISOLATED_WORDS
+                and not terminal and not short_response):
+            location = (f"与第{i + 2}句间隔{float(following['start']) - float(part['end']):.3f}秒"
+                        if following is not None else "位于片尾")
+            reasons.append(f"孤立词{response!r}（{location}），请区分邻句开头、识别残留和真实独立表达")
         if (duration < 0.5 - 0.001 and not terminal and not short_response
                 and (left_connected or (next_connected and not terminal))):
             reasons.append("不足0.5秒且紧连邻句，可能是词或半句，也可能是正常短表达")
@@ -85,8 +96,7 @@ def semantic_boundary_warnings(parts: list[dict], pause: float) -> list[str]:
         if density > max(20, duration * 65):
             reasons.append(f"文字密度较高（{density}个加权单位/{duration:.3f}秒），"
                            "仅凭文字长度不能判断实际语速或时间有错")
-        words = _LATIN_WORDS.findall(text)
-        if next_connected and words:
+        if next_connected and words and not short_response:
             tail_word = words[-1].casefold()
             next_words = _LATIN_WORDS.findall(str(following["text"]))
             next_response = _response_text(str(following["text"]))
@@ -112,7 +122,7 @@ def semantic_boundary_warnings(parts: list[dict], pause: float) -> list[str]:
 
 
 def semantic_pause_issues(parts: list[dict], words: list[dict], pause: float) -> list[str]:
-    """只在文本可靠匹配词级锚点时调用，识别句内明显无声区。
+    """真实无台词区约束时间，不以纠错词形作为是否跨静音的证据。
 
     两秒及以上无台词区间独立于普通停顿阈值，不应被长字幕覆盖。
     与提示词和时间修复共用有声区间并集，不把重叠词误判成静音。
@@ -121,6 +131,11 @@ def semantic_pause_issues(parts: list[dict], words: list[dict], pause: float) ->
     from dubforge.pipeline.speech_gaps import speech_gaps
 
     gaps = [(gap.start, gap.end) for gap in speech_gaps(words)]
+    return semantic_pause_time_issues(parts, gaps)
+
+
+def semantic_pause_time_issues(parts: list[dict], gaps: list[tuple[float, float]]) -> list[str]:
+    """已有完整词轴空档的时间复核；包括局部占用，不丢掉区间外的声学锚点。"""
     issues: list[str] = []
     if not gaps:
         return issues
@@ -128,13 +143,15 @@ def semantic_pause_issues(parts: list[dict], words: list[dict], pause: float) ->
     cursor = 0
     for i, part in enumerate(parts):
         start, end = float(part["start"]), float(part["end"])
-        while cursor < len(gaps) and gaps[cursor][0] <= start + 0.011:
+        while cursor < len(gaps) and gaps[cursor][1] <= start + 0.011:
             cursor += 1
         position = cursor
-        while position < len(gaps) and gaps[position][1] < end - 0.011:
+        while position < len(gaps) and gaps[position][0] < end - 0.011:
             lo, hi = gaps[position]
-            issues.append(f"第{i + 1}句跨越词级时间轴{lo:.2f}–{hi:.2f}秒"
-                          f"的{hi - lo:.2f}秒长停顿，请保留真实无声区并重新分句")
+            if start < hi - 0.011 and end > lo + 0.011:
+                action = '跨越' if start <= lo + 0.011 and end >= hi - 0.011 else '占用'
+                issues.append(f"第{i + 1}句{action}词级时间轴{lo:.2f}–{hi:.2f}秒"
+                              f"的{hi - lo:.2f}秒长停顿，请保留真实无声区并重新分句")
             if len(issues) >= 8:
                 return issues
             position += 1

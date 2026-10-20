@@ -47,10 +47,17 @@ async function flush() { for (let i = 0; i < 15; i++) await Promise.resolve() }
 
 const defaults = Object.fromEntries(SUBTITLE_WORKSPACE_PATHS.map(path => [path,
   path === 'assemble.subtitle_track' ? 'bilingual' : path === 'subtitles.mode' ? 'all'
-    : path === 'subtitles.source_first' ? false : path === 'subtitles.min_duration' ? 1 : 48]))
+    : path === 'subtitles.source_first' || path === 'assemble.subtitle_source_style_enabled' ? false
+    : path === 'assemble.subtitle_auto_fit' ? true
+    : path === 'assemble.subtitle_min_size' ? 32 : path === 'assemble.subtitle_source_min_size' ? 28
+    : path === 'assemble.subtitle_shrink_width_percent' ? 80 : path === 'assemble.subtitle_wrap_width_percent' ? 90
+    : path === 'subtitles.min_duration' ? 1 : 48]))
 function schema() {
   const fields = [...SUBTITLE_WORKSPACE_PATHS, 'assemble.voice_volume', 'assemble.burn_subtitles'].map(path => ({
-    path, label: path, type: path === 'subtitles.source_first' ? 'bool' : 'str',
+    path, label: path, type: ['subtitles.source_first', 'assemble.subtitle_auto_fit', 'assemble.subtitle_source_style_enabled'].includes(path) ? 'bool'
+      : ['assemble.subtitle_shrink_width_percent', 'assemble.subtitle_wrap_width_percent'].includes(path) ? 'int' : 'str',
+    depends_on: ['assemble.subtitle_min_size', 'assemble.subtitle_shrink_width_percent'].includes(path) ? [['assemble.subtitle_auto_fit', true]]
+      : path === 'assemble.subtitle_source_min_size' ? [['assemble.subtitle_source_style_enabled', true], ['assemble.subtitle_auto_fit', true]] : [],
   }))
   return { defaults, steps: Object.fromEntries(['assemble', 'subtitles'].map(key => [key, {
     fields: fields.filter(field => field.path.startsWith(`${key}.`)), values: { ...defaults },
@@ -179,7 +186,110 @@ test('合成页过滤重复字幕控件，保留自己的混音与流程参数',
   await flush()
   assert.deepEqual(form.fields.value.map((f: any) => f.path), ['assemble.voice_volume', 'assemble.burn_subtitles'])
   assert.deepEqual(subtitleSettingsLink('fixture'), { path: '/projects/fixture/steps/tts', query: { panel: 'subtitles', from: 'assemble' } })
-  assert.match(subtitleStyleSummary({ subtitle_track: 'bilingual', subtitle_size: 80 }), /双语.*字号 80/)
+  assert.match(subtitleStyleSummary({ subtitle_track: 'bilingual', subtitle_size: 80 }), /双语.*字号 32–80.*优先缩小/)
+})
+
+test('字幕摘要显示实际字号范围，关闭缩放和原文独立样式有对应说明', () => {
+  const independent = { subtitle_track: 'bilingual', subtitle_size: 80, subtitle_min_size: 34,
+    subtitle_source_style_enabled: true, subtitle_source_size: 40, subtitle_source_min_size: 28,
+    subtitle_source_font: 'Arial' }
+  assert.match(subtitleStyleSummary(independent), /双语.*译文 34–80 \/ 原文 28–40.*优先缩小/)
+  const fixed = subtitleStyleSummary({ ...independent, subtitle_auto_fit: false })
+  assert.match(fixed, /双语.*译文 80 \/ 原文 40.*自动换行/)
+  assert.doesNotMatch(fixed, /34–80|28–40|优先缩小/)
+  assert.match(subtitleStyleSummary({ ...independent, subtitle_track: 'source' }), /原文 · Arial · 字号 28–40/)
+  assert.match(subtitleStyleSummary({ ...independent, subtitle_source_style_enabled: false }), /双语.*字号 34–80/)
+})
+
+test('字幕摘要区分缩小目标与换行上限，关闭自适应仅显示换行宽度', () => {
+  assert.match(subtitleStyleSummary(), /缩小 80% \/ 换行 90%/)
+  const cfg = { subtitle_shrink_width_percent: 75, subtitle_wrap_width_percent: 92 }
+  assert.match(subtitleStyleSummary(cfg), /缩小 75% \/ 换行 92%/)
+  const disabled = subtitleStyleSummary({ ...cfg, subtitle_auto_fit: false })
+  assert.match(disabled, /换行 92%/)
+  assert.doesNotMatch(disabled, /缩小 75%/)
+})
+
+test('两项宽度读取一次并归整体设置，关闭自适应只禁用缩小目标且保值，一次保存全部修改', async t => {
+  const data = schema(), requests: any[] = []
+  t.mock.method(globalThis, 'fetch', async (url: string, init: any) => {
+    const body = init.body && JSON.parse(init.body)
+    requests.push({ url, method: init.method || 'GET', body })
+    if (body) for (const step of Object.values(data.steps)) Object.assign(step.values, body.updates)
+    return new Response(JSON.stringify(data))
+  })
+  const form = await fixture(t, formBundle, { uid: 'fixture', stepKey: 'assemble', paths: SUBTITLE_STYLE_PATHS })
+  await flush()
+  assert.equal(requests.length, 1)
+  const shrink = form.fields.value.find((field: any) => field.path === 'assemble.subtitle_shrink_width_percent')
+  const wrap = form.fields.value.find((field: any) => field.path === 'assemble.subtitle_wrap_width_percent')
+  assert.ok(shrink); assert.ok(wrap)
+  assert.equal(form.draft.value[shrink.path], 80)
+  assert.equal(form.draft.value[wrap.path], 90)
+  const common = form.groups.value.find((group: any) => group.name === '')
+  assert.ok(common.fields.some((field: any) => field.path === shrink.path))
+  assert.ok(common.fields.some((field: any) => field.path === wrap.path))
+  assert.equal(form.disabledField(shrink), false)
+  assert.equal(form.disabledField(wrap), false)
+  form.editField(shrink.path, 76)
+  form.editField(wrap.path, 94)
+  form.editField('assemble.subtitle_auto_fit', false)
+  assert.equal(form.disabledField(shrink), true)
+  assert.equal(form.disabledField(wrap), false)
+  assert.equal(form.draft.value[shrink.path], 76)
+  assert.equal(form.draft.value[wrap.path], 94)
+  assert.equal(requests.length, 1, '切换与修改不应自动保存或预览')
+  await form.save()
+  assert.deepEqual(requests.filter(request => request.method === 'PUT').map(request => request.body), [{
+    updates: {
+      'assemble.subtitle_auto_fit': false,
+      'assemble.subtitle_shrink_width_percent': 76,
+      'assemble.subtitle_wrap_width_percent': 94,
+    }, reset: [],
+  }])
+  assert.equal(form.dirty.value, false)
+  assert.equal(form.draft.value[shrink.path], 76)
+  assert.equal(form.draft.value[wrap.path], 94)
+})
+
+test('长字幕自适应范围随草稿生效，关闭只禁用下限且保留值，保存一次提交', async t => {
+  const data = schema(), writes: any[] = []
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: any) => {
+    if (init.method === 'PUT') {
+      const body = JSON.parse(init.body); writes.push(body)
+      for (const step of Object.values(data.steps)) Object.assign(step.values, body.updates)
+    }
+    return new Response(JSON.stringify(data))
+  })
+  const form = await fixture(t, formBundle, { uid: 'fixture', stepKey: 'assemble', paths: SUBTITLE_STYLE_PATHS })
+  await flush()
+  for (const path of ['assemble.subtitle_auto_fit', 'assemble.subtitle_min_size', 'assemble.subtitle_source_min_size']) {
+    assert.ok(form.fields.value.some((field: any) => field.path === path))
+  }
+  const translated = form.fields.value.find((field: any) => field.path === 'assemble.subtitle_min_size')
+  const original = form.fields.value.find((field: any) => field.path === 'assemble.subtitle_source_min_size')
+  assert.equal(form.disabledField(translated), false)
+  assert.equal(form.disabledField(original), true)
+  form.enableSourceStyle()
+  assert.equal(form.disabledField(original), false)
+  form.editField('assemble.subtitle_min_size', 34)
+  form.editField('assemble.subtitle_source_min_size', 30)
+  form.editField('assemble.subtitle_auto_fit', false)
+  assert.equal(form.disabledField(translated), true)
+  assert.equal(form.disabledField(original), true)
+  assert.equal(form.draft.value['assemble.subtitle_min_size'], 34)
+  assert.equal(form.draft.value['assemble.subtitle_source_min_size'], 30)
+  assert.equal(form.disabledField({ path: 'assemble.subtitle_size' }), false)
+  assert.equal(form.draft.value['assemble.subtitle_size'], 48)
+  assert.equal(writes.length, 0)
+  await form.save()
+  assert.deepEqual(writes, [{ updates: {
+    'assemble.subtitle_source_style_enabled': true,
+    'assemble.subtitle_min_size': 34,
+    'assemble.subtitle_source_min_size': 30,
+    'assemble.subtitle_auto_fit': false,
+  }, reset: [] }])
+  assert.equal(form.dirty.value, false)
 })
 
 test('步骤和本句来源随编辑、恢复继承、放弃修改准确切换，同值也保留明确覆盖', async t => {
@@ -220,6 +330,8 @@ test('预览串行且丢弃旧响应，合并快速修改并传入草稿顺序�
   assert.equal(requests.length, 1)
   page.draft.value['subtitles.source_first'] = true
   page.draft.value['subtitles.min_duration'] = 2
+  page.draft.value['assemble.subtitle_shrink_width_percent'] = 76
+  page.draft.value['assemble.subtitle_wrap_width_percent'] = 94
   t.mock.timers.tick(650)
   assert.equal(requests.length, 1, '旧请求未完成时不能并发调用 FFmpeg')
   completed[0](new Response('old-image'))
@@ -229,6 +341,11 @@ test('预览串行且丢弃旧响应，合并快速修改并传入草稿顺序�
   assert.equal(requests.length, 2)
   assert.equal(requests[1].settings['subtitles.source_first'], true)
   assert.equal(requests[1].settings['subtitles.min_duration'], 2)
+  assert.equal(requests[1].settings['assemble.subtitle_auto_fit'], true)
+  assert.equal(requests[1].settings['assemble.subtitle_min_size'], 32)
+  assert.equal(requests[1].settings['assemble.subtitle_source_min_size'], 28)
+  assert.equal(requests[1].settings['assemble.subtitle_shrink_width_percent'], 76)
+  assert.equal(requests[1].settings['assemble.subtitle_wrap_width_percent'], 94)
   assert.equal('subtitles.mode' in requests[1].settings, false)
   completed[1](new Response('new-image'))
   await flush()
@@ -319,8 +436,8 @@ test('定位范围优先视频时长，未就绪回退字幕终点；末尾、�
   assert.equal(page.sliderValue.value, 0)
   assert.equal(subtitleTimelineDuration(Infinity, [{ end: 5 }, { end: NaN }]), 5)
   assert.equal(subtitleTimelineDuration(undefined, []), 0)
-  assert.equal(subtitleTimeLabel(3671.2), '61:11.2')
-  assert.equal(subtitleTimeLabel(null), '00:00.0')
+  assert.equal(subtitleTimeLabel(3671.2), '01:01:11.2')
+  assert.equal(subtitleTimeLabel(null), '—')
 })
 
 test('字幕开始点准确跟随编辑，定位只更新预览而不改字幕或播放器', async t => {
@@ -338,4 +455,19 @@ test('字幕开始点准确跟随编辑，定位只更新预览而不改字幕�
   assert.equal(requests.length, 1); assert.equal(requests[0].seconds, 11.1)
   assert.equal(p.fixtureProps.position, 0); assert.equal(p.fixtureProps.lines[1].start, 11)
   assert.equal(p.events.length, 0)
+})
+
+test('字幕工作区定位使用播放排布，选句、拖动条与实际烧录预览时钟一致', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  const requests: any[] = []
+  t.mock.method(globalThis, 'fetch', async (_url: string, init: any) => { requests.push(JSON.parse(init.body)); return new Response('frame') })
+  const lines = [{ id: 1, start: 1, end: 2, playback_start: .5, playback_end: 3, text: '较长配音' }]
+  const p = await fixture(t, workspaceBundle, { uid: 'fixture', active: true, position: 0, duration: 30, lines, subtitleState: {} })
+  p.draft.value = { ...defaults }
+  assert.equal(p.cues.value[0].start, .5); assert.equal(p.cues.value[0].end, 3)
+  p.chooseLine(1)
+  assert.equal(p.seconds.value, 1.75)
+  t.mock.timers.tick(650); await flush()
+  assert.equal(requests[0].seconds, 1.75)
+  assert.equal(p.fixtureProps.lines[0].start, 1); assert.equal(p.fixtureProps.lines[0].end, 2)
 })

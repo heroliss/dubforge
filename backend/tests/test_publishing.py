@@ -11,7 +11,7 @@ from dubforge.db import get_engine
 from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 from dubforge.publishing import credentials, service, transport
-from dubforge.publishing.models import Publication, PublishAccount
+from dubforge.publishing.models import Publication, PublicationUpdate, PublishAccount
 
 
 @pytest.fixture()
@@ -78,14 +78,14 @@ def upload(row):
 
 
 def test_combined_publish_rechecks_review_settings_changed_during_upload(setup_publish, monkeypatch):
-    from dubforge import config
-    _, row, artifacts, calls = setup_publish
+    from test_publishing_studio_review import _project_setting
+    uid, row, artifacts, calls = setup_publish
     original = transport.call
 
     def change_policy(operation, payload=None, **kwargs):
         result = original(operation, payload, **kwargs)
         if operation == 'upload':
-            config.set_key('content_review.blocked_terms', '河内')
+            _project_setting(uid, 'content_review.blocked_terms', '河内', external=True)
         return result
 
     monkeypatch.setattr(transport, 'call', change_policy)
@@ -210,6 +210,26 @@ def test_project_detail_and_list_api_keep_production_and_publication_status_sepa
     assert calls == []
 
 
+def test_project_status_includes_latest_original_update_progress(setup_publish):
+    uid, row, _, _ = setup_publish
+    with Session(get_engine()) as session:
+        session.add(PublicationUpdate(
+            id='update-progress', source_publication_id=row['id'], project_uid=uid,
+            account_id='123', bvid='BV1234567890', status='delivering',
+            phase='同步章节与后续设置', progress=68,
+            execution=json.dumps({'stages': {'chapters': {'status': 'running', 'progress': 68}},
+                                  'current_part': 1})))
+        session.commit()
+    status = service.project_status(uid)
+    update = status['latest_update']
+    assert update['status'] == 'delivering'
+    assert update['progress'] == 68
+    assert update['phase'] == '同步章节与后续设置'
+    chapter = next(item for item in update['execution']['stages'] if item['key'] == 'chapters')
+    assert chapter['progress'] == 68
+    assert update['execution']['current_stage'] == 'chapters'
+
+
 def test_publication_sources_keep_frozen_template_identity_and_restore_inheritance(setup_publish):
     from dubforge import configuration as cfg
     uid, row, _, _ = setup_publish
@@ -218,11 +238,11 @@ def test_publication_sources_keep_frozen_template_identity_and_restore_inheritan
     plan = cfg.binding_plan([uid], template['key'][7:])
     cfg.bind(dict(uids=[uid], template_id=template['key'][7:], fingerprint=plan['fingerprint'], confirmed=True))
     row = service.view(row['id'])
-    assert row['sources']['watermark'] == {'kind': 'series', 'name': '本稿件'}
+    assert row['sources']['watermark'] == {'kind': 'series', 'name': '本稿件', 'frozen': True}
     assert row['sources']['title'] == {'kind': 'publication'}
     assert row['sources']['close_comments'] == {'kind': 'global'}
     row = upload(row)
-    assert row['snapshot']['base_sources']['watermark'] == {'kind': 'series', 'name': '本稿件'}
+    assert row['snapshot']['base_sources']['watermark'] == {'kind': 'series', 'name': '本稿件', 'frozen': True}
     current = cfg.resolve(key=template['key'])
     cfg.save(template['key'], {'revision': current['revision'], 'updates': {}, 'name': '后来改名'})
     assert service.view(row['id'])['sources']['watermark']['name'] == '本稿件'
@@ -232,7 +252,7 @@ def test_publication_sources_keep_frozen_template_identity_and_restore_inheritan
     overrides.pop('watermark')
     row = service.save(row['id'], dict(row['draft'], revision=row['revision'], overrides=overrides))
     assert row['settings']['watermark'] is True
-    assert row['sources']['watermark'] == {'kind': 'series', 'name': '本稿件'}
+    assert row['sources']['watermark'] == {'kind': 'series', 'name': '本稿件', 'frozen': True}
 
 
 def publish(row):
@@ -787,6 +807,7 @@ def test_collection_platform_reason_survives_and_retry_only_joins(setup_publish,
     result = finish(row['id'])
     assert result['error'] == message
     assert transport._error_detail(dict(stage='join_add',remote_code=21001,headers={'Cookie':'private'})) == dict(stage='join_add',remote_code=21001)
+    assert transport._error_detail(dict(stage='validate',remote_code=-400,headers={'Cookie':'private'})) == dict(stage='validate',remote_code=-400)
     calls.clear()
     monkeypatch.setattr(transport, 'call', original)
     service.enqueue(row['id'], dict(action='collection', revision=result['revision']))

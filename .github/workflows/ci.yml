@@ -1,0 +1,97 @@
+name: Windows checks
+
+on:
+  push:
+    # 所有分支都检查；版本标签复用同一提交的结果，避免重复整套媒体回归。
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: windows-latest
+    timeout-minutes: 120
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      # 固定到官方稳定发布的提交；更新时核对对应 tag，不使用浮动主版本。
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '24'
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          version: '0.11.8'
+          enable-cache: false
+      - name: Prepare isolated configuration and caches
+        run: |
+          $ciRoot = Join-Path $env:RUNNER_TEMP ('dubforge-ci-' + [guid]::NewGuid().ToString('N'))
+          foreach ($name in @('data', 'hf', 'tmp', 'torch', 'pycache')) {
+            New-Item -ItemType Directory -Path (Join-Path $ciRoot $name) -Force | Out-Null
+          }
+          Copy-Item -LiteralPath 'config.example.yaml' -Destination (Join-Path $ciRoot 'config.yaml')
+          $ciEnvironment = @{
+            DUBFORGE_CONFIG = (Join-Path $ciRoot 'config.yaml')
+            DUBFORGE_DATA_ROOT = (Join-Path $ciRoot 'data')
+            HF_HOME = (Join-Path $ciRoot 'hf')
+            TORCH_HOME = (Join-Path $ciRoot 'torch')
+            PYTHONPYCACHEPREFIX = (Join-Path $ciRoot 'pycache')
+            TEMP = (Join-Path $ciRoot 'tmp')
+            TMP = (Join-Path $ciRoot 'tmp')
+            HF_HUB_OFFLINE = '1'
+            TRANSFORMERS_OFFLINE = '1'
+            PYTHONIOENCODING = 'utf-8'
+          }
+          foreach ($entry in $ciEnvironment.GetEnumerator()) {
+            Add-Content -LiteralPath $env:GITHUB_ENV -Value "$($entry.Key)=$($entry.Value)" -Encoding utf8
+          }
+      - name: Install locked backend and test capabilities
+        run: uv sync --locked --directory backend --extra asr --extra separation
+      - name: Release checker safety tests (no services)
+        run: python scripts/test_release_checks.py
+      - name: Documentation demo safety tests (no services)
+        run: python scripts/docs/test_prepare_demo.py
+      - name: Ensure FFmpeg tools
+        run: |
+          if (-not (Get-Command ffmpeg -ErrorAction SilentlyContinue) -or -not (Get-Command ffprobe -ErrorAction SilentlyContinue)) {
+            choco install ffmpeg --yes --no-progress
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          ffmpeg -version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          ffprobe -version
+      - name: Installation and smoke safety tests (no services)
+        run: uv run --locked --directory backend --extra asr --extra separation python -m unittest discover -s ../scripts/tests -p 'test_*.py' -v
+      - name: Backend tests
+        run: uv run --locked --directory backend --extra asr --extra separation pytest -q
+      - name: Install frontend
+        working-directory: frontend
+        run: npm ci
+      - name: Frontend tests
+        working-directory: frontend
+        run: npm test
+      - name: Frontend typecheck
+        working-directory: frontend
+        run: npm run typecheck
+      - name: Frontend build
+        working-directory: frontend
+        run: npm run build
+      - name: Install publishing worker
+        working-directory: workers/bilibili
+        run: npm ci --ignore-scripts
+      - name: Publishing worker tests
+        working-directory: workers/bilibili
+        run: npm test
+      - name: Release metadata and documentation checks
+        run: uv run --locked --directory backend --extra asr --extra separation python ../scripts/check_release.py
+      - name: Isolated 8611 health (reuse completed tests and build)
+        run: ./scripts/smoke.ps1 -SkipTests -SkipFrontendBuild

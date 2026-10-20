@@ -51,6 +51,28 @@ def test_checks_both_languages_without_combining_unrelated_tracks():
     assert review.blocked_comment('Tiananmen Square', '这是一场悲剧') == []
 
 
+def test_comment_platform_risk_phrases_are_screened_in_both_source_and_translation():
+    source = ('That square is the most sensitive place in the country. Cameras are useful, '
+              'especially at the square, a place where terrorism has actually happened.')
+    translation = ('那个广场是全国最敏感的地方，摄像头很有用，尤其是在那个广场——一个确实发生过恐怖袭击的地方。')
+    reasons = review.blocked_comment(source, translation)
+    assert any('高敏感' in reason for reason in reasons)
+    assert any('人工复核' in reason for reason in reasons)
+    assert review.blocked_comment(source) and review.blocked_comment(translation)
+
+
+@pytest.mark.parametrize('text', [
+    '我们参观了广场，了解当地的建筑和历史。',
+    'The square is beautiful at night and the cameras make the walk easy.',
+    '这条评论讨论了敏感词检测，但没有描述敏感地点。',
+    '报道介绍了反恐行动和恐怖袭击的受害者，呼吁和平。',
+    'A museum exhibit explains how terrorism harms civilians.',
+    'That square is the most sensitive place in the country, so we follow the security rules.',
+])
+def test_comment_risk_screen_does_not_block_normal_tourism_or_meta_discussion(text):
+    assert review.blocked_comment(text) == []
+
+
 def test_custom_terms_accept_newlines_nfkc_case_whitespace_and_duplicates():
     assert review.normalize_terms('  禁 止 词 \n\nＢＡＤ　ＷＯＲＤ\nbad word\n禁止词') == [
         '禁 止 词', 'ＢＡＤ　ＷＯＲＤ']

@@ -13,7 +13,7 @@ export function latestJobActivity(lines: unknown, jobId: number): ProgressActivi
     if (!match || Number(match[2]) !== jobId) continue
     let message = match[3].trim()
     // 配置快照、时限和结构化传输数据不是当前工作内容。
-    if (/^(🔒|⏱|DUBFORGE_|收尾清理:|🧹)/.test(message)) continue
+    if (/^(🔒|⏱|DUBFORGE_)/.test(message)) continue
     message = message.replace(/\u001b\[[0-9;]*m/g, '')
       .replace(/(https?:\/\/)[^\s/]+@/gi, '$1[已隐藏凭据]@')
       .replace(/(https?:\/\/[^\s?#]+)[?#][^\s]+/gi, '$1?[已隐藏参数]')
@@ -40,17 +40,25 @@ export function stepActivity(step: any, log?: ProgressActivity | null): Progress
 
 /** 使用运行时冻结计划，不把用户后来修改的默认规则说成本次计划。 */
 export function workflowComments(run: any, plan: any): { state: string; message: string } | null {
-  if (!run || !plan || plan.id !== run.id) return null
-  const index = plan.steps?.indexOf('comments') ?? -1
-  if (index < 0) return { state: 'none', message: '本次流程未安排自动采集评论；使用已保存方案或版本未启用评论叠加。' }
+  if (!run || !plan || plan.id !== run.id || !Array.isArray(plan.steps)
+    || !plan.steps.every((key:unknown) => typeof key === 'string' && key.trim())) return null
+  const index = plan.steps.indexOf('comments')
+  if (index < 0) return { state: 'none', message: '本次流程未安排自动评论准备；使用已保存方案或版本未启用评论叠加。' }
   const cursor = Number(run.cursor) || 0
   if (cursor > index || run.status === 'completed') return { state: 'done', message: '本次流程的评论已准备完成，可在下方查看。' }
   if (['failed', 'paused', 'attention', 'stopping', 'cancelled'].includes(run.status)) return {
-    state: 'stopped', message: cursor === index ? '评论准备尚未完成，流程已暂停或需要处理。' : '流程已暂停或需要处理，尚未执行评论准备。',
+    state: 'stopped', message: cursor === index
+      ? '评论准备尚未完成，流程已暂停或需要处理。已完成结果保留；继续时复用有效结果，仅补缺失或变化部分。采集范围扩大或来源变化时可能重新获取。'
+      : '流程已暂停或需要处理，尚未执行评论准备。已保存结果保留，继续时按本次范围检查复用。',
   }
-  if (cursor === index && run.status === 'running') return { state: 'running', message: '正在自动准备评论：采集、评分并翻译，完成后用于合成。' }
+  if (cursor === index && run.status === 'running') {
+    // 只有当前评论阶段的实际动态可进入此提示，不能混入前后步骤的旧阶段。
+    const phase = typeof run.phase === 'string' ? run.phase.trim() : ''
+    return { state: 'running', message: /^评论(?:采集|评分|筛选|翻译|确认)(?:[：:\s·]|$)/.test(phase)
+      ? phase : '正在自动准备评论：优先复用已有采集和有效评分，按需翻译候选并确认上屏方案。' }
+  }
   const before = plan.steps?.[index - 1], label = plan.labels?.[before] || '前序步骤'
-  return { state: 'upcoming', message: `${label}完成后自动准备评论：最多采集 ${plan.recipe?.comment_limit ?? '所设数量的'} 条，精选最多 ${plan.recipe?.comment_count ?? '所设数量的'} 条上屏。` }
+  return { state: 'upcoming', message: `${label}完成后自动准备评论：优先复用已采集评论，需要时最多获取 ${plan.recipe?.comment_limit ?? '所设数量的'} 条；精选最多 ${plan.recipe?.comment_count ?? '所设数量的'} 条上屏，仅按需翻译候选。` }
 }
 
 export function publicationActivity(row: any): ProgressActivity | null {

@@ -7,9 +7,8 @@ from fastapi.testclient import TestClient
 
 from app.main import app
 from dubforge import comment_studio as cs, config, workflows
-from dubforge.backends.tts_indextts25 import synthesis_profiles
 from dubforge.domain import crud
-from dubforge.pipeline.step_params import COMMENT_DEFAULT_FIELDS, STEP_PARAM_SCHEMA, validate_numeric_updates
+from dubforge.pipeline.step_params import COMMENT_DEFAULT_FIELDS, STEP_PARAM_SCHEMA
 
 
 def test_global_schema_covers_project_fields_and_comment_style(make_project):
@@ -37,16 +36,25 @@ def test_global_subtitle_colors_keep_project_overrides(make_project):
         'assemble.subtitle_outline_color': '#30213A'}}).status_code == 200
     values = api.get(f'/api/projects/{uid}/step_params').json()['steps']['assemble']['values']
     assert values['assemble.subtitle_color'] == '#F7F3E8'
-    assert values['assemble.subtitle_outline_color'] == '#30213A'
+    assert values['assemble.subtitle_outline_color'] == '#000000'
+    fresh = make_project()
+    new_values = api.get(f'/api/projects/{fresh}/step_params').json()['steps']['assemble']['values']
+    assert new_values['assemble.subtitle_color'] == '#FFD65A'
+    assert new_values['assemble.subtitle_outline_color'] == '#30213A'
 
 
 def test_comment_and_workflow_use_same_inheritance_without_editing_content(make_project):
     from test_configuration import save
+    from dubforge import configuration
     first, second = make_project(), make_project()
     save('project:'+first, {'comments.color':'#FFFFFF'})
     cs._write(crud.get_project(first), {'overlay': {'settings': {'start': 8}, 'items': []}})
     snapshot = (crud.project_dir(first) / 'comment_studio.json').read_bytes()
     save('global', {'comments.color':'#FFD65A', 'comments.background_opacity':0})
+    assert cs.view(second)['defaults']['color'] == '#FFFFFF'
+    assert cs.view(first)['overlay']['settings']['background_opacity'] == 50
+    plan = configuration.binding_plan([first, second], '')
+    configuration.bind(dict(uids=[first, second], template_id='', fingerprint=plan['fingerprint'], confirmed=True))
     assert cs.view(second)['defaults']['color'] == '#FFD65A'
     assert workflows.view(second)['recipe']['comment_settings']['color'] == '#FFD65A'
     assert cs.view(first)['overlay']['settings']['color'] == '#FFFFFF'
@@ -87,15 +95,14 @@ def test_can_repair_manually_invalid_comment_default(isolated_env):
     assert cs.default_settings()['duration'] == 6
 
 
-def test_indextts_recommendations_are_valid_and_do_not_change_config(isolated_env):
+def test_settings_expose_parameter_help_without_generation_profiles(isolated_env):
     before = copy.deepcopy(config.load_config())
-    balanced, fast = synthesis_profiles()
-    for profile in (balanced, fast):
-        validate_numeric_updates(profile['values'])
-        assert not any(key.endswith(('.lang', '.timbre_mode', '.timbre_audio', '.emo_mode', '.emo_audio', '.url', '.project_dir', '.duration_retry_factors')) for key in profile['values'])
-    assert balanced['values']['tts.indextts25.emo_weight'] == .65
-    assert balanced['values']['tts.indextts25.duration_factor'] == 1
-    assert balanced['values']['tts.indextts25.emo_random'] is False
-    assert {key for key in balanced['values'] if balanced['values'][key] != fast['values'][key]} == {'tts.indextts25.num_beams'}
-    assert fast['values']['tts.indextts25.num_beams'] == 1
+    api = TestClient(app)
+    for path in ('/api/settings/step_params', '/api/configuration/global'):
+        response = api.get(path)
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert 'indextts_profiles' not in data
+        section = data.get('steps', data.get('sections'))['tts']
+        assert all(field['help'] for field in section['fields'] if field['path'].startswith('tts.indextts25.'))
     assert config.load_config() == before

@@ -1,5 +1,6 @@
 """项目发布文案预览与显式候选生成；不创建稿件、不修改配置。"""
 import copy
+import math
 import threading
 
 from dubforge import configuration, video_info
@@ -20,7 +21,24 @@ def source_content(project, info=None):
         description=source_credit.append_attribution(summary or '', source_credit.attribution(project, info)),
         source=source_credit.source_url(project),
     )
-    return dict(content=content, content_sources={key: dict(kind='content') for key in content},
+    links = source_credit.extract_description_links(
+        info.get('description'), exclude_url=source_credit.source_url(project), include_sponsor=True)
+    details = info.get('content') or {}
+    chapters = []
+    for row in details.get('chapters', []) if isinstance(details.get('chapters'), list) else []:
+        if not isinstance(row, dict) or not isinstance(row.get('title'), str):
+            continue
+        try:
+            start = float(row.get('start_time'))
+            end = float(row.get('end_time')) if row.get('end_time') is not None else None
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(start) or start < 0 or end is not None and (not math.isfinite(end) or end <= start):
+            continue
+        chapters.append({'title': row['title'].strip()[:150], 'start_time': start,
+                         'end_time': end})
+    return dict(content=content, chapters=chapters[:100], source_links=links,
+                content_sources={key: dict(kind='content') for key in content},
                 source_published_date=source_credit.published_date(info),
                 thumbnail=(info.get('content') or {}).get('thumbnail', ''))
 
@@ -62,6 +80,7 @@ def preview(uid):
             origins[key] = data['origins'][path]
     return dict(project_uid=uid, revision=data['revision'], fingerprint=data['fingerprint'],
                 content=base['content'], content_sources=base['content_sources'],
+                source_links=base.get('source_links', []),
                 source_published_date=base['source_published_date'],
                 content_fingerprint=_content_fingerprint(project, info, base['content']),
                 configured=data['configured'], parent_configured=parent['configured'],
@@ -85,13 +104,14 @@ def _evidence_fingerprint(project):
 
 def suggest(uid, body):
     from dubforge import runtime_edit
-    from dubforge.publishing.service import PublishError, _project, _copy_request
+    from dubforge.publishing.service import PublishError, _project, _copy_request, _copy_options
 
     if not isinstance(body, dict) or set(body) - {
-        'revision', 'fingerprint', 'content_fingerprint', 'current', 'instruction'
+        'revision', 'fingerprint', 'content_fingerprint', 'current', 'instruction', 'copy_options'
     }:
         raise PublishError('项目文案请求包含不支持的字段')
     current, instruction = _copy_request(body)
+    options = _copy_options(body)
     initial = preview(uid)
     _assert_current(initial, body)
     with _gate:
@@ -104,7 +124,7 @@ def suggest(uid, body):
         evidence = _evidence_fingerprint(project)
         # 预览和证据读取之后再次核验，不用旧资料启动请求。
         _assert_current(preview(uid), body)
-        result = copywriting.generate(project, current, instruction)
+        result = copywriting.generate(project, current, instruction, options)
         if _evidence_fingerprint(_project(uid)) != evidence:
             raise PublishError('生成期间视频资料或有效字幕已变化，候选未应用，请重新生成', code='PUBLISH_CONFLICT')
         latest = preview(uid)

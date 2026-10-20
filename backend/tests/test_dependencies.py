@@ -7,6 +7,7 @@ import pytest
 from conftest import mark_upstream_done, wait_status
 from dubforge import config
 from dubforge.domain import crud
+from test_configuration import save
 from dubforge.errors import DubForgeError
 from dubforge.pipeline.dependencies import Dependencies, project_status
 from dubforge.runner import compute_fingerprint, runner
@@ -61,7 +62,7 @@ def test_minimal_source_plan(make_project):
 
 
 def test_editor_sync_plan_updates_upstream_and_both_outputs(make_project):
-    """上游失效后，字幕与配音的一次同步计划必须包含导出与逐句配音。"""
+    """下游只按直接消费的产物决定计划，不因更早步骤的旧产物状态级联。"""
     uid = make_project(params={"auto_steps": ["subtitles", "tts"]})
     mark_upstream_done(uid, "tts")
     runner.start_step(uid, "subtitles")
@@ -82,17 +83,14 @@ def test_editor_sync_plan_updates_upstream_and_both_outputs(make_project):
     source_path = root / "srt/src.srt"
     source_path.write_text("1\n00:00:00,000 --> 00:00:01,500\nchanged hello\n",
                            encoding="utf-8")
-    crud.add_artifact(project.id, "transcribe", "text", "src.srt", source_path,
-                      str(source_path.relative_to(root)))
     split = crud.get_step(project.id, "split")
     split.input_fingerprint = "previous-run"
     crud.save_step(split)
 
     plan = Dependencies(crud.get_project(uid)).plan(["subtitles", "tts"], True)
-    assert plan["steps"] == ["split", "translate", "tts", "subtitles"]
+    assert plan["steps"] == ["tts", "subtitles"]
     assert not plan["blockers"]
-    assert any(i["step"] == "split" and i["state"] == "stale" for i in plan["requirements"])
-    assert any(i["step"] == "translate" and i["state"] == "stale" for i in plan["requirements"])
+    assert not any(i["step"] in {"split", "translate"} for i in plan["requirements"])
 
 
 def test_minimal_dubbing_plan_skips_subtitle_export(make_project):
@@ -103,7 +101,7 @@ def test_minimal_dubbing_plan_skips_subtitle_export(make_project):
     assert "subtitles" not in deps.plan(["assemble"], True)["steps"]
     assert deps.inputs("tts") == deps.dubbing_inputs()
     assert "dubtask" not in deps.plan(["assemble"], True)["steps"]
-    config.set_key("tts.indextts25.timbre_mode", "dynamic")
+    save('project:' + p.uid, {'tts.indextts25.timbre_mode': 'dynamic'})
     assert Dependencies(p).plan(["tts"], True)["blockers"][0]["name"] == "vocal.wav"
 
 
@@ -132,12 +130,11 @@ def test_unrelated_settings_and_outputs_do_not_change_tts_fingerprint(make_proje
     mark_upstream_done(uid, "tts")
     p = crud.get_project(uid)
     before = compute_fingerprint(p, "tts")
-    config.set_key("subtitles.source_first", True)
-    config.set_key("subtitles.min_duration", 2)
+    save('project:' + uid, {'subtitles.source_first': True, 'subtitles.min_duration': 2})
     seed(uid, "subtitles", "bilingual.srt", "新字幕")
     assert compute_fingerprint(p, "tts") == before
     assert Dependencies(p).downstream("subtitles") == []
-    config.set_key("assemble.burn_subtitles", True)
+    save('project:' + uid, {'assemble.burn_subtitles': True})
     assert Dependencies(p).downstream("subtitles") == ["assemble"]
 
 
@@ -152,7 +149,9 @@ def test_stale_translation_blocks_dubbing(make_project):
     step = crud.get_step(p.id, "translate")
     step.input_fingerprint = compute_fingerprint(p, "translate")
     crud.save_step(step)
-    config.set_key("translate.style_prompt", "使用自然的口语表达")
+    save('project:' + uid, {'translate.style_prompt': '使用自然的口语表达'})
+    translate_path = Dependencies(p).path("translate", "translate.txt")
+    translate_path.write_text(translate_path.read_text(encoding="utf-8") + "\nchanged", encoding="utf-8")
     deps = Dependencies(p)
     assert not deps.missing("tts")
     stale, = deps.unready("tts")
@@ -190,7 +189,9 @@ def test_existing_dependencies_keep_distinct_states(make_project, change, state)
         path.unlink()
     elif change == "edit":
         path.write_text("修改后的原文", encoding="utf-8")
-    elif change in {"stale", "running"}:
+    elif change == "stale":
+        path.write_text("上游文件已经替换", encoding="utf-8")
+    elif change == "running":
         row = crud.get_step(p.id, "split")
         row.status = change
         crud.save_step(row)
@@ -206,9 +207,8 @@ def test_plan_separates_missing_and_stale_dependencies(make_project):
     uid = make_project()
     seed(uid, "split", "split.txt", "1. 0.000-1.000: hello\n")
     p = crud.get_project(uid)
-    row = crud.get_step(p.id, "split")
-    row.status = "stale"
-    crud.save_step(row)
+    path = Dependencies(p).path("split", "split.txt")
+    path.write_text("上游文件已经替换", encoding="utf-8")
     plan = Dependencies(p).plan(["dubtask"])
     assert len(plan["blockers"]) == 2
     assert [(i["name"], i["state"]) for i in plan["missing"]] == [("translate.txt", "missing")]
@@ -250,11 +250,11 @@ def test_export_tracks_order_no_hard_wrap_and_remove_unselected(make_project):
     root = crud.project_dir(uid) / "srt"
     assert (root / "trans.srt").read_text(encoding="utf-8").splitlines()[2] == target
     assert (root / "bilingual.srt").read_text(encoding="utf-8").splitlines()[2:4] == [target, "hello"]
-    config.set_key("subtitles.source_first", True)
+    save('project:' + uid, {'subtitles.source_first': True})
     runner.start_step(uid, "subtitles")
     wait_status(uid, "subtitles", {"done"})
     assert (root / "bilingual.srt").read_text(encoding="utf-8").splitlines()[2:4] == ["hello", target]
-    config.set_key("subtitles.mode", "source")
+    save('project:' + uid, {'subtitles.mode': 'source'})
     runner.start_step(uid, "subtitles")
     wait_status(uid, "subtitles", {"done"})
     assert (root / "source.srt").exists() and not (root / "trans.srt").exists()
@@ -270,7 +270,7 @@ def test_legacy_recognition_cache_remains_usable(make_project):
     crud.save_step(step)
     assert Dependencies(p).fresh("transcribe")
     assert runner.start_step(uid, "transcribe")["status"] == "skipped"
-    config.set_key("asr.model", "different")
+    save('project:' + uid, {'asr.model': 'medium'})
     assert not Dependencies(p).fresh("transcribe")
 
 
@@ -291,13 +291,21 @@ def test_missing_voice_and_same_size_changed_input(make_project):
     assert any(i["name"] == "2.wav" for i in deps.missing("assemble"))
     path = deps.path("split", "split.txt")
     path.write_bytes(path.read_bytes().replace(b"hello", b"world"))
-    with pytest.raises(DubForgeError, match="内容已变化"):
+    with pytest.raises(DubForgeError, match="上游产物已变化"):
         deps.require("translate")
 
 
 def test_non_contiguous_selected_chain_and_status(make_project, stub_heavy_steps):
+    import wave
     from app.api.projects import RunChain, run_chain, _auto_chain_of
     uid = make_project(params={"auto_steps": ["translate", "tts"]})
+    # 此用例检查选中步骤的续跑语义；引用和服务使用有效隔离替身。
+    reference = crud.project_dir(uid) / 'reference.wav'
+    with wave.open(str(reference), 'wb') as wav:
+        wav.setparams((1, 2, 32000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(b'\x00\x10' * 32000)
+    save('project:' + uid, {'tts.indextts25.timbre_audio': str(reference),
+                           'tts.indextts25.emo_audio': str(reference)})
     mark_upstream_done(uid, "translate")
     stub_heavy_steps("translate", "tts")
     assert _auto_chain_of(crud.get_project(uid)) == ["translate", "tts"]
@@ -324,9 +332,9 @@ def test_line_cache_tracks_voice_settings_not_subtitle_settings(make_project):
     p = crud.get_project(make_project())
     line = {"id": 1, "start": 0, "end": 1, "text": "你好"}
     fp = line_fingerprint(p, line)
-    config.set_key("subtitles.source_first", True)
+    save('project:' + p.uid, {'subtitles.source_first': True})
     assert line_fingerprint(p, line) == fp
-    config.set_key("tts.indextts25.emo_weight", 0.5)
+    save('project:' + p.uid, {'tts.indextts25.emo_weight': 0.5})
     assert line_fingerprint(p, line) != fp
 
 
@@ -334,7 +342,7 @@ def test_manual_voice_artifacts_can_bypass_batch_step(make_project):
     from dubforge.pipeline.step_tts import line_fingerprint
     uid = make_project()
     mark_upstream_done(uid, "tts")
-    config.set_key("assemble.bgm_volume", 0)
+    save('project:' + uid, {'assemble.bgm_volume': 0})
     p = crud.get_project(uid)
     deps = Dependencies(p)
     lines = deps.dubbing_lines(required=True)
@@ -345,7 +353,7 @@ def test_manual_voice_artifacts_can_bypass_batch_step(make_project):
     step.status = "pending"
     crud.save_step(step)
     Dependencies(p).require("assemble")
-    config.set_key("tts.indextts25.emo_weight", 0.2)
+    save('project:' + uid, {'tts.indextts25.emo_weight': 0.2})
     deps = Dependencies(p)
     assert not deps.missing("assemble")
     assert any(i["step"] == "tts" and i["state"] == "stale" for i in deps.unready("assemble"))
@@ -412,14 +420,16 @@ def test_source_choice_is_absent_from_project_and_global_forms(make_project):
 
 
 def test_partial_tts_retry_reuses_valid_lines(make_project, monkeypatch):
+    import wave
     from dubforge.backends import tts_indextts25
     uid = make_project()
     mark_upstream_done(uid, "tts")
     root = crud.project_dir(uid)
     ref = root / "reference.wav"
-    ref.write_bytes(b"reference")
-    config.set_key("tts.indextts25.timbre_audio", str(ref))
-    config.set_key("tts.indextts25.emo_audio", str(ref))
+    with wave.open(str(ref), 'wb') as stream:
+        stream.setparams((1, 2, 32000, 0, 'NONE', 'not compressed'))
+        stream.writeframes(b'\x00\x10' * 32000)
+    save('project:' + uid, {'tts.indextts25.timbre_audio': str(ref), 'tts.indextts25.emo_audio': str(ref)})
     seed(uid, "split", "split.txt", "1. 0.000-1.000: hello\n2. 1.000-2.000: world\n")
     seed(uid, "translate", "translate.txt", "1. 你好\n2. 世界\n")
     calls = []
@@ -436,8 +446,14 @@ def test_partial_tts_retry_reuses_valid_lines(make_project, monkeypatch):
         return out
 
     monkeypatch.setattr(tts_indextts25, "synth", synth)
+    monkeypatch.setattr(tts_indextts25, 'is_online', lambda *_args, **_kwargs: True)
     runner.start_step(uid, "tts")
     wait_status(uid, "tts", {"failed"})
+    # failed 可先于安全收尾对外可见；重试必须等同一任务真正退出。
+    with runner._lock:
+        pending = list(runner._futures)
+    for future in pending:
+        future.result(timeout=5)
     fail_second = False
     runner.start_step(uid, "tts")
     wait_status(uid, "tts", {"done"})

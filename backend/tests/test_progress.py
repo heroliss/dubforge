@@ -23,6 +23,9 @@ class Ctx:
     def set_progress_provider(self, provider):
         self.progress = provider
 
+    def set_progress_detail(self, detail):
+        self.detail = dict(detail)
+
     def report_progress(self, value):
         self.percent.append(value)
 
@@ -311,6 +314,10 @@ def test_download_aggregates_video_and_audio_and_excludes_resumed_bytes(monkeypa
         tick("v", 600, 800)
         assert ctx.percent[-1] == 60
         assert ctx.eta() == 20
+        assert ctx.detail["phase"] == "downloading"
+        assert ctx.detail["loaded"] == 600
+        assert ctx.detail["total"] == 1000
+        assert ctx.detail["speed_bps"] == 20
         ctx.now = 20
         tick("v", 800, 800)
         assert ctx.percent[-1] == 80

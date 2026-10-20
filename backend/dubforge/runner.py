@@ -8,7 +8,7 @@
     2) 产出 Job 记录, 提交线程池 (每步骤并行闸门保护显存)
     3) 执行中: 心跳定时器 + 协作式取消 + 每步活动时长超时兜底
     4) 结束: done (登记产物) / failed (错误三件套入库) / cancelled
-- 重跑语义: force 重跑 = 删本步产物 → 已有结果的下游置 stale，未运行的保持 pending
+- 重跑语义: force 不复用步骤缓存；下载、翻译、配音及正式成片保留已完成结果，按实际产物变化更新下游
 - 指纹: sha256( cfg_keys 配置快照 + 上游产物[name,sha256] 列表 + 首步源快照 )
 - 崩溃恢复: recover() —— 启动时 running→interrupted / running Job→dead
 - 日志: 项目 logs/<step>.log 追加; 步骤内通过 ctx.log() 打点
@@ -24,14 +24,15 @@ import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import contextmanager
 from pathlib import Path
 
-from dubforge import config
+from dubforge import config, llm_conversations
 from dubforge.domain import crud
 from dubforge.domain.models import Job, Project, StepRun
 from dubforge.errors import DubForgeError, StepFailedError
+from dubforge.execution_progress import Recorder, normalize as execution_snapshot, report_stage
 from dubforge.pipeline.registry import STEP_KEYS, STEP_MAP
 from dubforge.utils.fs import atomic_replace
 
@@ -49,6 +50,13 @@ class StepTimeout(StepCancelled):
 
     code = "STEP_TIMEOUT"
     suggestion = "步骤超过设定的运行时间, 已清理临时文件; 请检查服务是否卡住或适当调大本步骤超时。"
+
+
+class StepInterrupted(StepCancelled):
+    """服务关闭时安全停止，保留逐项完成的产物供恢复。"""
+
+    code = "STEP_INTERRUPTED"
+    suggestion = "程序关闭，任务已停止；已完成产物保留，可在下次启动后继续。"
 
 
 # 临时/半成品文件的清扫模式: 取消、失败、强制结束后清一遍 (原子写保证正式产物
@@ -106,21 +114,26 @@ class StepContext:
     def __init__(self, project: Project, step_key: str, pdir: Path,
                  log_file: Path, cancel_event: threading.Event,
                  pause_event: threading.Event | None = None,
-                 force: bool = False, job_id: int | None = None):
+                 force: bool = False, job_id: int | None = None,
+                 shutdown_event: threading.Event | None = None,
+                 defer_snapshot: bool = False):
         self.project = project
         self.step_key = step_key
         self.pdir = pdir
         self._log_file = log_file
         self._cancel = cancel_event
+        self._shutdown = shutdown_event
         self._pause = pause_event or threading.Event()
         self.force = bool(force)             # 本次是否强制重跑 (步骤实现可据此决定真重做)
         self.trial_only = False              # 试合成等临时任务不改变正式产物指纹
         self.job_id = job_id
         self.task_data = {}
+        self._execution_snapshot = None
         self._job = None
         self.rebuild = False                # 输入变化/失败恢复时替换旧产物
         self._log_lock = threading.Lock()   # 分块并行时多线程写同一日志
         self._llm_trace_file = log_file.with_name(f"{step_key}.llm.jsonl")
+        self._llm_secrets = ()
         self._subprocs: set = set()          # 本步骤启动的子进程 (取消/强制结束时终止)
         self._subproc_lock = threading.Lock()
         self._pause_notice = False
@@ -134,41 +147,79 @@ class StepContext:
         self._eta_scope = "step"
         self._progress_provider = None
         self._progress_phase = ("", False)
+        # 步骤可选的结构化实时详情（例如下载字节数和速度）。
+        # 与百分比/ETA 分开保存，避免把展示字段混入产物或改变步骤幂等性。
+        self._progress_detail = {}
         self._progress_lock = threading.RLock()
-        # 运行期间固定配置快照。编辑门禁仍不能替代快照，避免外部文件修改让同一轮任务
-        # 的后续窗口突然换模型/参数，否则会表现为“模型重新开始思考”或
-        # 同一任务前后结果不可复现。下一次运行才读取新配置。
+        # 排队时不读取配置；拿到真正的执行槽位、状态切换为 running 前才冻结。
+        # 这样排队中的任务可以自然使用用户刚保存的设置，运行中的步骤仍保持
+        # 一次执行内完全可复现。
+        self._config_snapshot = None
+        self.project_params: dict = {}
+        self._project_step_params_snapshot = {}
+        self.execution = Recorder(self._persist_execution, owner='step', job_id=job_id)
+        if not defer_snapshot:
+            self.freeze_configuration()
+
+    def _persist_execution(self, value):
+        if self._job is not None:
+            self._job.execution = json.dumps(value, ensure_ascii=False)
+            crud.update_job(self._job, execution_only=True)
+
+    def freeze_configuration(self) -> None:
+        """在步骤即将进入 running 时捕获不可变执行配置。"""
+        if self._config_snapshot is not None:
+            return
+        # 入队期间项目参数也可能发生变化；和配置文件一样，必须在 running
+        # 边界读取数据库最新行，而不能复用入队时的 ORM 快照。
+        latest = crud.get_project(self.project.uid)
+        if latest is not None:
+            self.project = latest
         self._config_snapshot = copy.deepcopy(config.load_config())
-        self.project_params: dict = crud.project_params(project)
+        self.project_params = crud.project_params(self.project)
         from dubforge.configuration import step_values
         self._project_step_params_snapshot = copy.deepcopy(
-            step_values(project, settings=self._config_snapshot))
-        self.llm_trace("run_start", "", job_id=job_id)
+            step_values(self.project, settings=self._config_snapshot))
         llm_cfg = self._config_snapshot.get("llm", {})
+        self._llm_secrets = llm_conversations.collect_secrets(llm_cfg)
+        self.llm_trace("run_start", "", job_id=self.job_id)
         profile_names = [str(p.get("name") or "(未命名)")
                          for p in (llm_cfg.get("profiles") or [])
                          if isinstance(p, dict) and p.get("enabled", True)]
-        self.log("🔒 本次运行已固定配置快照；运行期间设置与勾选项已锁定（实时显示设置除外）"
+        self.log("🔒 本次运行已固定配置快照；制作参数和模型配置已锁定，连接/运行保护参数可在原子边界更新"
                  + (f"（启用 LLM 配置: {'、'.join(profile_names)}）"
                     if profile_names else ""))
 
     def save_task_data(self) -> None:
         """仅在句子切换/结束时保存任务范围和结果；细粒度进度沿用步骤上报。"""
         if self._job is not None:
-            self._job.task_data = json.dumps(self.task_data, ensure_ascii=False)
+            payload = dict(self.task_data)
+            if self._execution_snapshot is not None:
+                payload['execution_snapshot'] = self._execution_snapshot
+            self._job.task_data = json.dumps(payload, ensure_ascii=False)
             crud.update_job(self._job)
+
+    def artifact_audit(self) -> dict:
+        """返回产物登记用的本次执行审计字段，不包含原始配置或密钥。"""
+        snapshot = self._execution_snapshot or {}
+        return dict(job_id=self.job_id,
+                    settings_snapshot_hash=str(snapshot.get('configuration_digest') or ''))
 
     def dependencies(self, *, assemble_variants=None):
         """执行校验与输入记录使用本轮冻结配置，不重新读取运行中修改的设置。"""
         from dubforge.pipeline.dependencies import Dependencies
-        return Dependencies(self.project, assemble_variants=assemble_variants,
-                            settings=self._config_snapshot,
-                            overrides=self._project_step_params_snapshot)
+        result = Dependencies(self.project, assemble_variants=assemble_variants,
+                              settings=self._config_snapshot,
+                              overrides=self._project_step_params_snapshot)
+        if self.step_key == 'assemble' and 'output_cuts' in self.task_data:
+            result._output_cuts_snapshot = copy.deepcopy(self.task_data['output_cuts'])
+        return result
 
     # ---- 日志 (带时间戳追加; 立即落盘, 崩溃后可读到最后状态) ----
     def log(self, msg: str) -> None:
         ts = datetime.datetime.now().astimezone().strftime("%H:%M:%S")
         run_tag = f" [任务#{self.job_id}]" if self.job_id is not None else ""
+        msg = llm_conversations.redact(str(msg), secrets=self._llm_secrets)
         with self._log_lock, open(self._log_file, "a", encoding="utf-8") as f:
             f.write(f"[{ts}]{run_tag} {msg}\n")
 
@@ -179,12 +230,13 @@ class StepContext:
         保证长提示词和思考内容可完整回看。JSONL 追加写入，多个翻译
         块并行时沿用日志锁保证每行完整。
         """
-        record = {
+        self.execution.llm_trace(event, content, **meta)
+        record = llm_conversations.redact({
             "ts": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
             "event": event,
             "content": str(content or ""),
             **{k: v for k, v in meta.items() if k not in {"api_key", "token", "secret"}},
-        }
+        }, secrets=self._llm_secrets)
         try:
             # 实时面板只服务于当前运行；新任务从头覆盖，避免长期运行把
             # 多轮对话无限追加，也让前端轮询不必读取历史大文件。
@@ -197,6 +249,8 @@ class StepContext:
 
     # ---- 取消 (协作式: 步骤在循环/分块间主动调用) ----
     def check_cancel(self) -> None:
+        if self._shutdown is not None and self._shutdown.is_set():
+            raise StepInterrupted("程序正在关闭，步骤已停止；已完成产物保留")
         if self._timeout.is_set():
             raise StepTimeout("步骤超过运行超时兜底, 已请求终止")
         if self._cancel.is_set():
@@ -324,7 +378,8 @@ class StepContext:
         finally:
             tmp.unlink(missing_ok=True)
         crud.add_artifact(self.project.id, self.step_key, kind, name,
-                          final, str(final.relative_to(self.pdir)))
+                          final, str(final.relative_to(self.pdir)),
+                          **self.artifact_audit())
         return final
 
     def write_json(self, name: str, data, kind: str = "json") -> Path:
@@ -340,7 +395,8 @@ class StepContext:
         except ValueError:
             rel = str(path)
         crud.add_artifact(self.project.id, self.step_key, kind, name,
-                          path, rel, replace_existing=replace_existing)
+                          path, rel, replace_existing=replace_existing,
+                          **self.artifact_audit())
         return path
 
     # ---- 配置读取 (项目级覆盖优先, 全局 config 兜底; 本次运行固定快照) ----
@@ -362,6 +418,33 @@ class StepContext:
                         target = target.setdefault(part, {})
                     target[parts[-1]] = copy.deepcopy(value)
         return node
+
+    def runtime_cfg(self, key: str, default=None):
+        """读取允许在运行中更新的连接/保护参数。
+
+        步骤的制作参数和模型快照仍由 :meth:`cfg` 固定，保证本次产物可复现。
+        少数明确列入 ``RUNTIME_PARAM_PATHS`` 的参数在原子工作边界重新读取，
+        例如逐句 TTS 的单次请求超时。已提交给服务的请求不会被中途改写，
+        只有下一句/下一次请求读取新值。
+        """
+        from dubforge.pipeline.step_params import RUNTIME_PARAM_PATHS
+        if key not in RUNTIME_PARAM_PATHS:
+            return self.cfg(key, default)
+        try:
+            from dubforge.configuration import step_values
+            values = step_values(self.project)
+            if key in values:
+                value = copy.deepcopy(values[key])
+                previous = getattr(self, '_runtime_values_seen', {}).get(key, object())
+                if previous != value:
+                    seen = getattr(self, '_runtime_values_seen', {})
+                    seen[key] = copy.deepcopy(value)
+                    self._runtime_values_seen = seen
+                    self.log(f'🔄 已应用运行中更新：{key}={value!r}；从当前未提交的请求边界生效')
+                return value
+        except Exception as exc:  # 配置热读是增强能力，不能阻断当前配音
+            self.log(f'⚠ 运行中读取 {key} 失败，继续使用本次快照：{exc}')
+        return self.cfg(key, default)
 
     def llm_profile_snapshot(self, selected: str | None = None) -> list[dict]:
         """返回本次运行固定的 LLM 配置组快照。
@@ -396,6 +479,14 @@ class StepContext:
         """由步骤提供剩余时间算法；轮询时直接计算，不依赖进度增长。"""
         self._eta_provider, self._eta_scope = provider, scope
 
+    def clear_phase_eta(self) -> None:
+        """阶段结束时撤下阶段估时，保持真实步骤进度和整步估时。"""
+        with self._progress_lock:
+            if self._eta_scope != "phase":
+                return
+            self._eta_provider = None
+            self.report_progress(getattr(self, "_last_pct", 0.0))
+
     def set_progress_provider(self, provider) -> None:
         """仅 LLM 提供实时预计进度；其他步骤继续使用实际回调进度。"""
         self._progress_provider = provider
@@ -403,6 +494,38 @@ class StepContext:
     def set_progress_phase(self, label: str, *, indeterminate=False) -> None:
         """没有真实工作量回调的准备阶段只显示状态，不编造百分比。"""
         self._progress_phase = (label, indeterminate)
+        self.execution.phase(label, label)
+
+    def set_progress_detail(self, detail: dict | None) -> None:
+        """登记供状态 API 展示的短小结构化进度详情。
+
+        详情只存在当前运行上下文内，不写入步骤产物；调用方应传入 JSON
+        标量，运行器只保留一层字典，避免日志/状态接口被任意对象污染。
+        """
+        if not isinstance(detail, dict):
+            return
+        allowed = {}
+        for key, value in detail.items():
+            if not isinstance(key, str) or len(key) > 64:
+                continue
+            if isinstance(value, float) and not math.isfinite(value):
+                continue
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                allowed[key] = value
+        with self._progress_lock:
+            self._progress_detail = allowed
+        metrics = {key: value for key, value in allowed.items()
+                   if key not in {'phase', 'label', 'detail', 'state', 'completed', 'total', 'unit', 'attempt', 'max_attempts'}}
+        self.execution.update(**{key: value for key, value in allowed.items()
+            if key in {'phase', 'label', 'detail', 'state', 'completed', 'total', 'unit', 'attempt', 'max_attempts'}}, metrics=metrics)
+
+    def report_execution(self, code, label, *, detail='', state='running', completed=None, total=None, unit=None, **metrics):
+        self._progress_phase = (label, completed is None or total is None)
+        with self._progress_lock:
+            self._progress_detail = dict(phase=code, label=label, detail=detail, state=state,
+                                         completed=completed, total=total, unit=unit, **metrics)
+        self.execution.phase(code, label, detail=detail, state=state, completed=completed,
+                             total=total, unit=unit, metrics=metrics)
 
     def report_eta(self, remaining_seconds: float) -> None:
         """登记从现在起的剩余时间；超过估计后撤下倒计时。"""
@@ -485,7 +608,7 @@ def _cfg_snapshot(cfg_keys: tuple[str, ...], overrides: dict | None = None, *, s
     return snap
 
 
-def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False) -> dict:
+def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False, legacy_execution=False) -> dict:
     """指纹的唯一输入表示；更新原因复用此数据，避免另写一套失效规则。"""
     from dubforge.pipeline.dependencies import Dependencies
     deps = dependencies or Dependencies(project)
@@ -501,7 +624,13 @@ def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, l
         if step_key == "translate":
             cfg_keys = ("translate", "llm")
     from dubforge.pipeline.config_fingerprint import snapshot
-    cfg_snapshot = snapshot(deps, step_key, keys=cfg_keys, legacy=legacy_config)
+    cfg_snapshot = snapshot(deps, step_key, keys=cfg_keys, legacy=legacy_config, execution=legacy_execution)
+    if step_key == 'assemble':
+        from dubforge.pipeline.output_cuts import snapshot as cut_snapshot
+        if cuts := cut_snapshot(deps):
+            from dubforge.pipeline.output_cuts import RENDER_VERSION as CUT_RENDER_VERSION
+            cfg_snapshot['output_cuts'] = cuts
+            cfg_snapshot['output_cuts_renderer'] = CUT_RENDER_VERSION
     if step_key in {'assemble', 'subtitles'} and deps.cfg('content_review.enabled', True):
         from dubforge.content_review import REVIEW_VERSION
         cfg_snapshot['content_review.version'] = REVIEW_VERSION
@@ -510,6 +639,11 @@ def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, l
                 arts.setdefault(source, deps.arts[source])
     if step_key == 'assemble' and isinstance(cfg_snapshot.get('assemble'), dict):
         assembly = cfg_snapshot['assemble']
+        # 关闭字号自适应后，下限只保留在表单，不影响实际成片。
+        if not assembly.get('subtitle_auto_fit', True):
+            assembly.pop('subtitle_min_size', None)
+            assembly.pop('subtitle_source_min_size', None)
+            assembly.pop('subtitle_shrink_width_percent', None)
         if not assembly.get('subtitle_source_style_enabled') or assembly.get('subtitle_track', 'trans') == 'trans':
             cfg_snapshot['assemble'] = {k: v for k, v in assembly.items() if not k.startswith('subtitle_source_')}
     # 原文来源已固定；保留旧指纹中的固定标记，复用整理稿对应的有效产物。
@@ -553,7 +687,8 @@ def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, l
         # 仅有有效逐句覆盖时扩展指纹，保留升级前的普通句级缓存。
         customized = [line for line in deps.dubbing_lines() if overrides(project, line)]
         if customized:
-            cfg_snapshot["line_settings"] = [line_fingerprint(project, line, dependencies=deps)
+            cfg_snapshot["line_settings"] = [line_fingerprint(project, line, dependencies=deps,
+                                              _legacy_service=bool(legacy_execution or legacy_config))
                                               for line in customized]
     payload = {
         "step": step_key,
@@ -566,10 +701,19 @@ def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, l
     if step_key in {'assemble', 'subtitles'} and deps.cfg('content_review.enabled', True):
         from dubforge.pipeline.subtitle_document import records
         payload['content_review_edits'] = records(project)
+        from dubforge.pipeline.content_redaction import fingerprint_effect
+        if (effect := fingerprint_effect(deps)) is not None:
+            payload['content_review_decisions'] = effect
     if step_key == 'assemble':
         from dubforge.pipeline.dubbing_edit import production_lines
         payload['dubbing_edit'] = [{k: l[k] for k in ('id', 'source', 'take')}
                                    for l in production_lines(project, deps.dubbing_lines(), deps.root, dependencies=deps)]
+        from dubforge.pipeline.audio_post import records as audio_gain_records
+        if gains := audio_gain_records(project):
+            payload['audio_line_gains'] = gains
+    if step_key in {'subtitles', 'assemble'}:
+        from dubforge.pipeline.voice_timing import fingerprint as placement_fingerprint
+        payload['voice_placement'] = placement_fingerprint(deps)
     if step_key in {"split", "translate"}:
         from dubforge.pipeline.text_prompts import ASR_CORRECTION_VERSION
         payload["correction_prompt"] = ASR_CORRECTION_VERSION
@@ -608,18 +752,18 @@ def fingerprint_payload(project: Project, step_key: str, *, dependencies=None, l
     return payload
 
 
-def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False) -> str:
+def compute_fingerprint(project: Project, step_key: str, *, dependencies=None, legacy=False, legacy_config=False, legacy_execution=False) -> str:
     """输入指纹 = 配置、上游产物以及首步源输入的稳定快照。"""
-    payload = fingerprint_payload(project, step_key, dependencies=dependencies,
-                                  legacy=legacy, legacy_config=legacy_config)
-    return hashlib.sha256(json.dumps(payload, sort_keys=True,
-                                     ensure_ascii=False).encode()).hexdigest()
+    from dubforge.utils.input_fingerprint import fingerprint_digest
+    return fingerprint_digest(fingerprint_payload(project, step_key, dependencies=dependencies,
+        legacy=legacy, legacy_config=legacy_config, legacy_execution=legacy_execution))
 
 
 class Runner:
     """全局单例: 受每步骤并行闸门约束的线程池 + 取消标志 + 心跳"""
 
     def __init__(self, max_workers: int = 8):
+        self._max_workers = max_workers
         self._pool = ThreadPoolExecutor(max_workers=max_workers,
                                         thread_name_prefix="dubforge-step")
         self._cancels: dict[tuple[int, str], threading.Event] = {}
@@ -631,15 +775,306 @@ class Runner:
         self._retries: dict[tuple[int, str], tuple[threading.Event, int, float]] = {}
         self._held: dict[str, int] = {}          # 每槽位键 (步骤或资源组) 当前占用数
         self._slot_cond = threading.Condition()
+        # 资源等待留在一个准入队列，不占用执行线程；全局池大小仍是并行上限。
+        self._pending_executions = []
+        self._slot_reservations = {}
+        self._admitted = 0
+        self._admission_stop = threading.Event()
         self._lock = threading.Lock()
         # 防止重复点击在“检查状态→置 queued→提交 Job”之间竞态。
         self._start_lock = threading.RLock()
+        self._shutdown = threading.Event()
+        self._closing = False
+        self._futures = set()
+        self._drained = threading.Condition(self._lock)
         self._active_jobs: dict[int, Job] = {}          # job.id -> Job (心跳用)
         self._heartbeat_stop = threading.Event()
-        threading.Thread(target=self._heartbeat_loop, daemon=True,
-                         name="dubforge-heartbeat").start()
+        self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                                                   name="dubforge-heartbeat")
+        self._heartbeat_thread.start()
+        self._start_admission()
+
+    def _start_admission(self):
+        self._admission_thread = threading.Thread(target=self._admit_executions,
+            args=(self._admission_stop,), daemon=True, name='dubforge-admission')
+        self._admission_thread.start()
+
+    def _queue_execution(self, *args):
+        future = Future()
+        with self._slot_cond:
+            self._pending_executions.append((future, args))
+            self._slot_cond.notify_all()
+        return future
+
+    def _admit_executions(self, stop):
+        """按资源内入队次序准入；被占用资源不会挡住其他空闲资源。"""
+        while not stop.is_set():
+            picked = None
+            admission_error = None
+            with self._slot_cond:
+                for index, (future, args) in enumerate(self._pending_executions):
+                    cancel, step_key = args[5], args[1]
+                    if future.cancelled() or cancel.is_set():
+                        picked = self._pending_executions.pop(index)
+                        break
+                    try:
+                        key = self._slot_key(step_key)
+                        limit = self.concurrency_limit(step_key)
+                    except (TypeError, ValueError, AttributeError):
+                        admission_error = DubForgeError('执行资源并行配置无效，请检查设置后重试', code='RUNNER_RESOURCE_INVALID')
+                        picked = self._pending_executions.pop(index)
+                        break
+                    if self._admitted < self._max_workers and self._held.get(key, 0) < limit:
+                        self._held[key] = self._held.get(key, 0) + 1
+                        self._slot_reservations[cancel] = key
+                        self._admitted += 1
+                        picked = self._pending_executions.pop(index)
+                        break
+                if picked is None:
+                    self._slot_cond.wait(.2)
+                    continue
+            future, args = picked
+            cancel = args[5]
+            if admission_error is not None:
+                if future.set_running_or_notify_cancel():
+                    future.set_exception(admission_error)
+                continue
+            if cancel.is_set() or future.cancelled():
+                self._release_admission(cancel)
+                future.cancel()
+                continue
+            try:
+                with self._start_lock:
+                    if stop.is_set():
+                        self._release_admission(cancel)
+                        future.cancel()
+                        continue
+                    task = self._pool.submit(self._execute_admitted, future, args)
+                task.add_done_callback(lambda task, future=future, cancel=cancel:
+                                       self._admission_finished(task, future, cancel))
+            except Exception:
+                self._release_admission(cancel)
+                if future.set_running_or_notify_cancel():
+                    future.set_exception(DubForgeError('步骤未能提交到执行线程，请重新运行', code='RUNNER_SUBMIT_FAILED'))
+                logger.exception('步骤未能提交到执行线程')
+
+    def _execute_admitted(self, future, args):
+        if future.set_running_or_notify_cancel():
+            return self._execute(*args)
+
+    def _release_admission(self, cancel, *, admitted=False):
+        with self._slot_cond:
+            key = self._slot_reservations.pop(cancel, None)
+            if key is not None:
+                self._held[key] = max(0, self._held.get(key, 0) - 1)
+            if admitted or key is not None:
+                self._admitted = max(0, self._admitted - 1)
+            self._slot_cond.notify_all()
+
+    def _admission_finished(self, task, future, cancel):
+        # _execute 若在认领预留前取消，仍由此回收；认领后沿用原 finally 释放槽。
+        self._release_admission(cancel, admitted=True)
+        if task.cancelled():
+            future.cancel()
+        elif not future.cancelled():
+            error = task.exception()
+            if error is not None:
+                future.set_exception(error)
+            else:
+                future.set_result(task.result())
+
+    def startup(self) -> None:
+        """同进程再次进入应用生命周期时，旧任务收尾完成后才重新开放。"""
+        with self._start_lock, self._lock:
+            if not self._closing:
+                return
+            if self._futures or self._admitted:
+                raise DubForgeError("上次关闭的任务仍在收尾，暂不能重新启动执行器", code="RUNNER_FINALIZING")
+            self._pool = ThreadPoolExecutor(max_workers=self._max_workers,
+                                            thread_name_prefix="dubforge-step")
+            self._shutdown.clear()
+            self._pending_executions = []
+            self._admission_stop = threading.Event()
+            self._closing = False
+            self._heartbeat_stop = threading.Event()
+            self._heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True,
+                                                       name="dubforge-heartbeat")
+            self._heartbeat_thread.start()
+            self._start_admission()
+
+    def request_shutdown(self) -> None:
+        """先关闭入队边界，再取消排队/在途任务；不等待任务持有的领域锁。"""
+        with self._start_lock:
+            with self._lock:
+                self._closing = True
+                self._shutdown.set()
+                self._admission_stop.set()
+                for event in self._cancels.values():
+                    event.set()
+                for event in self._pauses.values():
+                    event.clear()
+                for event, _, _ in self._retries.values():
+                    event.set()
+                self._retries.clear()
+                futures = list(self._futures)
+            self._heartbeat_stop.set()
+            with self._slot_cond:
+                self._pending_executions.clear()
+                self._slot_cond.notify_all()
+            # 尚未进入 worker 的任务没有 finally，由完成回调记录中断状态。
+            for future in futures:
+                future.cancel()
+            self._pool.shutdown(wait=False, cancel_futures=True)
+        self._admission_thread.join(timeout=1)
+
+    def wait_for_shutdown(self, timeout: float = 5) -> int:
+        """等待有限时间，返回仍在安全收尾的任务数；不强杀进程内计算。"""
+        deadline = time.monotonic() + max(0.0, timeout)
+        with self._drained:
+            while self._futures:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._drained.wait(remaining)
+            return len(self._futures)
+
+    def shutdown(self, timeout: float = 5) -> int:
+        self.request_shutdown()
+        return self.wait_for_shutdown(timeout)
+
+    def _queued_interrupted(self, project, step_key, job, cancel, pause, *, error=None) -> None:
+        """排队 Future 被取消时只改变任务状态，已有正式产物不受影响。"""
+        key = (project.id, step_key)
+        error = error or (StepInterrupted("程序正在关闭，尚未开始的步骤已停止") if self._shutdown.is_set()
+                          else StepCancelled("步骤在排队时被取消"))
+        with self._lock:
+            abandoned = key in self._abandoned
+        step = crud.get_step(project.id, step_key)
+        if step is not None and not abandoned:
+            step.status = "failed"
+            step.error_code, step.error_message = error.code, error.message
+            step.error_suggestion = error.suggestion
+            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
+            crud.save_step(step)
+        job.status = 'cancelled' if isinstance(error, StepCancelled) else 'failed'
+        job.error_detail = '强制结束' if abandoned else error.message
+        job.finished_at = datetime.datetime.now(datetime.timezone.utc)
+        crud.update_job(job)
+        if not abandoned:
+            self._hold_chain(project, step_key, error.code, error.message, job=job)
+        with self._lock:
+            if self._current_jobs.get(key) is job:
+                self._current_jobs.pop(key, None)
+            if self._cancels.get(key) is cancel:
+                self._cancels.pop(key, None)
+            if self._pauses.get(key) is pause:
+                self._pauses.pop(key, None)
+            self._abandoned.discard(key)
+        if crud.get_project(project.uid) is not None and crud.project_dir(project.uid).is_dir():
+            crud.write_manifest(project.uid)
+            self._refresh_project_status(project.uid)
 
     # ============ 启动/恢复 ============
+
+    @staticmethod
+    def _chain_signature(params) -> str:
+        """任务只推进入队时的剩余计划，不把后来确认的计划当作自己的。"""
+        return hashlib.sha256(json.dumps({
+            'remaining': params.get('_chain'),
+            'execution': params.get('_chain_resume_plan'),
+        }, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+
+    @classmethod
+    def _owns_chain(cls, params, binding, job_id) -> bool:
+        return (isinstance(binding, dict) and type(job_id) is int
+                and params.get('_chain_job_id') == job_id
+                and binding.get('signature') == cls._chain_signature(params))
+
+    def _completed_version_chain(self, project, params, session) -> bool:
+        """只清理有成功证据的合成链尾；不启动任务、不补写旧任务来源。"""
+        from sqlmodel import select
+        from dubforge import comment_studio
+        from dubforge.pipeline import assembly_versions as versions
+        from dubforge.pipeline.dependencies import Dependencies
+
+        if params.get('_chain') != ['assemble']:
+            return False
+        if params.get('_chain_state') == 'held':
+            hold = params.get('_chain_hold') or {}
+            if (not isinstance(hold, dict) or hold.get('code') != 'STEP_INTERRUPTED'
+                    or hold.get('step') != 'assemble'):
+                return False
+        elif params.get('_chain_state', 'active') != 'active':
+            return False
+        try:
+            job = session.exec(select(Job).where(Job.project_id == project.id)
+                               .order_by(Job.id.desc()).limit(1)).first()
+            step = session.exec(select(StepRun).where(StepRun.project_id == project.id,
+                                                     StepRun.step_key == 'assemble')).first()
+            if (not job or job.step_key != 'assemble' or job.status != 'done'
+                    or job.error_detail or not step or step.status != 'done'
+                    or not step.input_fingerprint):
+                return False
+            task, snapshot = json.loads(job.task_data), json.loads(step.input_snapshot)
+            if (task.get('scope') != 'versions' or snapshot.get('scope') != 'versions'
+                    or snapshot.get('step') != 'assemble' or snapshot.get('incomplete_comments')
+                    or snapshot.get('fingerprint') != step.input_fingerprint):
+                return False
+            # Step 的完成记录必须来自这个 Job，不能拿较早的成功文件抹掉后来失败。
+            times = [job.started_at, step.started_at, step.finished_at, job.finished_at]
+            if any(value is None for value in times):
+                return False
+            times = [value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None
+                     else value for value in times]
+            if times != sorted(times):
+                return False
+            captured = datetime.datetime.fromisoformat(snapshot['captured_at'])
+            if captured.tzinfo is None or not times[0] <= captured <= times[-1]:
+                return False
+            specs = task.get('version_specs')
+            if not isinstance(specs, list) or not specs:
+                return False
+            definitions = versions.validate_list([{key: row[key] for key in (
+                'id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides', 'partial', 'update', 'timeline') if key in row}
+                for row in specs])
+            ids = [row['id'] for row in definitions]
+            if snapshot.get('selection', {}).get('version_ids') != ids:
+                return False
+            if task.get('chain_binding'):
+                if not self._owns_chain(params, task['chain_binding'], job.id):
+                    return False
+            else:
+                # 旧版本任务没有 owner。只兼容有冻结恢复方案、且没有新版绑定的链尾。
+                frozen = params.get('_chain_resume_plan')
+                if (params.get('_chain_job_id') is not None or not isinstance(frozen, dict)
+                        or frozen.get('version_definitions_digest') != versions.digest(definitions)):
+                    return False
+            if versions.catalog(project.uid)['versions'] != definitions:
+                return False
+            deps = Dependencies(project)
+            overlay = comment_studio.effective_overlay(project.uid, comment_studio._read(project).get('overlay'))
+            resolved = [versions.resolve(deps, row, comment_plan=overlay) for row in definitions]
+            deps = deps.with_versions(resolved)
+            actual = 'versions:' + versions.digest([versions.fingerprint(deps, row) for row in resolved])
+            from dubforge.pipeline.version_render import uses_source_directly
+            from dubforge.pipeline.video_source import resolve_video
+
+            def completed_version(row):
+                scoped = deps.for_version(row)
+                if not uses_source_directly(scoped, row):
+                    return versions.is_current(deps, row)
+                source = resolve_video(project, deps.root)
+                registered = scoped.path('download', 'video.mp4')
+                artifact = scoped.arts.get('download/video.mp4')
+                return bool(source and registered and artifact and artifact.sha256 and artifact.size > 0
+                            and source.resolve() == registered.resolve()
+                            and source.stat().st_size == artifact.size and not scoped.unready('assemble'))
+
+            # 启动恢复不扫描 GB 级视频；核对登记哈希、文件大小、版本指纹和所有上游依赖。
+            return (actual == step.input_fingerprint
+                    and all(completed_version(row) for row in resolved))
+        except (DubForgeError, OSError, TypeError, ValueError, KeyError, AttributeError):
+            return False
 
     def recover(self) -> dict:
         """进程启动时调用: 上次运行残留的 running 状态一律判中断 (原子写保证产物完整)"""
@@ -682,7 +1117,13 @@ class Runner:
                 params = crud.project_params(project)
                 if '_chain' in params:
                     chain = [k for k in (params.get('_chain') or []) if k in STEP_KEYS]
-                    if chain:
+                    if (chain and not interrupted.get(project.id)
+                            and project.id not in project_ids
+                            and self._completed_version_chain(project, params, s)):
+                        for key in ('_chain', '_chain_state', '_chain_hold', '_chain_resume_plan', '_chain_job_id', '_chain_dubbing'):
+                            params.pop(key, None)
+                        logger.info('恢复时已核对并结束成功的制作计划: 项目 %s', project.uid)
+                    elif chain:
                         # 兼容旧数据 (链头启动前已出队): 中断且位于链头之前的步骤补回。
                         heads = sorted(
                             (k for k in interrupted.get(project.id, [])
@@ -690,17 +1131,27 @@ class Runner:
                              and STEP_KEYS.index(k) < STEP_KEYS.index(chain[0])),
                             key=STEP_KEYS.index)
                         params['_chain'] = heads + chain
+                        invalid_hold = (params.get('_chain_state') == 'held'
+                                        and not isinstance(params.get('_chain_hold'), dict))
+                        preserve_hold = (not heads and not interrupted.get(project.id)
+                                         and params.get('_chain_state') == 'held'
+                                         and isinstance(params.get('_chain_hold'), dict)
+                                         and params['_chain_hold'].get('code'))
                         params['_chain_state'] = 'held'
-                        params['_chain_hold'] = {
-                            'step': (heads or chain)[0],
-                            'code': 'STEP_INTERRUPTED',
-                            'message': '上次执行被中断 (进程退出)',
-                        }
+                        if not preserve_hold:
+                            params['_chain_hold'] = {
+                                'step': (heads or chain)[0],
+                                'code': 'CHAIN_INVALID' if invalid_hold else 'STEP_INTERRUPTED',
+                                'message': ('保留的制作计划记录不完整，请检查恢复方案后继续'
+                                            if invalid_hold else '上次执行被中断 (进程退出)'),
+                            }
                     else:
                         # 空链 = 计划已跑完, 清理登记即可。
                         params.pop('_chain', None)
                         params.pop('_chain_state', None)
                         params.pop('_chain_hold', None)
+                        params.pop('_chain_resume_plan', None)
+                        params.pop('_chain_job_id', None)
                     project.params = json.dumps(params, ensure_ascii=False)
                     s.add(project)
                     project_ids.add(project.id)
@@ -723,9 +1174,8 @@ class Runner:
     def output_file_edit(self, uid):
         """成品回收与合成入队互斥；强制结束后的收尾同样需要保护。"""
         with self._start_lock:
-            project = crud.get_project(uid)
-            if not project:
-                raise DubForgeError('项目不存在', code='PROJECT_NOT_FOUND')
+            from dubforge.project_archive import assert_active
+            project = assert_active(uid)
             step = crud.get_step(project.id, 'assemble')
             if (self.current_job_id(project.id, 'assemble') is not None
                     or step and step.status in {'running', 'queued'}):
@@ -733,7 +1183,7 @@ class Runner:
             yield project
 
     def start_step(self, uid: str, step_key: str, force: bool = False, *,
-                   resume_chain: bool = False) -> dict:
+                   resume_chain: bool = False, dubbing=None, dubbing_operation_id=None) -> dict:
         from dubforge.pipeline import dubbing_session
         from dubforge import video_info
         with self._start_lock, dubbing_session.gate, video_info.gate:
@@ -742,16 +1192,34 @@ class Runner:
             dubbing_session.check_idle(uid)
             # 启动成功后才激活挂起链: 校验失败 (依赖未就绪/占用中) 时保留
             # 挂起标记与原因, chain/resume 入口不丢失。
-            r = self._start_step(uid, step_key, force)
+            # 工作流显式传入本轮意图；旧制作链从自己的持久计划读取同一策略。
+            # 手动合成所选句子有独立范围，不走这条链入口。
+            if step_key == 'tts' and dubbing is None:
+                project = crud.get_project(uid)
+                binding = crud.project_params(project).get('_chain_dubbing') if project else None
+                if isinstance(binding, dict) and crud.project_params(project).get('_chain'):
+                    dubbing, dubbing_operation_id = binding.get('policy'), binding.get('operation_id')
+            r = self._start_step(uid, step_key, force, dubbing=dubbing,
+                                 dubbing_operation_id=dubbing_operation_id)
             if resume_chain:
                 self._activate_chain(uid)
             return r
 
-    def start_dubbing(self, uid: str, line_ids, *, takes=None, force=True) -> dict:
-        from dubforge.pipeline import dubbing_session
+    def start_dubbing(self, uid: str, line_ids, *, takes=None, force=True, expected=None,
+                      append_to_job_id=None) -> dict:
+        from dubforge.pipeline import dubbing_session, live_dubbing
         with self._start_lock, dubbing_session.gate:
+            project = crud.get_project(uid)
+            if append_to_job_id is not None:
+                job, active, _ = live_dubbing._active(project) if project is not None else (None, False, False)
+                if type(append_to_job_id) is not int or not active or job.id != append_to_job_id:
+                    raise DubForgeError('原配音队列已结束或已更换，请刷新后重新选择生成操作',
+                                        code='LINE_UPDATE_QUEUE_CLOSED')
+            if project is not None and live_dubbing._active(project)[1]:
+                return live_dubbing.enqueue_generation(project, line_ids, takes=takes,
+                                                        force=force, expected=expected)
             dubbing_session.check_idle(uid)
-            return self._start_step(uid, 'tts', force, selection=(line_ids, takes))
+            return self._start_step(uid, 'tts', force, selection=(line_ids, takes, expected))
 
     def start_assemble_preview(self, uid: str, start: float, end: float, *, include_comments=False, overlay_revision=None, output=None) -> dict:
         import math
@@ -759,7 +1227,8 @@ class Runner:
                 or not math.isfinite(start) or not math.isfinite(end)):
             raise DubForgeError("试合成区域无效，请填写有限时间", code="ASSEMBLE_PREVIEW_RANGE")
         start, end = float(start), float(end)
-        if start < 0 or end <= start or end - start < 0.2:
+        # 边界如 9.8→10 的浮点差可能略小于 0.2；仅容忍计算误差。
+        if start < 0 or end <= start or end - start < 0.2 - 1e-9:
             raise DubForgeError("试合成区域需满足 0 ≤ 起点 < 终点，且至少 0.2 秒",
                                 code="ASSEMBLE_PREVIEW_RANGE",
                                 suggestion="请在视频预览中重新拖选一段区域。")
@@ -798,30 +1267,48 @@ class Runner:
         with self._start_lock, dubbing_session.gate, video_info.gate:
             dubbing_session.check_idle(uid)
             candidate = frozen or versions.plan(uid, body, allow_draft=preview)
+            if preview and candidate.get('force_rebuild'):
+                raise versions.VersionError('试片不支持完整重制，请从正式生成入口建立新的完整成片。')
+            if preview and any(v.get('partial') or v.get('update') or v.get('timeline') for v in candidate.get('versions', [])):
+                raise versions.VersionError('局部修订请生成完整的新成片后预览；试片不能展示范围外保留的基准画面。')
             if candidate.get('blockers'):
                 raise DubForgeError('版本依赖未就绪，请先准备所需步骤', code='DEPS_NOT_MET')
             if not preview and frozen is None and candidate['fingerprint'] != body.get('fingerprint'):
                 raise versions.VersionError('版本效果或输入已变化，请重新预检', code='ASSEMBLY_VERSION_CONFLICT')
             task = dict(scope='preview' if preview else 'versions', version_specs=candidate['versions'])
+            if not preview and candidate.get('force_rebuild'):
+                task['force_rebuild'] = True
             if preview:
                 start, end = body.get('start'), body.get('end')
                 if (type(start) not in (int, float) or type(end) not in (int, float)
-                        or not all(math.isfinite(x) for x in (start, end)) or start < 0 or end - start < .2 or len(candidate['versions']) != 1):
+                        or not all(math.isfinite(x) for x in (start, end)) or start < 0 or end - start < .2 - 1e-9 or len(candidate['versions']) != 1):
                     raise versions.VersionError('请选择一个版本及有效的试片范围（至少0.2秒）')
+                cuts = candidate['versions'][0].get('output_cuts')
+                if cuts:
+                    from dubforge.pipeline.output_cuts import keep_segments, OutputCutsError
+                    if not keep_segments(cuts, start, end):
+                        raise OutputCutsError('试片范围全部位于删除片段内，请选择包含保留画面的区间。',
+                                              code='OUTPUT_CUTS_PREVIEW_EMPTY')
                 task.update(start=start, end=end)
+                # 评论方案已由 plan 校验；将其身份与任务一同冻结，供生成后的试片核对。
+                if candidate['versions'][0]['include_comments']:
+                    task['overlay_revision'] = body.get('overlay_revision')
             return self._start_step(uid, 'assemble', task_data=task, clear_chain_reason='运行明确选择的成片版本')
 
     def _start_step(self, uid: str, step_key: str, force: bool = False, *,
-                    selection=None, task_data=None, clear_chain_reason=None) -> dict:
+                    selection=None, task_data=None, clear_chain_reason=None,
+                    dubbing=None, dubbing_operation_id=None) -> dict:
+        if self._closing:
+            raise DubForgeError("程序正在关闭，暂不能启动新任务", code="RUNNER_SHUTTING_DOWN",
+                                suggestion="请等待程序重新启动后继续。")
         from dubforge.workflows import check_idle
+        from dubforge.project_archive import assert_active
         check_idle(uid)
+        project = assert_active(uid)
         if step_key not in STEP_MAP:
             raise DubForgeError(f"步骤不存在: {step_key}", code="STEP_NOT_FOUND",
                                 suggestion=f"合法步骤: {', '.join(STEP_KEYS)}")
         step_def = STEP_MAP[step_key]
-        project = crud.get_project(uid)
-        if not project:
-            raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
         # 幽灵项目门禁: 目录不在磁盘上 (被移走/删除) 不允许启动 —— 启动只会
         # 失败并"补回"一个空目录骨架, 让项目列表失真。从回收站还原目录后即可恢复。
         pdir = crud.project_dir(uid)
@@ -855,7 +1342,15 @@ class Runner:
 
         # 按当前设置检查实际需要的文件，缺失或过期均在入队前说明。
         from dubforge.pipeline.dependencies import Dependencies
+        chain_source = selection is None and not task_data and clear_chain_reason is None
         task_data = task_data or {}
+        # 分块语义整理失败后，下一次“重做本步”应恢复已经通过校验的块。
+        # 这只打开按完整提示/输入指纹绑定的响应缓存；最终产物仍会重新写入，
+        # 已完成步骤的主动重做不会复用旧块，保留 force 的直觉语义。
+        resume_split_cache = force and step_key == 'split' and step.status in {'failed', 'interrupted'}
+        if resume_split_cache:
+            task_data = dict(task_data)
+            task_data['resume_split_cache'] = True
         if step_key == 'assemble' and not task_data:
             from dubforge.pipeline import assembly_versions
             from dubforge import comment_studio
@@ -864,7 +1359,7 @@ class Runner:
             versions = [assembly_versions.resolve(base,v) for v in definitions]
             base.with_versions(versions).require(step_key)
             overlay, auto_comments = None, False
-            if any(v['include_comments'] for v in definitions):
+            if any(v['include_comments'] and not v.get('update') and not v.get('timeline') for v in definitions):
                 from dubforge import comments_auto
                 overlay, auto_comments = comments_auto.confirmed_or_auto(uid, project)
             task_data = dict(scope='versions', version_specs=[assembly_versions.resolve(base,v,comment_plan=overlay) for v in definitions])
@@ -874,6 +1369,19 @@ class Runner:
         outputs_run = task_data.get("scope") == "outputs"
         versions_run = bool(task_data.get('version_specs'))
         deps = Dependencies(project, assemble_variants=task_data.get("variants") if outputs_run or trial_only else None)
+        policy_run = step_key == 'tts' and dubbing is not None and selection is None
+        if policy_run:
+            import uuid
+            from dubforge.pipeline import dubbing_policy
+            policy = dubbing_policy.normalize(dubbing)
+            operation_id = dubbing_operation_id or uuid.uuid4().hex
+            if not isinstance(operation_id, str) or not operation_id or len(operation_id) > 200:
+                raise DubForgeError('配音运行标识无效，请重新检查', code='DUB_POLICY_INVALID')
+            # 这里只登记意图；排队期间配置可修改，拿到执行槽位后才冻结句子和目标槽。
+            task_data = dict(scope='policy', policy=policy, operation_id=operation_id)
+            if policy['line_settings'] == 'project':
+                deps = Dependencies(dubbing_policy.synthesis_project(project, policy),
+                                    settings=deps.settings, overrides=deps.overrides)
         if versions_run:
             deps = deps.with_versions(task_data['version_specs'])
         if selection is not None:
@@ -881,7 +1389,15 @@ class Runner:
             task_data = prepare(project, deps, *selection)
             self._clear_chain(project, '手动合成所选句子')
         else:
-            deps.require(step_key)
+            if policy_run:
+                policy_summary = dubbing_policy.preview(project, policy, dependencies=deps,
+                    operation_id=operation_id)
+                # 纯时间修复消费旧声音快照的参考文件，实际需求由 prepare 核验；
+                # 项目后来选择的新音色/动态参考不应阻断旧配音修复。
+                if policy_summary.get('generate') or policy_summary.get('deferred') or not policy_summary.get('repair'):
+                    deps.require(step_key)
+            else:
+                deps.require(step_key)
             if clear_chain_reason:
                 self._clear_chain(project, clear_chain_reason)
 
@@ -890,7 +1406,7 @@ class Runner:
         if versions_run:
             from dubforge.pipeline import assembly_versions
             fp = 'versions:' + assembly_versions.digest([assembly_versions.fingerprint(deps, v) for v in task_data['version_specs']])
-            if not force and not trial_only and step.status == 'done' and all(
+            if not force and not task_data.get('force_rebuild') and not trial_only and step.status == 'done' and all(
                     assembly_versions.is_current(deps, v, verify_hash=True) for v in task_data['version_specs']):
                 return {'status':'skipped','message':'所选版本的输入与成品均未变化，无需重跑'}
         if outputs_run:
@@ -903,11 +1419,19 @@ class Runner:
             if task_data.get('comment_overlay') and default_variants(deps.cfg)[0] not in task_data['variants']:
                 # 评论版不能使不含评论的流程默认版被误判为最新。
                 fp = 'comments:' + hashlib.sha256((fp + json.dumps(task_data['comment_overlay'], sort_keys=True)).encode()).hexdigest()
+        policy_pending = False
+        if policy_run:
+            policy_pending = bool(policy_summary['generate'] or policy_summary.get('repair'))
         if (selection is None and not trial_only and not outputs_run and not versions_run and not force
+                and not policy_pending
                 and ((step_key != 'tts' and step.status == "done" and deps.matches_fingerprint(step_key))
                      or (step_key == "tts" and deps.fresh("tts")))
                 and (step_key == 'tts' or crud.step_artifacts_exist(project.id, step_key, verify_hash=True))):
             return {"status": "skipped", "message": "输入未变化 (配置与上游产物一致), 无需重跑"}
+
+        # 保存本次启动前的登记摘要。下游只有在本步骤真正写出不同产物后才会
+        # 被标记需更新；设置变化本身不会把“需更新”向下游传播。
+        previous_artifacts = self._artifact_signature(project.id, step_key)
 
         # 入队前保存重建语义。下面会先把行状态改成 queued；若只在
         # _execute() 里读取状态，failed/stale 会被 queued 覆盖，重试时可能
@@ -919,11 +1443,10 @@ class Runner:
                  or (step.input_fingerprint and step.input_fingerprint != fp)))
 
         if force:
-            # 配音保留已完成的句子；下载在校验新文件后替换，不能在入队前删旧登记。
-            # 其他步骤沿用各自产物清理规则；下游已有结果置 stale。
-            if step_key not in {'tts', 'download'}:
+            # 配音保留已完成的句子；下载、翻译在完整成功后替换，不能在入队前删旧登记。
+            # 其他步骤沿用各自产物清理规则；下游状态等本步成功后比较摘要再决定。
+            if step_key not in {'tts', 'download', 'translate'}:
                 crud.delete_step_artifacts(project.id, step_key)
-            self._mark_downstream_stale(project.id, step_key)
 
         cancel = threading.Event()
         pause = threading.Event()
@@ -941,19 +1464,50 @@ class Runner:
 
         log_file = crud.project_dir(uid) / "logs" / f"{step_key}.log"
         log_file.parent.mkdir(parents=True, exist_ok=True)
+        if chain_source:
+            latest = crud.get_project(uid)
+            params = crud.project_params(latest)
+            chain = params.get('_chain')
+            if isinstance(chain, list) and chain and chain[0] == step_key:
+                task_data['chain_binding'] = {'signature': self._chain_signature(params)}
         job = crud.add_job(project.id, step_key, str(log_file), task_data=task_data)
+        job.execution = json.dumps(Recorder(owner='step', job_id=job.id).phase(
+            'queue', '等待执行资源', state='queued', metrics={'resource': self._slot_key(step_key)}), ensure_ascii=False)
+        crud.update_job(job, execution_only=True)
+        if task_data.get('chain_binding'):
+            params['_chain_job_id'] = job.id
+            latest.params = json.dumps(params, ensure_ascii=False)
+            crud.save_project(latest)
         with open(log_file, "a", encoding="utf-8") as f:
             f.write(f"\n===== 运行开始 {datetime.datetime.now().astimezone().isoformat(timespec='seconds')} "
                     f"(任务#{job.id}, force={force}) =====\n")
 
         with self._lock:
             self._current_jobs[k] = job
-        fut = self._pool.submit(self._execute, project, step_key, step_def, job,
-                                log_file, cancel, pause, fp, force, rebuild)
+        fut = self._queue_execution(project, step_key, step_def, job,
+                                log_file, cancel, pause, fp, force, rebuild,
+                                previous_artifacts)
+        with self._lock:
+            self._futures.add(fut)
         # future 异常必须被观测, 否则线程池静默吞错 (排查问题时是盲区)
-        fut.add_done_callback(
-                lambda f: f.exception() and logger.error(
-                "步骤任务异常退出: %s", f.exception(), exc_info=f.exception()))
+        def finished(future):
+            try:
+                if future.cancelled():
+                    self._queued_interrupted(project, step_key, job, cancel, pause)
+                elif error := future.exception():
+                    logger.error("步骤任务异常退出: %s", error, exc_info=error)
+                    current = crud.get_step(project.id, step_key)
+                    if current is not None and current.status == 'queued':
+                        self._queued_interrupted(project, step_key, job, cancel, pause,
+                            error=error if isinstance(error, DubForgeError) else
+                            DubForgeError('步骤未能开始执行，请重新运行', code='RUNNER_SUBMIT_FAILED'))
+            except Exception:
+                logger.exception("关闭时记录排队任务失败: %s", job.id)
+            finally:
+                with self._drained:
+                    self._futures.discard(future)
+                    self._drained.notify_all()
+        fut.add_done_callback(finished)
         result = {"status": "started", "job_id": job.id, "log": str(log_file)}
         if task_data.get("scope") == "preview":
             result.update({"start": task_data["start"], "end": task_data["end"]})
@@ -966,14 +1520,23 @@ class Runner:
     def _execute(self, project: Project, step_key: str, step_def, job: Job,
                  log_file: Path, cancel: threading.Event,
                  pause: threading.Event, fingerprint: str,
-                 force: bool = False, rebuild: bool = False) -> None:
+                 force: bool = False, rebuild: bool = False,
+                 previous_artifacts: dict | None = None) -> None:
         from dubforge.pipeline.steps import get_runner
         pdir = crud.project_dir(project.uid)
         ctx = StepContext(project, step_key, pdir, log_file, cancel, pause,
-                          force=force, job_id=job.id)
+                          force=force, job_id=job.id, shutdown_event=self._shutdown,
+                          defer_snapshot=True)
         ctx.task_data = json.loads(job.task_data)
         ctx.trial_only = ctx.task_data.get("scope") == "preview"
         ctx._job = job
+        try:
+            previous_execution = json.loads(job.execution)
+        except (TypeError, ValueError):
+            previous_execution = {}
+        ctx.execution = Recorder(ctx._persist_execution, previous=previous_execution,
+                                 owner='step', job_id=job.id)
+        report_stage(ctx, 'queue', '等待执行资源', state='queued', resource=self._slot_key(step_key))
         k = (project.id, step_key)
 
         # 取 DB 里的最新 step 行 (start_step 读到的可能是旧快照);
@@ -984,21 +1547,73 @@ class Runner:
             self._ctxs[k] = ctx
 
         try:
+            ctx.check_cancel()
             # 队列中已被取消 → 直接退出
             if cancel.is_set():
                 raise StepCancelled("步骤在排队时被取消")
             # 并发闸门: 资源组/每步骤并行度 (GPU 组=1, 下载/LLM 类可多并行)
             slot_key = self.acquire_slot(step_key, cancel)
+            ctx._resource_slot = slot_key
             try:
                 if cancel.is_set():   # 等额度期间被取消 → 不执行
                     raise StepCancelled("步骤在排队时被取消")
                 if step is None:
                     raise StepCancelled("项目已删除, 结果丢弃")
+                # queued → running 与配置保存共用启动锁。先把状态公开为 running，
+                # 再冻结配置，保证保存要么发生在快照之前，要么被当前步骤字段门禁拒绝。
+                with self._start_lock:
+                    latest = crud.get_step(project.id, step_key)
+                    if latest is None or latest.status not in {'queued', 'running'}:
+                        raise StepCancelled("步骤已不在排队状态")
+                    if latest.status == 'queued':
+                        latest.status = 'running'
+                        latest.started_at = datetime.datetime.now(datetime.timezone.utc)
+                        crud.save_step(latest)
+                    step = latest
+                # 直到这里才绑定配置；queued 阶段保存的新设置对本次任务生效。
+                with self._start_lock:
+                    ctx.freeze_configuration()
+                    if step_key == 'assemble':
+                        from dubforge.pipeline.output_cuts import snapshot as cut_snapshot
+                        # 排队时采用最新剪辑；一旦运行就固定，即使用户保存下次方案也不热切换。
+                        cut_deps = ctx.dependencies()
+                        if hasattr(cut_deps, '_output_cuts_snapshot'):
+                            del cut_deps._output_cuts_snapshot
+                        immutable_cuts = bool(ctx.task_data.get('version_specs')) and all(
+                            v.get('timeline') for v in ctx.task_data['version_specs'])
+                        ctx.task_data['output_cuts'] = (None if immutable_cuts else copy.deepcopy(cut_snapshot(cut_deps)))
+                        if ctx.task_data.get('version_specs'):
+                            # 版本方案已经在入队时解析并冻结；仅为旧调用者
+                            # 未携带 output_cuts 字段的规格补回项目级默认方案，
+                            # 不能再把一个项目级方案覆盖到其他版本。
+                            project_cuts = copy.deepcopy(ctx.task_data['output_cuts'])
+                            ctx.task_data['version_specs'] = [
+                                # project scope 表示入队时只是回退到全局默认；
+                                # 排队期间全局方案变化时仍采用最新值，保留
+                                # 原有“队列可编辑”语义。显式 version scope
+                                # 则完全冻结，删除/恢复不会串到其他版本。
+                                ({**v, 'output_cuts': project_cuts}
+                                 if not v.get('update') and not v.get('timeline') and v.get('output_cuts_scope', 'project') == 'project'
+                                 else v)
+                                for v in ctx.task_data['version_specs']]
+                        ctx.save_task_data()
+                project = ctx.project
                 # 入队与真正执行之间设置可能改变；记录实际执行快照，不能把
                 # 入队指纹和另一时刻的配置拼成一份虚假的生成历史。
                 scoped_outputs = ctx.task_data.get('scope') in {'outputs', 'preview'}
                 execution_deps = ctx.dependencies(
                     assemble_variants=ctx.task_data.get('variants') if scoped_outputs else None)
+                if step_key == 'tts' and ctx.task_data.get('scope') == 'policy':
+                    from dubforge.pipeline import dubbing_policy
+                    binding = ctx.task_data.get('chain_binding')
+                    ctx.task_data = dubbing_policy.prepare(project, execution_deps,
+                        ctx.task_data['policy'], ctx.task_data['operation_id'], exclude_job_id=job.id)
+                    if binding:
+                        ctx.task_data['chain_binding'] = binding
+                    ctx.save_task_data()
+                    if ctx.task_data['policy']['line_settings'] == 'project':
+                        execution_deps = dubbing_policy._execution_dependencies(project, execution_deps,
+                                                                               ctx.task_data['policy'])
                 if ctx.task_data.get('version_specs'):
                     execution_deps = execution_deps.with_versions(ctx.task_data['version_specs'])
                     from dubforge.pipeline import assembly_versions
@@ -1006,7 +1621,7 @@ class Runner:
                         assembly_versions.fingerprint(execution_deps, v)
                         for v in ctx.task_data['version_specs']])
                 else:
-                    fingerprint = compute_fingerprint(project, step_key, dependencies=execution_deps)
+                    fingerprint = compute_fingerprint(execution_deps.project, step_key, dependencies=execution_deps)
                     if ctx.task_data.get('scope') == 'outputs':
                         ctx.task_data['production_fingerprint'] = fingerprint
                         from dubforge.pipeline.assembly_outputs import default_variants
@@ -1023,6 +1638,21 @@ class Runner:
                 from dubforge.pipeline.stale_explanation import capture
                 input_snapshot = capture(execution_deps, step_key, fingerprint=fingerprint,
                                          scope=ctx.task_data.get('scope', 'full'))
+                # Job.task_data 保存本次实际执行快照，运行中和失败后都可审计；
+                # 仅保存 stale-explanation 的脱敏内容，不写入密钥或代理凭据。
+                from dubforge.pipeline.config_fingerprint import snapshot as config_snapshot
+                execution_settings = config_snapshot(execution_deps, step_key, execution=True)
+                ctx._execution_snapshot = {
+                    'schema': 1, 'step': step_key, 'fingerprint': fingerprint,
+                    'captured_at': input_snapshot.get('captured_at'),
+                    'input_snapshot': input_snapshot,
+                    # 执行参数单独保留安全摘要；详细可比对设置仍来自
+                    # input_snapshot.entries，密钥和凭据永不落盘。
+                    'configuration_digest': hashlib.sha256(
+                        json.dumps(execution_settings, ensure_ascii=False, sort_keys=True,
+                                   default=str).encode()).hexdigest(),
+                }
+                ctx.save_task_data()
                 ctx.rebuild = bool(rebuild or force
                                    or (step.input_fingerprint
                                        and step.input_fingerprint != fingerprint))
@@ -1040,10 +1670,13 @@ class Runner:
                         daemon=True, name=f"dubforge-timeout-{step_key}")
                     watchdog.start()
                 try:
+                    report_stage(ctx, 'execute', '执行' + step_def.label)
                     run_fn(ctx)
                     # 看门狗可能恰好在步骤函数返回前触发; 再检查一次，避免
                     # 超时运行被误记成 done。
                     ctx.check_cancel()
+                    self._mark_downstream_stale_if_changed(
+                        project.id, step_key, previous_artifacts or {})
                 finally:
                     watchdog_stop.set()
                     if watchdog:
@@ -1061,10 +1694,10 @@ class Runner:
             step = crud.get_step(project.id, step_key)
             if step is None:              # 项目/步骤行已被删除 (强制删除流程)
                 raise StepCancelled("项目已删除, 结果丢弃")
-            step.status = "done"
-            step.progress = 100.0
+            # 真正完成登记与临时文件收尾后，才向界面和下游公开100%。
+            step.status = "running"
+            step.progress = 99.0
             step.eta_seconds = 0.0
-            step.finished_at = datetime.datetime.now(datetime.timezone.utc)
             if not ctx.trial_only and ctx.task_data.get('scope') != 'selected':
                 # 自动准备评论等输入在编码前才最终确定；渲染器用本轮冻结
                 # 配置捕获实际方案，成功后才能提升为正式生成历史。
@@ -1075,15 +1708,16 @@ class Runner:
             job.status = "done"
             self._retries.pop(k, None)
             ctx.log("✅ 步骤完成")
-            if ctx.task_data.get('scope') not in {'selected', 'preview', 'outputs', 'versions'}:
-                self.continue_chain(project, ctx)
         except StepCancelled as e:
+            if self._shutdown.is_set() and e.code == "STEP_CANCELLED":
+                e = StepInterrupted("程序正在关闭，步骤已停止；已完成产物保留")
             with self._lock:
                 abandoned = k in self._abandoned
             # 强制结束时 force_stop 已写好挂起信息; 普通取消/超时在此挂起链。
             if not abandoned:
                 self._hold_chain(project, step_key, e.code,
-                                 "步骤超时" if e.code == "STEP_TIMEOUT" else "用户取消")
+                                 "步骤超时" if e.code == "STEP_TIMEOUT" else
+                                 "程序关闭" if e.code == "STEP_INTERRUPTED" else "用户取消", job=job)
             step = crud.get_step(project.id, step_key)
             # 项目可能已被删除 (强制删除流程): 只留日志, 不把行写回成幽灵
             if step is not None:
@@ -1102,12 +1736,12 @@ class Runner:
             ctx.log(f"⏰ 已超时: {e.message}" if e.code == "STEP_TIMEOUT"
                     else f"⛔ 已取消: {e.message}")
         except DubForgeError as e:
-            if self._schedule_chain_retry(project, step_key, e, ctx.log):
+            if self._schedule_chain_retry(project, step_key, e, ctx.log, job=job):
                 # 已排定自动重试: Job 落终态, 步骤保持 failed 可见, 等待期不占槽位。
                 job.status, job.error_detail = "failed", f"等待自动重试: {e.message}"
             else:
                 self._retries.pop(k, None)
-                self._hold_chain(project, step_key, e.code, e.message)
+                self._hold_chain(project, step_key, e.code, e.message, job=job)
                 step = crud.get_step(project.id, step_key)
                 if step is not None:
                     step.status = "failed"
@@ -1124,7 +1758,7 @@ class Runner:
             # GPU 显存不足在多项目批量下常见 (配音服务驻留显存 + 分离/转写争用):
             # 给出可操作的中文指引, 而不是一屏英文堆栈。
             if "out of memory" in str(e).lower() or "cuda error" in str(e).lower():
-                self._hold_chain(project, step_key, "GPU_OOM", "显存不足 (CUDA OOM)")
+                self._hold_chain(project, step_key, "GPU_OOM", "显存不足 (CUDA OOM)", job=job)
                 step = crud.get_step(project.id, step_key)
                 if step is not None:
                     step.status = "failed"
@@ -1139,7 +1773,7 @@ class Runner:
                 job.status, job.error_detail = "failed", tb
                 ctx.log(f"❌ 显存不足 (CUDA OOM): {e}")
             else:
-                self._hold_chain(project, step_key, "UNEXPECTED_ERROR", f"未预期的错误: {type(e).__name__}")
+                self._hold_chain(project, step_key, "UNEXPECTED_ERROR", f"未预期的错误: {type(e).__name__}", job=job)
                 step = crud.get_step(project.id, step_key)
                 if step is not None:
                     step.status = "failed"
@@ -1152,6 +1786,12 @@ class Runner:
                 job.status, job.error_detail = "failed", tb
                 ctx.log(f"❌ 未预期异常:\n{tb}")
         finally:
+            failure = crud.get_step(project.id, step_key)
+            if job.status not in {'done', 'running'}:
+                ctx.execution.finish('interrupted' if self._shutdown.is_set() else
+                                     'cancelled' if job.status == 'cancelled' else 'failed',
+                                     detail=failure.error_message if failure else '执行已停止')
+            report_stage(ctx, 'cleanup', '登记结果与清理临时文件')
             # 收尾兜底: 暂停标志必须清掉, 否则后续运行会在第一个暂停点卡死
             pause.clear()
             if step_key in {'preprocess', 'transcribe'} and job.status != 'done':
@@ -1164,8 +1804,8 @@ class Runner:
                 # 强制结束后的 worker 可能已经越过了取消检查并写出正式
                 # 产物；统一清掉本次步骤登记/文件，避免失败结果被下游复用。
                 try:
-                    if step_key == 'download':
-                        ctx.log("保留已有完整源视频与资料登记；失败状态阻止下游误用，临时下载单独清理")
+                    if step_key in {'download', 'translate'}:
+                        ctx.log("保留已有完整源视频或译文登记；失败状态阻止下游误用，本轮部分结果单独保存")
                     elif step_key != 'tts':
                         crud.delete_step_artifacts(project.id, step_key)
                         ctx.log("🗑 强制结束收尾：已移除本次步骤产物登记与可删除文件，避免失败结果被复用")
@@ -1188,8 +1828,36 @@ class Runner:
                 ctx.log(f"收尾清理: 保留正式产物 [{kept_desc}]；删除临时文件 [{removed_desc}]")
             except Exception:
                 logger.exception("临时文件清扫失败: %s", pdir)
-            job.finished_at = datetime.datetime.now(datetime.timezone.utc)
-            crud.update_job(job)
+            # 与停止共用最终提交边界：停止先到则丢弃成功状态，成功先提交
+            # 则控制接口重验为已结束，不能留下 Step.done + Job.cancelled。
+            with self._start_lock:
+                with self._lock:
+                    abandoned_final = k in self._abandoned
+                    owns_final = self._current_jobs.get(k) is job
+                job.finished_at = datetime.datetime.now(datetime.timezone.utc)
+                final_step = crud.get_step(project.id, step_key)
+                save_final_step = False
+                if job.status == 'done' and (cancel.is_set() or abandoned_final or not owns_final):
+                    job.status, job.error_detail = 'cancelled', '收尾时收到停止请求'
+                    if owns_final and final_step is not None and final_step.status == 'running':
+                        final_step.status = 'failed'
+                        final_step.error_code = 'STEP_INTERRUPTED' if self._shutdown.is_set() else 'STEP_CANCELLED'
+                        final_step.error_message = '程序关闭，步骤已停止' if self._shutdown.is_set() else '步骤已停止，已完成产物保留'
+                        final_step.finished_at = job.finished_at
+                        save_final_step = True
+                        self._hold_chain(project, step_key, final_step.error_code, final_step.error_message, job=job)
+                elif job.status == 'done' and final_step is not None:
+                    final_step.status, final_step.progress, final_step.eta_seconds = 'done', 100., 0.
+                    final_step.finished_at = job.finished_at
+                    save_final_step = True
+                elif abandoned_final:
+                    job.status = 'cancelled'
+                crud.finish_job(job, final_step if save_final_step else None)
+                ctx.execution.finish('completed' if job.status == 'done' else
+                                     'interrupted' if self._shutdown.is_set() else
+                                     'cancelled' if job.status == 'cancelled' else 'failed',
+                                     detail='' if job.status == 'done' else
+                                     (final_step.error_message if final_step else '执行已结束'))
             with self._lock:
                 self._active_jobs.pop(job.id, None)
                 if self._current_jobs.get(k) is job:
@@ -1207,6 +1875,8 @@ class Runner:
                     self._abandoned.discard(k)
             if (crud.get_project(project.uid) is not None
                     and crud.project_dir(project.uid).is_dir()):
+                if job.status == 'done' and ctx.task_data.get('chain_binding'):
+                    self.continue_chain(project, ctx)
                 crud.write_manifest(project.uid)
                 self._refresh_project_status(project.uid)
 
@@ -1249,6 +1919,11 @@ class Runner:
 
     def cancel_step(self, uid: str, step_key: str,
                     expected_job_id: int | None = None) -> dict:
+        with self._start_lock:
+            return self._cancel_step(uid, step_key, expected_job_id)
+
+    def _cancel_step(self, uid: str, step_key: str,
+                     expected_job_id: int | None = None) -> dict:
         project = crud.get_project(uid)
         if not project:
             raise DubForgeError(f"项目不存在: {uid}", code="PROJECT_NOT_FOUND")
@@ -1309,6 +1984,11 @@ class Runner:
 
     def force_stop(self, uid: str, step_key: str,
                    expected_job_id: int | None = None) -> dict:
+        with self._start_lock:
+            return self._force_stop(uid, step_key, expected_job_id)
+
+    def _force_stop(self, uid: str, step_key: str,
+                    expected_job_id: int | None = None) -> dict:
         """强制结束: 取消信号 + 立即终止本步骤的全部子进程 (ffmpeg/yt-dlp 即刻死),
         步骤行立刻按「已取消」呈现。进程内计算 (demucs/torch) 无法腰斩 —— 线程仍在
         后台跑完当前单元, 但结果会被丢弃 (abandoned), 不产生半成品。"""
@@ -1354,7 +2034,7 @@ class Runner:
                                      "后台收尾, 结果会自动丢弃。可直接重跑。")
             step.finished_at = datetime.datetime.now(datetime.timezone.utc)
             crud.save_step(step)
-        self._hold_chain(project, step_key, "STEP_FORCE_STOPPED", "强制结束")
+        self._hold_chain(project, step_key, "STEP_FORCE_STOPPED", "强制结束", job=job)
         crud.write_manifest(uid)
         self._refresh_project_status(uid)
         return {"status": "force_stopped", "message": "已强制结束 (后台残余计算将自动丢弃结果)"}
@@ -1395,13 +2075,64 @@ class Runner:
         with self._lock:
             ctx = self._ctxs.get((project_id, step_key))
         if ctx and ctx._progress_provider:
-            return {**ctx._progress_provider(), "eta_scope": ctx._eta_scope}
+            return {**ctx._progress_provider(), "eta_scope": ctx._eta_scope,
+                    "execution": ctx.execution.snapshot(),
+                    "progress_detail": dict(ctx._progress_detail)}
         phase, indeterminate = ctx._progress_phase if ctx else ("", False)
         return {"eta_seconds": ctx.eta_seconds() if ctx else 0.0,
                 "eta_scope": ctx._eta_scope if ctx else "step",
                 "progress_estimated": False,
                 "progress_phase": phase, "progress_indeterminate": indeterminate,
-                "elapsed_seconds": round(ctx.active_seconds(), 1) if ctx else 0.0}
+                "elapsed_seconds": round(ctx.active_seconds(), 1) if ctx else 0.0,
+                "progress_detail": dict(ctx._progress_detail) if ctx else {},
+                "execution": ctx.execution.snapshot() if ctx else {}}
+
+    def latest_execution_jobs(self, project_ids):
+        """列表一次查询每个项目各步骤的最新任务，避免逐行查询执行历史。"""
+        from sqlmodel import Session, select
+        from sqlalchemy import func
+        from dubforge.db import get_engine
+        ids = list(project_ids)
+        if not ids:
+            return {}
+        with Session(get_engine()) as session:
+            newest = select(func.max(Job.id)).where(Job.project_id.in_(ids)).group_by(Job.project_id, Job.step_key)
+            return {(job.project_id, job.step_key): job for job in
+                    session.exec(select(Job.id, Job.project_id, Job.step_key, Job.status,
+                        Job.execution, Job.started_at, Job.finished_at).where(Job.id.in_(newest))).all()}
+
+    def execution_details(self, project_id, steps, *, jobs=None):
+        """一批读取最新任务诊断；不扫日志、产物或模型配置。"""
+        latest = self.latest_execution_jobs([project_id]) if jobs is None else jobs
+        result = {}
+        for step in steps:
+            job = latest.get((project_id, step.step_key))
+            with self._lock:
+                ctx = self._ctxs.get((project_id, step.step_key))
+                retry = self._retries.get((project_id, step.step_key))
+            if ctx and (job is None or ctx.job_id == job.id):
+                value = ctx.execution.snapshot()
+            elif job:
+                try:
+                    value = json.loads(job.execution)
+                except (ValueError, TypeError):
+                    value = {}
+            else:
+                continue
+            state = ('interrupted' if job and job.status == 'dead' else
+                     'cancelled' if job and job.status == 'cancelled' else step.status)
+            if retry and not retry[0].is_set():
+                state = 'retrying'
+                value = {**value, 'phase': 'retry.wait', 'label': '等待自动重试',
+                         'detail': step.error_message, 'attempt': retry[1],
+                         'next_check_at': time.time() + max(0, retry[2] + max(1, int(config.get('runner.retry_delay', 15) or 15)) - time.monotonic())}
+            if not value.get('label'):
+                value = {**value, 'label': '等待执行资源' if step.status == 'queued' else '未记录详细阶段'}
+            result[step.step_key] = execution_snapshot(value, state=state, owner='step', job_id=job.id if job else ctx.job_id,
+                started_at=job.started_at if job else None, finished_at=job.finished_at if job else None)
+            # execution 与其 started_at 采用同一累计时钟，含本轮排队/协作暂停。
+            # 活动耗时和 ETA 独立保留在 progress_eta，不能因内存上下文有无而改口径。
+        return result
 
     def _begin_running(self, ctx: StepContext, step: StepRun, step_def,
                        fingerprint: str) -> None:
@@ -1416,6 +2147,7 @@ class Runner:
         step.eta_seconds = 0.0
         ctx._run_started = time.monotonic()   # 排队等待不计入已耗时
         ctx._paused_seconds = 0.0
+        report_stage(ctx, 'prepare', '检查输入与执行设置')
         crud.save_step(step)
         ctx.log(f"▶ 开始步骤 [{step_def.label}] ({step.step_key})")
 
@@ -1425,33 +2157,35 @@ class Runner:
         - 配音步骤前: 托管服务未在线 → 自动启动并等待就绪 (超时则明确失败)
         - 分离/转写步骤前: 空闲显存低于阈值 → 自动停止托管服务释放显存
         外部启动的服务不受管控 (无法安全代停), 只提示; 显存仍不足时走 CPU 降级。"""
-        if not config.get("runner.auto_tts_vram", True):
+        if not ctx.cfg("runner.auto_tts_vram", True):
             return
         from dubforge import tts_service
         try:
-            svc = tts_service.status()
+            report_stage(ctx, 'service.check', '检查配音服务与显存资源')
+            svc = tts_service.status(ctx.cfg)
         except Exception as exc:                     # 服务探测失败不阻塞制作
             ctx.log(f"⚠ 读取配音服务状态失败，跳过显存协调: {exc}")
             return
         if step_key == 'tts':
             if svc.get('online'):
                 return
-            if not svc.get('managed'):
+            if not (svc.get('managed') or svc.get('can_start')):
                 ctx.log(f"⚠ 配音服务未在线且为外部启动，无法自动启动: {svc.get('message') or '请在服务页启动'}")
                 return
             try:
-                timeout = max(30, int(config.get("runner.tts_start_timeout", 300) or 300))
+                timeout = max(30, int(ctx.cfg("runner.tts_start_timeout", 300) or 300))
             except (TypeError, ValueError):
                 timeout = 300
             ctx.log("🎙 配音服务未在线，自动启动并等待就绪…")
             try:
-                tts_service.start()
+                report_stage(ctx, 'service.start', '启动配音服务', state='waiting')
+                tts_service.start(ctx.cfg)
             except Exception as exc:
                 raise DubForgeError(f"配音服务自动启动失败: {exc}", code="TTS_SERVICE_START_FAIL",
                                     suggestion="请到服务页手动启动配音服务并查看启动日志。")
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
-                if tts_service.status().get('online'):
+                if tts_service.status(ctx.cfg).get('online'):
                     ctx.log("🎙 配音服务已就绪")
                     return
                 ctx.check_cancel()
@@ -1467,7 +2201,7 @@ class Runner:
             return
         from dubforge.utils.gpu_memory import free_mb
         try:
-            reserve = max(0, int(config.get("runner.gpu_free_reserve_mb", 4096) or 4096))
+            reserve = max(0, int(ctx.cfg("runner.gpu_free_reserve_mb", 4096) or 4096))
         except (TypeError, ValueError):
             reserve = 4096
         free = free_mb()
@@ -1476,7 +2210,8 @@ class Runner:
         ctx.log(f"🧹 空闲显存 {free} MiB 低于阈值 {reserve} MiB，自动停止配音服务释放显存"
                 f"（之后的配音步骤会自动重启服务）…")
         try:
-            tts_service.stop()
+            report_stage(ctx, 'service.release', '释放配音服务占用的显存', state='waiting')
+            tts_service.stop(ctx.cfg)
         except Exception as exc:
             ctx.log(f"⚠ 配音服务停止失败，显存不足时将自动降级 CPU: {exc}")
 
@@ -1492,6 +2227,8 @@ class Runner:
         返回实际占用的槽位键 —— 释放时必须用它, 配置中途改动才不会泄漏槽位。"""
         key = self._slot_key(step_key)
         with self._slot_cond:
+            if cancel is not None and not cancel.is_set() and cancel in self._slot_reservations:
+                return self._slot_reservations.pop(cancel)
             while True:
                 if cancel is not None and cancel.is_set():
                     raise StepCancelled("步骤在排队时被取消")
@@ -1572,6 +2309,12 @@ class Runner:
             if project is None:
                 return {"started": None, "stopped": None}
             params = crud.project_params(project)
+            if ctx is not None:
+                if not self._owns_chain(params, ctx.task_data.get('chain_binding'), ctx.job_id):
+                    log('⛓ 本任务的制作计划已取消或替换，保留当前计划，不继续执行')
+                    return {"started": None, "stopped": None}
+                # 本任务只负责核对一次链归属；出队后下一个任务会绑定新 Job。
+                ctx = None
             if params.get("_chain_state") == "held":
                 # 挂起的链不自动续跑: 等用户显式恢复 (重试并继续 / 继续剩余步骤)。
                 return {"started": None, "stopped": None}
@@ -1579,7 +2322,7 @@ class Runner:
             if not chain:
                 if "_chain" in params:
                     # 跑完的空链: 清理计划三键, 项目回到无链状态。
-                    for key in ("_chain", "_chain_state", "_chain_hold", "_chain_resume_plan"):
+                    for key in ("_chain", "_chain_state", "_chain_hold", "_chain_resume_plan", "_chain_job_id", "_chain_dubbing"):
                         params.pop(key, None)
                     project.params = json.dumps(params, ensure_ascii=False)
                     crud.save_project(project)
@@ -1587,6 +2330,7 @@ class Runner:
             # 刚完成的链头步骤出队; 后续循环中链头是待启动步骤, 不再出队。
             if done_key is not None and chain[0] == done_key:
                 params["_chain"] = chain[1:]
+                params.pop('_chain_job_id', None)
                 project.params = json.dumps(params, ensure_ascii=False)
                 crud.save_project(project)
                 done_key = None
@@ -1616,7 +2360,7 @@ class Runner:
             crud.save_project(project)
 
     def _schedule_chain_retry(self, project: Project, step_key: str,
-                              exc: DubForgeError, log) -> bool:
+                              exc: DubForgeError, log, *, job: Job | None = None) -> bool:
         """链内步骤失败且还有重试额度: 排定延迟自动重试 (ADR-0076)。
         只对 active 链的链头生效; 用户取消/超时/未预期异常不重试。
         返回是否已排定。"""
@@ -1626,6 +2370,9 @@ class Runner:
             if latest is None:
                 return False
             params = crud.project_params(latest)
+            if job is not None and not self._owns_chain(
+                    params, json.loads(job.task_data).get('chain_binding'), job.id):
+                return False
             chain = params.get("_chain") or []
             if params.get("_chain_state") == "held" or not chain or chain[0] != step_key:
                 return False
@@ -1638,10 +2385,11 @@ class Runner:
         if limit <= 0:
             return False
         with self._lock:
-            if k in self._abandoned:
+            if self._closing or k in self._abandoned:
                 return False
             entry = self._retries.get(k)
-            attempts = entry[1] if entry and time.monotonic() - entry[2] <= 600 else 0
+            # 额度属于本轮链操作；长步骤耗时不能使失败次数重新归零。
+            attempts = entry[1] if entry else 0
             if attempts >= limit:
                 self._retries.pop(k, None)
                 return False
@@ -1672,35 +2420,38 @@ class Runner:
                 return
             # 链可能在等待期被放弃/替换/再次挂起: 重启前重验, 避免废弃计划复活。
             from dubforge.pipeline import dubbing_session
-            with dubbing_session.gate:
+            with self._start_lock, dubbing_session.gate:
                 latest = crud.get_project(project.uid)
                 params = crud.project_params(latest) if latest else {}
                 chain = params.get("_chain") or []
-                if params.get("_chain_state") == "held" or not chain or chain[0] != step_key:
+                if (params.get("_chain_state") == "held" or not chain or chain[0] != step_key
+                        or job is not None and not self._owns_chain(
+                            params, json.loads(job.task_data).get('chain_binding'), job.id)):
                     with self._lock:
                         self._retries.pop(k, None)
                     return
-            try:
-                r = self.start_step(project.uid, step_key)
-            except DubForgeError as start_err:
-                with self._lock:
-                    self._retries.pop(k, None)
-                current = crud.get_step(project.id, step_key)
-                if current is not None and current.status in ("running", "queued"):
-                    return          # 用户已手动重跑, 不与手动操作竞争
-                self._hold_chain(project, step_key, getattr(start_err, "code", "RETRY_START_FAIL"),
-                                 f"自动重试未能启动: {start_err.message}")
-                log(f"⛓ 自动续跑挂起: {start_err.message}")
-                return
-            if r.get("status") == "skipped":
-                # 等待期被手动跑好: 出队并继续链, 不然链会静默卡住。
-                self.continue_chain(project)
+                try:
+                    r = self.start_step(project.uid, step_key)
+                except DubForgeError as start_err:
+                    with self._lock:
+                        self._retries.pop(k, None)
+                    current = crud.get_step(project.id, step_key)
+                    if current is not None and current.status in ("running", "queued"):
+                        return          # 用户已手动重跑, 不与手动操作竞争
+                    self._hold_chain(project, step_key, getattr(start_err, "code", "RETRY_START_FAIL"),
+                                     f"自动重试未能启动: {start_err.message}", job=job)
+                    log(f"⛓ 自动续跑挂起: {start_err.message}")
+                    return
+                if r.get("status") == "skipped":
+                    # 等待期被手动跑好: 出队并继续链, 不然链会静默卡住。
+                    self.continue_chain(project)
         timer = threading.Timer(delay, fire)
         timer.daemon = True
         timer.start()
         return True
 
-    def _hold_chain(self, project: Project, step_key: str, code: str, message: str) -> None:
+    def _hold_chain(self, project: Project, step_key: str, code: str, message: str,
+                    *, job: Job | None = None) -> None:
         """失败/取消/中断只挂起自动续跑计划, 不销毁: 失败步骤保留在链头,
         记录挂起原因, 供「重试并继续」/「继续剩余步骤」恢复。无链 (普通单步
         运行) 或失败的不是链头 (挂起期间的手动运行) 则不动计划。"""
@@ -1710,6 +2461,9 @@ class Runner:
             if latest is None:
                 return
             params = crud.project_params(latest)
+            if job is not None and not self._owns_chain(
+                    params, json.loads(job.task_data).get('chain_binding'), job.id):
+                return
             chain = params.get("_chain")
             if not isinstance(chain, list) or not chain or chain[0] != step_key:
                 return
@@ -1743,6 +2497,8 @@ class Runner:
                 params.pop("_chain_state", None)
                 params.pop("_chain_hold", None)
                 params.pop("_chain_resume_plan", None)
+                params.pop('_chain_job_id', None)
+                params.pop('_chain_dubbing', None)
                 latest.params = json.dumps(params, ensure_ascii=False)
                 crud.save_project(latest)
                 logger.info("自动续跑已停止 (%s): 项目 %s", reason, project.uid)
@@ -1750,7 +2506,8 @@ class Runner:
     # ============ 心跳 ============
 
     def _heartbeat_loop(self) -> None:
-        while not self._heartbeat_stop.wait(HEARTBEAT_SEC):
+        stop = self._heartbeat_stop
+        while not stop.wait(HEARTBEAT_SEC):
             with self._lock:
                 jobs = list(self._active_jobs.values())
             for job in jobs:
@@ -1762,7 +2519,17 @@ class Runner:
 
     # ============ 内部 ============
 
-    def _mark_downstream_stale(self, project_id: int, step_key: str) -> None:
+    @staticmethod
+    def _artifact_signature(project_id: int, step_key: str) -> dict[str, tuple[str, int]]:
+        """读取某步骤启动前/完成后的登记摘要，不读取大文件内容。"""
+        return {a.name: (a.sha256 or '', int(a.size or 0))
+                for a in crud.latest_artifacts(project_id, [step_key]).values()}
+
+    def _mark_downstream_stale_if_changed(self, project_id: int, step_key: str,
+                                          previous: dict[str, tuple[str, int]]) -> None:
+        current = self._artifact_signature(project_id, step_key)
+        if current == (previous or {}):
+            return
         produced = {a.step_key for a in crud.latest_artifacts(project_id, None).values()}
         from dubforge.pipeline.dependencies import Dependencies
         project = crud.get_project_by_id(project_id)

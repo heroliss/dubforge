@@ -8,7 +8,7 @@ export function textStyleFieldGroups(fields: any[], prefix: string, values: Reco
   const common: any[] = [], translated: any[] = [], original: any[] = []
   for (const field of visible) {
     const name = field.path.startsWith(prefix) ? field.path.slice(prefix.length) : ''
-    if (['font','size','font_size','color','outline','outline_color'].includes(name)) translated.push(field)
+    if (['font','size','min_size','font_size','min_font_size','color','outline','outline_color'].includes(name)) translated.push(field)
     else if (name.startsWith('source_') && name !== 'source_first') original.push(field)
     else common.push(field)
   }

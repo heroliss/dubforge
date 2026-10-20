@@ -29,13 +29,14 @@ def test_actual_i_before_six_second_pause_keeps_meaningful_half_sentence():
     assert "".join(part["text"] for part in result) == text
 
 
-def test_actual_theres_outside_model_time_is_not_lost_or_moved_to_about():
+def test_actual_single_edge_correction_keeps_complete_anchored_phrase_for_review():
     words = _words([(77.74, 78.96, " there's"), (91.44, 91.58, " about"),
                     (91.58, 92.06, " 30"), (92.06, 92.46, " gates")])
     text = "There's about 30 gates."
-    result = repair_long_pauses([_part(text, 91.44, 92.46)], words, .6)
-    assert [part["text"] for part in result] == ["There's ", "about 30 gates."]
-    assert [(part["start"], part["end"]) for part in result] == [(77.74, 78.96), (91.44, 92.46)]
+    warnings = []
+    result = repair_long_pauses([_part(text, 91.44, 92.46)], words, .6, warnings=warnings)
+    assert result == [_part(text, 91.44, 92.46)]
+    assert len(warnings) == 1 and '边缘文字的识别与声学归属仍需复核' in warnings[0]
     assert "".join(part["text"] for part in result) == text
 
 
@@ -249,7 +250,7 @@ def test_same_short_addition_in_single_candidate_crossing_real_gap_still_fails(t
     assert warnings == []
 
 
-@pytest.mark.parametrize("end,start", [(1.02, 8), (1, 7.98), (.8, 8), (1, 8.2)])
+@pytest.mark.parametrize("end,start", [(1.02, 8), (.8, 8), (1, 8.2)])
 def test_separated_addition_requires_actual_gap_boundaries_not_only_model_separation(end, start):
     words = _words([(0, 1, "I"), (8, 9, "think")])
     with pytest.raises(PauseAlignmentError, match="新增文字"):
@@ -370,3 +371,40 @@ def test_repeated_i_anchor_in_longer_context_cannot_prove_cross_pause_word_movem
     warnings = []
     assert repair_long_pauses(candidates, words, .6, align_all=True, warnings=warnings) == candidates
     assert len(warnings) == 1 and "声学对应位置需复核" in warnings[0]
+
+
+def test_remote_raw_overlap_does_not_reject_already_separated_corrected_gap():
+    words = _words([(0, 1, 'hello'), (1, 2, 'world'), (10, 11, 'I'), (18, 19, 'think')])
+    candidates = [_part('hello', 0, 1.3), _part('world', 1.1, 2),
+                  _part('I', 10, 11), _part('I think', 18, 19)]
+    warnings = []
+    result = repair_long_pauses(candidates, words, .6, align_all=True, warnings=warnings)
+    assert [part['text'] for part in result] == [part['text'] for part in candidates]
+    assert [(part['start'], part['end']) for part in result] == [(0, 1), (1, 2), (10, 11), (18, 19)]
+    assert any('新增短词' in warning for warning in warnings)
+
+
+def test_ambiguous_gap_error_identifies_current_interval_and_candidate_line():
+    words = _words([(0, 1, 'I'), (8, 9, 'think')])
+    with pytest.raises(PauseAlignmentError) as error:
+        repair_long_pauses([_part('I surely think', 0, 9)], words, .6)
+    message = str(error.value)
+    assert '无台词区 1.000–8.000 秒' in message
+    assert '第 1 句（0.000–9.000 秒）' in message
+    assert 'I surely think' in message
+
+
+def test_prepare_keeps_gap_when_later_fuzzy_alignment_would_fill_it():
+    from dubforge.pipeline import step_split
+    from dubforge.utils.srt import SubLine
+
+    words = _words([(0, 1, 'alpha'), (1, 2, 'bravo'), (2, 3, 'charlie'), (3, 4, 'would'),
+                    (11, 12, 'go'), (12, 13, 'kilo'), (13, 14, 'lima'), (14, 15, 'mike')])
+    candidates = [_part("alpha bravo charlie won't", 0, 4), _part('leave kilo lima mike', 11, 15)]
+    source = 'alpha bravo charlie would go kilo lima mike'
+    lines = [SubLine(1, 0, 4, 'alpha bravo charlie would'), SubLine(2, 11, 15, 'go kilo lima mike')]
+    warnings = []
+    result, _ = step_split._prepare_semantic_parts(
+        candidates, lines, source, words, 50, 15, .6, warnings=warnings)
+    assert result == candidates
+    assert any('近似时间对齐会占用真实无台词区' in warning for warning in warnings)

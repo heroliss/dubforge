@@ -101,6 +101,44 @@ def test_failed_config_write_preserves_original(isolated_env, monkeypatch):
     assert config.config_path().read_bytes() == before
 
 
+def test_global_subtitle_partial_update_validates_merged_widths_atomically(isolated_env):
+    config.set_key('assemble.subtitle_shrink_width_percent', 75)
+    before = config.config_path().read_bytes()
+    with pytest.raises(ConfigError, match='缩小目标宽度不能大于换行上限宽度'):
+        config.update_config({'server.port': 8611, 'assemble.subtitle_wrap_width_percent': 70})
+    assert config.config_path().read_bytes() == before
+    config.update_config({'assemble.subtitle_auto_fit': False, 'assemble.subtitle_wrap_width_percent': 70})
+    assert config.get('assemble.subtitle_shrink_width_percent') == 75
+    assert config.get('assemble.subtitle_wrap_width_percent') == 70
+    before = config.config_path().read_bytes()
+    with pytest.raises(ConfigError, match='缩小目标宽度不能大于换行上限宽度'):
+        config.set_key('assemble.subtitle_auto_fit', True)
+    assert config.config_path().read_bytes() == before
+    config.update_config({'assemble.subtitle_auto_fit': True, 'assemble.subtitle_shrink_width_percent': 65})
+    assert config.get('assemble.subtitle_auto_fit') is True
+
+
+@pytest.mark.parametrize('value', [9, 101, None, True, '80'])
+def test_global_subtitle_direct_writes_validate_numeric_values(isolated_env, value):
+    config.set_key('extension.note', '保留')
+    before = config.config_path().read_bytes()
+    with pytest.raises(ConfigError):
+        config.set_key('assemble.subtitle_shrink_width_percent', value)
+    assert config.config_path().read_bytes() == before
+
+
+@pytest.mark.parametrize('section', [
+    {'subtitle_shrink_width_percent': 95, 'subtitle_wrap_width_percent': 80},
+    {'subtitle_wrap_width_percent': None},
+])
+def test_global_assemble_section_update_also_validates_subtitle_widths(isolated_env, section):
+    config.set_key('extension.note', '保留')
+    before = config.config_path().read_bytes()
+    with pytest.raises(ConfigError):
+        config.set_key('assemble', section)
+    assert config.config_path().read_bytes() == before
+
+
 def test_data_directory_changes_only_with_database_restart(isolated_env, monkeypatch):
     from dubforge.domain import crud
 

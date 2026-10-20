@@ -37,3 +37,23 @@ test('超时、服务失败与进程中断仍显示错误，重跑时旧错误�
   assert.equal(showStepError({status: 'failed'}), false)
   assert.equal(stepDisplayStatus({status: 'running', error: {code: 'STEP_CANCELLED'}}), 'running')
 })
+
+test('最新任务的取消与活动事实优先于旧步骤失败，错代次和无身份不得借用', () => {
+  const old = { status: 'failed', error: '步骤已停止，已完成产物保留' }
+  assert.equal(stepDisplayStatus({...old,job_id:18,job_status:'cancelled'}),'stopped')
+  assert.equal(stepDisplayStatus({...old,execution:{schema:1,owner:'step',job_id:18,state:'cancelled'}}),'stopped')
+  assert.equal(stepDisplayStatus({...old,job_id:'18',execution:{schema:1,owner:'step',job_id:18,state:'cancelled'}}),'stopped')
+  for (const execution of [
+    {schema:1,owner:'step',job_id:17,state:'cancelled'},
+    {schema:1,owner:'workflow',job_id:18,state:'cancelled'},
+    {schema:1,owner:'step',state:'cancelled'},
+  ]) assert.equal(stepDisplayStatus({...old,job_id:18,execution}),'failed')
+  for (const status of ['queued','running']) {
+    assert.equal(stepDisplayStatus({...old,job_id:19,job_status:status}),status)
+    assert.equal(stepDisplayStatus({...old,job_id:19,execution:{schema:1,owner:'step',job_id:19,state:status}}),status)
+    assert.equal(stepDisplayStatus({...old,job_id:19,execution:{schema:1,owner:'step',job_id:18,state:'cancelled'},job_status:status}),status)
+  }
+  assert.equal(stepDisplayStatus({...old,job_id:19,job_status:'failed',error:{code:'STEP_CANCELLED'}}),'failed','真实新任务失败不借旧取消原因')
+  assert.equal(stepDisplayStatus(old),'failed','旧服务没有身份依据时保持原错误，不猜主动停止')
+  assert.equal(stepDisplayStatus({...old,job_status:'cancelled'}),'failed')
+})

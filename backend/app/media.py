@@ -1,5 +1,6 @@
 """可取消的媒体分段传输，避免废弃的预览继续读取大文件。"""
 from contextlib import asynccontextmanager
+import os
 from secrets import token_hex
 
 import anyio
@@ -124,3 +125,47 @@ class MediaFileResponse(FileResponse):
         await send({'type': 'http.response.body',
                     'body': b'' if send_header_only else f'--{boundary}--'.encode('latin-1'),
                     'more_body': False})
+
+
+class MediaSnapshotResponse(FileResponse):
+    """短音频完整读入后关闭文件，以内存快照支持浏览器定位与 Range。"""
+
+    def __init__(self, path, *, media_type=None, headers=None):
+        # 同一句可随时重合成；响应开始前释放句柄，避免 Windows 原子替换被锁住。
+        # 元数据与内容必须来自同一文件版本，不能在读完后重新 stat 同名路径。
+        with open(path, 'rb') as file:
+            stat_result = os.fstat(file.fileno())
+            self.content = file.read()
+        super().__init__(path, media_type=media_type, headers=headers,
+                         stat_result=stat_result)
+        self.headers['content-length'] = str(len(self.content))
+
+    async def _handle_simple(self, send, send_header_only, send_pathsend):
+        await send({'type': 'http.response.start', 'status': self.status_code,
+                    'headers': self.raw_headers})
+        await send({'type': 'http.response.body',
+                    'body': b'' if send_header_only else self.content,
+                    'more_body': False})
+
+    async def _handle_single_range(self, send, start, end, file_size, send_header_only):
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers['content-range'] = f'bytes {start}-{end - 1}/{file_size}'
+        headers['content-length'] = str(end - start)
+        await send({'type': 'http.response.start', 'status': 206, 'headers': headers.raw})
+        await send({'type': 'http.response.body',
+                    'body': b'' if send_header_only else self.content[start:end],
+                    'more_body': False})
+
+    async def _handle_multiple_ranges(self, send, ranges, file_size, send_header_only):
+        boundary = token_hex(13)
+        length, make_header = self.generate_multipart(
+            ranges, boundary, file_size, self.headers['content-type'])
+        headers = MutableHeaders(raw=list(self.raw_headers))
+        headers['content-type'] = f'multipart/byteranges; boundary={boundary}'
+        headers['content-length'] = str(length)
+        await send({'type': 'http.response.start', 'status': 206, 'headers': headers.raw})
+        body = b'' if send_header_only else b''.join(
+            part for start, end in ranges
+            for part in (make_header(start, end), self.content[start:end], b'\r\n')
+        ) + f'--{boundary}--'.encode('latin-1')
+        await send({'type': 'http.response.body', 'body': body, 'more_body': False})

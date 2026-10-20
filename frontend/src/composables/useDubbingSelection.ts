@@ -43,14 +43,17 @@ export function useDubbingSelection(options: {
 
   function apply(state: any) {
     if (!state) return state
-    const lines = state.lines.map((line: any) => {
+    const pendingPlacement = Object.keys(edits.value).length > 0
+    const lines = state.lines.map((input: any) => {
+      // 一个选槽会影响邻句共同排布；旧组时钟不能搭配新声源继续使用。
+      const line = pendingPlacement ? { ...input, playback_start: undefined, playback_end: undefined, timing: undefined } : input
       const edit = edits.value[line.id]
       if (!edit) return line
       const wav = line.versions.find((take: any) => take.id === edit.selection.take)
         ?? { exists: false, stale: edit.selection.take !== null, url: null, seconds: null }
       return { ...line, selection: { ...edit.selection, explicit: true }, wav, confirmed: !!wav.confirmed }
     })
-    return { ...state, lines, counts: { ...state.counts,
+    return { ...state, lines, ...(pendingPlacement ? { placement: null, timing: null, placement_pending: true } : {}), counts: { ...state.counts,
       synthesized: lines.filter((line: any) => line.wav.exists).length,
       confirmed: lines.filter((line: any) => line.confirmed).length } }
   }

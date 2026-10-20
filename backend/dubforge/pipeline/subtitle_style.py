@@ -7,14 +7,19 @@ import tempfile
 from pathlib import Path
 
 from dubforge.errors import ConfigError, DubForgeError
-from dubforge.utils.srt import write_srt
+from dubforge.utils.srt import parse_srt
 from dubforge.pipeline.text_style import paint_style, validate_color, validate_opacity, validate_font, language_style, ass_inline, ass_text, ass_clock
 from dubforge.utils.fs import atomic_write_bytes
+from dubforge.utils.ffmpeg import ass_file_filter
 
 
 STYLE_DEFAULTS = {
     'assemble.subtitle_font': 'Microsoft YaHei',
     'assemble.subtitle_size': 48,
+    'assemble.subtitle_auto_fit': True,
+    'assemble.subtitle_min_size': 32,
+    'assemble.subtitle_shrink_width_percent': 80,
+    'assemble.subtitle_wrap_width_percent': 90,
     'assemble.subtitle_color': '#FFFFFF',
     'assemble.subtitle_outline_color': '#000000',
     'assemble.subtitle_outline': 2,
@@ -24,6 +29,7 @@ STYLE_DEFAULTS = {
     'assemble.subtitle_source_style_enabled': False,
     'assemble.subtitle_source_font': 'Microsoft YaHei',
     'assemble.subtitle_source_size': 40,
+    'assemble.subtitle_source_min_size': 28,
     'assemble.subtitle_source_color': '#FFFFFF',
     'assemble.subtitle_source_outline_color': '#000000',
     'assemble.subtitle_source_outline': 2,
@@ -44,6 +50,16 @@ def validate_style(values):
         validate_font(values.get(key, STYLE_DEFAULTS[key]))
     if 'assemble.subtitle_source_style_enabled' in values and type(values['assemble.subtitle_source_style_enabled']) is not bool:
         raise ConfigError('请明确选择是否启用字幕原文独立样式')
+    if 'assemble.subtitle_auto_fit' in values and type(values['assemble.subtitle_auto_fit']) is not bool:
+        raise ConfigError('请明确选择是否启用长字幕自适应字号')
+    # 只对完整有效值或明确的开启请求校验关系，不用缺省值猜测局部更新。
+    shrink_key, wrap_key = 'assemble.subtitle_shrink_width_percent', 'assemble.subtitle_wrap_width_percent'
+    if (values.get('assemble.subtitle_auto_fit') is True
+            and shrink_key in values and wrap_key in values
+            and type(values[shrink_key]) in (int, float) and type(values[wrap_key]) in (int, float)
+            and values[shrink_key] > values[wrap_key]):
+        raise ConfigError('缩小目标宽度不能大于换行上限宽度，请调整两个比例后保存。',
+                          suggestion='请在字幕设置中保持缩小目标宽度不大于换行上限宽度，例如 80% 和 90%。')
     track = values.get('assemble.subtitle_track', 'trans')
     if not isinstance(track, str) or track not in {'source', 'trans', 'bilingual'}:
         raise ConfigError('请选择原文、目标语言或双语字幕')
@@ -84,6 +100,27 @@ def video_canvas(video):
         return max(1, round(1080 * width / height)), 1080
     except (ValueError, TypeError, KeyError, IndexError, ZeroDivisionError) as exc:
         raise DubForgeError('无法读取视频画面尺寸', code='VIDEO_DIMENSIONS') from exc
+
+
+def render_canvas(ctx, video):
+    """本轮预览/合成共用画幅；源文件身份改变后重新探测，不留跨任务缓存。"""
+    path = Path(video).resolve()
+    try:
+        stat = path.stat()
+    except OSError:
+        # 没有可核对的文件身份时仍保留原探测与错误行为，不能缓存未知结果。
+        return video_canvas(video)
+    identity = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+    cache = getattr(ctx, '_render_canvas_cache', None)
+    if cache is None:
+        cache = ctx._render_canvas_cache = {}
+    key = str(path)
+    saved = cache.get(key)
+    if saved is not None and saved[0] == identity:
+        return saved[1]
+    canvas = video_canvas(video)
+    cache[key] = (identity, canvas)
+    return canvas
 
 
 def subtitle_filter(filename, cfg, canvas):
@@ -127,15 +164,16 @@ def separate_source_style(cfg):
 
 
 def ass_document(lines, cfg, canvas, start=0.0, end=None):
-    """语言分段由统一字幕文档提供；顺序变化不改变原文/译文的样式身份。"""
+    """语言分段由统一字幕文档提供；两种语言分别缩字、换行，共用时间轴。"""
     from dubforge.pipeline.step_params import validate_numeric_updates
+    from dubforge.pipeline.subtitle_layout import layout_text
     values = {key: cfg(key, default) for key, default in STYLE_DEFAULTS.items()}
     validate_numeric_updates(values)
     settings = {k.removeprefix('assemble.subtitle_'): v for k, v in values.items()}
     settings['font_size'], settings['source_font_size'] = settings['size'], settings['source_size']
     paint = paint_style(**{key: settings[key] for key in ('color', 'outline_color', 'outline', 'background_color', 'background_opacity')})
     header = ('[Script Info]\nScriptType: v4.00+\n'
-        f'PlayResX: {canvas[0]}\nPlayResY: {canvas[1]}\nWrapStyle: 0\nScaledBorderAndShadow: yes\n'
+        f'PlayResX: {canvas[0]}\nPlayResY: {canvas[1]}\nWrapStyle: 2\nScaledBorderAndShadow: yes\n'
         '[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n'
         f'Style: Subtitle,{validate_font(settings["font"])},{settings["font_size"]},{paint["PrimaryColour"]},&H00FFFFFF,{paint["OutlineColour"]},{paint["BackColour"]},0,0,0,0,100,100,0,0,{paint["BorderStyle"]},{paint["Outline"]},{paint["Shadow"]},2,50,50,{settings["margin"]},1\n'
         '[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n')
@@ -149,7 +187,24 @@ def ass_document(lines, cfg, canvas, start=0.0, end=None):
             if track == 'bilingual':
                 raise DubForgeError('字幕缺少语言分段信息，请从字幕工作区重新生成预览', code='SUBTITLE_LANGUAGE_PARTS')
             parts = ((track, line.text),)
-        body = '\\N'.join(ass_inline(language_style(settings, language == 'source')) + ass_text(text) for language, text in parts)
+        rendered = []
+        for language, text in parts:
+            style = language_style(settings, language == 'source')
+            minimum_key = ('source_min_size' if language == 'source' and settings['source_style_enabled']
+                           else 'min_size')
+            # 百分比相对完整画面；不再额外乘统一比例，避免重复缩窄用户设置。
+            # 仍遵守 ASS 左右各 50 的安全边距，并容纳描边与底色。
+            padding = style['outline'] * 2 + (16 if settings['background_opacity'] > 0 else 0)
+            def available_width(percent):
+                return max(1.0, min(canvas[0] * percent / 100, canvas[0] - 100) - padding)
+            shrink_width = available_width(settings['shrink_width_percent'])
+            available = available_width(settings['wrap_width_percent'])
+            # 正文的安全替换会改变字宽，因此先替换，再按实际渲染文字估算。
+            plain = str(text).replace('\\', '＼').replace('{', '｛').replace('}', '｝')
+            size, wrapped = layout_text(plain, style['font_size'], settings[minimum_key], available,
+                                        settings['auto_fit'], shrink_width=shrink_width)
+            rendered.append(ass_inline({**style, 'font_size': size}) + ass_text(wrapped))
+        body = '\\N'.join(rendered)
         stop = min(line.end, end) if end is not None else line.end
         events.append(f'Dialogue: 0,{ass_clock(max(line.start, start)-start)},{ass_clock(stop-start)},Subtitle,,0,0,0,,{body}\n')
     return header + ''.join(events)
@@ -158,44 +213,34 @@ def ass_document(lines, cfg, canvas, start=0.0, end=None):
 def prepare_subtitle_lines(lines, cfg, canvas, folder, *, name='preview', start=0.0, end=None):
     if not re.fullmatch(r'[A-Za-z0-9_.-]+', name):
         raise ConfigError('字幕文件名无效')
-    if separate_source_style(cfg):
-        filename = name + '.ass'
-        atomic_write_bytes(Path(folder) / filename, ass_document(lines, cfg, canvas, start, end).encode('utf-8-sig'))
-        return f'ass={filename}'
-    write_srt(lines, Path(folder) / (name + '.srt'))
-    return subtitle_filter(name + '.srt', cfg, canvas)
+    # 普通、独立样式和预览都走同一份显式排版，不再依赖 libass 的分词能力。
+    filename = name + '.ass'
+    atomic_write_bytes(Path(folder) / filename, ass_document(lines, cfg, canvas, start, end).encode('utf-8-sig'))
+    return ass_file_filter(Path(folder) / filename)
 
 
 def prepare_burn_filter(ctx, video, source, start=None, duration=None):
-    """独立样式只生成临时 ASS，普通样式继续复用已导出的 SRT；调用方负责清理。"""
+    """所有烧录组合共用临时 ASS；导出文件保留，调用方负责清理临时文件。"""
     import uuid
     from dubforge.pipeline.step_subtitles import build_tracks
-    canvas = video_canvas(video)
-    if ctx.cfg('content_review.enabled', True):
+    canvas = render_canvas(ctx, video)
+    track = ctx.cfg('assemble.subtitle_track', 'trans')
+    # 版本执行器刚从统一稿准备的列表保留双语 parts；只复用当前上下文私有
+    # 结果，旧公共 SRT 和其他版本不能绕过这里的审查与时间轴重建。
+    prepared = getattr(ctx, '__dict__', {}).get('_prepared_subtitle_lines')
+    if (prepared is not None and prepared['track'] == track
+            and getattr(ctx, 'subtitle_path', None) == source):
+        lines = prepared['lines']
+    elif ctx.cfg('content_review.enabled', True) or track == 'bilingual':
         # 旧导出文件可能尚未更新；烧录始终从已筛查的统一稿重新生成临时字幕。
-        track = ctx.cfg('assemble.subtitle_track', 'trans')
         tracks, _ = build_tracks(ctx, mode={'trans': 'target', 'source': 'source', 'bilingual': 'bilingual'}[track])
-        name = '.subtitle_' + uuid.uuid4().hex
         lines = tracks[track + '.srt']
-        if start is not None and not separate_source_style(ctx.cfg):
-            from dubforge.utils.srt import SubLine
-            lines = [SubLine(l.index, max(0.0, l.start-start), min(l.end, start+duration)-start, l.text)
-                     for l in lines if l.end > start and l.start < start+duration]
-        graph = prepare_subtitle_lines(lines, ctx.cfg, canvas, source.parent, name=name,
-            start=start or 0 if separate_source_style(ctx.cfg) else 0,
-            end=start + duration if separate_source_style(ctx.cfg) and start is not None else None)
-        return graph, source.parent / (name + ('.ass' if separate_source_style(ctx.cfg) else '.srt'))
-    if separate_source_style(ctx.cfg):
-        track = ctx.cfg('assemble.subtitle_track', 'trans')
-        tracks, _ = build_tracks(ctx, mode='target' if track == 'trans' else track)
-        name = '.subtitle_' + uuid.uuid4().hex
-        graph = prepare_subtitle_lines(tracks[track + '.srt'], ctx.cfg, canvas, source.parent, name=name,
-            start=start or 0, end=start + duration if start is not None and duration is not None else None)
-        return graph, source.parent / (name + '.ass')
-    if start is not None:
-        from dubforge.pipeline.step_assemble import _write_preview_srt
-        path = source.with_name('.preview_' + uuid.uuid4().hex + '.srt')
-        graph = subtitle_filter(path.name, ctx.cfg, canvas)
-        _write_preview_srt(source, start, start + duration, path)
-        return graph, path
-    return subtitle_filter(source.name, ctx.cfg, canvas), None
+    else:
+        # 关闭审查的历史单语导出仍可独立烧录；语言身份由明确的单语轨决定。
+        lines = parse_srt(source)
+        for line in lines:
+            line.parts = ((track, line.text),)
+    name = '.subtitle_' + uuid.uuid4().hex
+    graph = prepare_subtitle_lines(lines, ctx.cfg, canvas, source.parent, name=name,
+        start=start or 0, end=start + duration if start is not None and duration is not None else None)
+    return graph, source.parent / (name + '.ass')

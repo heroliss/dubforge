@@ -1,18 +1,45 @@
 <script setup lang="ts">
 import { computed } from 'vue'
-import { NProgress } from 'naive-ui'
+import ExecutionProgress from './ExecutionProgress.vue'
 import { publicationUploadProgress } from '../utils/publishing'
 import { fmtSize } from '../utils/format'
+import { executionForPublication, executionForChapter } from '../utils/executionProgress'
+import { publicationChapterState } from '../utils/publicationChapters'
+import { publicationActivity } from '../utils/progressActivity'
+import { publicationUpdateProgress } from '../utils/publicationUpdate'
 
-const props = defineProps<{ publication: any; compact?: boolean }>()
+const props = defineProps<{ publication: any; compact?: boolean; chapters?: boolean }>()
 const progress = computed(() => publicationUploadProgress(props.publication))
+const execution = computed(() => {
+  const value = executionForPublication(props.publication, progress.value)
+  // 兼容聚合接口把当前章节放在投稿execution；章节只在独立叶任务显示一次。
+  return value?.owner === 'chapters' ? null : value
+})
+const chapter = computed(() => publicationChapterState(props.publication))
+const chapterExecution = computed(() => props.chapters !== false && props.publication?.receipt?.bvid
+  ? executionForChapter(props.publication, chapter.value) : null)
+const update = computed(() => publicationUpdateProgress(props.publication))
+const updateExecution = computed(() => {
+  const value = update.value
+  if (!value) return null
+  const state = value.status === 'completed' ? 'completed'
+    : value.status === 'failed' ? 'failed'
+    : value.status === 'unknown' ? 'unknown'
+    : value.status === 'paused' ? 'paused'
+    : value.active ? (value.status === 'waiting' ? 'waiting' : 'running') : 'queued'
+  return { schema: 1, state, label: value.phase || value.text,
+    detail: value.current?.label || '', completed: value.progress, total: 100, unit: '%',
+    metrics: value.current?.progress !== null && value.current?.progress !== undefined
+      ? { current_stage: value.current.label, stage_progress: value.current.progress } : undefined }
+})
 </script>
 
 <template>
-  <div v-if="progress" class="publication-progress" :class="{ compact }" data-publication-progress>
-    <div class="progress-heading"><span>{{ progress.merging ? '视频字节已传完' : progress.complete ? '视频文件已上传' : '视频文件上传' }}</span><span>{{ progress.percentage.toFixed(1) }}%<template v-if="progress.hasBytes"> · {{ fmtSize(progress.loaded) }} / {{ fmtSize(progress.total) }}</template></span></div>
-    <n-progress type="line" :percentage="progress.percentage" :show-indicator="false" :height="compact ? 4 : 8" :processing="progress.active && (!progress.complete || progress.merging)" :status="publication.status === 'failed' ? 'error' : 'default'" />
-    <p role="status" aria-live="polite"><span v-if="progress.active" class="activity-dot" aria-hidden="true" />{{ progress.phase }}<span v-if="progress.part"> · {{ progress.part }}</span><span v-if="progress.totalParts"> · 已完成 {{ progress.completedParts }} / {{ progress.totalParts }} 个分P</span></p>
+  <div v-if="progress || execution || chapterExecution || updateExecution" class="publication-progress" :class="{ compact }" data-publication-progress>
+    <div v-if="progress?.hasBytes" class="progress-heading"><span>{{ progress.merging ? '视频字节已传完' : progress.complete ? '视频文件已上传' : '视频文件上传' }}</span><span>{{ fmtSize(progress.loaded) }} / {{ fmtSize(progress.total) }}</span></div>
+    <ExecutionProgress :execution="execution" :percentage="progress?.hasBytes ? progress.percentage : null" :indeterminate="!progress?.hasBytes" :activity="publicationActivity(publication)" :compact="compact" progress-label="视频文件" />
+    <ExecutionProgress :execution="updateExecution" :percentage="update?.progress" :indeterminate="update?.progress === null || !!update?.current && update.current.progress === null" :compact="compact" progress-label="原稿更新" />
+    <ExecutionProgress :execution="chapterExecution" :compact="compact" />
   </div>
 </template>
 

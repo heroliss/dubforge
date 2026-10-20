@@ -7,6 +7,7 @@ import threading
 import time
 import traceback
 import uuid
+from contextlib import nullcontext
 from datetime import datetime, timezone
 
 from dubforge import config, video_info, comment_diagnostics, comment_recovery, content_review
@@ -18,10 +19,11 @@ from dubforge.utils.fs import atomic_write_bytes
 from dubforge.pipeline.text_style import validate_color, validate_opacity, validate_outline, validate_font
 
 DEFAULT_SETTINGS = copy.deepcopy(config.DEFAULTS['comments']['overlay'])
-# 上屏排版保护上限，与供阅读的完整原文、译文长度分离；界面从 API 读取。
+# 自动候选长度上限；人工保留仅提示超长，完整文字仍可上屏。
 OVERLAY_TEXT_LIMITS = {'translated': 240, 'original': 600}
+PROCESSING_TIMEOUT_SECONDS = 1800
 FILTER_VERSION = 'audience-feedback-review-v3'
-RENDER_VERSION = 'word-wrap-v2'
+RENDER_VERSION = 'font-metrics-range-v5'
 FILTER_PROMPT = ('挑选适合展示的观众反馈：观感、共鸣、幽默、对创作者或互动氛围的赞美与祝福、'
                  '个人经历、建议、疑问及有理有据的批评都可入选，不要求提供具体信息或复述视频。'
                  '排除广告引流、刷屏、无意义重复、人身攻击及明显与此次观看或创作者互动无关的灌水。'
@@ -35,12 +37,60 @@ REVIEW_FILTER_INSTRUCTION = (
     '模型未识别风险不能保证内容安全或平台审核通过，最终仍执行本地高置信规则。')
 LEGACY_FILTER_PROMPT = '选出与视频内容有关、有具体观点或有趣体验的评论，排除广告、重复和人身攻击。'
 _jobs: dict[str, dict] = {}
+_diagnostics: dict[str, comment_diagnostics.Diagnostics] = {}
 _cancels: dict[str, threading.Event] = {}
+_prepare_jobs: dict[str, dict] = {}
+_prepare_cancels: dict[str, threading.Event] = {}
+_shutdown = threading.Event()
+_drained = threading.Condition(video_info.gate)
 
 
 class CommentError(DubForgeError):
     code = 'COMMENTS_INVALID'
     suggestion = '请检查评论内容和参数后重试；已保存的翻译、评分与上屏方案不会因失败丢失。'
+
+
+def _check_accepting():
+    if _shutdown.is_set():
+        raise CommentError('程序正在关闭，评论任务已停止；已完成结果保留', code='COMMENTS_INTERRUPTED',
+                           suggestion='程序重新启动后可继续，只补齐尚未完成的评论。')
+
+
+def startup():
+    """只有上一轮评论任务已安全退出后，才能重新开放处理入口。"""
+    with video_info.gate:
+        if _cancels or _prepare_cancels:
+            raise CommentError('上次评论任务仍在收尾，请稍后再启动', code='COMMENTS_FINALIZING')
+        _shutdown.clear()
+
+
+def request_shutdown():
+    """关闭注册入口并通知全部独立/流水线评论任务，不清除已有结果。"""
+    with video_info.gate:
+        _shutdown.set()
+        for uid, event in _cancels.items():
+            event.set()
+            if job := _jobs.get(uid):
+                job['cancelling'] = True
+        for uid, event in _prepare_cancels.items():
+            event.set()
+            _prepare_jobs[uid]['cancelling'] = True
+
+
+def wait_for_shutdown(timeout=5):
+    deadline = time.monotonic() + max(0.0, timeout)
+    with _drained:
+        while _cancels or _prepare_cancels:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            _drained.wait(remaining)
+        return len(set(_cancels) | set(_prepare_cancels))
+
+
+def shutdown(timeout=5):
+    request_shutdown()
+    return wait_for_shutdown(timeout)
 
 
 def _hash(value):
@@ -49,6 +99,51 @@ def _hash(value):
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec='seconds')
+
+
+def _comment_timestamp(value):
+    """发布时间仅作排序元数据；无效或缺失时间不能冒充最早发布。"""
+    if type(value) not in (int, float):
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) and number > 0 else None
+    except (OverflowError, ValueError):
+        return None
+
+
+def validate_order_mode(value):
+    if value not in ('chronological', 'manual'):
+        raise CommentError('评论上屏顺序无效，请选择发布时间顺序或手动顺序')
+    return value
+
+
+def selection_origin(item, saved=None):
+    """仅显式人工选择需要保护；缺失标记继承同源保存值，否则归为自动。"""
+    if 'selection_origin' in item:
+        origin = item['selection_origin']
+    elif (saved is not None and (item.get('id'), item.get('source_hash'))
+            == (saved.get('id'), saved.get('source_hash'))):
+        origin = saved.get('selection_origin', 'automatic')
+    else:
+        origin = 'automatic'
+    if origin not in ('manual', 'automatic', 'legacy'):
+        raise CommentError('评论选择来源无效')
+    return 'automatic' if origin == 'legacy' else origin
+
+
+def chronological_items(items, source_rows):
+    """评分只决定入选；上屏默认按发布时间，未知与同刻稳定沿用采集顺序。"""
+    sources = list(source_rows.values()) if isinstance(source_rows, dict) else list(source_rows)
+    by_id = {row['id']: row for row in sources}
+    positions = {row['id']: index for index, row in enumerate(sources)}
+    def key(indexed):
+        index, item = indexed
+        current = by_id.get(item['id'])
+        original = current if current and current.get('source_hash') == item.get('source_hash') else item
+        timestamp = _comment_timestamp(original.get('timestamp'))
+        return timestamp is None, timestamp or 0, positions.get(item['id'], len(sources) + index)
+    return [item for _, item in sorted(enumerate(items), key=key)]
 
 
 def _project(uid):
@@ -60,6 +155,71 @@ def _project(uid):
 
 def _path(project):
     return crud.project_dir_by_project(project) / 'comment_studio.json'
+
+
+def _data_revision(project):
+    """数据版本只看三份原子保存的资料，不为进度轮询重算配置和逐条校验。"""
+    root = crud.project_dir_by_project(project)
+    versions = []
+    for relative in ('comment_studio.json', 'artifacts/download/video_info.json', 'imports/bilibili_comments.json'):
+        try:
+            stat = (root / relative).stat()
+            versions.append((relative, stat.st_mtime_ns, stat.st_size))
+        except OSError:
+            versions.append((relative, None, None))
+    return _hash(versions)
+
+
+def _current_job(uid):
+    """调用方持资料锁；流式事件另受诊断锁保护，复制时不能与事件投影交错。"""
+    job = _jobs.get(uid)
+    diag = _diagnostics.get(uid)
+    return diag.snapshot() if diag and diag.job is job else comment_diagnostics.snapshot(job)
+
+
+def _progress_records(project):
+    """调用方持资料锁；单页与项目列表复用同一任务真值，不额外查询项目。"""
+    current = _current_job(project.uid)
+    jobs = {action: current if current and current.get('action') == action
+            else comment_diagnostics.restored_job(project, action) for action in ('filter', 'translate')}
+    latest = current or max((job for job in jobs.values() if job),
+                            key=comment_diagnostics.started_at_key, default=None)
+    return latest, jobs, comment_diagnostics.snapshot(_prepare_jobs.get(project.uid))
+
+
+def workspace_summaries(projects):
+    """列表批量投影已加载项目；不读取平台原文列表、解析配置或另查制作新鲜度。"""
+    from dubforge.comment_workspace import saved_overlay, workspace
+    result = {}
+    for project in projects:
+        root = crud.project_dir_by_project(project)
+        with video_info.gate:
+            _latest, jobs, preparation = _progress_records(project)
+            record = video_info._comment_runs.get(project.uid, {})
+            # 内存采集记录只用于同一来源和目录；不借历史项目的活动推测当前状态。
+            matches = (record.get('source_url') == video_info._url(project.source_url)
+                       and record.get('root') == str(root))
+            collection = {key: record.get(key) for key in
+                          ('status', 'started_at', 'updated_at', 'finished_at')} if matches else {}
+            if video_info._active.get(project.uid) == 'comments':
+                collection.update(busy=True, status='running')
+        # 原子文件可独立读取；较大的工作区 JSON 解析不占住全局资料锁。
+        result[project.uid] = workspace(saved_overlay(root / 'comment_studio.json'),
+                                        collection=collection, jobs=jobs, prepare_job=preparation)
+    return result
+
+
+def progress(uid):
+    """独立操作、全流程和成片准备共用的轻量实时状态。"""
+    with video_info.gate:
+        project = _project(uid)
+        latest, jobs, preparation = _progress_records(project)
+        collection = video_info.comment_progress(uid)
+        from dubforge.comment_workspace import saved_overlay, workspace
+        return dict(job=latest, jobs=jobs, collection=collection, prepare_job=preparation,
+                    workspace=workspace(saved_overlay(_path(project)), collection=collection,
+                                        jobs=jobs, prepare_job=preparation),
+                    data_revision=_data_revision(project))
 
 
 def _read(project):
@@ -93,6 +253,11 @@ def _read(project):
         if not isinstance(issues, dict) or any(not isinstance(bucket, dict) or any(
                 not isinstance(item, dict) or any(not isinstance(item.get(k), str)
                     for k in ('source_hash', 'fingerprint', 'status', 'code', 'message'))
+                or not isinstance(item.get('request_scope', 'unknown'), str)
+                or item.get('request_scope', 'unknown') not in ('item', 'batch', 'unknown')
+                or not isinstance(item.get('request_sources', {}), dict)
+                or any(not isinstance(k, str) or not isinstance(v, str)
+                       for k, v in item.get('request_sources', {}).items())
                 for item in bucket.values()) for bucket in issues.values()):
             raise ValueError()
         if plan is not None and (not isinstance(plan, dict) or not isinstance(plan.get('settings'), dict)
@@ -130,6 +295,7 @@ def _rows(project):
             continue
         seen.add(row['id'])
         item = {key: row.get(key) for key in ('id', 'text', 'author', 'like_count', 'is_pinned', 'author_is_uploader')}
+        item['timestamp'] = _comment_timestamp(row.get('timestamp'))
         item['url'] = video_info._url(row.get('url'))
         # ID 在不同平台可能重用，缓存同时绑定来源页面与文本。
         item['source_hash'] = _hash([project.source_url, row['id'], row['text'], row.get('author')])
@@ -137,25 +303,29 @@ def _rows(project):
     return rows
 
 
+def _translation_for(doc, ident, *sources):
+    """仅附属于可核验原文的缓存译文参与显示与审查，过期译文保持隔离。"""
+    translated = doc.get('translations', {}).get(ident, {})
+    hashes = {row.get('source_hash') for row in sources if isinstance(row, dict)}
+    return translated.get('text_zh', '') if translated.get('source_hash') in hashes else ''
+
+
 def _review_settings(uid, values=None):
     """评论审查使用项目解析后的配置快照，不能绕过继承规则读取全局值。"""
     if values is None:
         from dubforge import configuration
         values = configuration.resolve(uid)['values']
-    return content_review.settings_from_cfg(values)
+    from dubforge import content_review_decisions
+    enabled, terms = content_review.settings_from_cfg(values)
+    return enabled, terms, content_review_decisions.load(_project(uid))
 
 
 def review_reasons(item, review_settings, *, originals=()):
     """所有文字独立核对；精简上屏原文或切换语言不能隐藏权威来源中的命中。"""
-    enabled, terms = review_settings
-    texts = [item.get(key, '') for key in ('text', 'text_zh', 'display_text', 'source_text')]
-    texts.extend(row.get('text', '') for row in originals if row)
-    reasons = []
-    for text in texts:
-        for reason in content_review.blocked_comment(text or '', custom_terms=terms, enabled=enabled):
-            if reason not in reasons:
-                reasons.append(reason)
-    return reasons
+    from dubforge import content_review_decisions
+    finding = content_review_decisions.comment_finding(item, review_settings[:2], originals=originals,
+        store=review_settings[2] if len(review_settings) > 2 else None)
+    return finding['reasons'] if finding and finding['active'] else []
 
 
 def _review_empty(excluded):
@@ -167,10 +337,8 @@ def view(uid):
     with video_info.gate:
         project = _project(uid)
         doc, rows = _read(project), _rows(project)
-        translations = doc.get('translations', {})
         for row in rows:
-            translated = translations.get(row['id'], {})
-            row['text_zh'] = translated.get('text_zh', '') if translated.get('source_hash') == row['source_hash'] else ''
+            row['text_zh'] = _translation_for(doc, row['id'], row)
         filtered = doc.get('filter', {})
         source_version = _hash(sorted((r['id'], r['source_hash']) for r in rows))
         source_versions = {source_version}
@@ -191,9 +359,29 @@ def view(uid):
             row.update(review_blocked=bool(reasons), review_reasons=reasons)
         current_rows = {row['id']: row for row in rows}
         for item in (overlay or {}).get('items', []):
-            reasons = review_reasons(item, review_settings, originals=(current_rows.get(item['id']),))
+            current = current_rows.get(item['id'])
+            cached_text = _translation_for(doc, item['id'], item, current)
+            reasons = review_reasons({**item, 'text_zh': cached_text}, review_settings, originals=(current,))
             if reasons:
                 item.update(review_blocked=True, review_reasons=reasons)
+            else:
+                item.pop('review_blocked', None)
+                item.pop('review_reasons', None)
+        if filtered and review_settings[2]['entries']:
+            # 模型是否适用保留原评分；人工误报只重算本地排除与候选建议，不重跑模型。
+            filtered = copy.deepcopy(filtered)
+            assessed = filtered.get('assessments', filtered.get('items', []))
+            for item in assessed:
+                current = current_rows.get(item['id'])
+                if current is not None:
+                    item.update(review_blocked=current['review_blocked'], review_reasons=current['review_reasons'])
+            picked = sorted((item for item in assessed if item['eligible'] and not item.get('review_blocked')),
+                            key=lambda item: -item['score'])[:filtered.get('limit', len(assessed))]
+            selected = {item['id'] for item in picked}
+            for item in assessed:
+                item['outcome'] = ('review_blocked' if item.get('review_blocked') else 'selected' if item['id'] in selected
+                                   else 'limit' if item['eligible'] else 'excluded')
+            filtered.update(items=picked, assessments=assessed)
         cached = _cached_ratings(rows, doc.get('rating_cache') or filtered,
                                   settings_scope['values']['comments.prompt'], _context(project))
         profiles = _profiles()
@@ -202,7 +390,10 @@ def view(uid):
             issues = _current_issues(doc, rows, action, fingerprint)
             for row in rows:
                 if row['id'] in issues:
-                    row.setdefault('ai_issues', {})[action] = issues[row['id']]
+                    issue = dict(issues[row['id']])
+                    issue['retryable'] = issue['status'] != 'blocked'
+                    issue.setdefault('request_scope', 'unknown')
+                    row.setdefault('ai_issues', {})[action] = issue
         return {'rows': rows, 'source_version': source_version,
                 'filter': filtered, 'filter_stale': bool(filtered and filtered.get('source_version') not in source_versions),
                 'default_filter_prompt': FILTER_PROMPT, 'legacy_filter_prompt': LEGACY_FILTER_PROMPT,
@@ -214,24 +405,37 @@ def view(uid):
                 'defaults': project_settings(uid),
                 'configuration': settings_scope,
                 'fields': configuration.schema()['comments']['fields'],
-                'job': copy.deepcopy(_jobs.get(uid)) or comment_diagnostics.restored_job(project),
+                'job': _current_job(uid) or comment_diagnostics.restored_job(project),
+                'prepare_job': comment_diagnostics.snapshot(_prepare_jobs.get(uid)),
+                'data_revision': _data_revision(project),
                 'busy': video_info._active.get(uid)}
 
 
 def diagnostics(uid, action, *, after=0, trace_id=''):
     with video_info.gate:
         project = _project(uid)
-        current = copy.deepcopy(_jobs.get(uid))
+        current = _current_job(uid)
     return comment_diagnostics.read(project, action, current=current, after=after, trace_id=trace_id)
 
 
 def cancel(uid, job_id):
     with video_info.gate:
         job = _jobs.get(uid)
+        preparation = _prepare_jobs.get(uid)
+        if preparation and preparation.get('status') == 'running' and preparation.get('id') == job_id:
+            _prepare_cancels[uid].set()
+            preparation['cancelling'] = True
+            if uid in _cancels:
+                _cancels[uid].set()
+                job['cancelling'] = True
+            return {'ok': True}
         if not job or job.get('status') != 'running' or job.get('id') != job_id:
             raise CommentError('评论任务已变化，请刷新后再停止', code='COMMENTS_JOB_CHANGED')
         _cancels[uid].set()
         job['cancelling'] = True
+        if uid in _prepare_cancels:
+            _prepare_cancels[uid].set()
+            _prepare_jobs[uid]['cancelling'] = True
     return {'ok': True}
 
 
@@ -276,7 +480,29 @@ def _processing_key(action, prompt, context, profiles):
 def _current_issues(doc, rows, action, fingerprint):
     current = {row['id']: row['source_hash'] for row in rows}
     return {ident: value for ident, value in doc.get('ai_issues', {}).get(action, {}).items()
-            if value.get('fingerprint') == fingerprint and value.get('source_hash') == current.get(ident)}
+            if value.get('fingerprint') == fingerprint and value.get('source_hash') == current.get(ident)
+            and all(current.get(peer) == source_hash for peer, source_hash in value.get('request_sources', {}).items())}
+
+
+def _issue_cause(error, diag):
+    """只保留受控的服务商错误字段；不保存请求正文、完整响应或配置凭据。"""
+    detail = error.detail if isinstance(error.detail, dict) else {}
+    providers = detail.get('providers')
+    sources = providers[:8] if isinstance(providers, list) else [{'code': error.code, 'detail': detail}]
+    result = []
+    for source in sources:
+        if not isinstance(source, dict):
+            continue
+        cause = source.get('detail') if isinstance(source.get('detail'), dict) else {}
+        row = {}
+        for key, value in [('profile', source.get('profile')), ('code', source.get('code')),
+                           ('provider_code', cause.get('code') or cause.get('type')),
+                           ('finish_reason', cause.get('finish_reason'))]:
+            if isinstance(value, (str, int)) and value != '':
+                row[key] = str(diag.clean(str(value)))[:120]
+        if row:
+            result.append(row)
+    return result
 
 
 def _validate_result(value, batch, action):
@@ -310,6 +536,7 @@ def _complete_batch(batch, action, payload, instruction, *, check, diag, save, p
 
     def ask(group, attempts):
         known = {row['id']: row for row in group}
+        request_sources = {}
         def pending():
             return [row for row in group if row['id'] not in completed]
 
@@ -350,7 +577,9 @@ def _complete_batch(batch, action, payload, instruction, *, check, diag, save, p
             return {key: [completed[row['id']] for row in group]}
 
         def request(_error=None, _attempt=None):
+            nonlocal request_sources
             rows = pending()
+            request_sources = {row['id']: row['source_hash'] for row in rows}
             if _attempt:
                 diag.trace('retry_strategy', f'仅补充未通过校验的 {len(rows)} 条评论；已保存项不再请求。')
             return comment_protocol.request_text(rows, numbers, payload)
@@ -358,11 +587,20 @@ def _complete_batch(batch, action, payload, instruction, *, check, diag, save, p
         def parse(raw):
             return comment_protocol.parse_response(raw, {numbers[row['id']]: row['id'] for row in pending()}, action)
 
-        result = chat_validated(request(), parser=parse, validator=accept,
-            system=instruction + comment_protocol.instructions(action), temperature=0.1, failure_label='评论逐行格式',
-            max_retries=attempts, cancel_check=check, profile=profiles, log=diag.log, trace=diag.trace,
-            retry_request=request, retry_context=lambda *_: 'fresh',
-            retry_prompt=lambda exc, _: f'上次返回未通过校验：{exc}。只处理本条消息所列编号，每个编号恰好一行，保留编号；不要输出 JSON。')
+        try:
+            from dubforge import llm_conversations
+            with llm_conversations.context(project_uid=getattr(diag, 'project_uid', ''),
+                    operation='comment_translate' if action == 'translate' else 'comment_score',
+                    label='评论翻译' if action == 'translate' else '评论评分', owner_id=str(diag.job.get('id', ''))):
+                result = chat_validated(request(), parser=parse, validator=accept,
+                    system=instruction + comment_protocol.instructions(action), temperature=0.1, failure_label='评论逐行格式',
+                    max_retries=attempts, cancel_check=check, profile=profiles, log=diag.log, trace=diag.trace,
+                    retry_request=request, retry_context=lambda *_: 'fresh',
+                    retry_prompt=lambda exc, _: f'上次返回未通过校验：{exc}。只处理本条消息所列编号，每个编号恰好一行，保留编号；不要输出 JSON。')
+        except DubForgeError as error:
+            # 记录最后实际请求范围，部分成功后的补请求不能误绑到整个初始批次。
+            error.comment_request_sources = request_sources
+            raise
         return accept(result)
 
     try:
@@ -380,7 +618,10 @@ def _complete_batch(batch, action, payload, instruction, *, check, diag, save, p
 
 
 def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
-        failure_policy=None, retry_failed=False, only_cached=False):
+        failure_policy=None, retry_failed=False, only_cached=False, ids=None, recovery_budget=24,
+        budget_deadline=None, rejection_streak=0, _project_scope=None):
+    """处理全部评论或指定评论；局部处理保留范围外的有效评分与译文。"""
+    _check_accepting()
     if action not in {'translate', 'filter'}:
         raise CommentError('未知的评论操作')
     if action == 'filter' and (not isinstance(prompt, str) or not prompt.strip() or len(prompt) > 2000
@@ -390,12 +631,28 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
         raise CommentError('请明确是否重新评分')
     if only_cached and (action != 'filter' or force or retry_failed):
         raise CommentError('仅用已有评分不能与重新处理同时选择')
-    with video_info.operation(uid, f'{action}_comments') as project:
+    if type(recovery_budget) is not int or not 0 <= recovery_budget <= 24:
+        raise CommentError('评论诊断请求预算无效')
+    if budget_deadline is not None and (type(budget_deadline) not in (int, float) or not math.isfinite(budget_deadline)):
+        raise CommentError('评论处理时限无效')
+    if type(rejection_streak) is not int or not 0 <= rejection_streak < 3:
+        raise CommentError('评论内容拒绝计数无效')
+    with (nullcontext(_project_scope) if _project_scope is not None else video_info.operation(uid, f'{action}_comments')) as project:
         state = view(uid)
         failure_policy = failure_policy or state['configuration']['values']['comments.failure_policy']
         if failure_policy not in ('skip', 'stop'):
             raise CommentError('请选择有效的评论失败处理方式')
-        rows = state['rows']
+        all_rows = state['rows']
+        rows = all_rows
+        if ids is not None:
+            if (not isinstance(ids, list) or not ids or len(ids) > 500
+                    or any(not isinstance(ident, str) or not ident for ident in ids)
+                    or len(set(ids)) != len(ids)):
+                raise CommentError('请选择 1–500 条不同的评论', code='COMMENTS_SCOPE_INVALID')
+            by_id = {row['id']: row for row in all_rows}
+            if any(ident not in by_id for ident in ids):
+                raise CommentError('所选评论已变化，请重新读取后选择', code='COMMENTS_SCOPE_CHANGED')
+            rows = [by_id[ident] for ident in ids]
         if not rows:
             raise CommentError('请先获取评论正文', code='COMMENTS_EMPTY')
         requested = [row for row in rows if not row['text_zh']] if action == 'translate' else rows
@@ -404,26 +661,45 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
         previous = doc.get('rating_cache') or state['filter']
         profiles = copy.deepcopy(_profiles())
         fingerprint = _processing_key(action, prompt, context, profiles)
+        # 局部评分不能覆盖此前已完成的其他评论；换规则时旧评分仍正常失效。
+        valid_ratings = _cached_ratings(all_rows, previous, prompt, context) if action == 'filter' else {}
+        scope = {row['id'] for row in rows}
+        retained_ratings = [row for ident, row in valid_ratings.items() if ident not in scope]
         cached = {}
         if action == 'filter' and not force:
-            cached = _cached_ratings(rows, previous, prompt, context)
+            cached = {ident: row for ident, row in valid_ratings.items() if ident in scope}
             requested = [row for row in rows if row['id'] not in cached]
         if only_cached and not cached:
             raise CommentError('没有与当前原文、评分要求和视频背景匹配的评分', code='COMMENTS_CACHE_EMPTY')
-        known_issues = _current_issues(doc, requested, action, fingerprint)
-        skipped = {ident for ident, issue in known_issues.items() if issue['status'] != 'deferred'} if failure_policy == 'skip' and not (retry_failed or force or only_cached) else set()
+        known_issues = _current_issues(doc, all_rows, action, fingerprint)
+        requested_ids = {row['id'] for row in requested}
+        known_issues = {ident: issue for ident, issue in known_issues.items() if ident in requested_ids}
+        blocked_cached = {ident for ident, issue in known_issues.items() if issue['status'] == 'blocked'}
+        skipped = set(blocked_cached)
+        if failure_policy == 'skip' and not (retry_failed or force or only_cached):
+            skipped.update(ident for ident, issue in known_issues.items() if issue['status'] == 'failed')
         completed = set()
         event = threading.Event()
         with video_info.gate:
+            _check_accepting()
             _cancels[uid] = event
             job = _jobs[uid] = {'id': uuid.uuid4().hex, 'action': action, 'status': 'running',
                                'processed': 0, 'total': len(requested), 'cached': len(rows) - len(requested),
                                'skipped': len(skipped), 'deferred': 0, 'warning': '',
-                               'cancelling': False, 'error': '', 'code': '', 'suggestion': ''}
-        diag = comment_diagnostics.Diagnostics(project, job)
+                               'blocked': len(blocked_cached), 'blocked_cached': len(blocked_cached),
+                               'failed': len(skipped - blocked_cached), 'retryable': 0,
+                               'cancelling': False, 'error': '', 'code': '', 'suggestion': '',
+                               'isolation_requests': 0, 'rejection_streak': rejection_streak}
+            diag = comment_diagnostics.Diagnostics(project, job)
+            _diagnostics[uid] = diag
         diag.log(f'开始评论{"评分" if action == "filter" else "翻译"}：本次处理 {len(requested)} 条，复用 {job["cached"]} 条。')
-        deadline = time.monotonic() + 1800
+        if blocked_cached:
+            diag.log(f'{len(blocked_cached)} 条所在请求已有服务商审核拦截记录，未重新提交。请核对服务商原因；修改模型配置、原文或实际请求背景后可重新检查。')
+        deadline = time.monotonic() + PROCESSING_TIMEOUT_SECONDS
+        if budget_deadline is not None:
+            deadline = min(deadline, budget_deadline)
         def check():
+            _check_accepting()
             if cancel_check:
                 cancel_check()
             if event.is_set():
@@ -445,7 +721,7 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
                     new_matches = [{key: row[key] for key in ('id', 'eligible', 'reason', 'score')}
                                    | {'source_hash': by_id[row['id']]['source_hash'], 'assessed_at': _now()} for row in results]
                     doc['rating_cache'] = {'version': FILTER_VERSION, 'prompt': prompt.strip(), 'context_hash': _hash(context),
-                                           'assessments': matches + new_matches}
+                                           'assessments': retained_ratings + matches + new_matches}
                 issues = doc.setdefault('ai_issues', {}).setdefault(action, {})
                 for row in results:
                     issues.pop(row['id'], None)
@@ -464,21 +740,31 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
             with video_info.gate:
                 doc = _read(project)
                 issues = doc.setdefault('ai_issues', {}).setdefault(action, {})
+                request_sources = getattr(error, 'comment_request_sources', None) or {row['id']: row['source_hash'] for row in group}
                 for row in group:
                     issues[row['id']] = dict(source_hash=row['source_hash'], fingerprint=fingerprint,
                         status='deferred' if deferred else 'blocked' if blocked else 'failed',
-                        code=error.code, message=diag.clean(error.message), updated_at=_now())
+                        code=error.code, message=diag.clean(error.message), updated_at=_now(),
+                        request_scope='batch' if len(request_sources) > 1 else 'item',
+                        request_sources=request_sources if blocked else {}, cause=_issue_cause(error, diag))
                 _write(project, doc)
                 if not deferred:
                     skipped.update(row['id'] for row in group)
                 job['skipped'] = len(skipped)
-                label = '待处理' if deferred else '审核拦截' if blocked else '处理失败'
+                if not deferred:
+                    job['blocked' if blocked else 'failed'] += len(group)
+                label = '待处理' if deferred else '所在请求被审核拦截（未确认具体触发项）' if blocked and len(request_sources) > 1 else '审核拦截' if blocked else '处理失败'
                 diag.log(f'{len(group)} 条评论{label}；原文保留，不伪造评分或译文。')
                 for row in group:
                     diag.trace('item_skipped', f'{row["author"] or "匿名观众"}：{label} · {row["text"][:100]}',
                                comment_id=row['id'], code=error.code)
                 diag.persist()
         try:
+            if blocked_cached and failure_policy == 'stop':
+                job['deferred'] = len(remaining(requested))
+                job['retryable'] = job['deferred']
+                raise CommentError('所选范围含已有服务商审核拦截记录，本次未重复提交。', code='COMMENTS_BLOCKED',
+                    suggestion='请查看逐条原因并核对服务商要求；修改模型配置、原文或实际请求背景后可重新检查。')
             for profile in profiles:
                 # 输出协议属于任务，不能被全局 JSON 响应格式覆盖；只改本次快照。
                 params = profile.get('params') or {}
@@ -487,12 +773,23 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
                     diag.log(f'配置「{profile.get("name", "default")}」本次采用评论逐行文本协议，不使用 response_format。')
             recovery = None
             pending = remaining(requested) if not only_cached else []
-            for index, batch in enumerate(_batches(pending), 1):
+            oversized = [row for row in pending if len(row['text']) > 12000]
+            if oversized:
+                error = CommentError('本条评论超过 12000 字，无法自动处理；完整原文已保留，可人工处理', code='COMMENTS_TOO_LONG')
+                if failure_policy == 'stop':
+                    raise error
+                save_issues(oversized, error)
+                pending = remaining(pending)
+            batches = list(_batches(pending))
+            with video_info.gate:
+                job['batches'] = len(batches)
+            for index, batch in enumerate(batches, 1):
                 check()
-                job['batch'] = index
+                with video_info.gate:
+                    job.update(batch=index, batch_size=len(batch))
                 diag.log(f'第 {index} 批 · {len(batch)} 条')
                 diag.trace('batch_start', f'第 {index} 批 · {len(batch)} 条', batch=index)
-                diag.persist()
+                diag.persist(force=False)
                 payload = {}
                 instruction = ('逐条忠实翻译成简体中文，保留语气、否定、讽刺和专有名词；原文为中文时保持原意。'
                                '不能漏句、合并评论、编造或删改观点。')
@@ -523,20 +820,28 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
                         numbers_override={row['id']: number for number, row in enumerate(batch, 1)})
                 if recovery is None:
                     recovery = comment_recovery.Recovery(policy=failure_policy, check=check, remaining=remaining,
-                        execute=execute, failed=save_issues, trace=diag.trace)
+                        execute=execute, failed=save_issues, trace=diag.trace, max_extra=recovery_budget,
+                        initial_rejections=rejection_streak)
                 # 每批闭包携带本批输入，止损计数跨批保留。
                 recovery.execute = execute
                 recovery.process(batch)
+                job['isolation_requests'] = recovery.extra
+                job['rejection_streak'] = recovery.consecutive
                 if recovery.stopped:
                     deferred = remaining(requested)
-                    save_issues(deferred, CommentError('自动诊断已止损，本条尚未完成独立处理；可人工处理或换配置后重试。', code='COMMENTS_DEFERRED'), deferred=True)
+                    save_issues(deferred, CommentError('本次自动请求已停止，本条尚未处理；可人工处理或定向重试，已有审核拦截项不会重复提交。', code='COMMENTS_DEFERRED'), deferred=True)
                     break
             with video_info.gate:
                 check()
                 job['deferred'] = len(remaining(requested))
-                if not (job['processed'] or job['cached']) and (skipped or job['deferred']):
+                job['retryable'] = job['failed'] + job['deferred']
+                if (not (job['processed'] or job['cached']) and (skipped or job['deferred'])
+                        and (ids is None or failure_policy == 'stop')):
                     if recovery and recovery.last_error:
                         raise recovery.last_error
+                    if blocked_cached and len(blocked_cached) == len(requested):
+                        raise CommentError('所选评论均有服务商审核拦截记录，本次没有重新提交，也没有复用译文或评分。',
+                            code='COMMENTS_BLOCKED', suggestion='请查看逐条原因并核对服务商要求；修改模型配置、原文或实际请求背景后可重新检查。')
                     raise CommentError('暂无可用的处理结果，请查看逐条原因后处理或更换配置。', code='COMMENTS_NO_RESULTS')
                 if action == 'filter':
                     doc = _read(project)
@@ -556,7 +861,9 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
                     _write(project, doc)  # 仅保存建议，绝不代替人工勾选或上屏确认。
                 job['status'] = 'partial' if job['skipped'] or job['deferred'] else 'done'
                 if job['status'] == 'partial':
-                    job['warning'] = f'已完成 {job["processed"]} 条、复用 {job["cached"]} 条；{job["skipped"]} 条跳过、{job["deferred"]} 条待处理。可查看逐条原因或重试未完成项。'
+                    job['warning'] = (f'已完成 {job["processed"]} 条、复用 {job["cached"]} 条有效结果；'
+                        f'{job["blocked"]} 条所在请求被审核拦截、{job["failed"]} 条普通失败、{job["deferred"]} 条待处理。'
+                        '普通失败与待处理可定向重试；审核拦截不会重复提交，请核对服务商原因或修改实际请求配置后重新检查。')
                 diag.log(f'评论处理完成：新增 {job["processed"]} 条，复用 {job["cached"]} 条。')
                 diag.trace('run_end', job['warning'] or '本次评论处理完成')
         except Exception as exc:
@@ -574,7 +881,8 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
                 error = CommentError(f'评论 AI 处理失败：内部异常（{type(exc).__name__}），已完成 {job["processed"]}/{job["total"]} 条。',
                     code='COMMENTS_INTERNAL', suggestion='请查看评论日志与对话；已保存的结果仍可复用。')
             with video_info.gate:
-                job.update(status='cancelled' if error.code in {'COMMENTS_CANCELLED', 'WORKFLOW_STOPPED'} else 'failed',
+                job.update(status='interrupted' if error.code in {'COMMENTS_INTERRUPTED', 'STEP_INTERRUPTED'} else
+                           'cancelled' if error.code in {'COMMENTS_CANCELLED', 'WORKFLOW_STOPPED'} else 'failed',
                            error=error.message, code=error.code, suggestion=error.suggestion, detail=diag.clean(error.detail))
             diag.log('诊断堆栈（已脱敏）：\n' + traceback.format_exc())
             diag.log(f'[{error.code}] {error.message} {error.suggestion}')
@@ -586,6 +894,7 @@ def run(uid, action, *, prompt='', limit=10, force=False, cancel_check=None,
             diag.persist()
             with video_info.gate:
                 _cancels.pop(uid, None)
+                _drained.notify_all()
     return view(uid)
 
 
@@ -601,19 +910,47 @@ def project_settings(uid):
 
 
 def effective_overlay(uid, plan):
-    return {**copy.deepcopy(plan), 'settings': project_settings(uid)} if plan else None
+    if not plan:
+        return None
+    result = {**copy.deepcopy(plan), 'settings': project_settings(uid)}
+    # 历史缺失来源按自动选择读取，不改写历史文件，版本校验共用该视图。
+    for item in result.get('items', []):
+        item['selection_origin'] = selection_origin(item)
+    return result
 
 
-def render_fingerprint_plan(plan):
-    """未启用的语言样式不影响成品；新增默认字段也不应让已有成品无故过期。"""
+def render_fingerprint_plan(plan, *, legacy=False):
+    """返回实际渲染使用的评论方案摘要。
+
+    ``confirmed_at`` 只记录方案确认时间，不会被 ASS/FFmpeg 消费；把它放进
+    成品指纹会让用户重新确认同一批评论后，所有已有成片都被误判为过期。
+    新指纹默认会剔除它。``legacy=True`` 仅供读取历史
+    :class:`~dubforge.pipeline.assembly_models.AssemblyResult` 时兼容旧指纹，
+    不应用于新产物。
+    """
     if not plan:
         return plan
     result = copy.deepcopy(plan)
+    if not legacy:
+        result.pop('confirmed_at', None)
+        # 人工固定/自动选择及排除清单只属于编辑意图，不改变成片画面。
+        result.pop('excluded_ids', None)
+        result.pop('order_mode', None)
+        for item in result.get('items', []):
+            item.pop('selection_origin', None)
+            item.pop('timestamp', None)
     # 排版算法改变后重生成评论成品，不能继续复用逐字切断单词的旧画面。
     result['render_version'] = RENDER_VERSION
     settings = result['settings']
+    if not legacy:
+        # 缺失的新范围与明确保留缺省范围渲染相同；读取旧快照不应产生两套指纹。
+        for lower, upper in (('min_font_size', 'font_size'), ('source_min_font_size', 'source_font_size')):
+            settings.setdefault(lower, min(DEFAULT_SETTINGS[lower], settings.get(upper, DEFAULT_SETTINGS[upper])))
+        settings.setdefault('height_percent', DEFAULT_SETTINGS['height_percent'])
     if not settings.get('width_percent'):
-        settings.pop('width_percent', None)
+        # 自动与 100% 都使用扣除边距后的可用宽度。历史兼容分支也须使用
+        # 同一有效值，避免旧自动窄版通过 legacy 回退被误判为仍然有效。
+        settings['width_percent'] = 100
     if not settings.get('source_style_enabled') or settings.get('language_mode', 'translated') == 'translated':
         for key in list(settings):
             if key.startswith('source_') and key != 'source_first':
@@ -639,12 +976,28 @@ def validate_settings(raw):
     if not isinstance(raw, dict) or set(raw) - set(DEFAULT_SETTINGS):
         raise CommentError('评论显示设置无效')
     result = {**DEFAULT_SETTINGS, **raw}
-    ranges = {'start': (0, 86400), 'interval': (1, 600), 'duration': (1, 60), 'font_size': (18, 72), 'source_font_size': (18, 72), 'margin': (0, 400), 'width_percent': (0, 100)}
+    # 旧版方案没有字号下限；补程序缺省而不是读取当前全局设置，保留旧方案上限。
+    for lower, upper in (('min_font_size', 'font_size'), ('source_min_font_size', 'source_font_size')):
+        if lower not in raw and type(result[upper]) in (int, float) and math.isfinite(result[upper]):
+            result[lower] = min(DEFAULT_SETTINGS[lower], result[upper])
+    ranges = {'start': (0, 86400), 'interval': (1, 600), 'duration': (1, 60),
+              'font_size': (18, 72), 'min_font_size': (18, 72),
+              'source_font_size': (18, 72), 'source_min_font_size': (18, 72),
+              'margin': (0, 400), 'width_percent': (0, 100), 'height_percent': (1, 100)}
+    labels = {'width_percent': '最大宽度（画面 %，0 为自动）', 'height_percent': '目标最大高度（画面 %）',
+              'font_size': '译文最大字号（通用）', 'min_font_size': '译文最小字号（通用）',
+              'source_font_size': '原文最大字号', 'source_min_font_size': '原文最小字号'}
     for key, (lo, hi) in ranges.items():
         value = result[key]
         if type(value) not in (int, float) or not math.isfinite(value) or not lo <= value <= hi:
-            label = '最大宽度（画面 %，0 为自动）' if key == 'width_percent' else key
+            label = labels.get(key, key)
             raise CommentError(f'评论参数 {label} 必须在 {lo}–{hi} 之间')
+    for lower, upper, label in (('min_font_size', 'font_size', '译文'),
+                                 ('source_min_font_size', 'source_font_size', '原文')):
+        if lower == 'source_min_font_size' and not result['source_style_enabled']:
+            continue
+        if result[lower] > result[upper]:
+            raise CommentError(f'评论{label}最小字号不能大于最大字号')
     if result['duration'] > result['interval']:
         raise CommentError('评论停留时长不能大于出现间隔，以免相互重叠')
     if not isinstance(result['position'], str) or result['position'] not in {'top_left', 'top', 'top_right', 'bottom_left', 'bottom', 'bottom_right'} or type(result['show_author']) is not bool:
@@ -678,7 +1031,7 @@ def _display_parts(item, settings):
 
 
 def overlay_text_issues(item, settings):
-    """自动候选与最终保存共用规则；只检查当前显示语言，不影响完整评论阅读。"""
+    """长度建议与空白问题；自动候选按完整规则筛选，人工超长只提示。"""
     issues = []
     for text, limit, label in _display_parts(item, settings):
         length = len(text.strip()) if isinstance(text, str) else 0
@@ -689,28 +1042,70 @@ def overlay_text_issues(item, settings):
     return issues
 
 
+def blocking_text_issues(item, settings):
+    """人工选择只豁免长度建议，不能让空文字绕过预览、保存及成片校验。"""
+    if selection_origin(item) != 'manual':
+        return overlay_text_issues(item, settings)
+    return [f'{label}上屏文字为空' for text, _, label in _display_parts(item, settings)
+            if not isinstance(text, str) or not text.strip()]
+
+
+def uses_full_text_layout(item, settings):
+    """超长人工文字采用完整缩小策略；常规评论保留原有字号和安全区行为。"""
+    return selection_origin(item) == 'manual' and any(isinstance(text, str) and len(text.strip()) > limit
+            for text, limit, _ in _display_parts(item, settings))
+
+
 def display_lines(item, settings):
     """原文、中文分别编辑；双语保留分行，不自动替换人工文字。兼容旧确认快照。"""
-    issues = overlay_text_issues(item, settings)
+    issues = blocking_text_issues(item, settings)
     if issues:
-        raise CommentError('；'.join(issues) + '；请翻译、精简上屏文字或切换语言', code='COMMENTS_DISPLAY_TEXT')
+        author = item.get('author')
+        author = author.strip()[:48] if isinstance(author, str) else ''
+        label = f'上屏评论（{author}）' if author else '上屏评论'
+        too_long = any(isinstance(text, str) and len(text.strip()) > limit
+                       for text, limit, _ in _display_parts(item, settings))
+        guidance = '请到“上屏评论”页补齐所选语言的文字，或切换显示语言。'
+        if selection_origin(item) != 'manual' and too_long:
+            guidance = ('240/600 字符是中文/原文的自动选择建议上限；请到“上屏评论”页翻译、'
+                        '精简上屏文字、切换显示语言，或手动保留该评论以完整使用。')
+        raise CommentError(label + '显示文字需处理：' + '；'.join(issues) + '。' + guidance,
+                           code='COMMENTS_DISPLAY_TEXT', suggestion=guidance,
+                           detail={'comment_id': item.get('id'), 'author': author, 'issues': issues})
     return [text.strip() for text, _, _ in _display_parts(item, settings)]
 
 
-def draft(uid, body, *, review_values=None):
-    """前端只提交 ID、来源指纹和显示文字，原文/作者/链接由服务端核对。"""
+def draft(uid, body, *, review_values=None, display_settings=None):
+    """来源由服务端核对；自动准备可按实际分P校验，不改变公共默认设置。"""
     if not isinstance(body, dict) or not isinstance(body.get('items'), list) or len(body['items']) > 100:
         raise CommentError('最多确认 100 条评论')
     with video_info.gate:
         project = _project(uid)
         doc = _read(project)
+        order_mode = validate_order_mode(body.get('order_mode', (doc.get('overlay') or {}).get('order_mode', 'chronological')))
         settings = validate_settings(body.get('settings', {}))
+        if display_settings is None:
+            displays = [settings]
+        else:
+            # 只接受内部调用参数；请求 body 中的同名字段不能放宽文字校验。
+            if not isinstance(display_settings, (list, tuple)) or not display_settings:
+                raise CommentError('本次评论显示范围无效')
+            displays = [validate_settings(current) for current in display_settings]
         review_settings = _review_settings(uid, review_values)
         rows = _rows(project)
         current_rows = {r['id']: r for r in rows}
         available = {(r['id'], r['source_hash']): r for r in rows}
-        for row in (doc.get('overlay') or {}).get('items', []):
+        saved_items = {(row['id'], row['source_hash']): row
+                       for row in (doc.get('overlay') or {}).get('items', [])}
+        for row in saved_items.values():
             available.setdefault((row['id'], row['source_hash']), row)
+        exclusions = body.get('excluded_ids', (doc.get('overlay') or {}).get('excluded_ids', []))
+        if (not isinstance(exclusions, list) or len(exclusions) > 500
+                or any(not isinstance(row, dict) or not isinstance(row.get('id'), str)
+                       or not isinstance(row.get('source_hash'), str) for row in exclusions)
+                or len({row['id'] for row in exclusions}) != len(exclusions)):
+            raise CommentError('手动排除评论的来源标识无效', code='COMMENTS_SCOPE_INVALID')
+        exclusions = [{'id': row['id'], 'source_hash': row['source_hash']} for row in exclusions]
         items, seen, excluded = [], set(), []
         for item in body['items']:
             if not isinstance(item, dict) or not isinstance(item.get('id'), str) or not isinstance(item.get('source_hash'), str):
@@ -720,30 +1115,54 @@ def draft(uid, body, *, review_values=None):
                 raise CommentError('评论原文已变化或选择重复，请重新核对', code='COMMENTS_SOURCE_CHANGED')
             text = item.get('display_text', '')
             source = item.get('source_text', original['text'])
+            origin = selection_origin(item, saved_items.get((item['id'], item['source_hash'])))
             if not isinstance(text, str) or not isinstance(source, str) or len(text) > 15000 or len(source) > 12000:
                 raise CommentError('评论文字格式或长度无效', code='COMMENTS_DISPLAY_TEXT')
             seen.add(item['id'])
             entry = {key: original.get(key) for key in ('id', 'source_hash', 'text', 'author', 'url')}
-            entry.update(display_text=text.strip(), source_text=source.strip())
-            reasons = review_reasons(entry, review_settings, originals=(current_rows.get(item['id']),))
+            entry.update(display_text=text.strip(), source_text=source.strip(), selection_origin=origin,
+                         timestamp=_comment_timestamp(original.get('timestamp')))
+            current = current_rows.get(item['id'])
+            label = '手动保留'
+            if origin != 'automatic' and current and current['source_hash'] != item['source_hash']:
+                raise CommentError(label + '评论的来源原文已变化，请重新核对后确认', code='COMMENTS_MANUAL_INVALID',
+                    detail={'invalid_manual': [{'id': item['id'], 'selection_origin': origin,
+                                                'reasons': ['来源原文已变化']}]})
+            # 不同显示语言也核对有效缓存译文；过期译文不应误伤新原文。
+            cached_text = _translation_for(doc, item['id'], original, current)
+            from dubforge import content_review_decisions
+            evidence = content_review_decisions.comment_finding({**entry, 'text_zh': cached_text},
+                review_settings[:2], originals=(current,), store=review_settings[2])
+            if evidence:
+                entry['review_evidence_texts'] = evidence['evidence_texts']
+            reasons = evidence['reasons'] if evidence and evidence['active'] else []
             if reasons:
+                if origin != 'automatic':
+                    raise CommentError(label + '的评论尚未通过内容检查，请先核对后再确认上屏方案',
+                        code='COMMENTS_MANUAL_INVALID', detail={'invalid_manual': [{'id': item['id'],
+                            'selection_origin': origin, 'reasons': reasons}]})
                 excluded.append({'id': item['id'], 'review_reasons': reasons})
                 continue
-            display_lines(entry, settings)
+            for current in displays:
+                display_lines(entry, current)
             items.append(entry)
         if body['items'] and not items and excluded:
             raise _review_empty(excluded)
-        return {'settings': settings, 'items': items, **({'review_excluded': excluded} if excluded else {})}
+        exclusions = [row for row in exclusions if row['id'] not in seen]
+        return {'settings': settings, 'items': items, 'excluded_ids': exclusions, 'order_mode': order_mode,
+                **({'review_excluded': excluded} if excluded else {})}
 
 
-def save(uid, body):
+def save(uid, body, *, display_settings=None):
     from dubforge.workflows import check_idle
     from dubforge import configuration
     from dubforge.runner import runner
     from dubforge.pipeline import dubbing_session
     with runner._start_lock, dubbing_session.gate, video_info.gate:
         from dubforge import runtime_edit
-        runtime_edit.check_idle(uid, allow_owned=True)
+        # 评论方案会被合成步骤消费；只在当前合成/评论阶段冻结，下载、转录等
+        # 无关步骤运行时仍可先准备未来的上屏方案。
+        runtime_edit.check_idle(uid, allow_owned=True, paths={'comments'})
         check_idle(uid)
         project = _project(uid)
         doc = _read(project)
@@ -754,26 +1173,40 @@ def save(uid, body):
             raise CommentError('继承设置已变化，请重新读取后保存', code='COMMENTS_PLAN_CHANGED')
         reset = body.get('settings_reset', [])
         explicit = body.get('settings_explicit', [])
+        target = body.get('target')
+        if target is not None and (type(target) is not int or not 1 <= target <= 100):
+            raise CommentError('目标上屏数量应为 1–100 条')
         if any(not isinstance(keys, list) or any(not isinstance(k, str) or k not in DEFAULT_SETTINGS for k in keys) for keys in (reset, explicit)):
             raise CommentError('评论样式继承字段无效')
         settings = {**body.get('settings', {}), **{k:cfg['defaults']['comments.'+k] for k in reset}}
-        plan = draft(uid, {**body, 'settings':settings}, review_values=cfg['values'])
+        plan = draft(uid, {**body, 'settings':settings}, review_values=cfg['values'], display_settings=display_settings)
         plan['confirmed_at'] = _now()
         old = copy.deepcopy(doc)
         doc['overlay'] = plan
         updates = {'comments.' + k: v for k, v in plan['settings'].items() if k not in reset and (k in explicit or v != cfg['values']['comments.' + k])}
+        if target is not None and target != cfg['values']['comments.count']:
+            updates['comments.count'] = target
+            if target > cfg['values']['comments.limit']:
+                # 目标扩大只扩大下次采集的上限，不在确认保存时联网获取。
+                updates['comments.limit'] = target
         if updates or reset:
             configuration.save('project:' + uid, dict(revision=cfg['revision'], updates=updates, reset=['comments.'+k for k in reset]),
                 before_commit=lambda: _write(project, doc), on_rollback=lambda: _write(project, old))
         else:
             _write(project, doc)
+        # 仅记录成功确认事件；同秒保存相同内容时，签名本身可能不变。
+        # 不用评分/翻译也会改变的文件时间来冒充用户确认。
+        preparation = _prepare_jobs.get(uid)
+        if preparation and preparation.get('status') in {'done', 'partial'}:
+            preparation['confirmed_overlay_signature'] = _hash(plan)
     return view(uid)
 
 
 def confirmed(uid, revision=None):
     with video_info.gate:
         project = _project(uid)
-        plan = effective_overlay(uid, _read(project).get('overlay'))
+        doc = _read(project)
+        plan = effective_overlay(uid, doc.get('overlay'))
         if revision is not None and revision != _hash(plan):
             raise CommentError('已确认的评论方案发生变化，请重新确认合成范围', code='COMMENTS_PLAN_CHANGED')
         if not plan or not plan.get('items'):
@@ -783,7 +1216,9 @@ def confirmed(uid, revision=None):
         current_rows = {r['id']: r for r in _rows(project)}
         items, excluded = [], []
         for item in plan['items']:
-            reasons = review_reasons(item, review_settings, originals=(current_rows.get(item['id']),))
+            current = current_rows.get(item['id'])
+            cached_text = _translation_for(doc, item['id'], item, current)
+            reasons = review_reasons({**item, 'text_zh': cached_text}, review_settings, originals=(current,))
             if reasons:
                 excluded.append({'id': item['id'], 'review_reasons': reasons})
             else:

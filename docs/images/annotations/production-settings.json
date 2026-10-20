@@ -1,0 +1,9 @@
+{
+  "maxWidth": 1100,
+  "crop": {"left": 780, "top": 200, "width": 1230, "height": 960},
+  "marks": [
+    {"number": 1, "target": {"x": 28, "y": 129, "width": 200, "height": 180}, "label": {"x": 22, "y": 115}, "arrow": false},
+    {"number": 2, "target": {"x": 276, "y": 238, "width": 928, "height": 94}, "label": {"x": 250, "y": 224}, "arrow": false},
+    {"number": 3, "target": {"x": 276, "y": 555, "width": 928, "height": 382}, "label": {"x": 250, "y": 541}, "arrow": false}
+  ]
+}

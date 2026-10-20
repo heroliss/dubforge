@@ -12,6 +12,7 @@ from sqlmodel import select
 from conftest import mark_upstream_done, wait_status
 from dubforge import config, configuration
 from dubforge.domain import crud
+from test_configuration import save
 from dubforge.domain.models import Artifact, Job, Project, StepRun
 from dubforge.errors import DubForgeError
 from dubforge.publishing.models import Publication
@@ -32,6 +33,18 @@ def _save_params(uid, **updates):
     crud.save_project(project)
 
 
+def _completed_context(uid, step_key):
+    """模拟已归属当前计划的任务完成；不能用无来源的通知推进制作链。"""
+    project = crud.get_project(uid)
+    params = crud.project_params(project)
+    task_data = {'chain_binding': {'signature': runner._chain_signature(params)}}
+    job = crud.add_job(project.id, step_key, 'isolated-completion.log', task_data=task_data)
+    job.status = 'done'
+    crud.update_job(job)
+    _save_params(uid, _chain_job_id=job.id)
+    return SimpleNamespace(step_key=step_key, log=lambda _: None, task_data=task_data, job_id=job.id)
+
+
 def _held_translation(make_project, *, stale=False, steps=None):
     uid = make_project(params={"auto_steps": ["translate", "subtitles"]})
     mark_upstream_done(uid, "translate")
@@ -39,6 +52,10 @@ def _held_translation(make_project, *, stale=False, steps=None):
     split = crud.get_step(project.id, "split")
     split.input_fingerprint = "old-successful-input" if stale else compute_fingerprint(project, "split")
     crud.save_step(split)
+    if stale:
+        # 只有真正替换上游文件才会加入恢复计划；状态字段本身不再向下游传播。
+        split_path = Dependencies(project).path("split", "split.txt")
+        split_path.write_text(split_path.read_text(encoding="utf-8").replace("hello", "new source"), encoding="utf-8")
     translation = crud.get_step(project.id, "translate")
     translation.status = "failed"
     translation.error_code = "STEP_INTERRUPTED"
@@ -210,7 +227,7 @@ def test_preflight_change_requires_new_confirmation_without_mutation(make_projec
     uid = _held_translation(make_project)
     plan = _plan(uid)
     if drift == "configuration":
-        config.set_key("translate.style_prompt", "新的隔离翻译风格")
+        save('project:' + uid, {'translate.style_prompt': '新的隔离翻译风格'})
     elif drift == "remaining_steps":
         _save_params(uid, _chain=["translate"])
     elif drift == "hold_reason":
@@ -269,17 +286,22 @@ def test_change_after_confirmation_holds_before_remaining_step(make_project, mon
     response = _resume(uid, _body(plan))
     assert response.status_code == 200 and response.json()["started"] == "split", response.text
     if drift == "configuration":
-        config.set_key("translate.style_prompt", "确认后修改的隔离翻译风格")
+        save('project:' + uid, {'translate.style_prompt': '确认后修改的隔离翻译风格'})
     else:
         _source_versions(uid, ("确认后改名的原声版本",))
     # 前一步成功后正常交还续跑器；此处只模拟完成通知，不触发实际制片。
-    result = runner.continue_chain(crud.get_project(uid), SimpleNamespace(step_key="split", log=lambda _: None))
-    assert result["started"] is None and result["stopped"]
-    params = crud.project_params(crud.get_project(uid))
-    assert params["_chain_state"] == "held"
-    assert params["_chain_hold"]["code"] == "CHAIN_PLAN_CHANGED"
-    assert params["_chain"][0] == ("translate" if drift == "configuration" else "assemble")
-    assert calls == [(uid, "split")]
+    result = runner.continue_chain(crud.get_project(uid), _completed_context(uid, 'split'))
+    if drift == "configuration":
+        # 尚未运行的翻译步骤使用当前设置；无需因参数变化重新确认整条流程。
+        assert result["started"] == "translate" and result["stopped"] is None
+        assert crud.project_params(crud.get_project(uid))["_chain_state"] == "active"
+    else:
+        assert result["started"] is None and result["stopped"]
+        params = crud.project_params(crud.get_project(uid))
+        assert params["_chain_state"] == "held"
+        assert params["_chain_hold"]["code"] == "CHAIN_PLAN_CHANGED"
+        assert params["_chain"][0] == "assemble"
+    assert calls == ([(uid, "split")] if drift == "version" else [(uid, "split"), (uid, "translate")])
 
 
 def test_irrelevant_setting_change_does_not_stop_remaining_production(make_project, monkeypatch, no_external):
@@ -291,7 +313,7 @@ def test_irrelevant_setting_change_does_not_stop_remaining_production(make_proje
     response = _resume(uid, _body(plan))
     assert response.status_code == 200 and response.json()["started"] == "split", response.text
     config.set_key("server.port", 8611)
-    result = runner.continue_chain(crud.get_project(uid), SimpleNamespace(step_key="split", log=lambda _: None))
+    result = runner.continue_chain(crud.get_project(uid), _completed_context(uid, 'split'))
     assert result["started"] == "translate" and result["stopped"] is None
     assert calls == [(uid, "split"), (uid, "translate")]
 
@@ -339,7 +361,7 @@ def test_actual_subtitle_manual_save_stops_confirmed_version_before_encoding(mak
     plan, calls = _confirm_without_work(uid, monkeypatch)
     assert plan["recovery"]["start_step"] == "subtitles"
     _manual_text(uid, {field: "人工复核后的新文字"})
-    result = runner.continue_chain(crud.get_project(uid), SimpleNamespace(step_key="subtitles", log=lambda _: None))
+    result = runner.continue_chain(crud.get_project(uid), _completed_context(uid, 'subtitles'))
     assert result["started"] is None and result["stopped"]
     params = crud.project_params(crud.get_project(uid))
     assert params["_chain"] == ["assemble"] and params["_chain_state"] == "held"

@@ -53,6 +53,10 @@ def test_preview_time_color_position_bilingual_and_scale(video):
     {'assemble.subtitle_outline': float('inf')},
     {'assemble.subtitle_track': '../../bad'},
     {'assemble.subtitle_track': []},
+    {'assemble.subtitle_auto_fit': 'true'},
+    {'assemble.subtitle_min_size': None},
+    {'assemble.subtitle_min_size': 0},
+    {'assemble.subtitle_source_min_size': float('nan')},
     {'subtitles.source_first': 'false'},
     {'subtitles.min_duration': -1},
     {'subtitles.min_duration': 4},
@@ -94,26 +98,49 @@ def test_preview_api_without_tts_or_export(make_project, video, monkeypatch):
 
 
 def test_burn_uses_same_filter(make_project, video, monkeypatch, tmp_path):
-    from dubforge.pipeline import step_assemble
-    from dubforge.pipeline.subtitle_style import video_canvas
+    from dubforge.pipeline import step_assemble, step_subtitles
+    from dubforge.pipeline.subtitle_style import ass_document, video_canvas
     from dubforge.utils.srt import write_srt
     from types import SimpleNamespace
     srt = tmp_path / 'srt/trans.srt'
-    write_srt([SubLine(1, 1, 2, '画面字幕')], srt)
+    lines = [SubLine(1, 1, 2, '画面字幕', (('trans', '画面字幕'),))]
+    write_srt(lines, srt)
+    before = srt.read_bytes()
     settings = {**STYLE_DEFAULTS, 'assemble.burn_subtitles': True,
                 'assemble.bgm_volume': 0, 'assemble.subtitle_color': '#12AB34',
-                'content_review.enabled': False}  # 此用例单独验证未启用内容处理时的原有样式滤镜。
+                'content_review.enabled': False}  # 关闭内容处理也必须使用统一排版，不能退回 SRT 的自动换行。
+    monkeypatch.setattr(step_subtitles, 'build_tracks', lambda *_, **__: ({'trans.srt': lines}, []))
     commands = []
+    rendered = []
     def run(cmd, cwd=None, **_):
         commands.append(cmd)
+        if '-af' in cmd:
+            # 声音报告独立测量实际编码音轨；样式替身仍验证这次调用的合同，
+            # 不能假定所有 FFmpeg 命令都负责字幕烧录。
+            assert 'ebur128=peak=true' in cmd[cmd.index('-af') + 1]
+            assert cmd[cmd.index('-map') + 1] == '0:a:0'
+            # 输出线程保护可插在格式与目标之间，核对测量合同而不绑定参数位置。
+            assert cmd[cmd.index('-f') + 1] == 'null' and cmd[-1] == '-'
+            return 0, '', ('Summary:\n  Integrated loudness:\n    I: -20.0 LUFS\n'
+                           '  Loudness range:\n    LRA: 2.0 LU\n'
+                           '  True peak:\n    Peak: -3.0 dBFS\n')
+        graph = cmd[cmd.index('-filter_complex') + 1]
+        from dubforge.utils.ffmpeg import ass_file_filter
+        generated = next(cwd.glob('.subtitle_*.ass'))
+        assert '[0:v]' + ass_file_filter(generated) + '[v]' in graph
+        rendered.append(generated.read_text(encoding='utf-8-sig'))
         (cwd / cmd[-1]).write_bytes(b'mock mp4')
         return 0, '', ''
     ctx = SimpleNamespace(cfg=cfg(settings), upstream=lambda *_: srt, run_subprocess=run, task_data={})
     out = tmp_path / 'final.mp4'
     step_assemble._mux(ctx, tmp_path, video, tmp_path / 'voice.wav', out, burn=True)
-    expected = subtitle_filter(srt.name, ctx.cfg, video_canvas(video))
-    assert f'[0:v]{expected}[v]' in commands[0][commands[0].index('-filter_complex') + 1]
+    assert rendered == [ass_document(lines, ctx.cfg, video_canvas(video))]
+    assert '[0:v]ass=' in commands[0][commands[0].index('-filter_complex') + 1]
+    assert srt.read_bytes() == before and not list(srt.parent.glob('.subtitle_*.ass'))
     assert out.read_bytes() == b'mock mp4'
+    from dubforge.pipeline.audio_quality import read_report
+    assert read_report(out)['integrated_lufs'] == -20.0
+    assert len(commands) == 2
 
 
 def test_workspace_preview_uses_unsaved_order_and_duration(make_project, monkeypatch, tmp_path):

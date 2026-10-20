@@ -9,6 +9,7 @@ import { loginCredential } from './login-response.mjs'
 import { archiveView, STUDIO_OPERATIONS, studioOperation } from './studio.mjs'
 import { CollectionFailure, CollectionJoinFailure } from './collection-error.mjs'
 import { joinCollection } from './collection-join.mjs'
+import { collectionOrder } from './collection-order.mjs'
 
 const emit = (event, data) => process.stdout.write(JSON.stringify({ event, ...data }) + '\n')
 const engineVersion = JSON.parse(readFileSync(new URL('./node_modules/@renmu/bili-api/package.json', import.meta.url), 'utf8')).version
@@ -17,9 +18,15 @@ const loginError = code => Object.assign(new Error(safeError({ code }).message),
 // 登录状态查询与空间资料分离；不能因昵称/空间资料结构变化误报扫码失败。
 async function authenticatedAccount(client, expectedId) {
   const info = await client.user.request.get('https://api.bilibili.com/x/web-interface/nav', { timeout: 15000 })
-  if (info?.isLogin !== true) throw { code: -101 }
+  if (!info || typeof info !== 'object' || Array.isArray(info) || typeof info.isLogin !== 'boolean')
+    throw loginError('PUBLISH_ACCOUNT_RESPONSE')
+  if (info.isLogin === false) throw { code: -101 }
+  const validId = typeof info?.mid === 'number' ? Number.isSafeInteger(info.mid) && info.mid > 0
+    : typeof info?.mid === 'string' && /^[1-9]\d*$/.test(info.mid)
+  if (!validId) throw loginError('PUBLISH_ACCOUNT_RESPONSE')
   if (String(info.mid) !== String(expectedId)) throw loginError('PUBLISH_ACCOUNT_MISMATCH')
-  return { id: String(info.mid), name: info.uname || `B站用户 ${info.mid}` }
+  const name = typeof info.uname === 'string' ? info.uname.trim().slice(0, 150) : ''
+  return { id: String(info.mid), name: name || `B站用户 ${info.mid}` }
 }
 
 // 只重试幂等读取的暂时网络故障，验证要求、证书错误和投稿均不重试。
@@ -71,16 +78,21 @@ export async function execute({ operation, payload, credential }, sdk = { Auth, 
     throw loginError('PUBLISH_QR_EXPIRED')
   }
   const client = new Client(), auth = new Auth()
+  let account
   try {
     await client.setAuth(credential, Number(credential.DedeUserID))
     auth.setAuth(credential, Number(credential.DedeUserID))
-    await authenticatedAccount(client, payload.account_id)
+    account = await authenticatedAccount(client, payload.account_id)
   } catch (error) {
     if (operation === 'create_collection') throw new CollectionFailure('auth', error, credential)
     if (operation === 'collection') throw new CollectionJoinFailure('join_auth', error, credential)
     throw error
   }
-  if (STUDIO_OPERATIONS.has(operation)) return await studioOperation(client, operation, payload)
+  // 单独核验登录只读取身份，不读取合集、上传文件或发送投稿。
+  if (operation === 'account_check') return account
+  if (['collection_order_read', 'collection_order_apply', 'collection_order_verify'].includes(operation))
+    return await collectionOrder(client.platform, operation, payload, credential)
+  if (STUDIO_OPERATIONS.has(operation)) return await studioOperation(client, operation, payload, credential)
   if (operation === 'create_collection') {
     // SDK 未封装创建合集；仅在此适配层调用已记录的网页接口，不改第三方包。
     // https://github.com/afiuh/bilibili-api-collect/blob/master/docs/creativecenter/season.md

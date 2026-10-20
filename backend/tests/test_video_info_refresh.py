@@ -169,22 +169,22 @@ def test_comment_count_validation(project, limit):
 
 
 def test_fetch_command_is_metadata_only_and_honors_network_settings(source, monkeypatch, tmp_path):
+    from yt_dlp import YoutubeDL, parse_options
     cookies = tmp_path / 'cookies.txt'
     cookies.write_text('test cookies')
     seen = []
-    def run(cmd, **kwargs):
+    def popen(cmd, **kwargs):
         seen.append((cmd, kwargs))
-        return SimpleNamespace(returncode=0, stdout=json.dumps(source))
-    monkeypatch.setattr(subprocess, 'run', run)
+        return SimpleNamespace(returncode=0, communicate=lambda **kw: (json.dumps(source), ''), poll=lambda: 0)
+    monkeypatch.setattr(subprocess, 'Popen', popen)
     vi._fetch_source(source['webpage_url'], {'cookies_path': str(cookies), 'proxy': 'http://127.0.0.1:7897'})
     cmd, options = seen[0]
     assert all(flag in cmd for flag in ['--ignore-config', '--simulate', '--skip-download', '--no-playlist', '--no-write-comments'])
     assert '--download-archive' not in cmd and '-o' not in cmd
     assert cmd[cmd.index('--cookies') + 1] == str(cookies)
     assert cmd[cmd.index('--proxy') + 1] == 'http://127.0.0.1:7897'
-    assert options['timeout'] == 90
+    assert options['stdout'] == subprocess.PIPE and options['stderr'] == subprocess.PIPE
     # 用实际安装的提取器解析选项/模板，不访问网络，防止 CLI 拼写或结构投影不受支持。
-    from yt_dlp import YoutubeDL, parse_options
     parsed = parse_options(cmd[3:]).ydl_opts
     assert parsed['simulate'] and parsed['skip_download'] and not parsed['getcomments']
     with YoutubeDL({'quiet': True}) as ydl:
@@ -201,17 +201,91 @@ def test_fetch_command_is_metadata_only_and_honors_network_settings(source, monk
 
 @pytest.mark.parametrize('kind', ['timeout', 'exit', 'json', 'playlist', 'empty', 'comments_missing'])
 def test_fetch_rejects_unusable_platform_response(source, monkeypatch, kind):
-    def run(cmd, **kwargs):
+    def popen(cmd, **kwargs):
         if kind == 'timeout':
             raise subprocess.TimeoutExpired(cmd, 90)
         result = {'json': 'bad json', 'playlist': json.dumps({'_type': 'playlist', 'title': 'List'}),
                   'empty': '{}', 'comments_missing': json.dumps(source)}
         return SimpleNamespace(returncode=1 if kind == 'exit' else 0,
-                               stdout=result.get(kind, ''), stderr='secret proxy password')
-    monkeypatch.setattr(subprocess, 'run', run)
+                               communicate=lambda **kw: (result.get(kind, ''), 'secret proxy password'), poll=lambda: 0)
+    monkeypatch.setattr(subprocess, 'Popen', popen)
     with pytest.raises(vi.VideoInfoError) as exc:
         vi._fetch_source(source['webpage_url'], {}, comment_limit=2 if kind == 'comments_missing' else 0)
     assert 'secret' not in str(exc.value.to_dict())
+
+
+def test_collection_cancel_stops_extractor_and_reaps_pipes(source, monkeypatch):
+    """没有网络响应时也检查取消，不能等满 180 秒才停止。"""
+    from dubforge.errors import DubForgeError
+    calls, checks = [], []
+
+    class Process:
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def communicate(self, *, timeout):
+            calls.append(('communicate', timeout))
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired('extractor', timeout)
+            return '', ''
+        def kill(self):
+            calls.append(('kill', None))
+            self.returncode = -9
+
+    process = Process()
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **kw: process)
+    def cancel():
+        checks.append(1)
+        if len(checks) == 3:
+            raise DubForgeError('用户已停止', code='STEP_CANCELLED')
+    with pytest.raises(DubForgeError, match='用户已停止'):
+        vi._fetch_source(source['webpage_url'], {}, comment_limit=30, cancel_check=cancel)
+    assert calls == [('communicate', .2), ('kill', None), ('communicate', 2)]
+    assert process.returncode == -9
+
+
+def test_collection_timeout_is_total_deadline_and_reaps_process(source, monkeypatch):
+    calls = []
+    clock = iter([0., 0., 181.])
+    monkeypatch.setattr(vi.time, 'monotonic', lambda: next(clock))
+    class Process:
+        returncode = None
+        def poll(self):
+            return self.returncode
+        def communicate(self, *, timeout):
+            if self.returncode is None:
+                raise subprocess.TimeoutExpired('extractor', timeout)
+            return '', ''
+        def kill(self):
+            calls.append('kill')
+            self.returncode = -9
+    monkeypatch.setattr(subprocess, 'Popen', lambda *a, **kw: Process())
+    with pytest.raises(vi.VideoInfoError) as exc:
+        vi._fetch_source(source['webpage_url'], {}, comment_limit=30)
+    assert exc.value.code == 'VIDEO_INFO_TIMEOUT' and calls == ['kill']
+
+
+def test_cancelled_collection_preserves_snapshot_and_reports_cancelled(project, source, monkeypatch):
+    from dubforge.errors import DubForgeError
+    original = vi._build_video_info('youtube', source['title'], source['webpage_url'], None, source, summarize=False)
+    path = save_info(project, original)
+    previous = path.read_bytes()
+    cancelled = False
+    def check():
+        if cancelled:
+            raise DubForgeError('用户已停止', code='WORKFLOW_STOPPED')
+    def fetch(*a, **kw):
+        nonlocal cancelled
+        assert kw['cancel_check'] is check
+        cancelled = True
+        return {**source, 'comments': []}
+    monkeypatch.setattr(vi, '_fetch_source', fetch)
+    with pytest.raises(DubForgeError):
+        vi.ensure_comments(project.uid, comment_limit=30, cancel_check=check)
+    assert path.read_bytes() == previous
+    progress = vi.comment_progress(project.uid)
+    assert progress['status'] == 'cancelled'
+    assert progress['code'] == 'WORKFLOW_STOPPED' and not progress['busy']
 
 
 def test_refresh_occupancy_blocks_duplicate_download_and_delete(project, source, monkeypatch):
@@ -273,3 +347,17 @@ def test_download_in_progress_rejects_refresh(project):
     with pytest.raises(RuntimeEditError) as exc:
         vi.update(project.uid, 'refresh')
     assert exc.value.code == 'CONFIGURATION_BUSY'
+
+
+def test_refresh_updates_auto_name_without_starting_production(project, source, monkeypatch):
+    crud.update_project_title(project.uid, '自动占位名称', title_mode='auto')
+    monkeypatch.setattr(vi, '_fetch_source', lambda *a, **k: source)
+    monkeypatch.setattr(vi, 'chat_json', lambda *a, **k: pytest.fail('刷新资料不能为命名额外调用模型'))
+    before = [(s.step_key, s.status, s.input_fingerprint) for s in crud.get_steps(project.id)]
+    root = crud.project_dir(project.uid)
+    vi.update(project.uid, 'refresh')
+    current = crud.get_project(project.uid)
+    assert (current.title, current.title_mode) == (source['title'], 'auto')
+    assert crud.project_dir(project.uid) == root
+    assert [(s.step_key, s.status, s.input_fingerprint) for s in crud.get_steps(project.id)] == before
+    assert crud.latest_job(project.id, 'download') is None

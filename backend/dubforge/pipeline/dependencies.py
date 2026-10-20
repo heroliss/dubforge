@@ -1,5 +1,9 @@
 """按实际消费的文件解析依赖；顺序只用于展示和执行计划排序。"""
 import copy
+import hashlib
+import datetime
+import json
+import os
 from pathlib import Path
 
 from dubforge import config
@@ -33,12 +37,32 @@ class Dependencies:
         self._current = {}
         self._voice_lines = None
         self._dubbing_lines = None
+        # 配音输入合同的解析结果与逐句任务分开缓存：普通列表预检仍可在
+        # 产物缺失时显示依赖状态，但需要制作/恢复时必须知道是 split 还是
+        # translate 破坏了逐句对齐，不能把异常伪装成空句列表。
+        self._dubbing_alignment = None
         self._inputs = {}
         self._assembly_state = None
         self._paths = {}
         self._production_cache = {}
         self._assembly_records = None
         self._assembly_configuration = None
+        # 同一运行快照内逐句依赖经常指向同一份大原声；只按文件版本
+        # 复用真实摘要，不缓存“与登记相符”的结论，登记摘要仍逐次比较。
+        self._input_digests = {}
+        # 同一状态请求的版本核对共用逐句记录和排布；文件身份每次仍实时核对。
+        self._take_snapshots = {}
+        self._voice_timing_cache = {}
+        self._project_params_cache = None
+
+    def read_project_params(self, project=None):
+        """仅供读取的请求内参数快照；原 JSON 变化时立即失效，不缓存制作有效性。"""
+        project = project if project is not None else self.project
+        raw = project.params
+        previous = self._project_params_cache
+        if previous is None or previous[0] != raw:
+            self._project_params_cache = (raw, crud.project_params(project))
+        return self._project_params_cache[1]
 
     def with_assembly_variants(self, variants):
         """复用本次读取快照，仅重算成片组合依赖，不重复读取配置和逐句索引。"""
@@ -53,6 +77,8 @@ class Dependencies:
         return result
 
     def cfg(self, key, default=None):
+        if self.version and key in {'assemble.video_encoder', 'assemble.nvenc_cq'}:
+            return self.version['values'].get(key, 'software' if key == 'assemble.video_encoder' else 18)
         if self.version and key in self.version['values']:
             return self.version['values'][key]
         if key in self.overrides:
@@ -121,7 +147,8 @@ class Dependencies:
             from dubforge.pipeline.dubbing_edit import synthesis_lines
             source = self.dubbing_lines()
             requested = [line] if line is not None else synthesis_lines(self.project, source, self.root, dependencies=self)
-            configs = [effective_config(self.project, item, self.cfg)
+            params = self.read_project_params()
+            configs = [effective_config(self.project, item, self.cfg, params=params)
                        for item in requested]
             if not source:
                 configs = [self.cfg]
@@ -133,6 +160,9 @@ class Dependencies:
         if key == "assemble":
             if self.assembly_versions is not None:
                 return list(dict.fromkeys(item for version in self.assembly_versions for item in self.for_version(version).inputs(key)))
+            if self.version and (self.version.get('update') or self.version.get('timeline')):
+                # 所选更新消费不可变目标清单，未采用的工作稿不能阻塞或改变本次任务。
+                return []
             from dubforge.pipeline.assembly_outputs import default_variants, dimensions
             variants = self.assemble_variants or default_variants(self.cfg)
             specs = [self.version] if self.version else [dimensions(v) for v in variants]
@@ -145,7 +175,8 @@ class Dependencies:
                 else:
                     name = self.cfg("assemble.subtitle_track", "trans") + ".srt"
                     result.append(("subtitles", name, "烧录字幕"))
-            if not any(v['dubbing'] for v in specs):
+            from dubforge.pipeline.assembly_versions import requires_dubbing
+            if not any(requires_dubbing(v) for v in specs):
                 return result  # 原声烧录直接使用源视频音轨，不需要配音、分离或混音。
             result.extend(self.dubbing_inputs())
             from dubforge.pipeline.dubbing_edit import take_name
@@ -184,6 +215,36 @@ class Dependencies:
                 raise
             return []
 
+    def dubbing_alignment_error(self):
+        """返回逐句输入合同的破坏位置和原始错误；缺失依赖不算格式错误。
+
+        ``dubbing_lines()`` 的宽松模式是为了让依赖列表在 split/translate
+        尚未生成时仍能展示 missing 状态。恢复预检需要更细的证据：同样的
+        文件可能存在但句数或编号已不再对应，此时应把真正的生产者加入
+        重试队列。仅识别文本合同错误，DEPS_NOT_MET 留给依赖计划处理。
+        """
+        if self._dubbing_alignment is not None:
+            return self._dubbing_alignment
+        from dubforge.pipeline.text_source import source_lines, translated_lines
+        alignment_codes = {"TEXT_ALIGNMENT", "TEXT_EMPTY", "TEXT_TIMELINE"}
+        try:
+            source = source_lines(self)
+        except DubForgeError as exc:
+            self._dubbing_alignment = ('split', exc) if exc.code in alignment_codes else None
+            return self._dubbing_alignment
+        except OSError:
+            self._dubbing_alignment = None
+            return None
+        try:
+            translated_lines(self, source)
+        except DubForgeError as exc:
+            self._dubbing_alignment = ('translate', exc) if exc.code in alignment_codes else None
+        except OSError:
+            self._dubbing_alignment = None
+        else:
+            self._dubbing_alignment = None
+        return self._dubbing_alignment
+
     def production_lines(self):
         """一个依赖快照只解析一次逐句选择；不缓存音频是否有效。"""
         from dubforge.pipeline.dubbing_edit import production_lines
@@ -208,7 +269,7 @@ class Dependencies:
         elif producer == "subtitles" and name not in self.subtitle_outputs():
             reason = "字幕导出未选择此类型，请调整导出内容"
             config_blocked, state = True, "blocked"
-        elif step and step.status in {"running", "queued"}:
+        elif step and step.status == "running":
             state, reason = "updating", "正在更新" if art else "正在生成"
         elif not art:
             state, reason = "missing", "尚未生成"
@@ -216,11 +277,82 @@ class Dependencies:
             state, reason = "deleted", "文件已丢失"
         elif path.stat().st_size != art.size:
             state, reason = "stale", "依赖已过期：文件内容已变化，需更新"
-        elif (not self.voice_current(name) if producer == 'tts' else not self.current(producer)):
-            state, reason = "stale", "依赖已过期：输入或设置已变化，需更新"
+        # 下游只关心它实际消费的文件是否变了。生产者自己的设置变化不会
+        # 传播到下游；只有生产者重新生成/替换产物后，文件登记摘要才变化。
+        elif (not self.voice_current(name) if producer == 'tts' else not self.artifact_current(producer, name)):
+            state, reason = "stale", "依赖已过期：上游产物已变化，需更新"
         return {"step": producer, "name": name, "desc": desc,
                 "label": STEP_MAP[producer].label, "ready": state == "ready", "state": state,
                 "config_blocked": config_blocked, "reason": reason, "file": str(path) if path else ""}
+
+    def artifact_current(self, producer, name):
+        """只核对登记产物本身，不把生产者当前设置变化传递给消费者。"""
+        art = self.arts.get(f'{producer}/{name}')
+        path = self.path(producer, name)
+        if not art or not path or not path.is_file():
+            return False
+        try:
+            stat = path.stat()
+            if stat.st_size != art.size:
+                return False
+            # 文本和小型 JSON 全量核对；大媒体用 mtime/大小避免列表轮询读满磁盘。
+            if art.sha256 and stat.st_size <= 1024 * 1024:
+                with path.open('rb') as stream:
+                    if hashlib.file_digest(stream, 'sha256').hexdigest() != art.sha256:
+                        return False
+            elif art.created_at and stat.st_mtime_ns:
+                created = art.created_at
+                if created.tzinfo is None:
+                    created = created.replace(tzinfo=datetime.timezone.utc)
+                if stat.st_mtime_ns > int(created.timestamp() * 1e9) + 1_000_000:
+                    return False
+        except OSError:
+            return False
+        return True
+
+    def freshness_flags(self, key):
+        """返回独立的本步设置变化和上游产物变化维度。"""
+        step = self.steps.get(key)
+        result = dict(settings_changed=False, upstream_changed=False, artifact_missing=False)
+        if not step or not step.input_fingerprint:
+            return result
+        if self.display_fresh(key):
+            return result
+        try:
+            stored = json.loads(step.input_snapshot or '{}')
+            if not isinstance(stored, dict) or not isinstance(stored.get('entries'), dict):
+                return result
+            from dubforge.pipeline.stale_explanation import capture, _safe_previous
+            current = capture(self, key, scope=stored.get('scope', 'full'),
+                              fingerprint=stored.get('fingerprint') if stored.get('scope') == 'outputs' else None,
+                              _current=True)
+            for name in set(stored['entries']) | set(current.get('entries', {})):
+                old = _safe_previous(name, stored['entries'].get(name))
+                new = current.get('entries', {}).get(name)
+                if old and new and old.get('value') == new.get('value'):
+                    continue
+                if name.startswith(('input.', 'required.', 'source.')) or name.startswith('output.'):
+                    result['upstream_changed'] = True
+                elif old or new:
+                    result['settings_changed'] = True
+            # ``input.*`` entries contain the last registered artifact digest.
+            # A file can change in place without a new Artifact row, so compare
+            # the live dependency view as well; otherwise the consumer would
+            # show stale while both historical entry maps still look identical.
+            for item in self.input_view(key):
+                if item['state'] in {'stale', 'deleted', 'missing'}:
+                    result['upstream_changed'] = True
+            # 当前文件缺失/被截断属于独立的产物完整性问题，同时归入上游维度，
+            # 让消费者看到“文件变化”而不是误以为设置变了。
+            if not self.fresh(key):
+                own = [a for a in self.arts.values() if a.step_key == key]
+                result['artifact_missing'] = bool(own) and not crud.step_artifacts_exist(
+                    self.project.id, key, arts=self.arts, pdir=self.root)
+                if result['artifact_missing']:
+                    result['upstream_changed'] = True
+        except (DubForgeError, OSError, TypeError, ValueError, KeyError):
+            pass
+        return result
 
     def dubbing_summary(self):
         """与正式合成相同的逐句就绪条件，不把缺失配音计为主动选用原声。"""
@@ -264,8 +396,6 @@ class Dependencies:
             self._voice_lines = {l['id']: l for l in self.dubbing_lines()}
         line = self._voice_lines.get(int(match[1]))
         if not line:
-            return False
-        if not self.current('split') or not self.current('translate'):
             return False
         from dubforge.pipeline.dubbing_edit import playable
         return playable(self.project, line, self.root, int(match[2] or 1), dependencies=self)
@@ -348,6 +478,12 @@ class Dependencies:
             return False
         if step.input_fingerprint == compute_fingerprint(self.project, key, dependencies=self):
             return True
+        try:
+            if step.input_fingerprint == compute_fingerprint(
+                    self.project, key, dependencies=self, legacy_execution=True):
+                return True
+        except (DubForgeError, ValueError, TypeError):
+            pass  # 模型执行设置损坏不能阻止核对已经保存的内容。
         if key == 'translate' and self.cfg('translate.custom_terms_path'):
             return False  # 旧指纹只记录路径，无法证明术语文件内容仍匹配。
         if key in {'split', 'translate'} and step.input_fingerprint == compute_fingerprint(
@@ -355,9 +491,15 @@ class Dependencies:
             return True
         # 未改输出语义的旧缓存继续可用，避免升级后重新下载或识别。
         compatible = key in {"preprocess", "transcribe", "split", "translate"}
-        return compatible and any(step.input_fingerprint == compute_fingerprint(
-            self.project, key, dependencies=self, legacy=True, legacy_config=old_config)
-            for old_config in (False, True))
+        if compatible:
+            for mode in ({}, {'legacy_config': True}, {'legacy_execution': True}):
+                try:
+                    if step.input_fingerprint == compute_fingerprint(
+                            self.project, key, dependencies=self, legacy=True, **mode):
+                        return True
+                except (DubForgeError, ValueError, TypeError):
+                    continue
+        return False
 
     def require(self, key, *, line=None):
         blockers = self.unready(key, line=line)
@@ -366,14 +508,47 @@ class Dependencies:
                               for i in blockers[:8])
             raise DubForgeError(f"上游依赖未就绪：{detail}", code="DEPS_NOT_MET",
                                 suggestion="缺失产物需生成，过期产物需更新；可使用「准备依赖并运行」。")
-        import hashlib
         for producer, name, _ in self.inputs(key, line=line):
             art = self.arts[f"{producer}/{name}"]
-            with self.path(producer, name).open("rb") as stream:
-                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            digest = self._input_digest(self.path(producer, name))
             if art.sha256 and digest != art.sha256:
                 raise DubForgeError(f"依赖已过期：{name} 内容已变化，请重新运行「{STEP_MAP[producer].label}」",
                                     code="DEPS_NOT_MET")
+
+    @staticmethod
+    def _file_version(stat):
+        return (stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_dev, stat.st_ino)
+
+    def _input_digest(self, path):
+        """摘要只在本次依赖快照内复用；原地改写、替换及读取中变动均须重验。"""
+        name = str(path)
+        try:
+            path_version = self._file_version(path.stat())
+            with path.open('rb') as stream:
+                # 路径在 stat 与打开之间也可能被原子替换，不能把另一个文件
+                # 的摘要登记在旧版本下。读取前后同时核对句柄和当前路径。
+                opened = self._file_version(os.fstat(stream.fileno()))
+                # Windows 的 path.stat 与 os.fstat 对 ctime 的定义可能不同；
+                # 跨接口仅比对其余身份，ctime 各自与同接口的前后值比较。
+                if opened[:2] + opened[3:] != path_version[:2] + path_version[3:]:
+                    raise OSError('file changed before verification')
+                # Windows 路径 ctime 可能只表示创建时间；只读打开句柄取
+                # change time 也能识别同大小改写后恢复 mtime 的文件。
+                version = (path_version, opened)
+                cached = self._input_digests.get(name)
+                if cached is not None and cached[0] == version:
+                    digest = cached[1]
+                else:
+                    digest = hashlib.file_digest(stream, 'sha256').hexdigest()
+                if (self._file_version(os.fstat(stream.fileno())) != opened
+                        or self._file_version(path.stat()) != path_version):
+                    raise OSError('file changed during verification')
+        except OSError as exc:
+            self._input_digests.pop(name, None)
+            raise DubForgeError(f'依赖文件在核验期间发生变化或无法读取：{path.name}，请稍后重试。',
+                               code='DEPS_NOT_MET') from exc
+        self._input_digests[name] = (version, digest)
+        return digest
 
     def downstream(self, key):
         affected = {key}
@@ -421,9 +596,10 @@ def project_status(project, deps=None):
     deps = deps or Dependencies(project)
     if any(s.status in {"running", "queued"} for s in deps.steps.values()):
         return "processing"
-    chosen = selected_steps(project)
-    if any(deps.status(k) == "failed" for k in chosen):
+    from dubforge.project_execution import production_completion
+    scope = production_completion(deps)
+    if scope['failed']:
         return "failed"
-    if chosen and all(deps.display_fresh(k) for k in chosen):
+    if scope['complete']:
         return "done"
     return "created"

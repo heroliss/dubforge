@@ -1,11 +1,11 @@
 [project]
 name = "dubforge"
-version = "0.1.0"
+dynamic = ["version"]
 description = "DubForge —— 视频翻译配音工作台（下载/转录/翻译/配音/成片一站式流水线）"
 requires-python = ">=3.13,<3.14"
 dependencies = [
     "fastapi>=0.115",
-    "uvicorn[standard]>=0.30",
+    "uvicorn[standard]>=0.36",
     "sqlmodel>=0.0.22",
     "pydantic>=2.8",
     "pydantic-settings>=2.4",
@@ -50,6 +50,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["dubforge", "app"]
+
+[tool.hatch.version]
+path = "dubforge/__init__.py"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

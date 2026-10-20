@@ -1,0 +1,8 @@
+{
+  "maxWidth": 1180,
+  "crop": {"left": 620, "top": 80, "width": 1550, "height": 435},
+  "marks": [
+    {"number": 1, "target": {"x": 46, "y": 275, "width": 460, "height": 67}, "label": {"x": 26, "y": 254}, "arrow": false},
+    {"number": 2, "target": {"x": 1410, "y": 225, "width": 100, "height": 43}, "label": {"x": 1350, "y": 246}}
+  ]
+}

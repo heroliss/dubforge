@@ -5,7 +5,12 @@ const selected = computed(() => props.profiles.filter(p => p.enabled !== false &
 function detail(p: any) {
   if (!p.params_valid) return '自定义 JSON 格式有误，须填写对象'
   if (props.mode === 'low' || props.mode === 'fast') {
-    if (p.supports_low) return `实际请求：low${p.effort !== '服务商默认' ? ` · 覆盖 JSON 的 ${p.effort}` : ''}${p.has_thinking ? ' · 移除 thinking' : ''}`
+    if (p.supports_low) {
+      // 低思考适配按接口决定是否保留 thinking；旧摘要缺字段时不猜测模型行为。
+      const thinking = !p.has_thinking ? '' : p.removes_thinking === true ? ' · 移除 thinking' :
+        p.removes_thinking === false ? ` · 保留 thinking=${p.thinking_type}` : ' · thinking 的处理请刷新配置预览确认'
+      return `实际请求：low${p.effort !== '服务商默认' ? ` · 覆盖 JSON 的 ${p.effort}` : ''}${thinking}`
+    }
     return `保留 JSON：${p.effort} · 自动 low 未适配，仅提示词要求尽快完成${p.has_thinking ? ` · thinking=${p.thinking_type}` : ''}`
   }
   return `跟随 JSON：${p.effort}${p.has_thinking ? ` · thinking=${p.thinking_type}` : ''}`

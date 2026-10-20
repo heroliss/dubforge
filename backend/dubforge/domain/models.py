@@ -25,9 +25,11 @@ class Project(SQLModel, table=True):
     uid: str = Field(index=True, unique=True)          # 稳定标识 (API/URL 用, 永不变)
     dir_name: str = ""                                 # 项目目录名: 日期_标题 (空=旧项目沿用 uid)
     title: str = ""                                    # 展示名 (视频标题/文件名)
+    title_mode: str = "manual"                         # auto 跟随视频资料；manual 保留用户名称及旧记录
     source_url: str = ""                               # YouTube 链接等 (本地导入为路径)
     source_kind: str = "youtube"                       # youtube | local
     status: str = "created"                            # created | processing | done | failed
+    archived_at: datetime.datetime | None = None       # 项目管理标记；归档不改变制作状态或产物
     created_at: datetime.datetime = Field(default_factory=_now)
     updated_at: datetime.datetime = Field(default_factory=_now)
     params: str = "{}"                                 # 项目级参数覆盖 (JSON)
@@ -59,6 +61,9 @@ class Artifact(SQLModel, table=True):
     rel_path: str = ""                                 # 相对项目目录路径
     sha256: str = ""
     size: int = 0
+    # 仅作审计关联，不建立外键：清理 Job 历史时不能阻塞产物索引重建。
+    job_id: int | None = Field(default=None, index=True)
+    settings_snapshot_hash: str = ""        # 本次执行配置快照摘要（不含敏感值）
     created_at: datetime.datetime = Field(default_factory=_now)
 
 
@@ -74,3 +79,4 @@ class Job(SQLModel, table=True):
     finished_at: datetime.datetime | None = None
     error_detail: str = ""                             # 原始异常文本 (中文消息之外的调试信息)
     task_data: str = "{}"                              # 本次任务范围与逐句结果 (JSON)
+    execution: str = "{}"                              # 有界执行阶段诊断；不参与产物或配置指纹

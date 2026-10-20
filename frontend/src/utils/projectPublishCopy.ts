@@ -33,5 +33,5 @@ export function resolveProjectCopy(base: Record<string, any>, overrides: Record<
 export function copyRestoreLabels(preview: ProjectCopyPreview | null) {
   const inherited = new Set(preview?.parent_configured || [])
   return Object.fromEntries(PROJECT_COPY_FIELDS.map(key => [key,
-    preview && !inherited.has('publish.' + key) ? '恢复自动填充' : '恢复继承']))
+    preview && !inherited.has('publish.' + key) ? '恢复自动填充' : '恢复项目基础值']))
 }

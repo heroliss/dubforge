@@ -5,7 +5,7 @@ import wave
 import pytest
 
 from conftest import synthesize
-from test_dubbing_preparation import index_prepared, prepared
+from test_dubbing_preparation import index_prepared, prepared as _prepared
 from dubforge import config
 from dubforge.domain import crud
 from dubforge.errors import ConfigError, DubForgeError
@@ -13,6 +13,16 @@ from dubforge.pipeline import dubbing_edit, line_settings, tts_duration
 from dubforge.pipeline.dependencies import Dependencies
 from dubforge.pipeline.step_tts import line_cache_valid, line_fingerprint
 from dubforge.utils.fs import atomic_write_bytes
+
+
+@pytest.fixture
+def prepared(_prepared):
+    # 这些用例专门验证单句缩时、临时因子和失败保留。新默认的先滑动再缩时
+    # 由 test_voice_timing_integration 验证，不能让借用邻句空位改变此处预算。
+    from test_configuration import save
+    uid, project, calls = _prepared
+    save('project:' + uid, {'tts.placement.enabled': False})
+    return uid, project, calls
 
 
 def wav(path, seconds):
@@ -125,18 +135,28 @@ def test_initial_service_failure_does_not_trigger_duration_retries(tmp_path):
 
 
 @pytest.mark.parametrize('level', ['global', 'step', 'line'])
-def test_retry_saves_actual_factor_only_to_line_and_keeps_fingerprint_consistent(index_prepared, monkeypatch, level):
+def test_retry_uses_temporary_factor_without_changing_settings_or_request_fingerprint(index_prepared, monkeypatch, level):
     from dubforge.backends import tts_indextts25
     client, uid, _ = index_prepared
     base = f'/api/projects/{uid}'
     key = 'tts.indextts25.duration_factor'
     if level == 'global':
         config.set_key(key, .6)
+        # 已有项目主动应用当前全局，恢复本项覆盖后才使用新的基础值。
+        from dubforge import configuration
+        plan = configuration.binding_plan([uid], '')
+        configuration.bind(dict(uids=[uid], template_id='', fingerprint=plan['fingerprint'], confirmed=True))
         assert client.put(base + '/step_params', json={'updates': {}, 'reset': [key]}).status_code == 200
     elif level == 'step':
         assert client.put(base + '/step_params', json={'updates': {key: .6}}).status_code == 200
     else:
         assert client.put(base + '/workbench/lines/1/params', json={'updates': {key: .6}}).status_code == 200
+    project = crud.get_project(uid)
+    line = Dependencies(project).dubbing_lines()[0]
+    before_overrides = line_settings.overrides(project, line)
+    before_fingerprint = line_fingerprint(project, line)
+    before_global = config.get(key)
+    before_source = client.get(base + '/workbench/lines/1/params').json()['sources'][key]
     calls = []
     def generate(url, text, out, lang, **kwargs):
         factor = kwargs['duration_factor']
@@ -149,17 +169,28 @@ def test_retry_saves_actual_factor_only_to_line_and_keeps_fingerprint_consistent
     project = crud.get_project(uid)
     deps = Dependencies(project)
     line = deps.dubbing_lines()[0]
-    assert line_settings.effective_config(project, line, deps.cfg)(key) == .5
-    assert line_settings.overrides(project, line)[key] == .5
+    assert line_settings.effective_config(project, line, deps.cfg)(key) == .6
+    assert line_settings.overrides(project, line) == before_overrides
     assert deps.cfg(key) == (.6 if level != 'line' else 1.1)
+    assert config.get(key) == before_global
+    assert client.get(base + '/workbench/lines/1/params').json()['sources'][key] == before_source
+    assert line_fingerprint(project, line) == before_fingerprint
     data = dubbing_edit.read_take(crud.project_dir(uid), line, 1)
     assert data['settings']['duration_factor'] == .5
+    assert data['fingerprint'] == before_fingerprint
+    assert dubbing_edit.take_path(crud.project_dir(uid), 1).with_suffix('.input').read_text() == before_fingerprint
     assert data['duration_retry']['retries'] == 1 and data['duration_retry']['available'] == 3
     assert line_cache_valid(project, line, crud.project_dir(uid))
     current = client.get(base + '/workbench?probe=false').json()['lines'][0]['wav']
     assert current['duration_retry']['used_factor'] == .5 and not current['settings_changed']
+    assert synthesize(client, base + '/workbench/lines/1/synthesize', json={}).status_code == 200
+    assert calls == [.6, .5], '未修改设置时复用正式结果，不为临时因子重做'
     synthesize(client, base + '/workbench/lines/1/synthesize', json={'force': True})
-    assert calls == [.6, .5, .5], '下一次直接沿用本句已保存的因子'
+    assert calls == [.6, .5, .6, .5], '强制重新合成仍从用户配置的初始因子开始'
+    assert client.put(base + '/workbench/lines/1/params', json={'updates': {key: .65}}).status_code == 200
+    project = crud.get_project(uid)
+    assert not line_cache_valid(project, line, crud.project_dir(uid))
+    assert client.get(base + '/workbench?probe=false').json()['lines'][0]['wav']['settings_changed']
 
 
 def test_per_line_empty_list_disables_step_retry_and_invalid_input_does_not_save(index_prepared, monkeypatch):
@@ -213,16 +244,18 @@ def test_retry_cannot_swallow_stop_or_service_timeout(tmp_path, code):
     assert not list(tmp_path.glob('*.tmp'))
 
 
-def test_batch_saves_best_factor_preserving_other_lines_and_parameters(index_prepared, monkeypatch):
+def test_batch_records_best_temporary_factor_without_changing_any_line_settings(index_prepared, monkeypatch):
     from dubforge.backends import tts_indextts25
     client, uid, _ = index_prepared
     base = f'/api/projects/{uid}/workbench'
     key = 'tts.indextts25.duration_factor'
     other = 'tts.indextts25.temperature'
     client.put(base + '/lines/1/params', json={'updates': {other: .55}})
+    calls = []
 
     def generate(url, text, out, lang, **kwargs):
-        # 最后一次更慢，必须保存保留音频的 .7，而非最后尝试的 .5。
+        # 最后一次更慢，版本快照必须记录所保留音频的 .7，而非最后尝试的 .5。
+        calls.append((text, kwargs['duration_factor']))
         wav(out, {1.1: 5, .7: 3.5, .5: 4}[kwargs['duration_factor']])
         return out
 
@@ -231,10 +264,16 @@ def test_batch_saves_best_factor_preserving_other_lines_and_parameters(index_pre
     project = crud.get_project(uid)
     deps = Dependencies(project)
     lines = deps.dubbing_lines()
-    assert line_settings.overrides(project, lines[0]) == {key: .7, other: .55}
-    assert line_settings.overrides(project, lines[1]) == {key: .7}
+    assert calls == [('你好', 1.1), ('你好', .7), ('你好', .5),
+                     ('世界', 1.1), ('世界', .7), ('世界', .5)]
+    assert line_settings.overrides(project, lines[0]) == {other: .55}
+    assert line_settings.overrides(project, lines[1]) == {}
     for line in lines:
         assert line_cache_valid(project, line, crud.project_dir(uid))
+        data = dubbing_edit.read_take(crud.project_dir(uid), line, 1)
+        assert data['settings']['duration_factor'] == .7
+        assert data['duration_retry']['used_factor'] == .7
+        assert data['duration_retry']['attempts'][0]['factor'] == 1.1
     assert deps.cfg(key) == 1.1 and config.get(key) == 1.0
 
 
@@ -330,3 +369,79 @@ def test_gptsovits_does_not_use_index_specific_retry_policy(prepared, monkeypatc
     line = Dependencies(crud.get_project(uid)).dubbing_lines()[0]
     assert 'duration_retry' not in dubbing_edit.read_take(crud.project_dir(uid), line, 1)
     client.close()
+
+
+def test_keep_existing_with_empty_history_retains_shorter_audio_without_inventing_factor(tmp_path):
+    output = tmp_path / '1.wav'
+    wav(output, 2)
+    previous = output.read_bytes()
+    result = tts_duration.synthesize(lambda path, factor: wav(path, 3), output,
+        {'id': 1, 'start': 0, 'end': 1}, [.7], existing={},
+        log=lambda _: None, on_attempt=lambda *args: None, can_retry=lambda: True)
+    assert output.read_bytes() == previous
+    assert result['seconds'] == 2 and result['used_factor'] is None
+    assert result['attempts'] == [{'factor': .7, 'seconds': 3}]
+
+
+@pytest.mark.parametrize('candidate,expected_seconds,expected_factor', [(3., 2., 1.1), (1.3, 1.3, .7)])
+def test_legacy_voice_without_retry_history_uses_actual_snapshot_factor_and_keeps_shortest(
+        index_prepared, monkeypatch, candidate, expected_seconds, expected_factor):
+    import json
+    from dubforge.backends import tts_indextts25
+    from dubforge.pipeline import timing_repair
+    from dubforge.pipeline.step_tts import synth_line
+    client, uid, _ = index_prepared
+    calls = []
+
+    def generate(url, text, output, lang, **kwargs):
+        factor = kwargs['duration_factor']
+        calls.append(factor)
+        wav(output, 2. if len(calls) == 1 else candidate)
+        return output
+
+    monkeypatch.setattr(tts_indextts25, 'synth', generate)
+    assert synthesize(client, f'/api/projects/{uid}/workbench/lines/1/synthesize', json={}).status_code == 200
+    project, root = crud.get_project(uid), crud.project_dir(uid)
+    line = Dependencies(project).dubbing_lines()[0]
+    output = dubbing_edit.take_path(root, 1, 1)
+    record = dubbing_edit.read_take(root, line, 1)
+    record.pop('duration_retry')
+    atomic_write_bytes(output.with_suffix('.take.json'), json.dumps(record).encode())
+    original_audio = output.read_bytes()
+    assert client.put(f'/api/projects/{uid}/step_params', json={
+        'updates': {'tts.indextts25.duration_factor': 1.6}}).status_code == 200
+    project = crud.get_project(uid)
+    synthetic, get = timing_repair.context(project, line, root, 1, Dependencies(project).cfg)
+    synth_line(synthetic, line, root, force=True, cfg_get=get,
+               timing={'available': 1.4, 'factors': [.7], 'keep_existing': True})
+    current = dubbing_edit.read_take(root, line, 1)
+    assert calls == [1.1, .7]
+    assert tts_duration.audio_seconds(output) == pytest.approx(expected_seconds)
+    assert current['settings']['duration_factor'] == expected_factor
+    assert current['duration_retry']['used_factor'] == expected_factor
+    assert current['duration_retry']['attempts'] == [{'factor': .7, 'seconds': candidate}]
+    assert Dependencies(crud.get_project(uid)).cfg('tts.indextts25.duration_factor') == 1.6
+    if candidate > 2:
+        assert output.read_bytes() == original_audio
+
+
+def test_keep_existing_rejects_unknown_historical_factor_instead_of_using_current_setting(index_prepared, monkeypatch):
+    import json
+    from dubforge.backends import tts_indextts25
+    from dubforge.pipeline.step_tts import synth_line
+    client, uid, _ = index_prepared
+    assert synthesize(client, f'/api/projects/{uid}/workbench/lines/1/synthesize', json={}).status_code == 200
+    project, root = crud.get_project(uid), crud.project_dir(uid)
+    line = Dependencies(project).dubbing_lines()[0]
+    output = dubbing_edit.take_path(root, 1, 1)
+    record = dubbing_edit.read_take(root, line, 1)
+    record.pop('duration_retry')
+    record['settings'].pop('duration_factor')
+    atomic_write_bytes(output.with_suffix('.take.json'), json.dumps(record).encode())
+    original_audio = output.read_bytes()
+    monkeypatch.setattr(tts_indextts25, 'synth', lambda *args, **kwargs: pytest.fail('历史因子不明时不得请求模型'))
+    with pytest.raises(DubForgeError) as caught:
+        synth_line(project, line, root, force=True, cfg_get=Dependencies(project).cfg,
+                   timing={'available': .5, 'factors': [.7], 'keep_existing': True})
+    assert caught.value.code == 'TTS_TIMING_REPAIR_UNAVAILABLE'
+    assert output.read_bytes() == original_audio

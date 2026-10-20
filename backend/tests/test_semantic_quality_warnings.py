@@ -51,10 +51,36 @@ def test_independent_answers_and_complete_punctuation_do_not_need_review(text):
 
 
 @pytest.mark.parametrize("text", ["the", "I", "and", "in"])
-def test_real_pause_does_not_make_an_isolated_word_an_inferred_boundary_error(text):
+def test_real_pause_only_prompts_review_of_an_isolated_word_without_inferred_boundary_error(text):
     parts = [part(text, 0, .2), part("we continue the journey", 3, 5)]
+    original = deepcopy(parts)
+    assert semantic_quality_issues(parts, .6) == []
+    warnings = semantic_boundary_warnings(parts, .6)
+    assert len(warnings) == 1 and '孤立词' in warnings[0]
+    assert '间隔2.800秒' in warnings[0] and '不能确认错误' in warnings[0]
+    assert parts == original
+
+
+def test_trailing_word_is_reviewed_without_deleting_it_or_rejecting_the_draft():
+    parts = [part('See you in the next one.', 0, 1), part('You', 1, 1.2)]
+    original = deepcopy(parts)
+    assert semantic_quality_issues(parts, .6) == []
+    warnings = semantic_boundary_warnings(parts, .6)
+    assert len(warnings) == 1 and '位于片尾' in warnings[0]
+    assert '识别残留' in warnings[0] and '不能确认错误' in warnings[0]
+    assert parts == original
+
+
+@pytest.mark.parametrize('answer', ['I', 'You', 'A', 'China'])
+def test_single_word_answer_after_a_question_is_not_treated_as_recognition_residue(answer):
+    parts = [part('Which one?', 0, 1), part(answer, 1, 1.2), part('Then we leave.', 1.2, 2)]
     assert semantic_quality_issues(parts, .6) == []
     assert semantic_boundary_warnings(parts, .6) == []
+
+
+@pytest.mark.parametrize('text', ['type I', 'grade A', 'The Hague', 'You!', 'I...'])
+def test_letters_names_and_explicit_interruption_are_not_classified_as_isolated_residue(text):
+    assert semantic_boundary_warnings([part(text, 0, 1)], .6) == []
 
 
 def test_complete_preposition_at_end_is_not_inferred_to_belong_to_next_sentence():
@@ -127,3 +153,13 @@ def test_real_gap_after_nested_word_ranges_starts_after_all_known_speech():
     issues = semantic_pause_issues([part("first second third last", 0, 24)], words, .6)
     assert len(issues) == 1
     assert "20.00–23.00秒" in issues[0] and "的3.00秒" in issues[0]
+
+
+@pytest.mark.parametrize('start,end', [(0, 1.05), (2.95, 4), (1.5, 2), (0, 4)])
+def test_complete_word_axis_detects_partial_or_full_gap_occupation(start, end):
+    from dubforge.pipeline.semantic_quality import semantic_pause_issues
+
+    words = [dict(word='left', start=0, end=1), dict(word='right', start=3, end=4)]
+    issues = semantic_pause_issues([dict(text='edited wording', start=start, end=end)], words, .6)
+    assert len(issues) == 1
+    assert '1.00–3.00秒' in issues[0]

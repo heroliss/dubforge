@@ -12,29 +12,43 @@ import {
 } from 'naive-ui'
 import EnvironmentPanel from '../components/EnvironmentPanel.vue'
 import ConfigurationWorkspace from '../components/ConfigurationWorkspace.vue'
+import ConfigurationLockNotice from '../components/ConfigurationLockNotice.vue'
+import BiliAccountManager from '../components/BiliAccountManager.vue'
+import LlmParametersEditor from '../components/LlmParametersEditor.vue'
+import LlmConversationButton from '../components/LlmConversationButton.vue'
+import { parseLlmParams } from '../utils/llmParameters'
+import { configurationStageKey } from '../utils/configurationStages'
 
 const message = useMessage()
 const editability = useConfigurationEditability('global')
 const settingsLocked = computed(() => editability.locked.value || anySaving.value || loadingConfig.value)
+const llmProfilesLocked = computed(() => settingsLocked.value || editability.isPathLocked('llm.profiles'))
+const llmTimeoutLocked = computed(() => settingsLocked.value || editability.isPathLocked('llm.timeout'))
 const cfg = ref<any>(null)
 const saving = ref(false)
 const testing = ref(false) // 「并行测试全部」的全局转圈 (与单组测试互不影响)
 const loadError = ref('')
 // 分类只改变可见区域，已打开区域的草稿持续保留；模板范围变化才需确认。
 const route = useRoute(), router = useRouter(), dialog = useDialog()
-const section = computed(() => ['models', 'runtime'].includes(String(route.query.section)) ? String(route.query.section) : 'production')
+const section = computed(() => ['models', 'runtime', 'bilibili'].includes(String(route.query.section)) ? String(route.query.section) : 'production')
 const scopeFromQuery = (query: typeof route.query) => typeof query.template === 'string' && query.template ? 'series:' + query.template : 'global'
 const selectedScope = computed(() => scopeFromQuery(route.query))
+const selectedStage = computed(() => configurationStageKey(typeof route.query.stage==='string'?route.query.stage:undefined))
 const visited = ref(new Set<string>())
 watch(section, key => visited.value.add(key), { immediate: true })
 const productionDirty = ref(false), productionBusy = ref(false)
+const accountDirty = ref(false), accountBusy = ref(false)
+const accountContextFromQuery = (query: typeof route.query) => `${typeof query.account === 'string' ? query.account : ''}:${query.manage === 'studio' ? 'studio' : 'accounts'}:${typeof query.project === 'string' ? query.project : ''}:${typeof query.bvid === 'string' ? query.bvid : ''}`
+const accountContext = computed(() => accountContextFromQuery(route.query))
 const sections = computed(() => [
   { key: 'production', label: '制作与发布', dirty: productionDirty.value },
+  { key: 'bilibili', label: 'B站账号', dirty: accountDirty.value },
   { key: 'models', label: '模型与服务', dirty: isDirty.value },
   { key: 'runtime', label: '运行与存储', dirty: concDirty.value || rootDirty.value || displayDirty.value },
 ])
 function selectSection(key: string) { void router.push({ path: '/settings', query: { ...route.query, section: key } }) }
-function selectScope(scope: string) { void router.push({ path: '/settings', query: { section: 'production', ...(scope === 'global' ? {} : { template: scope.slice(7) }) } }) }
+function selectScope(scope: string) { void router.push({ path: '/settings', query: { section: 'production', ...(scope === 'global' ? {} : { template: scope.slice(7) }), ...(selectedStage.value?{stage:selectedStage.value}:{}) } }) }
+function selectStage(stage:string) { void router.push({path:'/settings',query:{...route.query,section:'production',stage:configurationStageKey(stage)}}) }
 const testResults = ref<Record<number, any>>({})
 const testingMap = ref<Record<number, boolean>>({}) // 每组独立的测试中状态 → 各组可并行测试
 
@@ -53,6 +67,10 @@ async function postTest(profileList: any[]) {
   return j.results ?? []
 }
 async function testOne(i: number) {
+  const current = profiles.value[i]
+  if (!current || testingMap.value[i]) return
+  const parsed = parseLlmParams(current.paramsJson)
+  if (!parsed.valid) { message.warning(`${current.name || '未命名配置'}：${parsed.error}`); return }
   delete testResults.value[i]
   testingMap.value[i] = true
   try {
@@ -135,9 +153,14 @@ const rootDirty = computed(() =>
   dirtyOn.value && form.value.data_root.trim() !== savedRoot.value)
 const isDirty = computed(() =>
   dirtyOn.value && (formDirty.value || profiles.value.length !== savedProfiles.value.length || cardDirty.value.some(Boolean)))
+const profilesDirty = computed(() =>
+  dirtyOn.value && (profiles.value.length !== savedProfiles.value.length || cardDirty.value.some(Boolean)))
+const llmApplyLocked = computed(() => settingsLocked.value
+  || profilesDirty.value && llmProfilesLocked.value
+  || formDirty.value && llmTimeoutLocked.value)
 const anyDirty = computed(() =>
-  isDirty.value || concDirty.value || rootDirty.value || displayDirty.value || productionDirty.value)
-const anySaving = computed(() => saving.value || savingConc.value || savingRoot.value || savingDisplay.value || productionBusy.value)
+  isDirty.value || concDirty.value || rootDirty.value || displayDirty.value || productionDirty.value || accountDirty.value)
+const anySaving = computed(() => saving.value || savingConc.value || savingRoot.value || savingDisplay.value || productionBusy.value || accountBusy.value)
 function markApplied() {
   savedProfiles.value = profiles.value.map(p => JSON.stringify(toWire(p)))
   savedForm.value = JSON.stringify({ timeout: form.value.timeout })
@@ -153,12 +176,14 @@ function confirmDiscard() {
     onClose: () => resolve(false), onMaskClick: () => resolve(false),
   }))
 }
-function waitForSave() { message.info('正在保存，请完成后再切换'); return false }
+function waitForSave() { message.info(accountBusy.value ? 'B站操作正在执行，请完成后再离开或切换账号' : '正在保存，请完成后再切换'); return false }
 onBeforeRouteLeave(() => anySaving.value ? waitForSave() : !anyDirty.value || confirmDiscard())
 onBeforeRouteUpdate(to => {
-  if (scopeFromQuery(to.query) === selectedScope.value) return true
-  if (productionBusy.value) return waitForSave()
-  return !productionDirty.value || confirmDiscard()
+  const changingAccount = accountContextFromQuery(to.query) !== accountContext.value
+  const changingScope = scopeFromQuery(to.query) !== selectedScope.value
+  const changingStage = configurationStageKey(typeof to.query.stage==='string'?to.query.stage:undefined)!==selectedStage.value
+  if (changingAccount && accountBusy.value || (changingScope || changingStage) && productionBusy.value) return waitForSave()
+  return !(changingAccount && accountDirty.value || changingScope && productionDirty.value) || confirmDiscard()
 })
 function warnUnload(e: BeforeUnloadEvent) {
   if (anyDirty.value || anySaving.value) { e.preventDefault(); e.returnValue = '' }
@@ -166,25 +191,24 @@ function warnUnload(e: BeforeUnloadEvent) {
 onMounted(() => window.addEventListener('beforeunload', warnUnload))
 onUnmounted(() => window.removeEventListener('beforeunload', warnUnload))
 
-// 专属参数解析: 留空或 JSON 非法都按 {} 处理 (不发任何额外字段)
+// 参数草稿统一解析；非法值仅在比较草稿时占位，保存和连通测试另行阻止提交。
 function parseParams(p: any): any {
-  try { return JSON.parse(p.paramsJson || '{}') } catch { return {} }
+  return parseLlmParams(p.paramsJson).params ?? {}
 }
-// 专属参数 JSON 是否填了但格式非法 (非法 ≠ 未填: 前者必须提示, 且算"未保存")
+// 非法 JSON 和非对象都属于未保存错误，不能无声变成空参数提交。
 function paramsJsonBad(p: any): boolean {
-  if (!(p.paramsJson || '').trim()) return false
-  try { JSON.parse(p.paramsJson); return false } catch { return true }
+  return !parseLlmParams(p.paramsJson).valid
 }
 
 function addProfile() {
-  if (settingsLocked.value) return
+  if (llmProfilesLocked.value) return
   profiles.value.push({ name: `配置${profiles.value.length + 1}`,
                         base_url: '', api_key: '', model: '', enabled: true,
                         params: {}, paramsJson: '' }) // 专属参数默认留空
 }
-function delProfile(i: number) { if (!settingsLocked.value) profiles.value.splice(i, 1) }
+function delProfile(i: number) { if (!llmProfilesLocked.value) profiles.value.splice(i, 1) }
 function move(i: number, d: number) {
-  if (settingsLocked.value) return
+  if (llmProfilesLocked.value) return
   const j = i + d
   if (j < 0 || j >= profiles.value.length) return
   ;[profiles.value[i], profiles.value[j]] = [profiles.value[j], profiles.value[i]]
@@ -219,30 +243,39 @@ async function loadSettings() {
     loadError.value = `加载失败 (${e.message}) —— 请确认后端服务正在运行，并使用启动脚本打开的地址`
   } finally { loadingConfig.value = false }
 }
-watch(section, key => { if (key !== 'production' && !cfg.value && !loadError.value) void loadSettings() }, { immediate: true })
+watch(section, key => { if (['models', 'runtime'].includes(key) && !cfg.value && !loadError.value) void loadSettings() }, { immediate: true })
 
 // 「应用」是唯一写入口: 只保存本卡内容 (LLM 配置组 + 通用参数)
 async function applySettings() {
-  if (settingsLocked.value) return
+  if (llmApplyLocked.value || !isDirty.value) return
+  const profileChanges = profilesDirty.value
+  const timeoutChanges = formDirty.value
   const bad = profiles.value.filter(paramsJsonBad).map(p => p.name?.trim() || '未命名配置')
-  if (bad.length) { message.warning(`请先修正专属参数的 JSON 格式：${bad.join('、')}`); return }
+  if (profileChanges && bad.length) { message.warning(`请先修正参数 JSON（必须为对象）：${bad.join('、')}`); return }
   saving.value = true
   // 仅记录本次请求提交的快照，不吞掉其他分区或请求期间的新修改。
   const submittedProfiles = profiles.value.map(p => toWire(p))
   const submittedForm = { timeout: form.value.timeout }
   try {
     if (editability.observing.value && !await editability.canEdit()) { message.info(editability.reason.value); return }
+    const updates: Record<string, any> = {}
+    if (profileChanges) updates['llm.profiles'] = submittedProfiles
+    if (timeoutChanges) updates['llm.timeout'] = submittedForm.timeout
     const r = await fetch('/api/settings', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ updates: {
-        'llm.profiles': submittedProfiles,
-        'llm.timeout': submittedForm.timeout,
-      } }),
+      body: JSON.stringify({ updates }),
     })
-    if (!r.ok) throw new Error('HTTP ' + r.status)
-    savedProfiles.value = submittedProfiles.map(p => JSON.stringify(p))
-    savedForm.value = JSON.stringify(submittedForm)
-    message.success('已应用并写入 config.yaml')
+    if (!r.ok) {
+      const reason = await r.json().catch(() => null)
+      throw new Error(typeof reason?.message === 'string' ? reason.message : 'HTTP ' + r.status)
+    }
+    if (profileChanges && JSON.stringify(profiles.value.map(p => toWire(p))) === JSON.stringify(submittedProfiles)) {
+      savedProfiles.value = submittedProfiles.map(p => JSON.stringify(p))
+    }
+    if (timeoutChanges && form.value.timeout === submittedForm.timeout) {
+      savedForm.value = JSON.stringify(submittedForm)
+    }
+    message.success('已保存模型设置；用于之后的调用，已有结果保持有效')
   } catch (e: any) {
     message.error(`应用失败: ${e.message}`)
   } finally { saving.value = false }
@@ -315,6 +348,9 @@ async function applyDisplay() {
 }
 
 async function testConnection() {
+  if (testing.value) return
+  const bad = profiles.value.filter(p => p.enabled && paramsJsonBad(p))
+  if (bad.length) { message.warning(`请先修正参数 JSON（必须为对象）：${bad.map(p => p.name || '未命名配置').join('、')}`); return }
   testing.value = true
   // 每组独立发请求: 谁先返回谁先显示, 不互相等待最慢的
   const targets = profiles.value
@@ -336,13 +372,21 @@ function extraParamsStr(r: any): string {
 
 <template>
   <div class="workspace-page settings-page">
-    <header class="page-head"><span class="page-kicker">偏好与配置</span><n-h1>设置</n-h1><p class="page-description">制作规则统一管理，服务连接与本机偏好独立设置。</p></header>
+    <header class="page-head"><span class="page-kicker">偏好与配置</span><n-h1>设置</n-h1><p class="page-description">制作与发布规则、B站账号、服务连接及本机偏好统一管理。</p></header>
     <nav class="section-nav" aria-label="设置分类"><button v-for="item in sections" :key="item.key" :aria-pressed="section === item.key" @click="selectSection(item.key)">{{ item.label }}<span v-if="item.dirty" class="dirty-dot" aria-label="有未保存修改">●</span></button></nav>
-    <ConfigurationWorkspace v-if="visited.has('production')" v-show="section === 'production'" :scope="selectedScope" @select="selectScope" @dirty-change="productionDirty = $event" @busy-change="productionBusy = $event" />
-    <div v-show="section !== 'production'">
-    <n-alert v-if="editability.locked.value" type="info" :show-icon="false" style="margin-bottom:16px">{{ editability.reason.value }} 显示追赶距离仍可实时调整。<n-button text :loading="editability.checking.value" @click="editability.refresh">重新核对</n-button></n-alert>
+    <ConfigurationWorkspace v-if="visited.has('production')" v-show="section === 'production'" :scope="selectedScope" :stage="selectedStage" @select="selectScope" @stage-change="selectStage" @dirty-change="productionDirty = $event" @busy-change="productionBusy = $event" />
+    <BiliAccountManager v-if="visited.has('bilibili')" v-show="section === 'bilibili'" :key="accountContext" :active="section === 'bilibili'" :default-account="typeof route.query.account === 'string' ? route.query.account : ''" :default-project="typeof route.query.project === 'string' ? route.query.project : ''" :default-bvid="typeof route.query.bvid === 'string' ? route.query.bvid : ''" :manage-studio="route.query.manage === 'studio'" @dirty-change="accountDirty = $event" @busy-change="accountBusy = $event" />
+    <div v-show="['models', 'runtime'].includes(section)">
+    <ConfigurationLockNotice v-if="editability.locked.value" :reason="editability.reason.value"
+                             :refresh="editability.refresh" style="margin-bottom:16px">
+      显示追赶距离以及下一次请求/步骤生效的时限仍可实时调整。
+    </ConfigurationLockNotice>
+    <n-alert v-else-if="editability.lockedPaths.value.length" type="info" :show-icon="false" style="margin-bottom:16px">
+      当前运行步骤的相关设置已冻结；其它步骤设置仍可修改，保存后只影响尚未开始的步骤。
+    </n-alert>
     <n-alert v-if="section === 'models'" type="info" :show-icon="false" style="margin-bottom: 20px">
       首次使用：填写接口地址、密钥和模型名 → 测试连接 → 保存模型设置。支持 OpenAI 兼容接口；多个配置按顺序自动切换。
+      <p style="margin:8px 0 0">模型连接与请求参数用于之后的调用；已有结果保持有效。想使用新模型重做，请在对应步骤主动重新生成。</p>
     </n-alert>
 
     <n-alert v-if="loadError" type="error">{{ loadError }} <n-button text @click="loadSettings">重试</n-button></n-alert>
@@ -360,47 +404,39 @@ function extraParamsStr(r: any): string {
                 <n-tag size="small" :bordered="false" round>#{{ i + 1 }}</n-tag>
                 <n-tag v-if="cardDirty[i]" size="small" type="warning"
                        :bordered="false">未应用</n-tag>
-                <n-switch v-model:value="p.enabled" :disabled="settingsLocked" size="small">
+                <n-switch v-model:value="p.enabled" :disabled="llmProfilesLocked" size="small" :aria-label="`${p.name || `模型配置 ${i + 1}`}是否启用`">
                   <template #checked>启用</template><template #unchecked>停用</template>
                 </n-switch>
-                <n-input v-model:value="p.name" :disabled="settingsLocked" size="small" placeholder="配置名称"
-                         class="name-input" />
+                <n-input v-model:value="p.name" :disabled="llmProfilesLocked" size="small" placeholder="配置名称"
+                         class="name-input" :input-props="{'aria-label': `模型配置 ${i + 1}的名称`}" />
                 <div class="flex-sp" />
                 <n-button size="small" type="primary" secondary :loading="isTesting(i)"
-                          @click="testOne(i)">
+                          :aria-label="`测试${p.name || `模型配置 ${i + 1}`}连接`" @click="testOne(i)">
                   <template #icon><span style="font-size:12px">⚡</span></template>
                   测试
                 </n-button>
-                <n-button size="small" quaternary :disabled="settingsLocked || i === 0"
-                          aria-label="提高配置优先级" @click="move(i, -1)">↑</n-button>
-                <n-button size="small" quaternary :disabled="settingsLocked || i === profiles.length - 1"
-                          aria-label="降低配置优先级" @click="move(i, 1)">↓</n-button>
+                <n-button size="small" quaternary :disabled="llmProfilesLocked || i === 0"
+                          :aria-label="`提高${p.name || `模型配置 ${i + 1}`}的优先级`" @click="move(i, -1)">↑</n-button>
+                <n-button size="small" quaternary :disabled="llmProfilesLocked || i === profiles.length - 1"
+                          :aria-label="`降低${p.name || `模型配置 ${i + 1}`}的优先级`" @click="move(i, 1)">↓</n-button>
                 <n-button size="small" quaternary type="error"
-                          :disabled="settingsLocked" @click="delProfile(i)">删除</n-button>
+                          :disabled="llmProfilesLocked" :aria-label="`删除${p.name || `模型配置 ${i + 1}`}`" @click="delProfile(i)">删除</n-button>
               </div>
               <!-- 字段区: 行内标签两列布局, 减少换行 -->
               <div class="fields">
                 <n-text depth="3" class="lb">接口地址</n-text>
-                <n-input v-model:value="p.base_url" :disabled="settingsLocked" size="small" class="c-span"
-                         placeholder="https://ark.cn-beijing.volces.com/api/plan/v3" />
+                <n-input v-model:value="p.base_url" :disabled="llmProfilesLocked" size="small" class="c-span"
+                         placeholder="https://ark.cn-beijing.volces.com/api/plan/v3" :input-props="{'aria-label': `${p.name || `模型配置 ${i + 1}`}的接口地址`}" />
                 <n-text depth="3" class="lb">模型名</n-text>
-                <n-input v-model:value="p.model" :disabled="settingsLocked" size="small"
-                         placeholder="如 glm-5.3-flash / deepseek-chat" />
+                <n-input v-model:value="p.model" :disabled="llmProfilesLocked" size="small"
+                         placeholder="如 glm-5.3-flash / deepseek-chat" :input-props="{'aria-label': `${p.name || `模型配置 ${i + 1}`}的模型名`}" />
                 <n-text depth="3" class="lb">API Key</n-text>
-                <n-input v-model:value="p.api_key" :disabled="settingsLocked" type="password"
+                <n-input v-model:value="p.api_key" :disabled="llmProfilesLocked" type="password"
                          show-password-on="click" size="small"
-                         placeholder="密钥保存在本地 config.yaml" />
-                <n-text depth="3" class="lb lb-top">专属参数</n-text>
+                          placeholder="密钥保存在本地 config.yaml" :input-props="{'aria-label': `${p.name || `模型配置 ${i + 1}`}的 API Key`}" />
+                <n-text depth="3" class="lb lb-top">请求参数</n-text>
                 <div class="c-span">
-                  <n-input v-model:value="p.paramsJson" :disabled="settingsLocked" type="textarea" size="small" :rows="2"
-                           placeholder='可选，留空=服务商默认；例如 {"temperature":1,"top_p":0.95} 或 {"reasoning_effort":"low"}' />
-                  <div class="param-hint">
-                    核心参数各家通用 (OpenAI 协议: temperature / top_p / max_tokens 等)；
-                    厂家私有参数（如 reasoning_effort、thinking）也写在这里。整理/翻译选择“低思考强度”时，适配模型会覆盖 reasoning_effort 为 low，并移除不兼容的 thinking；选择“跟随自定义 JSON / 服务商默认”则原样使用。其他参数保留；连通测试使用此处原参数。
-                    GLM-5.3/5.3-Flash 通常不能关闭思考，建议用
-                    <code>{"reasoning_effort":"low"}</code> 降低思考量；其他支持开关的模型才使用
-                    <code>{"thinking":{"type":"disabled"}}</code>。具体字段以该接口文档为准，返回 400 时删除不支持的字段即可
-                  </div>
+                  <LlmParametersEditor v-model="p.paramsJson" :model="p.model || ''" :base-url="p.base_url || ''" :disabled="llmProfilesLocked" />
                 </div>
               </div>
               <!-- 测试过程/结果: 发送了什么 / 过程事件 / 收到了什么 -->
@@ -435,7 +471,8 @@ function extraParamsStr(r: any): string {
                 </template>
               </div>
             </div>
-            <n-button size="small" dashed block :disabled="settingsLocked" @click="addProfile">＋ 新增一组配置</n-button>
+            <n-button size="small" dashed block :disabled="llmProfilesLocked" @click="addProfile">＋ 新增一组配置</n-button>
+            <LlmConversationButton operation="provider_test" />
           </div>
           <!-- LLM 运行设置: DubForge 自身参数 (非模型请求参数), 对所有配置组生效 -->
           <div class="globals-cap">
@@ -450,16 +487,18 @@ function extraParamsStr(r: any): string {
               <n-tooltip trigger="hover" placement="top">
                 <template #trigger><span class="g-lb">请求时限（秒） ⓘ</span></template>
                 语义整理和翻译：单次请求总时限，包括等待、思考和持续输出；收到新内容不会重置计时。
+                发布文案：整次生成的总时限，包含格式修复重试。
                 其他 LLM 调用：读超时，即单次等待返回数据的最长时间。
                 到时关闭本地连接，但不能确认服务商已停止计算或计费；慢模型可适当调大。
+                运行期间修改从下一次请求生效；发布文案从下一次生成生效，当前请求或生成继续使用已冻结的时限。
               </n-tooltip>
-              <n-input-number v-model:value="form.timeout" :disabled="settingsLocked" size="small"
+              <n-input-number v-model:value="form.timeout" :disabled="llmTimeoutLocked" size="small"
                               :min="10" :max="3600" style="width:100px" />
             </div>
           </div>
           <!-- 「应用」是唯一写入口: 覆盖本卡片全部内容 (配置组 + 通用参数) -->
           <div class="actions">
-            <n-button type="primary" :loading="saving" :disabled="settingsLocked || !isDirty"
+            <n-button type="primary" :loading="saving" :disabled="llmApplyLocked || !isDirty"
                       @click="applySettings()">保存模型设置</n-button>
             <n-button :loading="testing" @click="testConnection">🔌 并行测试全部</n-button>
             <n-text v-if="isDirty" type="warning" style="font-size: 12px">

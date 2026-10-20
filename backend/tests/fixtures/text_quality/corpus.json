@@ -1,0 +1,1919 @@
+{
+  "version": 1,
+  "description": "真实问题片段的离线观察样本；并非人工核听金标准。原字幕、词轴和候选快照保留出处，评价不修改生产校验。",
+  "sources": {
+    "train": {
+      "project_directory": "20260929_1926_www.youtube.com_vPoYu-uHQPg",
+      "captured_on": "2026-10-07",
+      "files": {
+        "srt/src.srt": "c66d01bb02614fa46cdc47bc77a174f3f06fde8f8376db89c200cf136536b962",
+        "artifacts/transcribe/words.json": "4977de64da9205d3219cc522d8604c43656a724c80ef6a53f4d1b57569322738"
+      },
+      "audio_review": "pending",
+      "note": "从真实项目只读截取；识别置信度历史缺失，文本和词轴不能证明无声或误词。",
+      "recorded_response": {
+        "timestamp": "2026-10-07T18:26:03+08:00",
+        "request_id": "e99da411a3",
+        "sha256": "99c2e8fcb480bd7ff03bb8099784c40ad80b9cefdc25b010b1cf18107d732ac9"
+      },
+      "artifact_sha256": "607d383fc632f8c70109d81cd757ee9c35a142dbc353eba5c326dd0c2451875b"
+    },
+    "short_answer": {
+      "project_directory": "20260929_1926_www.youtube.com_p8zmAdUISLI",
+      "captured_on": "2026-10-07",
+      "files": {
+        "srt/src.srt": "baeda20a832d579978d0c1fe4b1e3ce8f7bb9cc868fc64cec27b5853f32aaf2d",
+        "artifacts/transcribe/words.json": "921984f693e59f32785d74b043bd746807f4a651e7f463b9efec4714337f7ac8"
+      },
+      "audio_review": "pending",
+      "note": "从真实项目只读截取；识别置信度历史缺失，文本和词轴不能证明无声或误词。",
+      "artifact_sha256": "0beffd4d530a7bfce3b44769e2c52d053e40dbe9374e29600a0d14ceafe122d5"
+    }
+  },
+  "cases": [
+    {
+      "id": "currency",
+      "source": "train",
+      "window": [
+        30.83,
+        38.84
+      ],
+      "focus": "票价 10 yen/yuan 的上下文纠错；待核听，不能仅凭常识证明货币。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 17,
+          "start": 30.83,
+          "end": 32.59,
+          "text": "all i have to do is scan the qr"
+        },
+        {
+          "id": 18,
+          "start": 32.59,
+          "end": 34.31,
+          "text": "code the tickets were exactly"
+        },
+        {
+          "id": 19,
+          "start": 34.31,
+          "end": 36.09,
+          "text": "10 yen so"
+        },
+        {
+          "id": 20,
+          "start": 36.82,
+          "end": 37.76,
+          "text": "that's one dollar each"
+        },
+        {
+          "id": 21,
+          "start": 37.76,
+          "end": 38.84,
+          "text": "i"
+        }
+      ],
+      "words": [
+        {
+          "word": " everywhere",
+          "start": 30.27,
+          "end": 30.83
+        },
+        {
+          "word": " all",
+          "start": 30.83,
+          "end": 31.31
+        },
+        {
+          "word": " i",
+          "start": 31.31,
+          "end": 31.43
+        },
+        {
+          "word": " have",
+          "start": 31.43,
+          "end": 31.53
+        },
+        {
+          "word": " to",
+          "start": 31.53,
+          "end": 31.61
+        },
+        {
+          "word": " do",
+          "start": 31.61,
+          "end": 31.69
+        },
+        {
+          "word": " is",
+          "start": 31.69,
+          "end": 31.85
+        },
+        {
+          "word": " scan",
+          "start": 31.85,
+          "end": 32.11
+        },
+        {
+          "word": " the",
+          "start": 32.11,
+          "end": 32.27
+        },
+        {
+          "word": " qr",
+          "start": 32.27,
+          "end": 32.59
+        },
+        {
+          "word": " code",
+          "start": 32.59,
+          "end": 32.87
+        },
+        {
+          "word": " the",
+          "start": 32.87,
+          "end": 33.53
+        },
+        {
+          "word": " tickets",
+          "start": 33.53,
+          "end": 33.79
+        },
+        {
+          "word": " were",
+          "start": 33.79,
+          "end": 33.93
+        },
+        {
+          "word": " exactly",
+          "start": 33.93,
+          "end": 34.31
+        },
+        {
+          "word": " 10",
+          "start": 34.31,
+          "end": 34.71
+        },
+        {
+          "word": " yen",
+          "start": 34.71,
+          "end": 35.07
+        },
+        {
+          "word": " so",
+          "start": 35.07,
+          "end": 36.09
+        },
+        {
+          "word": " that's",
+          "start": 36.82,
+          "end": 37.04
+        },
+        {
+          "word": " one",
+          "start": 37.04,
+          "end": 37.2
+        },
+        {
+          "word": " dollar",
+          "start": 37.2,
+          "end": 37.42
+        },
+        {
+          "word": " each",
+          "start": 37.42,
+          "end": 37.76
+        },
+        {
+          "word": " i",
+          "start": 37.76,
+          "end": 38.84
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 13,
+          "start": 30.83,
+          "end": 32.87,
+          "text": "All I have to do is scan the QR code"
+        },
+        {
+          "id": 14,
+          "start": 32.87,
+          "end": 35.07,
+          "text": "The tickets were exactly 10 yen"
+        },
+        {
+          "id": 15,
+          "start": 35.07,
+          "end": 36.09,
+          "text": "so"
+        },
+        {
+          "id": 16,
+          "start": 36.82,
+          "end": 37.76,
+          "text": "that's one dollar each"
+        },
+        {
+          "id": 17,
+          "start": 37.76,
+          "end": 38.84,
+          "text": "I"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 13,
+          "start": 30.83,
+          "end": 32.87,
+          "text": "All I have to do is scan the QR code"
+        },
+        {
+          "id": 14,
+          "start": 32.87,
+          "end": 35.07,
+          "text": "The tickets were exactly 10 yen"
+        },
+        {
+          "id": 15,
+          "start": 35.07,
+          "end": 36.09,
+          "text": "so"
+        },
+        {
+          "id": 16,
+          "start": 36.82,
+          "end": 37.76,
+          "text": "that's one dollar each"
+        },
+        {
+          "id": 17,
+          "start": 37.76,
+          "end": 38.84,
+          "text": "I"
+        }
+      ],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "correction",
+          "label": "记录 yuan 纠错是否发生",
+          "alternatives": [
+            "10 yuan"
+          ],
+          "match_mode": "contains"
+        },
+        {
+          "kind": "suspected_noise",
+          "label": "记录句尾/独立 I 的保留",
+          "alternatives": [
+            "I"
+          ],
+          "match_mode": "exact"
+        }
+      ]
+    },
+    {
+      "id": "starter_i_mean",
+      "source": "train",
+      "window": [
+        117.92,
+        124.7
+      ],
+      "focus": "I mean 接续短语是否被拆开；不同自然分句可接受，不要求唯一整句。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 48,
+          "start": 117.92,
+          "end": 119.76,
+          "text": "they're caught in it close they're all"
+        },
+        {
+          "id": 49,
+          "start": 119.76,
+          "end": 120.92,
+          "text": "for the train i"
+        },
+        {
+          "id": 50,
+          "start": 120.92,
+          "end": 122.9,
+          "text": "mean fingers crossed they just"
+        },
+        {
+          "id": 51,
+          "start": 122.9,
+          "end": 124.7,
+          "text": "would go until we're all on"
+        }
+      ],
+      "words": [
+        {
+          "word": " but",
+          "start": 117.5,
+          "end": 117.92
+        },
+        {
+          "word": " they're",
+          "start": 117.92,
+          "end": 118.5
+        },
+        {
+          "word": " caught",
+          "start": 118.5,
+          "end": 118.7
+        },
+        {
+          "word": " in",
+          "start": 118.7,
+          "end": 118.82
+        },
+        {
+          "word": " it",
+          "start": 118.82,
+          "end": 118.9
+        },
+        {
+          "word": " close",
+          "start": 118.9,
+          "end": 119.14
+        },
+        {
+          "word": " they're",
+          "start": 119.14,
+          "end": 119.6
+        },
+        {
+          "word": " all",
+          "start": 119.6,
+          "end": 119.76
+        },
+        {
+          "word": " for",
+          "start": 119.76,
+          "end": 120.0
+        },
+        {
+          "word": " the",
+          "start": 120.0,
+          "end": 120.16
+        },
+        {
+          "word": " train",
+          "start": 120.16,
+          "end": 120.5
+        },
+        {
+          "word": " i",
+          "start": 120.5,
+          "end": 120.92
+        },
+        {
+          "word": " mean",
+          "start": 120.92,
+          "end": 121.8
+        },
+        {
+          "word": " fingers",
+          "start": 121.8,
+          "end": 122.16
+        },
+        {
+          "word": " crossed",
+          "start": 122.16,
+          "end": 122.44
+        },
+        {
+          "word": " they",
+          "start": 122.44,
+          "end": 122.66
+        },
+        {
+          "word": " just",
+          "start": 122.66,
+          "end": 122.9
+        },
+        {
+          "word": " would",
+          "start": 122.9,
+          "end": 123.08
+        },
+        {
+          "word": " go",
+          "start": 123.08,
+          "end": 123.3
+        },
+        {
+          "word": " until",
+          "start": 123.3,
+          "end": 123.66
+        },
+        {
+          "word": " we're",
+          "start": 123.66,
+          "end": 124.16
+        },
+        {
+          "word": " all",
+          "start": 124.16,
+          "end": 124.3
+        },
+        {
+          "word": " on",
+          "start": 124.3,
+          "end": 124.7
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 44,
+          "start": 117.5,
+          "end": 119.14,
+          "text": "but they're caught in it close"
+        },
+        {
+          "id": 45,
+          "start": 119.14,
+          "end": 120.5,
+          "text": "they're all for the train"
+        },
+        {
+          "id": 46,
+          "start": 120.5,
+          "end": 122.44,
+          "text": "I mean, fingers crossed"
+        },
+        {
+          "id": 47,
+          "start": 122.44,
+          "end": 125.02,
+          "text": "they just would go until we're all on. Yeah"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 43,
+          "start": 117.5,
+          "end": 119.14,
+          "text": "but they're caught in it close"
+        },
+        {
+          "id": 44,
+          "start": 119.14,
+          "end": 120.5,
+          "text": "they're all for the train"
+        },
+        {
+          "id": 45,
+          "start": 120.5,
+          "end": 122.44,
+          "text": "I mean, fingers crossed"
+        },
+        {
+          "id": 46,
+          "start": 122.44,
+          "end": 125.02,
+          "text": "they just would go until we're all on. Yeah"
+        }
+      ],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "boundary",
+          "label": "I mean 是否在同一行",
+          "alternatives": [
+            "I mean"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "long_gap_the_line",
+      "source": "train",
+      "window": [
+        101.66,
+        111.9
+      ],
+      "focus": "原词 the 与 line 之间有长词轴空档。历史后处理把模型 The line 拆为孤立 The；需区分模型输出和后处理变化。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 41,
+          "start": 101.1,
+          "end": 103.1,
+          "text": "a direction we have 20 minutes to"
+        },
+        {
+          "id": 42,
+          "start": 103.1,
+          "end": 104.5,
+          "text": "go the"
+        },
+        {
+          "id": 43,
+          "start": 109.66,
+          "end": 111.42,
+          "text": "line we're about to get in is so"
+        },
+        {
+          "id": 44,
+          "start": 111.42,
+          "end": 113.02,
+          "text": "long our line for check"
+        }
+      ],
+      "words": [
+        {
+          "word": " direction",
+          "start": 101.2,
+          "end": 101.66
+        },
+        {
+          "word": " we",
+          "start": 101.66,
+          "end": 102.22
+        },
+        {
+          "word": " have",
+          "start": 102.22,
+          "end": 102.34
+        },
+        {
+          "word": " 20",
+          "start": 102.34,
+          "end": 102.58
+        },
+        {
+          "word": " minutes",
+          "start": 102.58,
+          "end": 102.86
+        },
+        {
+          "word": " to",
+          "start": 102.86,
+          "end": 103.1
+        },
+        {
+          "word": " go",
+          "start": 103.1,
+          "end": 103.3
+        },
+        {
+          "word": " the",
+          "start": 103.3,
+          "end": 104.5
+        },
+        {
+          "word": " line",
+          "start": 109.66,
+          "end": 109.98
+        },
+        {
+          "word": " we're",
+          "start": 109.98,
+          "end": 110.2
+        },
+        {
+          "word": " about",
+          "start": 110.2,
+          "end": 110.34
+        },
+        {
+          "word": " to",
+          "start": 110.34,
+          "end": 110.48
+        },
+        {
+          "word": " get",
+          "start": 110.48,
+          "end": 110.66
+        },
+        {
+          "word": " in",
+          "start": 110.66,
+          "end": 110.82
+        },
+        {
+          "word": " is",
+          "start": 110.82,
+          "end": 111.08
+        },
+        {
+          "word": " so",
+          "start": 111.08,
+          "end": 111.42
+        },
+        {
+          "word": " long",
+          "start": 111.42,
+          "end": 111.9
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 37,
+          "start": 101.66,
+          "end": 103.3,
+          "text": "We have 20 minutes to go"
+        },
+        {
+          "id": 38,
+          "start": 103.3,
+          "end": 104.5,
+          "text": "The"
+        },
+        {
+          "id": 39,
+          "start": 109.66,
+          "end": 109.98,
+          "text": "line"
+        },
+        {
+          "id": 40,
+          "start": 109.98,
+          "end": 111.9,
+          "text": "we're about to get in is so long"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 37,
+          "start": 101.66,
+          "end": 103.3,
+          "text": "We have 20 minutes to go"
+        },
+        {
+          "id": 38,
+          "start": 109.66,
+          "end": 109.98,
+          "text": "The line"
+        },
+        {
+          "id": 39,
+          "start": 109.98,
+          "end": 111.9,
+          "text": "we're about to get in is so long"
+        }
+      ],
+      "reference_gaps": [
+        [
+          104.5,
+          109.66
+        ]
+      ],
+      "annotations": [
+        {
+          "kind": "boundary",
+          "label": "完整 The line 是否保留在一行",
+          "alternatives": [
+            "The line"
+          ],
+          "match_mode": "contains"
+        },
+        {
+          "kind": "suspected_noise",
+          "label": "是否重新制造独立 The",
+          "alternatives": [
+            "The"
+          ],
+          "match_mode": "exact"
+        }
+      ]
+    },
+    {
+      "id": "long_gap_we",
+      "source": "train",
+      "window": [
+        127.42,
+        139.27
+      ],
+      "focus": "we 与 made it 间有 4.35 秒词轴空档；核听前不能确认 we 是误识别，不能为合句占用空档。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 53,
+          "start": 126.68,
+          "end": 128.52,
+          "text": "isn't until 11 so"
+        },
+        {
+          "id": 54,
+          "start": 128.52,
+          "end": 130.22,
+          "text": "we're all for the train"
+        },
+        {
+          "id": 55,
+          "start": 130.22,
+          "end": 131.4,
+          "text": "we"
+        },
+        {
+          "id": 56,
+          "start": 135.75,
+          "end": 137.51,
+          "text": "made it with exactly"
+        },
+        {
+          "id": 57,
+          "start": 137.51,
+          "end": 139.27,
+          "text": "10 minutes to"
+        }
+      ],
+      "words": [
+        {
+          "word": " until",
+          "start": 127.18,
+          "end": 127.42
+        },
+        {
+          "word": " 11",
+          "start": 127.42,
+          "end": 127.82
+        },
+        {
+          "word": " so",
+          "start": 127.82,
+          "end": 128.52
+        },
+        {
+          "word": " we're",
+          "start": 128.52,
+          "end": 129.38
+        },
+        {
+          "word": " all",
+          "start": 129.38,
+          "end": 129.58
+        },
+        {
+          "word": " for",
+          "start": 129.58,
+          "end": 129.84
+        },
+        {
+          "word": " the",
+          "start": 129.84,
+          "end": 129.94
+        },
+        {
+          "word": " train",
+          "start": 129.94,
+          "end": 130.22
+        },
+        {
+          "word": " we",
+          "start": 130.22,
+          "end": 131.4
+        },
+        {
+          "word": " made",
+          "start": 135.75,
+          "end": 136.05
+        },
+        {
+          "word": " it",
+          "start": 136.05,
+          "end": 136.31
+        },
+        {
+          "word": " with",
+          "start": 136.31,
+          "end": 136.91
+        },
+        {
+          "word": " exactly",
+          "start": 136.91,
+          "end": 137.51
+        },
+        {
+          "word": " 10",
+          "start": 137.51,
+          "end": 138.35
+        },
+        {
+          "word": " minutes",
+          "start": 138.35,
+          "end": 139.05
+        },
+        {
+          "word": " to",
+          "start": 139.05,
+          "end": 139.27
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 49,
+          "start": 127.42,
+          "end": 127.82,
+          "text": "11"
+        },
+        {
+          "id": 50,
+          "start": 127.82,
+          "end": 130.22,
+          "text": "so we're all for the train"
+        },
+        {
+          "id": 51,
+          "start": 130.22,
+          "end": 131.4,
+          "text": "we"
+        },
+        {
+          "id": 52,
+          "start": 135.75,
+          "end": 136.31,
+          "text": "made it"
+        },
+        {
+          "id": 53,
+          "start": 136.31,
+          "end": 139.59,
+          "text": "with exactly 10 minutes to spare"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 48,
+          "start": 127.42,
+          "end": 128.52,
+          "text": "11"
+        },
+        {
+          "id": 49,
+          "start": 128.52,
+          "end": 130.22,
+          "text": "so we're all for the train"
+        },
+        {
+          "id": 50,
+          "start": 130.22,
+          "end": 131.4,
+          "text": "we"
+        },
+        {
+          "id": 51,
+          "start": 135.75,
+          "end": 136.31,
+          "text": "made it"
+        },
+        {
+          "id": 52,
+          "start": 136.31,
+          "end": 139.59,
+          "text": "with exactly 10 minutes to spare"
+        }
+      ],
+      "reference_gaps": [
+        [
+          131.4,
+          135.75
+        ]
+      ],
+      "annotations": [
+        {
+          "kind": "suspected_noise",
+          "label": "独立 we 是否存在",
+          "alternatives": [
+            "we"
+          ],
+          "match_mode": "exact"
+        },
+        {
+          "kind": "preserve",
+          "label": "数字 11 的有效内容保留",
+          "alternatives": [
+            "11"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "long_gap_one",
+      "source": "train",
+      "window": [
+        144.85,
+        168.38
+      ],
+      "focus": "独立 one 与后句间有 13.89 秒空档；允许跨停顿参考上下文纠错，时间仍需留空，是否删 one 需核听。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 61,
+          "start": 144.85,
+          "end": 145.61,
+          "text": "scaring me"
+        },
+        {
+          "id": 62,
+          "start": 145.61,
+          "end": 146.97,
+          "text": "one"
+        },
+        {
+          "id": 63,
+          "start": 160.86,
+          "end": 162.82,
+          "text": "really cool thing about taking the train in"
+        },
+        {
+          "id": 64,
+          "start": 162.82,
+          "end": 164.52,
+          "text": "china is our passports were"
+        },
+        {
+          "id": 65,
+          "start": 164.52,
+          "end": 166.38,
+          "text": "actually our tickets so we just scanned our"
+        },
+        {
+          "id": 66,
+          "start": 166.38,
+          "end": 168.38,
+          "text": "passports and that's what let us in we got"
+        }
+      ],
+      "words": [
+        {
+          "word": " just",
+          "start": 144.47,
+          "end": 144.85
+        },
+        {
+          "word": " scaring",
+          "start": 144.85,
+          "end": 145.31
+        },
+        {
+          "word": " me",
+          "start": 145.31,
+          "end": 145.61
+        },
+        {
+          "word": " one",
+          "start": 145.61,
+          "end": 146.97
+        },
+        {
+          "word": " really",
+          "start": 160.86,
+          "end": 161.4
+        },
+        {
+          "word": " cool",
+          "start": 161.4,
+          "end": 161.62
+        },
+        {
+          "word": " thing",
+          "start": 161.62,
+          "end": 161.82
+        },
+        {
+          "word": " about",
+          "start": 161.82,
+          "end": 162.04
+        },
+        {
+          "word": " taking",
+          "start": 162.04,
+          "end": 162.26
+        },
+        {
+          "word": " the",
+          "start": 162.26,
+          "end": 162.38
+        },
+        {
+          "word": " train",
+          "start": 162.38,
+          "end": 162.6
+        },
+        {
+          "word": " in",
+          "start": 162.6,
+          "end": 162.82
+        },
+        {
+          "word": " china",
+          "start": 162.82,
+          "end": 162.92
+        },
+        {
+          "word": " is",
+          "start": 162.92,
+          "end": 163.26
+        },
+        {
+          "word": " our",
+          "start": 163.26,
+          "end": 163.54
+        },
+        {
+          "word": " passports",
+          "start": 163.54,
+          "end": 164.34
+        },
+        {
+          "word": " were",
+          "start": 164.34,
+          "end": 164.52
+        },
+        {
+          "word": " actually",
+          "start": 164.52,
+          "end": 164.84
+        },
+        {
+          "word": " our",
+          "start": 164.84,
+          "end": 165.0
+        },
+        {
+          "word": " tickets",
+          "start": 165.0,
+          "end": 165.3
+        },
+        {
+          "word": " so",
+          "start": 165.3,
+          "end": 165.58
+        },
+        {
+          "word": " we",
+          "start": 165.58,
+          "end": 165.72
+        },
+        {
+          "word": " just",
+          "start": 165.72,
+          "end": 165.9
+        },
+        {
+          "word": " scanned",
+          "start": 165.9,
+          "end": 166.24
+        },
+        {
+          "word": " our",
+          "start": 166.24,
+          "end": 166.38
+        },
+        {
+          "word": " passports",
+          "start": 166.38,
+          "end": 166.88
+        },
+        {
+          "word": " and",
+          "start": 166.88,
+          "end": 167.14
+        },
+        {
+          "word": " that's",
+          "start": 167.14,
+          "end": 167.48
+        },
+        {
+          "word": " what",
+          "start": 167.48,
+          "end": 167.58
+        },
+        {
+          "word": " let",
+          "start": 167.58,
+          "end": 167.74
+        },
+        {
+          "word": " us",
+          "start": 167.74,
+          "end": 167.92
+        },
+        {
+          "word": " in",
+          "start": 167.92,
+          "end": 168.08
+        },
+        {
+          "word": " we",
+          "start": 168.08,
+          "end": 168.24
+        },
+        {
+          "word": " got",
+          "start": 168.24,
+          "end": 168.38
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 56,
+          "start": 144.47,
+          "end": 146.97,
+          "text": "just scaring me one"
+        },
+        {
+          "id": 57,
+          "start": 160.86,
+          "end": 162.92,
+          "text": "really cool thing about taking the train in China"
+        },
+        {
+          "id": 58,
+          "start": 162.92,
+          "end": 165.3,
+          "text": "is our passports were actually our tickets"
+        },
+        {
+          "id": 59,
+          "start": 165.3,
+          "end": 168.08,
+          "text": "so we just scanned our passports and that's what let us in"
+        },
+        {
+          "id": 60,
+          "start": 168.08,
+          "end": 169.26,
+          "text": "We got no tickets"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 55,
+          "start": 144.47,
+          "end": 146.97,
+          "text": "just scaring me one"
+        },
+        {
+          "id": 56,
+          "start": 160.86,
+          "end": 162.92,
+          "text": "really cool thing about taking the train in China"
+        },
+        {
+          "id": 57,
+          "start": 162.92,
+          "end": 165.3,
+          "text": "is our passports were actually our tickets"
+        },
+        {
+          "id": 58,
+          "start": 165.3,
+          "end": 168.08,
+          "text": "so we just scanned our passports and that's what let us in"
+        },
+        {
+          "id": 59,
+          "start": 168.08,
+          "end": 169.26,
+          "text": "We got no tickets"
+        }
+      ],
+      "reference_gaps": [
+        [
+          146.97,
+          160.86
+        ]
+      ],
+      "annotations": [
+        {
+          "kind": "suspected_noise",
+          "label": "独立 one 是否存在",
+          "alternatives": [
+            "one"
+          ],
+          "match_mode": "exact"
+        },
+        {
+          "kind": "preserve",
+          "label": "后句 train 内容仍存在",
+          "alternatives": [
+            "train"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "meaningful_yeah",
+      "source": "train",
+      "window": [
+        355.16,
+        362.28
+      ],
+      "focus": "真实候选保留短应答 Yeah。短时长不是删除理由；原音待核听，保留文字的回归期望与声学确认分开。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 169,
+          "start": 355.16,
+          "end": 356.42,
+          "text": "actually"
+        },
+        {
+          "id": 170,
+          "start": 358.82,
+          "end": 360.74,
+          "text": "pretty good yeah i hope it needs"
+        },
+        {
+          "id": 171,
+          "start": 360.74,
+          "end": 362.28,
+          "text": "more uva than crab"
+        }
+      ],
+      "words": [
+        {
+          "word": " was",
+          "start": 354.98,
+          "end": 355.16
+        },
+        {
+          "word": " actually",
+          "start": 355.16,
+          "end": 356.42
+        },
+        {
+          "word": " pretty",
+          "start": 358.82,
+          "end": 359.48
+        },
+        {
+          "word": " good",
+          "start": 359.48,
+          "end": 359.72
+        },
+        {
+          "word": " yeah",
+          "start": 359.72,
+          "end": 359.96
+        },
+        {
+          "word": " i",
+          "start": 359.96,
+          "end": 360.22
+        },
+        {
+          "word": " hope",
+          "start": 360.22,
+          "end": 360.46
+        },
+        {
+          "word": " it",
+          "start": 360.46,
+          "end": 360.56
+        },
+        {
+          "word": " needs",
+          "start": 360.56,
+          "end": 360.74
+        },
+        {
+          "word": " more",
+          "start": 360.74,
+          "end": 361.06
+        },
+        {
+          "word": " uva",
+          "start": 361.06,
+          "end": 361.48
+        },
+        {
+          "word": " than",
+          "start": 361.48,
+          "end": 361.88
+        },
+        {
+          "word": " crab",
+          "start": 361.88,
+          "end": 362.28
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 149,
+          "start": 352.9,
+          "end": 356.42,
+          "text": "and worth the wait, it was actually"
+        },
+        {
+          "id": 150,
+          "start": 358.82,
+          "end": 359.72,
+          "text": "pretty good"
+        },
+        {
+          "id": 151,
+          "start": 359.72,
+          "end": 359.96,
+          "text": "Yeah"
+        },
+        {
+          "id": 152,
+          "start": 359.96,
+          "end": 362.28,
+          "text": "I hope it needs more uva than crab"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 148,
+          "start": 352.4,
+          "end": 356.42,
+          "text": "and worth the wait, it was actually"
+        },
+        {
+          "id": 149,
+          "start": 358.82,
+          "end": 359.72,
+          "text": "pretty good"
+        },
+        {
+          "id": 150,
+          "start": 359.72,
+          "end": 360.22,
+          "text": "Yeah"
+        },
+        {
+          "id": 151,
+          "start": 360.22,
+          "end": 362.28,
+          "text": "I hope it needs more uva than crab"
+        }
+      ],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "preserve",
+          "label": "Yeah 应答是否保留",
+          "alternatives": [
+            "yeah"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "zero_duration_context_word",
+      "source": "train",
+      "window": [
+        703.99,
+        709.41
+      ],
+      "focus": "now 的原始词轴为零时长，但在 So now 句内有意义；零时长本身不能决定删词。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 328,
+          "start": 703.99,
+          "end": 705.81,
+          "text": "so now as i make my own"
+        },
+        {
+          "id": 329,
+          "start": 705.81,
+          "end": 707.75,
+          "text": "pancake i'm going to explain a little"
+        },
+        {
+          "id": 330,
+          "start": 707.75,
+          "end": 709.41,
+          "text": "bit of peking duck to you"
+        }
+      ],
+      "words": [
+        {
+          "word": " so",
+          "start": 703.99,
+          "end": 704.67
+        },
+        {
+          "word": " now",
+          "start": 704.67,
+          "end": 704.67
+        },
+        {
+          "word": " as",
+          "start": 704.67,
+          "end": 704.91
+        },
+        {
+          "word": " i",
+          "start": 704.91,
+          "end": 705.01
+        },
+        {
+          "word": " make",
+          "start": 705.01,
+          "end": 705.23
+        },
+        {
+          "word": " my",
+          "start": 705.23,
+          "end": 705.49
+        },
+        {
+          "word": " own",
+          "start": 705.49,
+          "end": 705.81
+        },
+        {
+          "word": " pancake",
+          "start": 705.81,
+          "end": 706.47
+        },
+        {
+          "word": " i'm",
+          "start": 706.47,
+          "end": 707.07
+        },
+        {
+          "word": " going",
+          "start": 707.07,
+          "end": 707.13
+        },
+        {
+          "word": " to",
+          "start": 707.13,
+          "end": 707.17
+        },
+        {
+          "word": " explain",
+          "start": 707.17,
+          "end": 707.47
+        },
+        {
+          "word": " a",
+          "start": 707.47,
+          "end": 707.59
+        },
+        {
+          "word": " little",
+          "start": 707.59,
+          "end": 707.75
+        },
+        {
+          "word": " bit",
+          "start": 707.75,
+          "end": 707.93
+        },
+        {
+          "word": " of",
+          "start": 707.93,
+          "end": 708.17
+        },
+        {
+          "word": " peking",
+          "start": 708.17,
+          "end": 708.55
+        },
+        {
+          "word": " duck",
+          "start": 708.55,
+          "end": 708.79
+        },
+        {
+          "word": " to",
+          "start": 708.79,
+          "end": 709.15
+        },
+        {
+          "word": " you",
+          "start": 709.15,
+          "end": 709.41
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 286,
+          "start": 703.99,
+          "end": 706.47,
+          "text": "So now as I make my own pancake"
+        },
+        {
+          "id": 287,
+          "start": 706.47,
+          "end": 709.41,
+          "text": "I'm going to explain a little bit of Peking duck to you"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 284,
+          "start": 703.99,
+          "end": 706.47,
+          "text": "So now as I make my own pancake"
+        },
+        {
+          "id": 285,
+          "start": 706.47,
+          "end": 709.41,
+          "text": "I'm going to explain a little bit of Peking duck to you"
+        }
+      ],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "preserve",
+          "label": "So now 的有意义措辞是否保留",
+          "alternatives": [
+            "so now"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "proper_name",
+      "source": "train",
+      "window": [
+        729.23,
+        737.51
+      ],
+      "focus": "ASR kwa jude 的专名规范化；记录 Quanjude，不将未匹配直接判为错误，需核听原名。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 342,
+          "start": 728.25,
+          "end": 729.89,
+          "text": "originated from the most"
+        },
+        {
+          "id": 343,
+          "start": 729.89,
+          "end": 731.87,
+          "text": "famous peking duck restaurant"
+        },
+        {
+          "id": 344,
+          "start": 731.87,
+          "end": 733.75,
+          "text": "here in beijing called kwa"
+        },
+        {
+          "id": 345,
+          "start": 733.75,
+          "end": 735.59,
+          "text": "jude i believe it was opened in the"
+        },
+        {
+          "id": 346,
+          "start": 735.59,
+          "end": 737.51,
+          "text": "1800s and claims to have sold"
+        }
+      ],
+      "words": [
+        {
+          "word": " from",
+          "start": 728.93,
+          "end": 729.23
+        },
+        {
+          "word": " the",
+          "start": 729.23,
+          "end": 729.59
+        },
+        {
+          "word": " most",
+          "start": 729.59,
+          "end": 729.89
+        },
+        {
+          "word": " famous",
+          "start": 729.89,
+          "end": 730.49
+        },
+        {
+          "word": " peking",
+          "start": 730.49,
+          "end": 731.23
+        },
+        {
+          "word": " duck",
+          "start": 731.23,
+          "end": 731.41
+        },
+        {
+          "word": " restaurant",
+          "start": 731.41,
+          "end": 731.87
+        },
+        {
+          "word": " here",
+          "start": 731.87,
+          "end": 732.29
+        },
+        {
+          "word": " in",
+          "start": 732.29,
+          "end": 732.47
+        },
+        {
+          "word": " beijing",
+          "start": 732.47,
+          "end": 732.91
+        },
+        {
+          "word": " called",
+          "start": 732.91,
+          "end": 733.31
+        },
+        {
+          "word": " kwa",
+          "start": 733.31,
+          "end": 733.75
+        },
+        {
+          "word": " jude",
+          "start": 733.75,
+          "end": 734.13
+        },
+        {
+          "word": " i",
+          "start": 734.13,
+          "end": 734.35
+        },
+        {
+          "word": " believe",
+          "start": 734.35,
+          "end": 734.61
+        },
+        {
+          "word": " it",
+          "start": 734.61,
+          "end": 734.95
+        },
+        {
+          "word": " was",
+          "start": 734.95,
+          "end": 735.05
+        },
+        {
+          "word": " opened",
+          "start": 735.05,
+          "end": 735.33
+        },
+        {
+          "word": " in",
+          "start": 735.33,
+          "end": 735.49
+        },
+        {
+          "word": " the",
+          "start": 735.49,
+          "end": 735.59
+        },
+        {
+          "word": " 1800s",
+          "start": 735.59,
+          "end": 736.43
+        },
+        {
+          "word": " and",
+          "start": 736.43,
+          "end": 736.59
+        },
+        {
+          "word": " claims",
+          "start": 736.59,
+          "end": 736.91
+        },
+        {
+          "word": " to",
+          "start": 736.91,
+          "end": 737.05
+        },
+        {
+          "word": " have",
+          "start": 737.05,
+          "end": 737.17
+        },
+        {
+          "word": " sold",
+          "start": 737.17,
+          "end": 737.51
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 296,
+          "start": 729.23,
+          "end": 731.87,
+          "text": "The most famous Peking duck restaurant"
+        },
+        {
+          "id": 297,
+          "start": 731.87,
+          "end": 733.31,
+          "text": "here in Beijing called"
+        },
+        {
+          "id": 298,
+          "start": 733.31,
+          "end": 734.13,
+          "text": "Kwa Jude"
+        },
+        {
+          "id": 299,
+          "start": 734.13,
+          "end": 736.43,
+          "text": "I believe it was opened in the 1800s"
+        },
+        {
+          "id": 300,
+          "start": 736.43,
+          "end": 740.09,
+          "text": "and claims to have sold over 300 million ducks"
+        }
+      ],
+      "recorded_model_rows": [
+        {
+          "id": 294,
+          "start": 728.93,
+          "end": 731.41,
+          "text": "The most famous Peking duck restaurant"
+        },
+        {
+          "id": 295,
+          "start": 731.41,
+          "end": 733.31,
+          "text": "here in Beijing called"
+        },
+        {
+          "id": 296,
+          "start": 733.31,
+          "end": 734.35,
+          "text": "Kwa Jude"
+        },
+        {
+          "id": 297,
+          "start": 734.35,
+          "end": 736.43,
+          "text": "I believe it was opened in the 1800s"
+        },
+        {
+          "id": 298,
+          "start": 736.43,
+          "end": 740.09,
+          "text": "and claims to have sold over 300 million ducks"
+        }
+      ],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "correction",
+          "label": "Quanjude 专名是否出现",
+          "alternatives": [
+            "Quanjude"
+          ],
+          "match_mode": "contains"
+        },
+        {
+          "kind": "preserve",
+          "label": "时间背景 1800s 是否仍存在",
+          "alternatives": [
+            "1800s"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    },
+    {
+      "id": "meaningful_okay",
+      "source": "short_answer",
+      "window": [
+        745.44,
+        751.54
+      ],
+      "focus": "独立 okay 应答是保留关注点，避免以孤词/短句规则误删；原音待核听。",
+      "audio_review": "pending",
+      "source_rows": [
+        {
+          "id": 304,
+          "start": 745.44,
+          "end": 747.24,
+          "text": "final food of the night a"
+        },
+        {
+          "id": 305,
+          "start": 747.24,
+          "end": 749.08,
+          "text": "white rabbit"
+        },
+        {
+          "id": 306,
+          "start": 749.08,
+          "end": 750.32,
+          "text": "freeze pot"
+        },
+        {
+          "id": 307,
+          "start": 750.32,
+          "end": 751.54,
+          "text": "okay"
+        }
+      ],
+      "words": [
+        {
+          "word": " our",
+          "start": 745.04,
+          "end": 745.44
+        },
+        {
+          "word": " final",
+          "start": 745.44,
+          "end": 745.8
+        },
+        {
+          "word": " food",
+          "start": 745.8,
+          "end": 746.06
+        },
+        {
+          "word": " of",
+          "start": 746.06,
+          "end": 746.18
+        },
+        {
+          "word": " the",
+          "start": 746.18,
+          "end": 746.26
+        },
+        {
+          "word": " night",
+          "start": 746.26,
+          "end": 746.5
+        },
+        {
+          "word": " a",
+          "start": 746.5,
+          "end": 747.24
+        },
+        {
+          "word": " white",
+          "start": 747.24,
+          "end": 748.16
+        },
+        {
+          "word": " rabbit",
+          "start": 748.16,
+          "end": 749.08
+        },
+        {
+          "word": " freeze",
+          "start": 749.08,
+          "end": 749.82
+        },
+        {
+          "word": " pot",
+          "start": 749.82,
+          "end": 750.32
+        },
+        {
+          "word": " okay",
+          "start": 750.32,
+          "end": 751.54
+        }
+      ],
+      "recorded_artifact_rows": [
+        {
+          "id": 123,
+          "start": 743.48,
+          "end": 750.32,
+          "text": "and I think I see our final food of the night: a White Rabbit freeze pot."
+        },
+        {
+          "id": 124,
+          "start": 750.32,
+          "end": 751.54,
+          "text": "Okay"
+        }
+      ],
+      "recorded_model_rows": [],
+      "reference_gaps": [],
+      "annotations": [
+        {
+          "kind": "preserve",
+          "label": "okay 应答是否保留",
+          "alternatives": [
+            "okay",
+            "OK"
+          ],
+          "match_mode": "contains"
+        }
+      ]
+    }
+  ]
+}

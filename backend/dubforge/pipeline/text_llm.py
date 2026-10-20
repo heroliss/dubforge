@@ -1,5 +1,7 @@
 """语义整理和翻译的请求级思考设置；不修改全局模型配置或降级顺序。
 
+GLM-5.3 系列官方 Chat 接口支持 low/high/max；仅覆盖明确模型与官方入口，保留 thinking。
+https://docs.bigmodel.cn/cn/guide/models/vlm/glm-5.3-flash
 官方Codex套餐文档说明low/medium/high思考强度：
 https://docs.volcengine.com/docs/ark/coding-plan-personal-ai-codex?lang=en
 Agent Plan的Chat/Responses专属入口说明：
@@ -16,24 +18,35 @@ from dubforge.errors import StepFailedError
 
 _ARK_HOST = 'ark.cn-beijing.volces.com'
 _ARK_PLAN_PATHS = {'/api/plan/v3', '/api/coding/v3'}
+_GLM_HOST = 'open.bigmodel.cn'
+_GLM_LOW_MODELS = {'glm-5.3', 'glm-5.3-flash', 'glm-5.3-flashx'}
 
 
-def _supports_low_mode(profile: dict) -> bool:
+def _low_adapter(profile: dict) -> str | None:
     """仅覆盖已核实的官方套餐入口与模型别名，不按域名后缀猜测兼容性。"""
     params = profile.get('params')
     model = params.get('model', profile.get('model')) if isinstance(params, dict) else profile.get('model')
-    if model != 'ark-code-latest':
-        return False
     endpoint = profile.get('base_url')
     if not isinstance(endpoint, str):
-        return False
+        return None
     try:
         parsed = urlsplit(endpoint)
-        return (parsed.scheme == 'https' and parsed.hostname == _ARK_HOST
-                and parsed.port in (None, 443)
-                and parsed.path.rstrip('/') in _ARK_PLAN_PATHS)
+        if (parsed.scheme != 'https' or parsed.port not in (None, 443)
+                or parsed.username or parsed.password or parsed.query or parsed.fragment):
+            return None
+        path = parsed.path.rstrip('/')
+        if parsed.hostname == _ARK_HOST and path in _ARK_PLAN_PATHS and model == 'ark-code-latest':
+            return 'ark_plan'
+        if (parsed.hostname == _GLM_HOST and path in {'/api/paas/v4', '/api/coding/paas/v4'}
+                and isinstance(model, str) and model.lower() in _GLM_LOW_MODELS):
+            return 'glm_5_3'
+        return None
     except ValueError:
-        return False
+        return None
+
+
+def _supports_low_mode(profile: dict) -> bool:
+    return _low_adapter(profile) is not None
 
 
 def thinking_profiles(profiles: list[dict]) -> list[dict]:
@@ -49,6 +62,7 @@ def thinking_profiles(profiles: list[dict]) -> list[dict]:
         result.append(dict(
             name=str(profile.get('name') or 'default'), enabled=profile.get('enabled', True),
             supports_low=_supports_low_mode(profile), params_valid=valid,
+            removes_thinking=_low_adapter(profile) == 'ark_plan',
             effort=(effort if isinstance(effort, str) and effort in
                     {'none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'}
                     else '自定义值' if 'reasoning_effort' in params else '服务商默认'),
@@ -57,7 +71,6 @@ def thinking_profiles(profiles: list[dict]) -> list[dict]:
                            {'enabled', 'disabled', 'auto'} else '自定义值'),
         ))
     return result
-
 
 def prepare_profiles(profiles: list[dict], mode: str = 'low', *, task: str = 'split',
                      log=lambda msg: None) -> list[dict]:
@@ -80,12 +93,14 @@ def prepare_profiles(profiles: list[dict], mode: str = 'low', *, task: str = 'sp
     for index, profile in enumerate(result, 1):
         if mode == 'follow_profile':
             continue
-        if _supports_low_mode(profile):
+        adapter = _low_adapter(profile)
+        if adapter:
             params = profile.setdefault('params', {})
             changed = '；覆盖自定义 JSON 的 reasoning_effort' if 'reasoning_effort' in params else ''
-            removed = '；移除本接口不兼容的 thinking 字段' if 'thinking' in params else ''
+            removed = '；移除本接口不兼容的 thinking 字段' if adapter == 'ark_plan' and 'thinking' in params else ''
             # 本机Chat路线已明确拒绝thinking；不把Messages接口参数混进Chat。
-            params.pop('thinking', None)
+            if adapter == 'ark_plan':
+                params.pop('thinking', None)
             params['reasoning_effort'] = 'low'
             log(f'{label}模型{index}：本步骤请求降低思考强度（low）{changed}{removed}，全局配置保持不变。')
         else:

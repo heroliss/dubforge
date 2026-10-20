@@ -41,7 +41,11 @@ def test_one_blocked_score_isolated_other_scores_saved_and_bad_cache_not_resent(
     cs.run(uid, 'filter', prompt='观众反馈')
     assert len(calls) == 5  # 相同输入与配置下，跳过已经明确失败的项。
     cs.run(uid, 'filter', prompt='观众反馈', retry_failed=True)
-    assert len(calls) == 6 and calls[-1][0]['text'] == 'Original opinion 1'
+    assert len(calls) == 5  # 普通重试不能绕过同一请求依据的明确审核拦截。
+    state = cs.view(uid)
+    assert state['job']['blocked_cached'] == 1 and state['job']['cached'] == 2
+    assert state['rows'][1]['ai_issues']['filter']['retryable'] is False
+    assert state['rows'][1]['ai_issues']['filter']['request_scope'] == 'item'
 
 
 def test_change_provider_retries_failure_but_keeps_successful_scores(uid, monkeypatch):
@@ -107,7 +111,8 @@ def test_use_cached_scores_is_readonly_to_model_and_preserves_pending_status(uid
     calls = model(monkeypatch, lambda *_: pytest.fail('仅用已有评分不得调用模型'))
     state = cs.run(uid, 'filter', prompt='观众反馈', only_cached=True, limit=1)
     assert not calls and len(state['filter']['items']) == 1
-    assert state['job']['deferred'] == 2 and state['job']['cached'] == 2 and state['job']['status'] == 'partial'
+    assert state['job']['deferred'] == 1 and state['job']['blocked'] == 1
+    assert state['job']['cached'] == 2 and state['job']['status'] == 'partial'
     assert len(state['available_assessments']) == 2 and state['overlay'] is None
 
 
@@ -142,6 +147,9 @@ def test_invalid_persisted_records_rejected(uid, doc):
 def test_failure_policy_inherits_global_series_project_and_freezes_recipe(uid):
     from test_configuration import save, bind
     save('global', {'comments.failure_policy':'stop'})
+    assert configuration.resolve(uid)['values']['comments.failure_policy'] == 'skip'
+    plan = configuration.binding_plan([uid], '')
+    configuration.bind(dict(uids=[uid], template_id='', fingerprint=plan['fingerprint'], confirmed=True))
     assert configuration.resolve(uid)['values']['comments.failure_policy'] == 'stop'
     template = configuration.create_template('评论宽容处理')
     save(template['key'], {'comments.failure_policy':'skip'})

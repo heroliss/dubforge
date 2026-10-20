@@ -1,16 +1,17 @@
 """
 IndexTTS2.5 后端 (gradio /gen_single)
 =====================================
-移植自 VideoLingo-Workspace 验证过的双维度参考设计:
-  音色 timbre: preset(固定文件) / stable(源音频开头切片) / dynamic(每句原声)
-  情感 emo:    preset / stable / dynamic / vector(8维)
-单一配置源 config.yaml tts.indextts25.*; 每次合成实时读取。
+通过 Gradio 接口分别传递音色与情感参考：
+  音色 timbre: preset(固定文件) / stable(指定句原声) / dynamic(每句原声)
+  情感 emo:    same / preset / stable / dynamic / vector(8维) / text
+调用方按全局、模板、项目和本句解析有效配置，后端只使用显式传入的参数。
 参考切片统一由调用方 (step_tts) 通过 resolve 参数传入路径。
 """
 import math
 import re
 import subprocess
 import time
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable
 
@@ -40,6 +41,25 @@ class IndexTTSAudioError(DubForgeError):
 
 
 def validate_reference(path: Path, label: str, *, minimum_seconds: float = 0) -> None:
+    """按文件版本复用成功校验，固定参考不再每句重复解码或启动 FFmpeg。"""
+    path = Path(path)
+    try:
+        resolved = path.resolve()
+        version = resolved.stat()
+    except (OSError, RuntimeError):
+        # 保留既有中文错误与兼容格式的探测逻辑；失败不能进入成功缓存。
+        return _validate_reference(path, label, minimum_seconds=minimum_seconds)
+    _validate_reference_version(str(resolved), version.st_size, version.st_mtime_ns,
+                                version.st_ctime_ns, version.st_ino, label, minimum_seconds)
+
+
+@lru_cache(maxsize=128)
+def _validate_reference_version(path, size, mtime_ns, ctime_ns, inode, label, minimum_seconds):
+    # 文件变化即重新检查；只缓存校验结果，不缓存音频内容，也不缓存异常。
+    _validate_reference(Path(path), label, minimum_seconds=minimum_seconds)
+
+
+def _validate_reference(path: Path, label: str, *, minimum_seconds: float = 0) -> None:
     """切片检查可读帧，上传模型时另核对最低特征帧时长。"""
     try:
         info = sf.info(str(path))
@@ -69,23 +89,6 @@ def validate_reference(path: Path, label: str, *, minimum_seconds: float = 0) ->
         raise ReferenceAudioError(
             f'{label}参考音频过短：{duration:.6f} 秒；IndexTTS 至少需要 {minimum_seconds:g} 秒参考音频。',
             detail={'path': str(path), 'duration_seconds': duration, 'minimum_seconds': minimum_seconds})
-
-
-def synthesis_profiles() -> list[dict]:
-    """只提供待保存的推理建议，不改变参考文件、语言、情感模式和重试策略。"""
-    from dubforge.config import DEFAULTS
-
-    keys = ('do_sample', 'top_p', 'top_k', 'temperature', 'length_penalty', 'num_beams',
-            'repetition_penalty', 'max_mel_tokens', 'max_text_tokens_per_segment', 'duration_factor', 'emo_random')
-    values = {f'tts.indextts25.{key}': DEFAULTS['tts']['indextts25'][key] for key in keys}
-    # 官方 WebUI 的参考情感权重为 0.65；文本情感另建议从 0.6 或更低试听。
-    values['tts.indextts25.emo_weight'] = .65
-    return [
-        {'id': 'balanced', 'name': '均衡推荐', 'values': values,
-         'description': '沿用官方采样参数和 3 束搜索；情感权重 0.65（文本情感 0.6）、时长因子 1、关闭情感随机。不是每种音色的最优解，请先试听。'},
-        {'id': 'fast', 'name': '速度优先 · 先试听', 'values': {**values, 'tts.indextts25.num_beams': 1},
-         'description': '只将搜索束数降为 1，减少搜索开销；效果和提速取决于硬件、文本及音色，确认发音后再用于批量配音。'},
-    ]
 
 
 def _enum_emo(emo_mode: str) -> str:
@@ -132,24 +135,65 @@ def _reported_progress(units):
 
 
 def _result_with_progress(job, progress: Callable[[float], None], *, check_cancel=lambda: None,
-                          timeout_seconds=300):
-    """读取当前 Gradio 任务的真实进度；未知阶段不按等待时间虚构进度。"""
+                          timeout_seconds=600):
+    """读取当前 Gradio 任务的真实进度，并区分本地等待与服务端完成状态。
+
+    ``Job.done()`` 的状态可能比远端回执慢一个轮询周期，因此截止时间到达时
+    先做一次非阻塞结果读取，避免恰好完成的请求被误报超时。超时详情保留最后
+    进度和轮询阶段，便于区分模型推理长尾、服务排队和结果回传抖动。
+    """
     previous = None
     started = time.monotonic()
+    polls = 0
+    phase = '等待服务端结果'
+
+    def finished():
+        try:
+            return bool(job.done())
+        except Exception:
+            return False
+
+    def timeout_error(elapsed=None):
+        from dubforge.tts_requests import RequestTimeout
+        elapsed = max(0.0, float(elapsed if elapsed is not None else time.monotonic() - started))
+        detail = {
+            'elapsed_seconds': round(elapsed, 2),
+            'timeout_seconds': float(timeout_seconds),
+            'last_progress': previous,
+            'phase': phase,
+            'status_polls': polls,
+        }
+        progress_text = (f'，最后已知进度 {previous * 100:.0f}%'
+                         if isinstance(previous, (int, float)) else '')
+        return RequestTimeout(
+            f'单次配音请求超过 {timeout_seconds:g} 秒，服务可能仍在推理或回传'
+            f'{progress_text}；已停止等待本批任务并保留已完成音频',
+            detail=detail)
+
     while True:
         check_cancel()
-        if timeout_seconds > 0 and time.monotonic() - started >= timeout_seconds:
-            from dubforge.tts_requests import RequestTimeout
-            raise RequestTimeout(f'单次配音请求超过 {timeout_seconds:g} 秒，已停止本批任务并保留已完成音频')
+        # 先确认已完成，避免在边界时刻先检查时钟而丢掉刚到达的结果。
+        if finished():
+            return job.result()
+        elapsed = time.monotonic() - started
+        if timeout_seconds > 0 and elapsed >= timeout_seconds:
+            # Future 状态有极短的传播延迟；零等待读取只接受已到达的结果。
+            try:
+                return job.result(timeout=0)
+            except TimeoutError:
+                raise timeout_error(elapsed)
+        phase = '读取服务端状态'
+        polls += 1
         value = _reported_progress(job.status().progress_data)
         if value is not None and (previous is None or value > previous):
             progress(value)
             previous = value
+        phase = '等待服务端结果'
         try:
             return job.result(timeout=0.5)
         except TimeoutError:
             # 区分等待超时和服务本身抛出的 TimeoutError，后者必须正常报错。
-            if job.done():
+            if finished():
                 return job.result()
 
 
@@ -159,7 +203,7 @@ def synth(url: str, text: str, out_path: Path, lang: str,
           emo_text: str = "", emo_random: bool = False,
           duration_factor: float = 1.0, advanced: dict | None = None,
           log=lambda m: None, progress: Callable[[float], None] | None = None,
-          check_cancel=lambda: None, timeout_seconds=300) -> Path:
+          check_cancel=lambda: None, timeout_seconds=600) -> Path:
     """合成一句; 返回 out_path (原子落盘由调用方保证临时名)"""
     from gradio_client import Client, handle_file
     from gradio_client.exceptions import AppError
@@ -185,7 +229,8 @@ def synth(url: str, text: str, out_path: Path, lang: str,
         "prompt": handle_file(str(timbre_ref)),
         "text": text,
         "lang_choice": lang,
-        "emo_ref_path": handle_file(str(emo_ref)) if emo_ref else None,
+        # 非音频情感模式不上传被模型忽略的旧参考文件。
+        "emo_ref_path": handle_file(str(emo_ref)) if emo_ref and emo_mode in {'preset', 'stable', 'dynamic'} else None,
         "emo_weight": float(emo_weight),
         "emo_text": emo_text if emo_mode == "text" else "",
         "emo_random": bool(emo_random) if emo_mode in {"vector", "text"} else False,

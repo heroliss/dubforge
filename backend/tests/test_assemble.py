@@ -48,8 +48,9 @@ def _mock_tts(monkeypatch, pdir: Path):
     # 让参数校验通过，避免测试依赖 Path("") 恰好是当前目录的旧行为。
     ref = pdir / "tts_ref.wav"
     ref.write_bytes(b"test reference")
-    config.set_key("tts.indextts25.timbre_audio", str(ref))
-    config.set_key("tts.indextts25.emo_audio", str(ref))
+    from test_configuration import save
+    project = next(p for p in crud.list_projects() if crud.project_dir_by_project(p).resolve() == pdir.resolve())
+    save('project:' + project.uid, {'tts.indextts25.timbre_audio': str(ref), 'tts.indextts25.emo_audio': str(ref)})
 
     def fake_synth(url, text, out_path, lang, **kw):
         no = int(str(out_path).split(os.sep)[-1].split(".")[0])
@@ -62,6 +63,8 @@ def _mock_tts(monkeypatch, pdir: Path):
         return out_path
 
     monkeypatch.setattr(tts_indextts25, "synth", fake_synth)
+    # 此夹具只验证伪配音与真实 FFmpeg，不应探测或启动本机真实模型服务。
+    monkeypatch.setattr(tts_indextts25, "is_online", lambda *args, **kwargs: True)
 
 
 def _seed_project(uid: str):
@@ -131,10 +134,10 @@ def test_assemble_burn_subtitles(make_project, isolated_env, monkeypatch):
     (pdir / "srt" / "trans.srt").write_text(
         "1\n00:00:00,500 --> 00:00:02,000\n第一句\n\n"
         "2\n00:00:03,000 --> 00:00:04,500\n第二句\n", encoding="utf-8")
-    from dubforge import config as cfgmod
-    cfgmod.set_key("assemble.burn_subtitles", True)
-    cfgmod.set_key("assemble.bgm_volume", 0)  # 此场景不制作背景音
-    cfgmod.set_key("assemble.loudnorm", False)   # 加速测试
+    from test_configuration import save
+    # 此场景不制作背景音，并关闭响度归一化以加速测试。
+    save('project:' + uid, {'assemble.burn_subtitles': True,
+                           'assemble.bgm_volume': 0, 'assemble.loudnorm': False})
 
     mark_upstream_done(uid, "tts")   # 手工播种产物越过依赖门禁
     project = crud.get_project(uid)
@@ -168,9 +171,9 @@ def test_assemble_preview_range_creates_short_clip_without_marking_full_output(
     pdir = _seed_project(uid)
     _make_fixture_media(pdir)
     _mock_tts(monkeypatch, pdir)
-    config.set_key("assemble.bgm_volume", 0)
-    config.set_key("assemble.loudnorm", False)
-    config.set_key("assemble.burn_subtitles", True)
+    from test_configuration import save
+    save('project:' + uid, {'assemble.bgm_volume': 0, 'assemble.loudnorm': False,
+                           'assemble.burn_subtitles': True})
     subtitle = pdir / "srt" / "trans.srt"
     subtitle.write_text("1\n00:00:00,500 --> 00:00:02,000\n第一句\n\n"
                         "2\n00:00:03,000 --> 00:00:04,500\n第二句\n", encoding="utf-8")
@@ -229,9 +232,8 @@ def _prepare_outputs_project(make_project, monkeypatch):
     _make_fixture_media(pdir)
     _mock_tts(monkeypatch, pdir)
     from dubforge import config
-    config.set_key("assemble.bgm_volume", 0)
-    config.set_key("assemble.loudnorm", False)
-    config.set_key("assemble.burn_subtitles", False)
+    from test_configuration import save
+    save('project:' + uid, {'assemble.bgm_volume': 0, 'assemble.loudnorm': False, 'assemble.burn_subtitles': False})
     subtitle = pdir / "srt" / "trans.srt"
     subtitle.write_text("1\n00:00:00,500 --> 00:00:02,000\n第一句\n\n"
                         "2\n00:00:03,000 --> 00:00:04,500\n第二句\n", encoding="utf-8")

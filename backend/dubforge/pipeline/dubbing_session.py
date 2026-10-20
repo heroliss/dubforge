@@ -24,10 +24,10 @@ def check_idle(uid):
 
 
 @contextmanager
-def edit(project):
+def edit(project, *, paths=None):
     """短暂编辑不显示为合成中，避免轮询导致播放器被卸载和复位。"""
     from dubforge import runtime_edit
-    with runtime_edit.editing('project:' + project.uid):
+    with runtime_edit.editing('project:' + project.uid, paths=paths):
         yield
 
 

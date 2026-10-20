@@ -22,6 +22,30 @@ test('导出预览保留文件的双语换行与时长，支持 BOM 和 CRLF', (
   assert.equal(vtt, 'WEBVTT\n\n00:00:01.000 --> 00:00:03.500\n译文\n&lt;Source&gt; &amp; text\n')
 })
 
+test('原文、译文和双语共同跟随配音排布，源稿时间不被改写', () => {
+  const shifted = [{ ...lines[0], playback_start: .75, playback_end: 3.25 }]
+  for (const mode of ['source', 'target', 'bilingual'] as const) {
+    const vtt = subtitlesToVtt(shifted, mode)
+    assert.match(vtt, /00:00:00.750 --> 00:00:03.250/)
+    assert.doesNotMatch(vtt, /00:00:01.125 --> 00:00:02.500/)
+  }
+  assert.equal(shifted[0].start, 1.125); assert.equal(shifted[0].end, 2.5)
+  assert.match(subtitlesToVtt([{ ...shifted[0], playback_end: -1 }], 'source'), /00:00:01.125 --> 00:00:02.500/)
+})
+
+test('超长中英文 cue 预览会在生成 VTT 时保守换行，避免原生播放器裁掉尾部', () => {
+  const source = '这是一段很长的中文字幕，用于确认浏览器字幕轨道不会把超出画面的文字直接隐藏。'
+  const vtt = subtitlesToVtt([{ ...lines[0], source_text: source, text: 'A very long subtitle line keeps enough words to exercise the preview wrapping behavior.' }], 'bilingual')
+  const cue = vtt.split('\n\n')[1]
+  const body = cue.split('\n').slice(2)
+  assert.ok(body.length > 2)
+  assert.ok(body.some(value => value.includes('\n')) === false)
+  assert.match(body.join('').replace(/&lt;|&gt;|&amp;/g, ''), /不会把超出画面的文字直接隐藏。/)
+
+  const imported = srtToVtt(`1\n00:00:01,000 --> 00:00:03,500\n${source}`)
+  assert.ok(imported.split('\n\n')[1].split('\n').length > 2)
+})
+
 const bundle = await build({ stdin: {
   contents: `export { useSubtitlePreview } from './src/composables/useSubtitlePreview'; export { ref, nextTick, effectScope } from 'vue'`,
   resolveDir: fileURLToPath(new URL('..', import.meta.url)), loader: 'ts',

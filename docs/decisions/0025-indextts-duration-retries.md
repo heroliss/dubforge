@@ -1,5 +1,7 @@
 # 0025 — IndexTTS 超长音频按因子重试
 
+2026-10-07：关于将实际因子写回本句设置的决策已由 [ADR-0112](0112-temporary-duration-factor.md) 取代；自动缩时仅使用本次临时参数。
+
 ## 决策
 
 - 新增 IndexTTS 专用 `duration_retry_factors` 文本设置，默认 `0.7, 0.5`，留空关闭。沿用本句、步骤、全局的逐项覆盖和校验；范围与 IndexTTS 时长因子一致，为 0.5～2。

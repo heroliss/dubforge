@@ -1,22 +1,37 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NAlert, NButton, NTag } from 'naive-ui'
-import { conversationRows, conversationLabels } from '../utils/llmConversation'
+import { conversationRows } from '../utils/llmConversation'
+import LlmConversationPanel from './LlmConversationPanel.vue'
+import { commentAction, commentJobSummary, preferredCommentAction, type CommentAction } from '../utils/commentWorkflow'
 
-const props=defineProps<{uid:string}>()
-const action=ref('filter'), events=ref<any[]>([]), lines=ref<string[]>([]), job=ref<any>(null)
+const props=defineProps<{uid:string; initialAction?: CommentAction}>()
+const action=ref<CommentAction>(props.initialAction || 'filter'), events=ref<any[]>([]), lines=ref<string[]>([]), job=ref<any>(null)
 const error=ref(''), fetching=ref(false), exists=ref(false), truncated=ref(false)
 const logBox=ref<HTMLElement|null>(null), historyBox=ref<HTMLElement|null>(null), follow=ref(true)
 const rows=computed(()=>conversationRows(events.value))
+const jobSummary=computed(()=>commentJobSummary(job.value,action.value))
 const stateLabel=computed(()=>({running:'处理中',done:'已完成',partial:'部分完成',failed:'失败',cancelled:'已停止',interrupted:'已中断'}[job.value?.status as string]||'暂无记录'))
 let cursor=0,traceId='',generation=0,disposed=false,mounted=false,timer:ReturnType<typeof setTimeout>|undefined,controller:AbortController|undefined
+let actionChosen=!!props.initialAction
 
-function reset(){
+function reset(discover=false){
   generation++;controller?.abort();clearTimeout(timer);cursor=0;traceId='';events.value=[];lines.value=[];job.value=null
   error.value='';exists.value=false;fetching.value=false;follow.value=true
-  if(mounted)void load()
+  if(mounted)void (discover ? discoverAction().then(()=>load()) : load())
 }
-function selectAction(value:string){if(value!==action.value){action.value=value;reset()}}
+function selectAction(value:string){const selected=commentAction(value);if(!selected)return;actionChosen=true;if(selected!==action.value){action.value=selected;reset()}}
+async function discoverAction(){
+  if(actionChosen||props.initialAction)return
+  const ticket=generation
+  const read=new AbortController();controller=read
+  try{
+    const response=await fetch(`/api/projects/${encodeURIComponent(props.uid)}/comments`,{cache:'no-store',signal:AbortSignal.any([read.signal,AbortSignal.timeout(10000)])})
+    const value=await response.json()
+    if(!response.ok||disposed||ticket!==generation||actionChosen)return
+    action.value=preferredCommentAction(value.job,value.rows)||'filter'
+  }catch{/* 自动定位失败不妨碍读取评分诊断；用户仍可切换动作。 */}
+}
 function scroll(){
   const el=historyBox.value
   if(el)follow.value=el.scrollHeight-el.clientHeight-el.scrollTop<45
@@ -53,8 +68,9 @@ async function load(){
     if(!disposed&&ticket===generation){fetching.value=false;if(mounted)timer=setTimeout(load,more?50:2000)}
   }
 }
-watch(()=>props.uid,reset,{flush:'sync'})
-onMounted(()=>{mounted=true;void load()})
+watch(()=>props.initialAction,value=>{if(value)selectAction(value)},{flush:'sync'})
+watch(()=>props.uid,()=>{actionChosen=!!props.initialAction;action.value=props.initialAction||'filter';reset(true)},{flush:'sync'})
+onMounted(()=>{mounted=true;void discoverAction().then(()=>load())})
 onBeforeUnmount(()=>{disposed=true;generation++;controller?.abort();clearTimeout(timer)})
 </script>
 <template>
@@ -62,7 +78,7 @@ onBeforeUnmount(()=>{disposed=true;generation++;controller?.abort();clearTimeout
     <div class="diagnostic-toolbar">
       <div class="action-tabs"><button v-for="item in [{id:'filter',label:'评论评分'},{id:'translate',label:'评论翻译'}]" :key="item.id" :aria-pressed="action===item.id" @click="selectAction(item.id)">{{ item.label }}</button></div>
       <n-tag size="small" :type="job?.status==='failed'?'error':job?.status==='running'?'info':'default'">{{ stateLabel }}</n-tag>
-      <span v-if="job" class="muted">本次 {{ job.processed }} / {{ job.total }} 条<span v-if="job.cached"> · 复用 {{ job.cached }} 条</span></span>
+      <span v-if="jobSummary" class="muted">{{ jobSummary }}</span>
       <n-button size="small" quaternary :loading="fetching" @click="load">刷新记录</n-button>
     </div>
     <n-alert v-if="error" type="warning" :show-icon="false">{{ error }}</n-alert>
@@ -71,16 +87,7 @@ onBeforeUnmount(()=>{disposed=true;generation++;controller?.abort();clearTimeout
     <n-alert v-if="job?.warning" type="warning" :show-icon="false">{{ job.warning }}</n-alert>
     <div class="diagnostic-columns">
       <section class="diagnostic-pane"><h3>评论运行日志</h3><small v-if="truncated" class="muted">仅显示末尾日志，完整内容保存在项目 logs 目录。</small><pre ref="logBox" class="diagnostic-log">{{ lines.join('\n') || '暂无记录；下次评论处理时会自动记录。' }}</pre></section>
-      <section class="diagnostic-pane"><div class="conversation-heading"><h3>LLM 对话</h3><n-button v-if="!follow" text size="tiny" @click="bottom">回到最新</n-button></div>
-        <div ref="historyBox" class="conversation-history" @scroll="scroll">
-          <p v-if="!rows.length" class="muted">{{ exists?'等待模型请求，或本次全部复用了缓存。':'此前未记录的对话无法恢复；下次运行后可查看。' }}</p>
-          <article v-for="row in rows" :key="row.id" :class="['conversation-row',row.role]">
-            <header><strong>{{ conversationLabels[row.role]||row.role }}</strong><time>{{ row.ts?.slice(11,19) }}</time><small v-if="row.profile || row.model">{{ row.profile }}<template v-if="row.profile && row.model"> / </template>{{ row.model }}</small><small v-if="row.code">{{ row.code }}</small><small v-if="row.attempt && row.attempt>1">第 {{ row.attempt }} 次尝试</small></header>
-            <details v-if="['system','reasoning','history'].includes(row.role)"><summary>展开查看 · {{ row.content.length }} 字</summary><pre v-text="row.content"/></details>
-            <pre v-else v-text="row.content"/>
-          </article>
-        </div>
-      </section>
+      <section class="diagnostic-pane"><LlmConversationPanel :rows="rows" :active="job?.status === 'running'" :empty-text="exists || job ? '本次暂无模型对话。复用有效结果或跳过旧问题都可能不发请求；是否仍有未完成项，请核对本次统计与逐条状态。' : '此前未记录的对话无法恢复；下次运行后可查看。'" /></section>
     </div>
   </section>
 </template>

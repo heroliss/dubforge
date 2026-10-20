@@ -84,13 +84,12 @@ def test_character_budget_stops_nonrepetitive_unfinished_line():
     assert error.value.code == 'LLM_OUTPUT_BUDGET'
 
 
-def test_reasoning_budget_is_separate_and_still_finite():
-    response = ResponseGuard(max_chars=20, timeout_s=300)
+def test_reasoning_is_not_limited_by_character_budget():
+    response = ResponseGuard(max_chars=20, reasoning_max_chars=1, timeout_s=300)
     response.feed('1. finished')
-    with pytest.raises(ResponseGuardError) as error:
-        response.feed(''.join(str(i) for i in range(100)), channel='reasoning')
-    assert error.value.code == 'LLM_OUTPUT_BUDGET'
-    assert error.value.detail['channel'] == 'reasoning'
+    response.feed(''.join(str(i) for i in range(100)), channel='reasoning')
+    response.finish()
+    assert response.counts['reasoning'] == 190
 
 
 def test_total_deadline_expires_even_with_continuous_tokens(monkeypatch):
@@ -103,6 +102,17 @@ def test_total_deadline_expires_even_with_continuous_tokens(monkeypatch):
     now[0] = 20.0
     with pytest.raises(ResponseGuardError) as error:
         response.check()
+    assert error.value.code == 'LLM_REQUEST_DEADLINE'
+
+
+def test_reasoning_is_still_stopped_by_total_deadline(monkeypatch):
+    now = [0.0]
+    monkeypatch.setattr(llm_guard.time, 'monotonic', lambda: now[0])
+    response = ResponseGuard(max_chars=20, timeout_s=20)
+    response.feed('持续推理。' * 20_000, channel='reasoning')
+    now[0] = 20.0
+    with pytest.raises(ResponseGuardError) as error:
+        response.feed('最后核对。', channel='reasoning')
     assert error.value.code == 'LLM_REQUEST_DEADLINE'
 
 

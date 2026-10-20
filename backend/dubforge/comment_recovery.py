@@ -17,11 +17,12 @@ def item_error_codes(error):
 
 class Recovery:
     """正常批处理；内容拒绝才拆半，连续三个单条拒绝或额外24次请求即止损。"""
-    def __init__(self, *, policy, check, remaining, execute, failed, trace):
+    def __init__(self, *, policy, check, remaining, execute, failed, trace, max_extra=24, initial_rejections=0):
         self.policy, self.check, self.remaining = policy, check, remaining
         self.execute, self.failed, self.trace = execute, failed, trace
         self.extra = 0
-        self.consecutive = 0
+        self.max_extra = max_extra
+        self.consecutive = initial_rejections
         self.stopped = False
         self.last_error = None
 
@@ -31,7 +32,7 @@ class Recovery:
         if not group or self.stopped:
             return
         if isolated:
-            if self.extra >= 24:
+            if self.extra >= self.max_extra:
                 self.stopped = True
                 self.trace('recovery_stop', '已达到本次额外诊断请求上限，剩余评论保留待处理。')
                 return
@@ -43,6 +44,9 @@ class Recovery:
         except DubForgeError as error:
             codes = item_error_codes(error)
             if self.policy == 'stop' or not codes:
+                if codes == {'LLM_CONTENT_REJECTED'}:
+                    # 严格模式不隔离；只能记录整个实际请求被拦截，不能归因各条。
+                    self.failed(self.remaining(group), error, True)
                 raise
             self.last_error = error
             pending = self.remaining(group)

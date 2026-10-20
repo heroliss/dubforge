@@ -12,7 +12,9 @@ import { OUTPUT_LABELS, selectedOutputVariants, outputChoice, outputKey, choiceL
 import DependencyNotice from './DependencyNotice.vue'
 import FilePathLink from './FilePathLink.vue'
 import { subtitleSettingsLink } from '../utils/subtitleWorkspace'
+import { commentWorkspaceLink } from '../utils/commentWorkflow'
 import { refreshInBackground } from '../utils/backgroundRefresh'
+import { formatTimecode } from '../utils/timecode'
 const props = defineProps<{ uid: string; artifacts: any[]; sourcePath: string; subtitlePath: string; subtitleName: string; disabled?: boolean; historyOnly?: boolean }>()
 const emit = defineEmits<{ 'choice-change': [value: AssemblyChoice]; 'recycle-active': [value: boolean] }>()
 const nav = useNavStore(), message = useMessage(), dialog = useDialog()
@@ -24,7 +26,7 @@ const confirming = ref(false), submitting = ref(false), planBlockers = ref<any[]
 const refreshing = ref(false), recycling = ref(false), recycleConfirming = ref(false)
 const { count: commentCount, revision: commentRevision, failed: commentsFailed, refresh: refreshComments } = useCommentOverlay(() => props.uid, () => !props.historyOnly)
 const running = computed(() => ['running', 'queued'].includes(nav.stepMap.assemble?.status))
-const locked = computed(() => !!props.disabled || running.value || submitting.value || confirming.value || recycling.value || recycleConfirming.value)
+const locked = computed(() => nav.archived || !!props.disabled || running.value || submitting.value || confirming.value || recycling.value || recycleConfirming.value)
 const recycleLocked = computed(() => locked.value || PUBLISH_ACTIVE.includes(nav.publication?.status))
 const currentKey = computed(() => outputKey(choice.value))
 const currentLabel = computed(() => choiceLabel(choice.value))
@@ -32,7 +34,7 @@ const canSubmit = computed(() => selected.value.length > 0 && !locked.value && (
 const taskLabel = computed(() => nav.stepMap.assemble?.assembly_task?.scope === 'preview' ? '正在生成试片' : '正在生成正式成品')
 const taskSummary = computed(() => {
   const step = nav.stepMap.assemble, task = step?.assembly_task
-  if (task?.scope === 'preview') return `正在试合成 ${task.start}–${task.end} 秒，不生成正式成品。`
+  if (task?.scope === 'preview') return `正在试合成 ${formatTimecode(task.start,3)}–${formatTimecode(task.end,3)}，不生成正式成品。`
   const labels = task?.version_names?.length ? task.version_names.join('；') : task?.scope === 'outputs' ? (task.variants ?? []).map((key: string) => OUTPUT_LABELS[key]).filter(Boolean).join('；') : step?.default_output_label
   return `当前正式合成任务：${labels || '读取方案中'}。${task?.comments_count ? `评论版使用 ${task.comments_count} 条已确认评论。` : '不叠加评论。'}当前任务以提交时的方案为准，不由页面勾选控制。`
 })
@@ -91,6 +93,7 @@ function confirmRemoval(file: any, missing: boolean) {
     onAfterLeave: () => { if (recycleDialog === confirmation) recycleConfirming.value = false },
     onNegativeClick: () => {},
     onPositiveClick: async () => {
+      if (nav.archived) { message.info('项目已归档，请先恢复项目后再修改成品。'); return false }
       if (disposed || uid !== props.uid || recycling.value || accepted) return false
       recycling.value = true
       confirmation.loading = true
@@ -99,7 +102,7 @@ function confirmRemoval(file: any, missing: boolean) {
       emit('recycle-active', true)
       try {
         await nextTick()
-        if (disposed || uid !== props.uid) return false
+        if (disposed || uid !== props.uid || nav.archived) return false
         const response = await fetch(`/api/projects/${uid}/steps/assemble/artifacts/${encodeURIComponent(name)}/${missing ? 'forget' : 'recycle'}`, {
           method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
         })
@@ -144,6 +147,7 @@ async function submit() {
       positiveText: `生成这 ${variants.length} 种成品`, negativeText: '取消', maskClosable: false, closeOnEsc: false,
       onNegativeClick: () => { confirming.value = false }, onClose: () => { confirming.value = false },
       onPositiveClick: async () => {
+        if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return false }
         if (disposed || uid !== props.uid || submitting.value || accepted) return false
         submitting.value = true
         try {
@@ -173,7 +177,7 @@ async function submit() {
       <section><h4>对话字幕</h4><n-radio-group :value="choice.burn_subtitles ? 'on' : 'off'" :disabled="locked" aria-label="是否烧录字幕" @update:value="setDimension('burn_subtitles', $event === 'on')"><n-radio-button value="off">不烧录</n-radio-button><n-radio-button value="on">烧录字幕</n-radio-button></n-radio-group></section>
       <section><h4>观众评论 <small>{{ commentCount }} 条已确认</small></h4><n-radio-group :value="choice.include_comments ? 'on' : 'off'" :disabled="locked" aria-label="是否叠加评论" @update:value="setDimension('include_comments', $event === 'on')"><n-radio-button value="off">不叠加</n-radio-button><n-radio-button value="on" :disabled="!commentCount || commentsFailed">叠加评论</n-radio-button></n-radio-group></section>
     </div>
-    <div class="related-links"><RouterLink :to="subtitleSettingsLink(uid)">调整字幕 →</RouterLink><RouterLink :to="`/projects/${uid}/steps/download#comments-studio`">编辑评论 →</RouterLink><n-button size="tiny" quaternary :disabled="locked" @click="refreshComments">{{ commentsFailed ? '评论读取失败，重试' : '刷新评论方案' }}</n-button></div>
+    <div class="related-links"><RouterLink :to="subtitleSettingsLink(uid)">调整字幕 →</RouterLink><RouterLink :to="commentWorkspaceLink(uid)">编辑评论 →</RouterLink><n-button size="tiny" quaternary :disabled="locked" @click="refreshComments">{{ commentsFailed ? '评论读取失败，重试' : '刷新评论方案' }}</n-button></div>
     <div class="current-combination"><div><small>当前组合 · 下方可试合成</small><strong>{{ currentLabel }} <n-tag v-if="existingKeys.has(currentKey)" size="small" :bordered="false" type="warning">已有成品 · 再生成将覆盖</n-tag></strong></div>
       <n-button v-if="currentKey !== 'src'" size="small" secondary :disabled="locked || selected.includes(currentKey) || (choice.include_comments && (!commentCount || commentsFailed))" @click="addCurrent">{{ selected.includes(currentKey) ? '已加入清单' : '加入本次清单' }}</n-button>
       <n-button v-else size="small" :disabled="!sourcePath" @click="reveal('download', 'video.mp4')">查看原片</n-button>

@@ -43,7 +43,7 @@ onMounted(refresh)
           <n-text depth="3" class="path">{{ item.url }} · <FilePathLink v-if="item.directory" :path="item.directory" /><template v-else>{{ item.message }}</template></n-text>
         </div>
       </div>
-      <n-text depth="3" class="small">配音服务各用独立环境，可只安装其中一种，或使用已有远程服务。地址与安装目录在本页「全局步骤参数 → 配音」填写，也可在项目配音页覆盖；本机服务可从配音页启动。</n-text>
+      <n-text depth="3" class="small">配音服务各用独立环境，可只安装其中一种，或使用已有远程服务。地址与安装目录在「制作与发布 → 全局默认 → 字幕与配音」填写，也可在项目配音页覆盖；本机服务可从配音页启动。</n-text>
     </template>
   </n-card>
 </template>

@@ -4,6 +4,7 @@ import re
 import pytest
 
 from dubforge.pipeline import step_split as ss
+from dubforge.pipeline.text_prompts import SEMANTIC_OUTPUT_SYSTEM
 from dubforge.errors import StepFailedError
 from dubforge.utils.srt import SubLine
 
@@ -29,7 +30,7 @@ def test_phrase_prompt_exposes_long_silence_hidden_inside_one_asr_phrase():
     assert '# 停顿' not in body
     assert '【长静音区间' not in prompt
     assert '不能从其前跨到其后' in prompt
-    assert '长停顿前的半句可以保留' in prompt
+    assert '真实未说完的表达按声学边界保留' in prompt
 
 
 def test_word_mode_keeps_word_timeline_and_same_long_silence_fact():
@@ -111,7 +112,11 @@ def test_full_prompt_keeps_every_source_phrase_and_uses_short_prioritized_instru
     guidance, body = prompt.split('【全文时间轴输入】\n', 1)
     assert len(body) > 8_000 and len(body.splitlines()) == 180
     assert 'phrase 1 ' in body and 'phrase 180 ' in body
-    assert len(guidance) < 800
+    # 软目标与接缝纠错需要明确说明，仍限制为短指令而不削减原文输入。
+    assert len(guidance) < 1_000
+    priorities = ('结合全文语境和常识', '每句尽量不超过', '时间取原始锚点', '【输出】')
+    positions = [guidance.index(rule) for rule in priorities]
+    assert positions == sorted(positions)
     assert '全文语义整理' in guidance and '不要求逐词照抄' in guidance
     assert '结合全文语境和常识' in guidance
     assert '人名、数字和币种等识别错误' in guidance
@@ -120,9 +125,12 @@ def test_full_prompt_keeps_every_source_phrase_and_uses_short_prioritized_instru
     assert '只提交一份最终编号时间轴' in guidance and '最后一条字幕结束即结束响应' in guidance
     assert '自检' not in guidance and '一次轻量核对' not in guidance
     assert '序号. 开始秒-结束秒: 原文片段' in guidance
-    assert '序号从1连续' in guidance and '时间递增且不重叠' in guidance
+    assert '序号仅作标记，程序按输出顺序重排' in guidance
+    assert '时间递增且不重叠' in guidance
     assert '超限由程序兜底' not in guidance and '输出示例' not in guidance
     assert '10个词、7秒' in guidance and '作为软参考' in guidance
+    assert '词数和时长都不是硬上限' in guidance
+    assert '超过不会自动判错、截断或强制拆句' in guidance
     assert '中文按自然语义词理解' in guidance
     assert '不按字符数或模型token数硬切' in guidance
     assert prompt.count('【全文时间轴输入】') == 1
@@ -131,15 +139,33 @@ def test_full_prompt_keeps_every_source_phrase_and_uses_short_prioritized_instru
     assert not re.search(r'保留所有(?:台词|词)', guidance)
 
 
+def test_output_contract_uses_generic_no_explanation_rule():
+    """协议约束不绑定某次模型偶发的英文自我修正措辞。"""
+    assert '不要输出任何说明、校对记录、自我修正文本或第二份草稿' in SEMANTIC_OUTPUT_SYSTEM
+    assert 'The above line was split incorrectly' not in SEMANTIC_OUTPUT_SYSTEM
+    assert 'corrected as follows' not in SEMANTIC_OUTPUT_SYSTEM
+
+
 def test_full_prompt_checks_both_sides_of_a_boundary_without_deleting_starters():
     prompt = ss._coarse_resegment_prompt([SubLine(1, 0, 8, 'great I think we visited the market')],
                                         50, 15, include_words=False)
     guidance = prompt.split('【全文时间轴输入】', 1)[0]
     assert '联合理解相邻句首句尾' in guidance
-    assert 'the、I、and' in guidance
-    assert '不为移动边界删除这些词' in guidance
+    assert 'I、you、the、and' in guidance
+    assert 'I mean、the train' in guidance
+    assert '输入时间是识别锚点，不是输出句界' in guidance
+    assert '不照留ASR碎片' in guidance and '保留实质信息而非每个识别词' in guidance
+    assert '属于相邻表达时随完整搭配输出' in guidance
+    assert '短暂停顿不强制拆行' in guidance
+    assert '停顿边缘或片尾的落单词' in guidance
+    assert '无意义识别残留时直接清理' in guidance and '漏词可补回' in guidance
+    assert '有时间戳也不代表应保留或单列' in guidance
+    assert '不按词表或仅凭位置、大小写、短时长删词' in guidance
+    assert '真实独立应答、字母专名和有意义的重复或中断保留' in guidance
+    assert '不确定时保留原意' in guidance
+    assert '未提供音频，不能声称核听原音' in guidance
     assert '时间取原始锚点' in guidance
-    assert '长停顿前的半句可以保留' in guidance
+    assert '真实未说完的表达按声学边界保留' in guidance
     assert '无台词区间必须留空' in guidance
     assert '可以改变ASR行数' in guidance
 
@@ -212,4 +238,7 @@ def test_repair_without_saved_prompt_preserves_supplied_timeline_and_protocol():
     assert '每行“序号. 开始秒-结束秒: 原文片段”' in retry
     assert '结合全文语境和常识' in retry
     assert '不要求逐词照抄' in retry
-    assert len(retry.split('【全文时间轴输入】', 1)[0]) < 400
+    assert '保留实质信息而非每个识别词' in retry
+    assert '有时间戳也不代表应保留或单列' in retry
+    assert '不确定时保留原意' in retry
+    assert len(retry.split('【全文时间轴输入】', 1)[0]) < 600

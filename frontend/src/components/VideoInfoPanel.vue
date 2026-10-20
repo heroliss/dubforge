@@ -1,22 +1,31 @@
 <script setup lang="ts">
+import LlmConversationButton from './LlmConversationButton.vue'
 // 获取视频步骤的整理信息：中文标题 / 内容概要 / 来源与作者描述，全部支持复制
 import { computed, onUnmounted, ref, watch } from 'vue'
+import { RouterLink } from 'vue-router'
 import { NAlert, NButton, NCollapse, NCollapseItem, NDescriptions, NDescriptionsItem, NInputNumber, NTag, NText, NTooltip, useMessage } from 'naive-ui'
 import CommentStudioPanel from './CommentStudioPanel.vue'
+import AppIcon from './AppIcon.vue'
 import { createLatestRefresh } from '../utils/preview'
 import { fmtDurCN } from '../utils/format'
 import { useConfigurationEditability } from '../utils/configurationEditability'
+import { commentWorkspaceLink, type CommentAction } from '../utils/commentWorkflow'
 
-const props = defineProps<{
+const props = withDefaults(defineProps<{
   uid: string
   available: boolean
   version?: string
   automation?: { state: string; message: string } | null
-}>()
+  mode?: 'video' | 'comments' | 'all'
+}>(), { mode: 'all' })
 const { locked: projectLocked, reason: projectLockReason, canEdit, observing } = useConfigurationEditability(() => 'project:' + props.uid)
 
 const message = useMessage()
-const emit = defineEmits<{ 'show-diagnostics': [] }>()
+const emit = defineEmits<{
+  'show-diagnostics': [action?: CommentAction]
+  /** 把已读取的平台资料向步骤页上抛，供原视频预览显示章节标记。 */
+  'info-change': [info: any | null]
+}>()
 const info = ref<any | null>(null)
 const failed = ref(false)
 const loading = ref(true)
@@ -28,6 +37,32 @@ const canSummarize = ref(false)
 const canComments = ref(false)
 const commentLimit = ref<number | null>(50)
 const commentWork = ref('')
+const studio = ref<InstanceType<typeof CommentStudioPanel> | null>(null)
+defineExpose({ showSettings: () => studio.value?.showSettings() })
+const commentDirty = ref(false), commentSaving = ref(false), commentLimitTouched = ref(false)
+const showVideo = computed(() => props.mode !== 'comments')
+const showComments = computed(() => props.mode === 'comments' || props.mode === 'all' && (canComments.value || !!info.value?.comments))
+const collectionBlocked = computed(() => projectLocked.value || !!active.value || !!collection.value.busy || commentSaving.value || commentDirty.value || props.automation?.state === 'running')
+const collectionBlockReason = computed(() => commentSaving.value ? '正在保存评论设置或确认上屏方案，请完成后再获取原文。'
+  : commentDirty.value ? '请先保存评论设置并确认或重置上屏草稿，再刷新原文；当前草稿会保留。' : '')
+function setCommentLimit(value: number | null) { commentLimitTouched.value = true; commentLimit.value = value }
+function applyCollectionLimit(value: number) { if (!commentLimitTouched.value) commentLimit.value = Number.isInteger(value) && value >= 1 && value <= 500 ? value : 50 }
+const collectionSnapshot = ref<any | null>(null)
+const collectionRequestLimit = ref<number | null>(null)
+const collection = computed(() => {
+  const snapshot = info.value?.comments
+  const saved = collectionSnapshot.value || {
+    status: snapshot?.collected_at ? 'completed' : 'idle', busy: false,
+    count: Array.isArray(snapshot?.items) ? snapshot.items.length : 0,
+    limit: snapshot?.requested_limit ?? null, collected_at: snapshot?.collected_at ?? null,
+    started_at: null, finished_at: null, error: '', code: '', reused: false, elapsed_seconds: null,
+  }
+  // POST 尚未返回时只显示正在采集；条数仍是上次快照，不估计网络逐条进度。
+  return pending.value === 'comments' ? { ...saved, status: 'running', busy: true,
+    limit: collectionRequestLimit.value ?? saved.limit,
+    started_at: saved.busy ? saved.started_at : null, finished_at: null,
+    elapsed_seconds: saved.busy ? saved.elapsed_seconds : null } : saved
+})
 const coverBroken = ref(false)
 const validCommentLimit = computed(() => Number.isInteger(commentLimit.value) && Number(commentLimit.value) >= 1 && Number(commentLimit.value) <= 500)
 const active = computed(() => pending.value || busy.value || commentWork.value)
@@ -43,31 +78,43 @@ const loader = createLatestRefresh(async (signal) => {
   if (!value || typeof value !== 'object') throw new Error('视频信息格式不正确')
   return value
 }, (value) => {
-  info.value = value.info; busy.value = value.busy || ''
+  info.value = value.info; emit('info-change', info.value); busy.value = value.busy || ''
+  collectionSnapshot.value = value.collection ?? null
   canRefresh.value = !!value.can_refresh; canSummarize.value = !!value.can_summarize
   canComments.value = !!value.can_collect_comments
   failed.value = false; loading.value = false
   clearTimeout(pollTimer)
-  if (busy.value && !disposed) pollTimer = setTimeout(() => void loader.refresh(), 2000)
+  if ((busy.value || pending.value === 'comments') && !disposed)
+    pollTimer = setTimeout(() => void loader.refresh(), 2000)
 }, () => { failed.value = true; loading.value = false })
 onUnmounted(() => { disposed = true; generation++; clearTimeout(pollTimer); loader.cancel() })
 
 watch(() => props.uid, () => {
   generation++; loader.cancel(); clearTimeout(pollTimer)
-  info.value = null; error.value = ''; pending.value = ''; busy.value = ''
+  info.value = null; emit('info-change', null); error.value = ''; pending.value = ''; busy.value = ''
+  collectionSnapshot.value = null; collectionRequestLimit.value = null; commentWork.value = ''
+  commentDirty.value = false; commentSaving.value = false; commentLimitTouched.value = false; commentLimit.value = 50
   canRefresh.value = canSummarize.value = canComments.value = false
   loading.value = true
 })
 watch(infoSignature, () => {
   if (!pending.value) void loader.refresh(true)
 }, { immediate: true })
+watch(() => props.automation?.state, () => { if (!disposed) void loader.refresh(false) })
+watch(commentWork, () => { if (!disposed) void loader.refresh(false) })
 
 async function runAction(action: 'refresh' | 'summarize' | 'comments') {
+  if (action === 'comments' && (props.mode === 'video' || collectionBlocked.value) || action !== 'comments' && props.mode === 'comments') return
   if (projectLocked.value || active.value || (action === 'comments' && !validCommentLimit.value)) return
   if (observing.value && !(await canEdit()) || projectLocked.value || active.value) { error.value = projectLockReason.value || '项目正在运行，请完成后再更新资料'; return }
+  if (action === 'comments' && collectionBlocked.value) return
   const ticket = generation, uid = props.uid
   loader.cancel(); clearTimeout(pollTimer)
   pending.value = action; error.value = ''
+  if (action === 'comments') {
+    collectionRequestLimit.value = commentLimit.value
+    pollTimer = setTimeout(() => void loader.refresh(false), 2000)
+  }
   try {
     const r = await fetch(`/api/projects/${uid}/steps/download/video-info/${action}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -76,7 +123,7 @@ async function runAction(action: 'refresh' | 'summarize' | 'comments') {
     const value = await r.json()
     if (!r.ok) throw new Error([value.message, value.suggestion].filter(Boolean).join('；') || '操作失败，旧资料已保留')
     if (!disposed && ticket === generation) {
-      info.value = value.info; failed.value = false
+      info.value = value.info; emit('info-change', info.value); failed.value = false
       message.success(action === 'refresh' ? '平台资料已更新，未重新下载视频' : action === 'comments'
         ? `已获取 ${value.info?.comments?.count ?? 0} 条热门评论，未加入成片` : '中文概要已重新整理')
     }
@@ -203,8 +250,11 @@ function copySource() {
 </script>
 
 <template>
-  <section class="video-info">
-    <n-alert v-if="projectLocked" type="info" :show-icon="false" class="notice">{{ projectLockReason }}；资料和评论仍可查看。</n-alert>
+  <section class="video-info" :class="{'comments-only': mode === 'comments'}">
+    <n-alert v-if="projectLocked && showVideo" type="info" :show-icon="false" class="notice">{{ projectLockReason }}；资料仍可查看。</n-alert>
+    <n-alert v-if="error" type="error" :show-icon="false" class="notice">{{ error }}</n-alert>
+    <n-alert v-if="failed" type="warning" :show-icon="false" class="notice">{{ mode === 'comments' ? '来源与采集状态读取失败。' : '资料读取失败。' }}<n-button size="tiny" @click="loader.refresh(true)">重试</n-button></n-alert>
+    <template v-if="showVideo">
     <header class="workspace-head">
       <h3>视频资料</h3>
       <div class="toolbar">
@@ -215,8 +265,6 @@ function copySource() {
     <n-alert v-if="['refresh', 'comments', 'summarize'].includes(active)" type="info" :show-icon="false" class="notice">
       {{ active === 'refresh' ? '正在刷新平台资料…' : active === 'comments' ? '正在获取热门评论…' : '正在整理中文标题与概要…' }}
     </n-alert>
-    <n-alert v-if="error" type="error" :show-icon="false" class="notice">{{ error }}</n-alert>
-    <n-alert v-if="failed" type="warning" :show-icon="false" class="notice">资料读取失败。<n-button size="tiny" @click="loader.refresh(true)">重试</n-button></n-alert>
 
     <template v-if="info">
       <div class="hero">
@@ -240,6 +288,7 @@ function copySource() {
         </div>
       </div>
       <n-alert v-if="info.summary_stale" type="warning" :show-icon="false" class="notice">平台资料已变化，中文标题与概要待更新。</n-alert>
+      <LlmConversationButton :project-uid="uid" operation="summary" />
       <section class="summary-card">
         <div class="section-head">
           <h4>内容概要 <n-tooltip><template #trigger><n-tag size="tiny" :bordered="false" tabindex="0">AI</n-tag></template>{{ info.summary_basis || '依据平台标题与简介，未读取完整视频或字幕正文。' }}<br />{{ statusText }} · {{ dateTime(info.summary_generated_at) }}</n-tooltip></h4>
@@ -252,7 +301,7 @@ function copySource() {
         <n-tag v-for="category in content.categories || []" :key="'c:' + category" size="small" type="info" :bordered="false">{{ category }}</n-tag>
         <n-tag v-for="tag in content.tags || []" :key="'t:' + tag" size="small" :bordered="false">{{ tag }}</n-tag>
       </div>
-      <n-collapse class="details" :default-expanded-names="['description']">
+      <n-collapse class="details" :default-expanded-names="content.chapters?.length ? ['description', 'chapters'] : ['description']">
         <n-collapse-item title="视频简介" name="description">
           <template #header-extra><n-button v-if="description" size="tiny" quaternary @click.stop="copy(description, '视频简介')">复制原文</n-button></template>
           <div v-if="description" class="description">{{ description }}</div><n-text v-else depth="3">暂无简介</n-text>
@@ -278,21 +327,37 @@ function copySource() {
     </template>
     <n-text v-else-if="loading" depth="3">正在读取资料…</n-text>
     <n-text v-else-if="!failed" depth="3">{{ canRefresh ? '暂无资料，点击“刷新平台资料”即可获取。' : '本地文件没有可刷新平台资料。' }}</n-text>
-    <section v-if="canComments || comments" class="comments" aria-label="评论精选">
-      <header class="workspace-head">
-        <h3>评论精选 <n-tooltip><template #trigger><n-text depth="3" class="help-icon" tabindex="0">ⓘ</n-text></template>默认只采集评论数。可另取 1–500 条平台热门顶层评论，不含回复，不保证全站最高赞。重新获取会替换原文列表；已确认的上屏方案独立保留。</n-tooltip></h3>
+    </template>
+    <section v-if="mode === 'video'" class="comment-overview" aria-label="评论工作区入口"><span>{{ collection.count ? `已获取 ${collection.count} 条评论原文` : '上屏评论' }}</span><RouterLink :to="commentWorkspaceLink(uid)">选评、翻译与上屏方案 →</RouterLink></section>
+    <section v-if="showComments" class="comments" :class="{'standalone-comments': mode === 'comments'}" aria-label="评论精选">
+      <header v-if="mode === 'comments'" class="collection-toolbar" aria-label="评论原文采集">
+        <div class="collection-identity"><AppIcon class="collection-symbol" name="menu" :size="19" /><div><div class="collection-title"><h3>评论原文</h3><n-tooltip><template #trigger><button type="button" class="collection-explainer" aria-label="热门评论采集说明"><AppIcon name="about" :size="15" /></button></template>可获取 1–500 条平台热门顶层评论，不含回复，不保证全站最高赞。本次数量初始采用项目采集上限；修改输入框不会保存项目设置。重新获取会替换原文列表；已确认的上屏方案独立保留。</n-tooltip></div><p v-if="source.platform || collection.collected_at" class="collection-source"><span v-if="source.platform">{{ source.platform }}</span><span v-if="collection.collected_at">更新于 {{ dateTime(collection.collected_at) }}</span></p></div></div>
+        <div class="collection-controls"><label><span>本次获取</span><n-input-number :input-props="{ 'aria-label': '热门评论采集数量' }" :value="commentLimit" :min="1" :max="500" :precision="0" :disabled="collectionBlocked" @update:value="setCommentLimit"><template #suffix>条</template></n-input-number></label><n-button size="small" type="info" secondary :aria-label="comments ? '刷新热门评论' : '获取热门评论'" :disabled="!canComments || collectionBlocked || !validCommentLimit" :loading="pending === 'comments'" @click="runAction('comments')"><template #icon><AppIcon :name="comments ? 'refresh' : 'arrow-down'" :size="15" /></template>{{ comments ? '刷新热门评论' : '获取热门评论' }}</n-button></div>
+      </header>
+      <header v-else class="workspace-head">
+        <h3>评论精选 <n-tooltip><template #trigger><n-text depth="3" class="help-icon" tabindex="0">ⓘ</n-text></template>可获取 1–500 条平台热门顶层评论，不含回复，不保证全站最高赞。本次数量初始采用项目采集上限；修改输入框不会保存项目设置。重新获取会替换原文列表；已确认的上屏方案独立保留。</n-tooltip></h3>
         <div class="toolbar">
-          <n-input-number :input-props="{ 'aria-label': '热门评论采集数量' }" v-model:value="commentLimit" :min="1" :max="500" :precision="0" :disabled="projectLocked || !!active || automation?.state==='running'" style="width:108px"><template #suffix>条</template></n-input-number>
-          <n-button size="small" :disabled="!canComments || projectLocked || !!active || !validCommentLimit || automation?.state==='running'" :loading="active === 'comments'" @click="runAction('comments')">{{ comments ? '刷新热门评论' : '获取热门评论' }}</n-button>
+          <n-input-number :input-props="{ 'aria-label': '热门评论采集数量' }" :value="commentLimit" :min="1" :max="500" :precision="0" :disabled="collectionBlocked" style="width:108px" @update:value="setCommentLimit"><template #suffix>条</template></n-input-number>
+          <n-button size="small" :aria-label="comments ? '刷新热门评论' : '获取热门评论'" :disabled="!canComments || collectionBlocked || !validCommentLimit" :loading="pending === 'comments'" @click="runAction('comments')">{{ comments ? '刷新热门评论' : '获取热门评论' }}</n-button>
         </div>
       </header>
-      <CommentStudioPanel :uid="uid" :version="comments?.collected_at || ''" :automation="automation" :video-duration="Number(info?.source?.duration) || 0" :blocked="projectLocked || !!pending || !!busy" @busy-change="commentWork = $event" @show-diagnostics="emit('show-diagnostics')" />
+      <p v-if="collectionBlockReason" class="collection-help" role="status">{{ collectionBlockReason }}</p>
+      <p v-else-if="mode === 'comments' && loading" class="collection-help" role="status">正在读取来源与采集能力…</p>
+      <p v-else-if="!canComments && !failed" class="collection-help">此来源暂不支持在线获取评论；仍可查看和编辑已有评论及上屏方案。在线采集目前支持 YouTube。</p>
+      <CommentStudioPanel ref="studio" :uid="uid" :version="comments?.collected_at || ''" :collection="collection" :automation="automation" :video-duration="Number(info?.source?.duration) || 0" :blocked="projectLocked || !!pending || !!busy || !!collection.busy" @busy-change="commentWork = $event" @dirty-change="commentDirty = $event" @saving-change="commentSaving = $event" @collection-limit="applyCollectionLimit" @show-diagnostics="emit('show-diagnostics',$event)" />
     </section>
   </section>
 </template>
 
 <style scoped>
 .video-info { border:1px solid rgba(128,128,128,.2); border-radius:12px; padding:20px; margin-top:14px; }
+.video-info.comments-only{border:0;border-radius:0;padding:0;margin:0}.comments.standalone-comments{border-top:0;padding-top:0;margin-top:0}.comment-overview{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px 16px;margin-top:22px;padding-top:16px;border-top:1px solid var(--df-border);font-size:12px;color:var(--df-muted)}.comment-overview a{color:var(--df-accent);text-decoration:none}.comment-overview a:hover{text-decoration:underline;text-underline-offset:3px}.collection-help{margin:8px 0;font-size:12px;line-height:1.75;color:var(--df-muted)}
+.collection-toolbar{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:14px 24px;padding:14px 16px;border:1px solid color-mix(in srgb,var(--df-border) 80%,transparent);border-radius:12px;background:color-mix(in srgb,var(--df-panel) 72%,transparent)}
+.collection-identity{display:flex;align-items:center;gap:11px;min-width:0}.collection-symbol{flex:none;color:var(--df-accent)}.collection-title{display:flex;align-items:center;gap:8px}.collection-title h3{font-size:14px;font-weight:550}
+.collection-explainer{display:inline-flex;align-items:center;justify-content:center;width:24px;height:24px;padding:3px;border:0;border-radius:5px;color:var(--df-muted);background:transparent;cursor:help}.collection-explainer:hover{color:var(--df-text);background:var(--df-accent-soft)}.collection-explainer:focus-visible{outline:2px solid var(--df-accent);outline-offset:2px}
+.collection-source{display:flex;align-items:center;flex-wrap:wrap;gap:4px 12px;margin:3px 0 0;color:var(--df-muted);font-size:11px;line-height:1.6;font-variant-numeric:tabular-nums}
+.collection-controls{display:flex;align-items:center;flex-wrap:wrap;gap:10px 12px}.collection-controls label{display:flex;align-items:center;gap:9px;color:var(--df-muted);font-size:12px;white-space:nowrap}.collection-controls :deep(.n-input-number){width:112px}.collection-controls :deep(.n-button){font-size:12px}
+.standalone-comments>.collection-help{margin:10px 2px 2px;padding-left:0;font-size:11px}
 .workspace-head, .toolbar, .section-head, .title-row { display:flex; align-items:center; justify-content:space-between; gap:10px; }
 .workspace-head { flex-wrap:wrap; margin-bottom:18px; }
 h3 { margin:0; font-size:16px; font-weight:650; } h4 { margin:0; font-size:13px; font-weight:600; }
@@ -317,4 +382,5 @@ h3 { margin:0; font-size:16px; font-weight:650; } h4 { margin:0; font-size:13px;
 .comments { border-top:1px solid rgba(128,128,128,.18); margin-top:24px; padding-top:20px; }
 .help-icon { font-size:13px; cursor:help; } .notice { margin-bottom:12px; }
 @media(max-width:700px) { .video-info { padding:14px; } .hero { grid-template-columns:1fr; gap:14px; } .cover-link,.cover-placeholder { max-width:360px; } .title-row h2 { font-size:19px; } .workspace-head { align-items:flex-start; } }
+@media(max-width:700px){.collection-toolbar{align-items:flex-start;padding:13px 14px;gap:12px}.collection-controls{justify-content:flex-end;width:100%}.collection-controls label{margin-right:auto}.collection-controls :deep(.n-input-number){width:102px}.collection-source{gap:4px 8px}}
 </style>

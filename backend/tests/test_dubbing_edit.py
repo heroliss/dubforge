@@ -6,6 +6,7 @@ from fastapi.testclient import TestClient
 from test_dubbing_preparation import prepared
 from dubforge import config
 from dubforge.domain import crud
+from test_configuration import save
 from dubforge.pipeline import dubbing_edit
 from dubforge.pipeline.dependencies import Dependencies
 from dubforge.runner import compute_fingerprint, runner
@@ -59,8 +60,7 @@ def test_empty_original_and_versions_are_used_in_actual_mix(prepared, monkeypatc
     import soundfile as sf
     uid, _, _ = prepared
     root = crud.project_dir(uid)
-    config.set_key('assemble.loudnorm', False)
-    config.set_key('assemble.bgm_volume', 0)
+    save('project:' + uid, {'assemble.loudnorm': False, 'assemble.bgm_volume': 0})
     with TestClient(app) as client:
         base = f'/api/projects/{uid}/workbench'
         for id in (1, 2):
@@ -110,7 +110,7 @@ def test_fill_remaining_does_not_overwrite_comparison_version(prepared):
         assert synthesize(client, f'/api/projects/{uid}/workbench/lines/1/synthesize', json={}).status_code == 200
         path = crud.project_dir(uid) / 'artifacts/tts/1.wav'
         before = path.read_bytes()
-        config.set_key('tts.gptsovits.character', '新角色')
+        save('project:' + uid, {'tts.gptsovits.character': '新角色'})
         runner.start_step(uid, 'tts')
         wait_status(uid, 'tts', {'done'})
         assert path.read_bytes() == before and calls == ['你好', '世界']

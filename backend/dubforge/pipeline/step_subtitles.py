@@ -1,4 +1,7 @@
 """从统一校对稿导出字幕；手动设置的时间优先于最短显示时长。"""
+import json
+from pathlib import Path
+
 from dubforge.pipeline.subtitle_document import read
 from dubforge.utils.srt import SubLine, write_srt
 
@@ -20,6 +23,25 @@ def _extend_short_cues(lines, min_duration, total=None, fixed_ids=(), barriers=(
     return changed
 
 
+def _apply_voice_timing(ctx, rows):
+    """原文和译文使用同一派生播放时钟；识别原稿与校对起止仍保留。"""
+    if getattr(ctx, 'version', None) and not ctx.version.get('dubbing', True):
+        return rows
+    from dubforge.pipeline import voice_timing, dubbing_edit
+    from dubforge.errors import DubForgeError
+    root = Path(getattr(ctx, 'pdir', None) or getattr(ctx, 'root', '.'))
+    try:
+        # 选槽身份依赖译文，原文单轨也从完整稿解析；缺译文时仍可独立导出。
+        document = read(ctx, translation=True)
+        selected = dubbing_edit.production_lines(ctx.project, document, root)
+        inputs = [{**row, 'source': row['source'] if row['source'] == 'original'
+                   else 'dub' if row.get('take') is not None else 'silent'} for row in selected]
+        layout = voice_timing.plan(ctx.project, root, inputs, ctx.cfg, dependencies=ctx)
+    except (DubForgeError, OSError):
+        return rows
+    return voice_timing.apply(rows, layout)
+
+
 def build_tracks(ctx, mode=None):
     """预览与导出共用文字、双语顺序和最短显示时长。"""
     mode = mode or ctx.cfg("subtitles.mode", "all")
@@ -29,8 +51,9 @@ def build_tracks(ctx, mode=None):
     document = read(ctx, translation=mode != 'source')
     from dubforge.pipeline.content_redaction import redact_document, plan
     document = redact_document(ctx, document)
-    source = [{**l, 'text': l['source_text']} for l in document]
-    target = document if mode != 'source' else []
+    playback = _apply_voice_timing(ctx, document)
+    source = [{**l, 'text': l['source_text']} for l in playback]
+    target = playback if mode != 'source' else []
     source_first = bool(ctx.cfg("subtitles.source_first", False))
     minimum = float(ctx.cfg("subtitles.min_duration", 1.5) or 0)
     tracks = {}
@@ -57,12 +80,15 @@ def build_tracks(ctx, mode=None):
 
 
 def run(ctx):
+    from dubforge.execution_progress import report_stage
+    report_stage(ctx, 'preparing_subtitles', '整理字幕文字、排布时间与屏蔽规则')
     tracks, document = build_tracks(ctx)
     if getattr(ctx, "rebuild", False):
         from dubforge.domain import crud
         crud.delete_step_artifacts(ctx.project.id, "subtitles")
-    for name, lines in tracks.items():
+    for index, (name, lines) in enumerate(tracks.items()):
         ctx.check_cancel()
+        report_stage(ctx, 'saving_subtitles', '导出字幕文件', completed=index, total=len(tracks), unit='文件', file=name)
         path = ctx.pdir / "srt" / name
         write_srt(lines, path)
         ctx.register_file(name, path, "srt")
@@ -70,4 +96,5 @@ def run(ctx):
         "source": "edited" if any(l['edited'] for l in document) else "split",
         "source_first": bool(ctx.cfg("subtitles.source_first", False)),
         "min_duration": float(ctx.cfg("subtitles.min_duration", 1.5) or 0)})
+    report_stage(ctx, 'saving_subtitles', '字幕文件已保存', completed=len(tracks), total=len(tracks), unit='文件')
     ctx.log(f"✅ 字幕导出：{len(document)} 句，{' / '.join(tracks)}；已应用保存的文字与时间")

@@ -1,4 +1,4 @@
-# 基础程序与可选能力安装；保留已有可选依赖，不下载配音模型。
+﻿# 基础程序与可选能力安装；保留已有可选依赖，不下载配音模型。
 param(
     [switch]$Asr,
     [switch]$Separation,
@@ -45,5 +45,5 @@ foreach ($ToolName in @('ffmpeg', 'ffprobe')) {
         Write-Warning "未找到 $ToolName；请按 docs/installation.md 安装 FFmpeg 并添加到 PATH。"
     }
 }
-Write-Host '所选依赖安装完成。请启动 DubForge，在“设置 → 环境与服务”检查环境并配置服务地址。' -ForegroundColor Green
+Write-Host '所选依赖安装完成。请启动 DubForge，在“设置 → 模型与服务”检查环境并配置服务地址。' -ForegroundColor Green
 Write-Host '模型权重在首次使用时按需下载；IndexTTS / GPT-SoVITS 按官方说明单独安装。'

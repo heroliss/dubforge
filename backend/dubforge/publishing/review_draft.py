@@ -17,6 +17,105 @@ from dubforge.publishing import service as pub
 from dubforge.publishing.models import Publication, PublishAccount
 
 
+def _review_sidecar(project, artifact):
+    """读取修订成片旁的来源配方。
+
+    审查修订成片在早期版本中可以由普通 ``assemble`` 步骤重新生成。
+    该步骤会更新 AssemblyResult 的普通版本快照，却不会把历史
+    ``review_render`` 元数据一并写回数据库；review-render 本身留下的
+    ``*.review.json`` 是这类文件唯一可核验的来源记录。这里只接受带有
+    完整来源身份、输入清单和编码器的 sidecar，普通成片不会因为文件名
+    看起来像 review 而被当成修订稿。
+    """
+    try:
+        root = crud.project_dir_by_project(project).resolve()
+        path = Path(artifact.rel_path)
+        if not path.is_absolute():
+            path = root / path
+        path = path.resolve()
+        if not path.is_relative_to(root) or path.suffix.lower() != '.mp4':
+            return None
+        sidecar = path.with_suffix('.review.json')
+        raw = json.loads(sidecar.read_text(encoding='utf-8'))
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(raw, dict) or raw.get('schema') not in {'review-render-v1', 'review-render-v2'} \
+            or type(raw.get('source_artifact_id')) is not int \
+            or not isinstance(raw.get('fingerprint'), str) \
+            or not isinstance(raw.get('recipe'), dict):
+        return None
+    recipe = raw['recipe']
+    if (recipe.get('source_artifact_id') != raw['source_artifact_id']
+            or recipe.get('schema') != raw['schema']
+            or versions.digest(recipe) != raw['fingerprint']
+            or recipe.get('encoder') != raw.get('encoder')
+            or not isinstance(recipe.get('inputs'), list)
+            or not isinstance(recipe.get('encoder'), dict)
+            or not isinstance(recipe.get('review_receipt'), dict)):
+        return None
+    return raw
+
+
+def _sidecar_current(deps, project, artifact, record, definition, info, *, verify_hash=False):
+    """核验普通 assemble 重生成的审查修订输出。
+
+    普通步骤登记的 fingerprint 证明当前 review 版本已按当前文字、审查
+    规则和输入重新生成；sidecar 再证明它仍源自原始成片且所有冻结输入
+    没有被替换。两层校验都通过才允许绕过旧输出文件哈希。
+    """
+    try:
+        if not versions.is_current(deps, definition, verify_hash=verify_hash):
+            return False
+        if info['recipe'].get('definition') != {key: definition[key] for key in
+                ('dubbing', 'burn_subtitles', 'include_comments')}:
+            return False
+        source_id = info['source_artifact_id']
+        source = next((a for a in deps.arts.values() if a.id == source_id), None)
+        if not source or source.step_key != 'assemble' or source.id == artifact.id:
+            return False
+        source_record = next((r for r in versions.results(project.uid).values()
+                              if r.artifact_id == source.id), None)
+        if not source_record or source_record.artifact_hash != source.sha256:
+            return False
+        inputs = info['recipe']['inputs']
+        if not inputs or any(not isinstance(item, dict) for item in inputs):
+            return False
+        # A review render must remain tied to both the current assembled source
+        # and the original downloaded video.  Checking only the source output
+        # lets a stale or substituted video pass after a normal assemble rerun.
+        video_id = info['recipe'].get('video_artifact_id')
+        if type(video_id) is not int or video_id == source.id:
+            return False
+        video = next((a for a in deps.arts.values() if a.id == video_id), None)
+        if not video or video.step_key != 'download':
+            return False
+        keys = [(item.get('step'), item.get('name')) for item in inputs]
+        if len(set(keys)) != len(keys) or len({item.get('id') for item in inputs}) != len(inputs):
+            return False
+        guards = {key: item for key, item in zip(keys, inputs)}
+        source_guard = guards.get(('assemble', source.name))
+        if not source_guard or source_guard.get('id') != source.id \
+                or source_guard.get('sha256') != source.sha256:
+            return False
+        video_guard = guards.get(('download', video.name))
+        if (not video_guard or video_guard.get('id') != video.id
+                or video_guard.get('sha256') != video.sha256
+                or video_guard.get('size') != video.size):
+            return False
+        for item in inputs:
+            if not isinstance(item, dict) or type(item.get('id')) is not int:
+                return False
+            current = next((a for a in deps.arts.values() if a.id == item['id']), None)
+            if (not current or current.sha256 != item.get('sha256')
+                    or current.size != item.get('size') or current.step_key != item.get('step')
+                    or current.name != item.get('name')):
+                return False
+            review_render._file(deps, current, verify_hash=verify_hash)
+        return True
+    except (DubForgeError, OSError, ValueError, TypeError, KeyError, AttributeError):
+        return False
+
+
 def revision_metadata(project, artifacts, *, verify_hash=False):
     """候选文件保留可核查的来源身份；不按文件名推断修订关系。"""
     deps = Dependencies(project)
@@ -36,22 +135,41 @@ def revision_metadata(project, artifacts, *, verify_hash=False):
         except (ValueError, TypeError):
             continue
         info = snapshot.get('review_render') if isinstance(snapshot, dict) else None
+        sidecar = None if isinstance(info, dict) else _review_sidecar(project, art)
+        if sidecar:
+            info = sidecar
         if not isinstance(info, dict):
             continue
         definition = definitions.get(record.version_id)
         encoder = info.get('encoder')
         try:
-            current = bool(art.sha256 == record.artifact_hash and isinstance(encoder, dict)
-                and definition and review_render.is_current(deps,
-                versions.resolve(deps, definition), record=record, verify_hash=verify_hash))
+            if art.sha256 != record.artifact_hash:
+                state = dict(current=False, reasons=[dict(code='REVIEW_OUTPUT_CHANGED', message='修订文件的登记身份已变化')])
+            elif not isinstance(encoder, dict):
+                state = dict(current=False, reasons=[dict(code='REVIEW_HISTORY_INVALID', message='修订缺少可核验的编码记录')])
+            elif not definition:
+                state = dict(current=False, reasons=[dict(code='REVIEW_VERSION_MISSING', message='此修订对应的成片版本已移除')])
+            elif sidecar:
+                from dubforge import comment_studio
+                overlay = comment_studio.effective_overlay(project.uid, comment_studio._read(project).get('overlay'))
+                current = _sidecar_current(deps, project, art, record,
+                                            versions.resolve(deps, definition, comment_plan=overlay), info,
+                                            verify_hash=verify_hash)
+                state = dict(current=current, reasons=[] if current else
+                             [dict(code='REVIEW_HISTORY_INVALID', message='修订来源或当前成片版本无法核验')])
+            else:
+                state = review_render.revision_state(deps,
+                    versions.resolve(deps, definition), record=record, verify_hash=verify_hash)
         except (DubForgeError, ValueError, TypeError, KeyError, AttributeError):
-            current = False
+            state = dict(current=False, reasons=[dict(code='REVIEW_HISTORY_INVALID', message='修订记录或当前版本设置无法核验')])
+        current, reasons = state['current'], state['reasons']
         result[art.id] = dict(is_review_revision=True,
             review_source_artifact_id=info.get('source_artifact_id'), review_revision_current=current,
             review_revision_created_at=info.get('created_at', ''),
             review_encoder=encoder.get('name', '') if isinstance(encoder, dict) else '',
             review_note=info.get('note', '基于已有文字与音轨的审查修订'),
-            review_revision_reason='' if current else '原视频、已有成片、文字、评论或设置已变化；请重新生成审查修订版')
+            review_revision_reasons=reasons,
+            review_revision_reason='' if current else '；'.join(r['message'] for r in reasons[:3]) + '；请重新生成成片')
     return result
 
 
@@ -114,23 +232,59 @@ def _plan(session, key):
     for index, source in enumerate(snapshot['parts'], 1):
         ident, title, expected = source.get('artifact_id'), source.get('title'), source.get('sha256')
         art = rows.get(ident)
+        source_info = None
+        record = by_artifact.get(ident)
+        if record:
+            try:
+                source_info = json.loads(record.snapshot).get('review_render')
+            except (ValueError, TypeError):
+                pass
+        if not isinstance(source_info, dict):
+            source_info = _review_sidecar(project, art) if art else None
+        source_identity, source_sha = ident, expected
+        # 原稿本身可能已经是一次审查修订稿。普通 assemble 重生成该版本
+        # 会替换同一个 Artifact 的文件哈希；此时以 sidecar 中冻结的底层
+        # 原成片作为来源身份，允许输出哈希更新，但不放宽普通原稿校验。
+        if source_info:
+            source_identity = source_info.get('source_artifact_id')
+            guards = source_info.get('recipe', {}).get('inputs', [])
+            source_sha = next((item.get('sha256') for item in guards
+                               if isinstance(item, dict) and item.get('id') == source_identity), None)
+            source_art = rows.get(source_identity)
+            source_state = revision_metadata(project, [art], verify_hash=True).get(ident, {}) if art else {}
+            if (not source_state.get('review_revision_current') or not source_art
+                    or source_art.sha256 != source_sha):
+                problems.append(dict(index=index, title=title, reason='原审查修订分P的来源或当前文件无法核验'))
+                continue
         if (type(ident) is not int or ident in seen or not isinstance(title, str) or not title.strip()
-                or not art or art.sha256 != expected):
+                or not art or (art.sha256 != expected and not source_info)
+                or (source_info and (type(source_identity) is not int or source_sha is None))):
             problems.append(dict(index=index, title=title, reason='原分P身份或冻结哈希已变化，无法精确匹配修订来源'))
             continue
         seen.add(ident)
         matches = []
         for candidate in candidates:
-            if not candidate.get('is_review_revision') or candidate.get('review_source_artifact_id') != ident:
+            if not candidate.get('is_review_revision') or candidate.get('review_source_artifact_id') != source_identity:
                 continue
             if not candidate.get('review_revision_current') or not candidate.get('exists') or candidate.get('review_ready') is False:
                 continue
             record = by_artifact.get(candidate['id'])
-            info = json.loads(record.snapshot).get('review_render', {}) if record else {}
-            inputs = info.get('recipe', {}).get('inputs', [])
-            if not any(item.get('id') == ident and item.get('sha256') == expected for item in inputs):
-                continue
             revised = rows.get(candidate['id'])
+            info = {}
+            if record:
+                try:
+                    info = json.loads(record.snapshot).get('review_render', {})
+                except (ValueError, TypeError):
+                    info = {}
+            if not isinstance(info, dict) or not info:
+                info = _review_sidecar(project, revised) if revised else None
+            info = info or {}
+            inputs = info.get('recipe', {}).get('inputs', [])
+            if not info.get('schema', '').startswith('review-render-'):
+                continue
+            if not any(isinstance(item, dict) and item.get('id') == source_identity
+                       and item.get('sha256') == source_sha for item in inputs):
+                continue
             path = pub._eligible_file(revised, project, root) if revised else None
             if (not path or not path.is_file() or path.stat().st_size != revised.size
                     or pub._file_hash(path) != revised.sha256):
@@ -144,8 +298,10 @@ def _plan(session, key):
                 if not matches else '存在多个仍有效的审查修订文件，请明确保留一个对应版本后重试'))
             continue
         candidate = matches[0]
-        parts.append(dict(index=index, title=title, source_artifact_id=ident, source_name=art.name,
-            source_sha256=expected, artifact_id=candidate['id'], name=candidate['name'],
+        source_art = rows.get(source_identity)
+        parts.append(dict(index=index, title=title, source_artifact_id=source_identity,
+            source_name=source_art.name if source_art else art.name,
+            source_sha256=source_sha, artifact_id=candidate['id'], name=candidate['name'],
             sha256=candidate['sha256'], size=candidate['size'],
             version_id=candidate.get('version_id'), version_name=candidate.get('version_name', candidate['name'])))
     if problems:
@@ -164,7 +320,7 @@ def _plan(session, key):
         settings=pub.validate_values(snapshot['settings']), parts=parts,
         notices=['这会创建新投稿并获得新BV；原稿件、审核记录和已发布快照保持保留。',
                  '创建草稿只保存到本地；上传与正式投稿仍需执行发布动作。',
-                 '本版创作管理可修改文案、排序或追加分P；替换原BV的视频请前往B站创作中心。',
+                 '保留原BV替换视频请使用原发布记录中的“更新原稿件”；此处仅准备另发新稿。',
                  '审查修订沿用已有文字与混音，需要另行核对画面，不能保证平台审核通过。'])
     result['fingerprint'] = pub._hash(result)
     return result

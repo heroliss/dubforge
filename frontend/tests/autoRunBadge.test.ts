@@ -27,21 +27,36 @@ test('全流程忙碌/监测/待继续 三态', async () => {
   const monitor = await render({ workflowStatus: 'monitoring' })
   assert.match(monitor, /已投稿 · 监测审核中/)
   const attention = await render({ workflowStatus: 'attention' })
-  assert.match(attention, /自动流程待继续/)
+  assert.match(attention, /上次完整流程需处理/)
 })
 
 test('自动链 active/held, 优先级低于全流程', async () => {
   const chain = { remaining: ['translate'], state: 'active' as const }
-  assert.match(await render({ chain, runningLabel: '翻译' }), /续跑中 · 翻译/)
+  assert.match(await render({ chain, runningLabel: '翻译' }), /制作续跑 · 翻译/)
   const held = { remaining: ['translate'], state: 'held' as const, hold: { step: 'translate', code: 'X', message: 'y' } }
-  assert.match(await render({ chain: held }), /自动运行已挂起/)
+  assert.match(await render({ chain: held }), /制作计划已挂起/)
   // 全流程存在时盖过链标识 (引擎互斥下的兜底优先级)。
   const both = await render({ workflowStatus: 'queued', chain, runningLabel: null })
-  assert.match(both, /自动流程运行中/); assert.doesNotMatch(both, /续跑中/)
+  assert.match(both, /自动流程运行中/); assert.doesNotMatch(both, /制作续跑/)
 })
 
 test('无运行状态不渲染; 手动单步回退 🔄 标签', async () => {
   assert.doesNotMatch(await render({}), /data-run-badge/)
   const manual = await render({ runningLabel: '获取视频' })
   assert.match(manual, /data-run-badge="🔄"/); assert.match(manual, /获取视频/)
+})
+
+test('旧完整流程中断不会覆盖当前制作，两个状态分别显示', async () => {
+  const chain = { remaining: ['assemble'], state: 'active' as const }
+  const active = await render({ workflowStatus: 'failed', chain, runningLabel: '合成成片' })
+  assert.match(active, /data-run-badge="⛓"/)
+  assert.match(active, /制作续跑 · 合成成片/)
+  assert.match(active, /data-workflow-history="true"/)
+  assert.match(active, /上次完整流程需处理/)
+  const manual = await render({ workflowStatus: 'paused', runningLabel: '配音' })
+  assert.match(manual, /data-run-badge="🔄"/)
+  assert.match(manual, /data-workflow-history="true"/)
+  const historical = await render({ workflowStatus: 'failed' })
+  assert.equal((historical.match(/data-run-badge=/g) || []).length, 1)
+  assert.doesNotMatch(historical, /data-workflow-history/)
 })

@@ -12,6 +12,7 @@ import { setup } from '@css-render/vue3-ssr'
 import { createPinia, disposePinia } from 'pinia'
 import { createMemoryHistory, createRouter, RouterView } from 'vue-router'
 import { NDialogProvider, NMessageProvider, useDialog } from 'naive-ui'
+import { createExecutionProjection } from '../src/utils/executionSnapshot.ts'
 
 // 加载实际步骤页及 Naive UI，不能用组件桩绕过空 trigger 导致的渲染异常。
 // 只运行内存中的组件渲染，不监听端口、不连接项目或外部服务。
@@ -59,6 +60,96 @@ const states = [
   { name: '已完成但过期', status: 'done', fresh: false, label: '需更新' },
   { name: '尚未运行', status: 'pending', fresh: false, label: '待运行' },
 ]
+
+test('合成AAC复核不能显示上个编码阶段的剩余5秒，整体进度和实际轮次仍保留', async () => {
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+  await router.push('/projects/assembly-audio-check/steps/assemble')
+  nav.$patch({ uid: 'assembly-audio-check', title: '合成音频复核', stepsLoaded: true, steps: [{
+    key: 'assemble', label: '合成成片', status: 'running', job_id: 19, cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+    progress: 49.5, eta_seconds: .1, eta_scope: 'phase', execution: { schema: 1, owner: 'step', state: 'running', job_id: 19,
+      phase: 'correcting_output_audio', label: '复核并纠正 AAC 编码真峰值', completed: 0, total: 3, unit: '轮' },
+  }] })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+  app.use(pinia); app.use(router); setup(app)
+  try {
+    const text = (await renderToString(app)).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ')
+    assert.match(text, /复核并纠正 AAC 编码真峰值/); assert.match(text, /已完成 0 \/ 3 轮/)
+    assert.match(text, /合成步骤 49\.5%/)
+    assert.doesNotMatch(text, /当前阶段预计剩余|预计剩余约 5 秒|当前编码阶段/)
+  } finally { nav.reset(); disposePinia(pinia) }
+})
+
+test('配音排队范围尚未准备时披露已知文稿句数，未知不显示零句或全量生成承诺', async () => {
+  for (const documentLines of [646, null]) {
+    const pinia = createPinia(), nav = useNavStore(pinia)
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+    await router.push('/projects/queued-dubbing/steps/tts')
+    nav.$patch({ uid: 'queued-dubbing', title: '等待资源的配音', stepsLoaded: true, steps: keys.map(key => ({
+      key, label: STEP_LABELS[key], status: key === 'tts' ? 'queued' : 'done', fresh: key !== 'tts', cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+      ...(key === 'tts' ? { synthesis_task: { scope: 'policy', active: true, queued: true, total: 0, completed: 0 },
+        execution: { schema: 1, state: 'queued', phase: 'queue', label: '等待执行资源', metrics: { resource: 'gpu' } } } : {}),
+    })) })
+    const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+    app.use(pinia); app.use(router); setup(app)
+    app.mixin({ created() { if (this.$options.__name === 'StepView') this.$.setupState.dubbingDocumentLines = documentLines } })
+    try {
+      const html = await renderToString(app), text = html.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ')
+      assert.match(text, /配音范围待准备/); assert.match(text, /取得执行资源后核定实际生成与复用范围/)
+      assert.match(text, /排队后自动继续/); assert.match(text, /GPU 计算资源/)
+      if (documentLines) assert.match(text, /已有文稿 646 句/)
+      else assert.match(text, /正在核对文稿内容/)
+      assert.doesNotMatch(text, /本次配音 0 句|生成 646 句|所需资源 gpu/)
+    } finally { nav.reset(); disposePinia(pinia) }
+  }
+})
+
+test('实时投影或启动回执后的新Job排队不能显示旧所选范围及失败句数', async () => {
+  for (const source of ['projection', 'started']) {
+    const pinia = createPinia(), nav = useNavStore(pinia)
+    const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+    await router.push('/projects/task-generation/steps/tts')
+    const oldTask = { job_id: 17, scope: 'selected', total: 1, completed: 0, failed: 1, lines: [{ id: 1, status: 'failed' }] }
+    const previous = { key: 'tts', label: '字幕与配音', status: 'failed', job_id: 17, synthesis_task: oldTask,
+      cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [], execution: { schema: 1, state: 'failed', job_id: 17, label: '上轮配音失败' } }
+    nav.$patch({ uid: 'task-generation', title: '配音代次回归', stepsLoaded: true, steps: source === 'projection'
+      ? createExecutionProjection().apply([previous], [{ key: 'tts', status: 'queued', job_id: 18 }]).steps : [previous] })
+    if (source === 'started') nav.stepStarted('task-generation', 'tts', { status: 'started', job_id: 18 })
+    assert.equal(nav.stepMap.tts.synthesis_task.job_id, 17, '真实路径仍保留旧任务数据，展示层必须自行核对代次')
+    const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+    app.use(pinia); app.use(router); setup(app)
+    app.mixin({ created() { if (this.$options.__name === 'StepView') this.$.setupState.dubbingDocumentLines = 646 } })
+    try {
+      const text = (await renderToString(app)).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ')
+      assert.match(text, /配音范围待准备.*已有文稿 646 句/)
+      assert.doesNotMatch(text, /本次所选 1 句|失败 1 句|上轮配音失败/)
+    } finally { nav.reset(); disposePinia(pinia) }
+  }
+})
+
+test('实际合成步骤页的整体41.4与当前编码83.6分开，不混淆阶段ETA和版本范围', async () => {
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid/steps/:key', component: StepView }] })
+  await router.push('/projects/assembly-progress-scope/steps/assemble')
+  nav.$patch({ uid: 'assembly-progress-scope', title: '合成范围回归', stepsLoaded: true, steps: [{
+    key: 'assemble', label: '合成成片', status: 'running', job_id: 19, cfg: {}, artifacts: [], inputs: [], outputs: [], affected_steps: [],
+    progress: 41.4, eta_seconds: 120, eta_scope: 'phase', execution: { schema: 1, state: 'running', job_id: 19,
+      phase: 'encoding', label: '编码成片画面、音频与字幕', completed: 1444.01, total: 1726.92, unit: '成片秒',
+      started_at: '2026-10-20T00:00:00Z', history: [
+        { phase: 'checking_version', label: '核对成片版本 1/2：配音', state: 'completed',
+          started_at: '2026-10-20T00:00:01Z', finished_at: '2026-10-20T00:00:02Z' },
+        { phase: 'encoding', state: 'running', started_at: '2026-10-20T00:00:03Z' },
+      ] },
+  }] })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, { default: () => h(NDialogProvider, null, { default: () => h(RouterView) }) }) })
+  app.use(pinia); app.use(router); setup(app)
+  try {
+    const text = (await renderToString(app)).replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ')
+    assert.match(text, /当前编码阶段 83\.6%/); assert.match(text, /当前版本 1\/2：配音/)
+    assert.match(text, /当前阶段预计剩余约 2 分钟/)
+    assert.doesNotMatch(text, /本阶段 41\.4%/)
+  } finally { nav.reset(); disposePinia(pinia) }
+})
 
 test('LLM 取消事件显示本地连接已关闭和服务端未确认，不继续显示模型思考中', async () => {
   const pinia = createPinia(), nav = useNavStore(pinia)
@@ -396,12 +487,12 @@ test('只显示成品历史时不读取生成所用的评论方案', async t => 
   } finally {disposePinia(pinia)}
 })
 
-test('项目列表慢刷新合并；人工刷新取消旧读，旧响应不能覆盖列表', async t => {
+test('项目列表慢核验合并；人工刷新等待在途结束后只排一次fresh读取', async t => {
   const {default: Projects} = await server.ssrLoadModule('/src/views/ProjectsView.vue')
   const reads:any[]=[]
   t.mock.method(globalThis,'fetch',(url,options)=> {
     if(String(url)!=='/api/projects') return new Promise(()=>{})
-    return new Promise(resolve=>reads.push({signal:options?.signal,resolve}))
+    return new Promise(resolve=>reads.push({signal:options?.signal,headers:options?.headers,resolve}))
   })
   let page:any
   const pinia=createPinia()
@@ -415,18 +506,20 @@ test('项目列表慢刷新合并；人工刷新取消旧读，旧响应不能�
     reads[0].resolve({ok:true,json:async()=>[{uid:'initial',title:'首次结果',steps:[]}]})
     await first
     assert.equal(reads.length,2)
-    const manual=page.load(true)
-    assert.equal(reads[1].signal.aborted,true)
+    const manual=page.load(true,true)
+    assert.equal(reads[1].signal.aborted,false)
+    assert.equal(reads.length,2,'手动fresh先合并在途核验，不叠加完整扫描')
+    reads[1].resolve({ok:true,json:async()=>[{uid:'old',title:'在途结果',steps:[]}]})
+    for(let i=0;i<20;i++)await Promise.resolve()
     assert.equal(reads.length,3)
+    assert.equal(reads[2].headers['X-DubForge-Refresh'],'fresh')
     reads[2].resolve({ok:true,json:async()=>[{uid:'latest',title:'最新结果',steps:[]}]})
     await manual
-    reads[1].resolve({ok:true,json:async()=>[{uid:'old',title:'迟到旧结果',steps:[]}]})
-    for(let i=0;i<12;i++)await Promise.resolve()
     assert.equal(page.projects[0].uid,'latest');assert.equal(page.loading,false)
   } finally {disposePinia(pinia)}
 })
 
-test('恢复入口真实传入所选项目，筛选隐藏的选择不被当前列表替代',async()=>{
+test('统一运行入口传入所选项目，筛选隐藏的选择不被当前列表替代',async()=>{
   const {default:Projects}=await server.ssrLoadModule('/src/views/ProjectsView.vue')
   const pinia=createPinia(),nav=useNavStore(pinia),scopes:any[]=[];let page:any
   const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(Projects)})})})
@@ -436,14 +529,16 @@ test('恢复入口真实传入所选项目，筛选隐藏的选择不被当前�
       page=this.$.setupState;page.projects=[{uid:'visible',title:'visible 项目',status:'created',steps:[]},{uid:'hidden',title:'hidden 项目',status:'created',steps:[]}]
       page.sel=new Set(['hidden']);page.searchText='visible'
     }
-    if(this.$options.__name==='BatchWorkflowResume')scopes.push(this.$.props)
+    if(this.$options.__name==='ProjectRunPanel')scopes.push(this.$.props)
   }})
   try{
     const html=await renderToString(app)
     assert.deepEqual(page.sortedProjects.map((p:any)=>p.uid),['visible'])
-    assert.deepEqual(scopes[0].projects.map((p:any)=>p.uid),['hidden'])
-    assert.match(scopes[0].scopeLabel,/所选 1 个项目/);assert.match(scopes[0].scopeLabel,/隐藏/)
-    assert.match(html,/检查恢复所选项目（1）/)
+    const opened:any[]=[];page.stepRun={open:(...args:any[])=>opened.push(args)};page.runSelected()
+    assert.deepEqual(opened[0][0].map((p:any)=>p.uid),['hidden'])
+    assert.match(opened[0][1],/所选 1 个项目/);assert.match(opened[0][1],/隐藏/)
+    assert.equal(scopes.length,1);assert.equal(scopes[0].hiddenTrigger,true)
+    assert.match(html,/运行所选项目（1）/)
     assert.doesNotMatch(html,/继续全部已挂起/)
   }finally{nav.reset();disposePinia(pinia)}
 })
@@ -467,7 +562,9 @@ for(const key of ['translate','assemble'])test(`${key}挂起且上游需更新�
 })
 
 for (const state of [
-  { name: '当前阶段剩余时间', status: 'running', eta_seconds: 180, eta_scope: 'phase', eta: '当前阶段预计剩余约 3 分钟' },
+  { name: '当前阶段剩余时间', status: 'running', job_id: 19, eta_seconds: 180, eta_scope: 'phase', eta: '当前阶段预计剩余约 3 分钟',
+    execution: { schema: 1, owner: 'step', state: 'running', job_id: 19, phase: 'encoding', completed: 42.5, total: 100, unit: '成片秒' } },
+  { name: '缺少阶段身份时隐藏旧ETA', status: 'running', eta_seconds: 180, eta_scope: 'phase' },
   { name: '估算百分比和长时间', status: 'running', eta_seconds: 7200, progress_estimated: true, eta: '预计剩余约 120 分钟' },
   { name: '无剩余时间', status: 'running', eta_seconds: null },
   { name: '未知进度只显示阶段', status: 'running', progress_indeterminate: true },
@@ -497,44 +594,67 @@ for (const state of [
       const html = await renderToString(app)
       assert.match(html, /发布到B站/)
       assert.doesNotMatch(html, /独立确认，不随勾选步骤自动投稿/)
-      assert.match(html, /仅运行勾选制作步骤/)
-      assert.doesNotMatch(html, /aria-label="选择发布到B站"/)
+      assert.match(html, /运行项目/);assert.doesNotMatch(html, /仅运行勾选制作步骤|设置本次流程/)
+      assert.doesNotMatch(html, /本次运行包含发布到B站|选择合成成片/)
       assert.ok(html.indexOf('publication-step') > html.indexOf('class="row"'))
       if (state.status === 'done') {
-        assert.doesNotMatch(html, /class="pbar"/)
+        assert.doesNotMatch(html, /aria-label="执行过程"/)
       } else if (state.progress_indeterminate) {
-        assert.match(html, /class="pbar-eta"[^>]*>视频编码<\/span>/)
-        assert.doesNotMatch(html, /class="pbar-inner"|class="pbar-value"/)
+        assert.match(html, /视频编码/)
+        assert.doesNotMatch(html, /class="execution-bar"/)
       } else {
-        assert.match(html, /aria-label="合成成片进度"/)
-        assert.match(html, state.progress_estimated ? />预计 42\.5%<\/span>/ : />42\.5%<\/span>/)
+        assert.match(html, /aria-label="执行过程"/)
+        assert.match(html, state.execution ? /当前编码阶段 42\.5%/ : state.progress_estimated ? /本阶段估算 42\.5%/ : /本阶段 42\.5%/)
         if (state.eta) {
           assert.ok(html.includes(state.eta))
-          // 时间必须在条形/百分比容器闭合后出现，不能再嵌在零行高轨道里。
-          assert.match(html, /class="pbar-value"[^>]*>[^<]+<\/span><\/span>\s*<span class="pbar-eta"/)
+          assert.ok(html.indexOf('class="execution-estimate"') > html.indexOf('class="execution-bar"'))
         } else {
-          assert.doesNotMatch(html, /class="pbar-eta"/)
+          assert.doesNotMatch(html, /class="execution-estimate"/)
         }
       }
     } finally { nav.reset(); disposePinia(pinia) }
   })
 }
 
+test('总览应用项目基础设置成功后立即刷新步骤状态', async t => {
+  const { default: Pipeline } = await server.ssrLoadModule('/src/views/PipelineView.vue')
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/projects/:uid', component: Pipeline }] })
+  await router.push('/projects/binding-refresh')
+  nav.$patch({ uid: 'binding-refresh', title: '应用设置刷新验证', stepsLoaded: true, steps: [] })
+  let refreshes = 0, onChanged: (() => void) | undefined
+  t.mock.method(nav, 'poll', async () => { refreshes++ })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, {
+    default: () => h(NDialogProvider, null, { default: () => h(RouterView) }),
+  }) })
+  app.use(pinia); app.use(router); setup(app)
+  app.mixin({ created() {
+    if (this.$options.__name === 'ProjectTemplateBinding') onChanged = this.$.vnode.props?.onChanged
+  } })
+  try {
+    await renderToString(app)
+    assert.equal(typeof onChanged, 'function')
+    onChanged!()
+    await nextTick()
+    assert.equal(refreshes, 1)
+  } finally { nav.reset(); disposePinia(pinia) }
+})
+
 test('总览进度布局：时间正常占行，百分比不绝对定位，窄容器允许换行', async () => {
-  const { descriptor } = parse(await readFile(new URL('../src/views/PipelineView.vue', import.meta.url), 'utf8'))
+  const { descriptor } = parse(await readFile(new URL('../src/components/ExecutionProgress.vue', import.meta.url), 'utf8'))
   const css = postcss.parse(descriptor.styles.map(style => style.content).join('\n'))
   const declarations = (selector: string) => {
     const result: Record<string, string> = {}
     css.walkRules(selector, rule => { rule.walkDecls(decl => { result[decl.prop] = decl.value }) })
     return result
   }
-  assert.equal(declarations('.pbar').display, 'grid')
-  assert.ok(Number(declarations('.pbar')['line-height']) >= 1)
-  assert.equal(declarations('.pbar')['max-width'], '100%')
-  assert.equal(declarations('.pbar-inner')['grid-template-columns'], 'minmax(0, 1fr) auto')
-  assert.equal(declarations('.pbar-value').position, undefined)
-  assert.notEqual(declarations('.pbar-eta')['white-space'], 'nowrap')
-  assert.equal(declarations('.row')['flex-wrap'], 'wrap')
+  assert.equal(declarations('.execution-progress')['max-width'], '100%')
+  assert.ok(Number(declarations('.execution-progress')['line-height']) >= 1)
+  assert.equal(declarations('.execution-bar').display, 'flex')
+  assert.equal(declarations('.execution-bar')['flex-wrap'], 'wrap')
+  assert.equal(declarations('.execution-bar>span').position, undefined)
+  assert.notEqual(declarations('.execution-estimate')['white-space'], 'nowrap')
+  assert.equal(declarations('.execution-facts')['flex-wrap'], 'wrap')
 })
 
 test('真实总览区分自动投稿策略和稿件状态，制作间隙不退回待准备或开放手动运行',async()=>{
@@ -547,11 +667,11 @@ test('真实总览区分自动投稿策略和稿件状态，制作间隙不退�
   app.use(pinia);app.use(router);setup(app)
   try{
     const html=await renderToString(app)
-    assert.match(html,/执行终点/);assert.match(html,/自动投稿/);assert.match(html,/准备发布资料/)
+    assert.match(html,/项目交付终点/);assert.match(html,/自动投稿/);assert.match(html,/准备发布资料/)
     assert.match(html,/data-source-kind="series"/);assert.match(html,/停止完整流程/)
     assert.doesNotMatch(html,/独立确认，不随勾选步骤自动投稿|待准备/)
-    const manual=[...html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(m=>m[0]).find(b=>b.includes('仅运行勾选制作步骤'))
-    assert.ok(manual);assert.match(manual,/disabled/)
+    assert.doesNotMatch(html,/检查并运行勾选范围|按当前勾选运行制作|设置本次流程/)
+    assert.match(html,/各步骤保存处理参数与可选功能/)
     assert.equal(nav.busy,true)
   }finally{nav.reset();disposePinia(pinia)}
 })
@@ -681,12 +801,17 @@ for (const key of keys) {
         assert.ok(html.includes(label), `必须显示正确状态：${label}`)
         if(state.status==='done' && !state.fresh)assert.match(html,/freshness-badge/)
         else assert.doesNotMatch(html,/freshness-badge/)
+        if (key === 'tts') {
+          assert.match(html, /默认覆盖当前槽/)
+          assert.match(html, /需要对比不同声音时可主动选择新槽/)
+          assert.doesNotMatch(html, /默认新建|默认新槽|默认写入共同新槽/)
+        }
         if (key === 'assemble') {
           assert.match(html, /选择成品方案/)
           assert.match(html, /成片版本/)
           assert.match(html, /继承规则/)
-          assert.match(html, /成品文件/)
-          assert.match(html, /同版本再次生成将替换自身/)
+          assert.match(html, /正式成品与原片/)
+          assert.match(html, /尚未生成正式成品/)
           assert.doesNotMatch(html, /当前字幕方案|加入本次清单|生成清单成品/)
           assert.doesNotMatch(html, /重做本步产物|n-checkbox--checked/)
         }
@@ -698,16 +823,16 @@ for (const key of keys) {
   }
 }
 
-test('语义整理真实运行页说明全文和low思考强度，关闭LLM时不宣称全文模型整理',async t=>{
+test('语义整理真实运行页说明自动分块和low思考强度，零上下文与关闭LLM均正确显示',async t=>{
   const requests:any[]=[]
   t.mock.method(globalThis,'fetch',(url,options)=>{requests.push({url:String(url),method:options?.method||'GET'});return new Promise(()=>{})})
-  for(const useLlm of [true,false]){
+  for(const [useLlm,overlap] of [[true,undefined],[true,0],[false,undefined]] as const){
     const pinia=createPinia(),nav=useNavStore(pinia)
     const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
     await router.push('/projects/full-semantic-fixture/steps/split')
     nav.$patch({uid:'full-semantic-fixture',title:'全文整理回归',stepsLoaded:true,steps:[{
       key:'split',label:STEP_LABELS.split,status:'running',fresh:false,selected:true,
-      cfg:{split:{use_llm:useLlm,thinking_mode:'low'}},artifacts:[],inputs:[],outputs:[],unready_inputs:[],affected_steps:[],
+      cfg:{split:{use_llm:useLlm,thinking_mode:'low',llm_chunk_overlap_words:overlap}},artifacts:[],inputs:[],outputs:[],unready_inputs:[],affected_steps:[],
     }]})
     const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
     app.use(pinia);app.use(router);setup(app)
@@ -715,11 +840,10 @@ test('语义整理真实运行页说明全文和low思考强度，关闭LLM时�
       const html=await renderToString(app)
       if(useLlm){
         assert.match(html,/全文语义整理/)
-        assert.match(html,/一次提供整段原文、时间轴和真实长静音/)
+        assert.ok(html.includes(`短稿一次整理；长稿自动按约500词分块，块间保留约${overlap ?? 80}词上下文；每块独立校验，最多尝试3次`))
         assert.match(html,/思考参数的实际生效值见下方设置预览/)
         assert.doesNotMatch(html,/在支持的模型上关闭思考/)
-        assert.match(html,/质量问题最多定向重试一次/)
-        assert.doesNotMatch(html,/主动小窗|逐块缓存|局部缩窗/)
+        assert.doesNotMatch(html,/一次提供整段原文|质量问题最多定向重试一次/)
       }else{
         assert.doesNotMatch(html,/全文语义整理|思考参数的实际生效值见下方设置预览/)
       }
@@ -797,6 +921,53 @@ test('下载失败页展示具体超时原因，不笼统承诺历史文件一�
     assert.match(html, /步骤日志中的具体原因与文件保留、清理记录/)
     assert.doesNotMatch(html, /正式产物会保留/)
   } finally { nav.reset(); disposePinia(pinia) }
+})
+
+test('语义整理响应预算错误说明不会写入半成品', async () => {
+  const pinia = createPinia(), nav = useNavStore(pinia)
+  const router = createRouter({ history: createMemoryHistory(), routes: [
+    { path: '/projects/:uid/steps/:key', component: StepView },
+  ] })
+  await router.push('/projects/split-budget/steps/split')
+  nav.$patch({ uid: 'split-budget', title: '语义整理预算回归', stepsLoaded: true, steps: [{
+    key: 'split', label: '语义整理', status: 'failed', fresh: false, progress: 22,
+    cfg: {}, artifacts: [], inputs: [], outputs: [], unready_inputs: [], affected_steps: [],
+    error: { code: 'LLM_OUTPUT_BUDGET', message: 'LLM 正文超过任务响应体积上限',
+      suggestion: '请减少本次响应内容后重试。', detail: { channel: 'content' } },
+  }] })
+  const app = createSSRApp({ render: () => h(NMessageProvider, null, {
+    default: () => h(NDialogProvider, null, { default: () => h(RouterView) }),
+  }) })
+  app.use(pinia); app.use(router); setup(app)
+  try {
+    const html = await renderToString(app)
+    assert.match(html, /响应正文超过本步骤安全上限/)
+    assert.match(html, /候选不会写入/)
+    assert.match(html, /LLM_OUTPUT_BUDGET/)
+  } finally { nav.reset(); disposePinia(pinia) }
+})
+
+test('合成页评论错误直达独立评论工作区，下载页不再嵌入评论诊断', async () => {
+  for(const key of ['assemble','download']) {
+    const pinia=createPinia(),nav=useNavStore(pinia)
+    const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+    await router.push(`/projects/comment-error/steps/${key}${key==='download'?'?comment_action=translate#llm-conversation':''}`)
+    nav.$patch({uid:'comment-error',title:'评论失败回归',stepsLoaded:true,steps:[{
+      key,label:STEP_LABELS[key],status:key==='assemble'?'failed':'done',fresh:true,selected:true,cfg:{},artifacts:[],inputs:[],outputs:[],unready_inputs:[],affected_steps:[],
+      error:key==='assemble'?{code:'COMMENTS_AI_FAILED',message:'评论 AI 处理失败',suggestion:'核对评论'}:null,
+    }]})
+    let diagnostics:any
+    const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+    app.use(pinia);app.use(router);setup(app)
+    app.mixin({created(){if(this.$options.__name==='CommentDiagnostics')diagnostics=this.$.setupState}})
+    try {
+      const html=await renderToString(app)
+      if(key==='assemble') {
+        assert.match(html,/核对评论与上屏方案/);assert.match(html,/查看评论 AI 日志/)
+        assert.match(html,/\/projects\/comment-error\/comments#llm-conversation/)
+      } else {assert.equal(diagnostics,undefined);assert.doesNotMatch(html,/评论 LLM 对话与日志/)}
+    } finally {nav.reset();disposePinia(pinia)}
+  }
 })
 
 test('实际成品组件：空选无请求，取消不执行，确认严格提交勾选方案', async t => {
@@ -1054,14 +1225,17 @@ test('试片跟随当前三维组合，原声无需配音依赖；检查期间�
     uid: 'fixture', artifacts: [], sourceUrl: '/isolated-video.mp4', choice,
   }) }) })
   app.use(pinia); setup(app)
-  app.mixin({ created() { if (this.$options.__name === 'AssemblePreviewPanel') panel = this.$.setupState } })
+  app.mixin({ created() { if (this.$options.__name === 'AssemblePreviewPanel') {
+    panel = this.$.setupState
+    panel.onMeta({ target: { duration: 200 } }); panel.setStart(1); panel.setEnd(3)
+  } } })
   try {
     const html = await renderToString(app)
     assert.match(html, /跟随上方“当前组合”/)
     assert.doesNotMatch(html, /默认方案|本次试片叠加已确认评论/)
     for (let i = 0; i < 10; i++) await Promise.resolve()
     panel.onMeta({ target: { duration: 200 } }); panel.setStart(1); panel.setEnd(3)
-    assert.equal(panel.fmt(124.5), '2:04.5'); assert.equal(panel.canSubmit, true)
+    assert.equal(panel.fmt(124.5), '00:02:04.500'); assert.equal(panel.canSubmit, true)
     const work = panel.submit(); await nextTick()
     choice.dubbing = true; choice.include_comments = false
     release(); await work
@@ -1103,7 +1277,7 @@ test('字幕工作区直达页无配音运行入口，草稿离开确认合并�
     assert.match(html, /字幕设置/)
     assert.match(html, /字幕文件/)
     assert.match(html, /返回校对与配音/)
-    assert.doesNotMatch(html, /重做全项目配音…/)
+    assert.doesNotMatch(html, /生成全部配音…|补齐未完成配音/)
     assert.equal(panel.activePane, 'subtitles')
     panel.subtitleDirty = true
     // 连续点击导航只出现一次对话框，取消不能清除草稿。
@@ -1131,7 +1305,7 @@ function commentsFixture() {
   return { rows: [
     { id: 'a', source_hash: 'a1', text: 'Original A <script>bad()</script>', text_zh: '中文评论 A', author: '观众 A' },
     { id: 'b', source_hash: 'b1', text: 'Original B', text_zh: '', author: '观众 B' },
-  ], filter: { items: [{ id: 'a', reason: '具体体验', score: 90 }] }, filter_stale: false,
+  ], default_filter_prompt: '保留相关的具体讨论', filter: { items: [{ id: 'a', reason: '具体体验', score: 90 }] }, filter_stale: false,
   defaults: { start: 5, interval: 15, duration: 6, position: 'top_left', font_size: 36, margin: 60, show_author: false,
     language_mode: 'translated', source_first: false, background_color: '#000000', background_opacity: 50 },
   fields:[{path:'comments.background_color',label:'文字底色',type:'color'}, {path:'comments.background_opacity',label:'底色不透明度',type:'int'}, {path:'comments.outline_color',label:'描边颜色',type:'color'}, {path:'comments.outline',label:'描边粗细',type:'float'}],
@@ -1140,11 +1314,18 @@ function commentsFixture() {
 
 async function renderComments(t: any, seed: (panel: any) => void = () => {}) {
   const { default: Panel } = await server.ssrLoadModule('/src/components/CommentStudioPanel.vue')
+  const fixtureData = commentsFixture()
+  // 初始化读必须有真实结束点；后续动作会复用正在进行的评论读取。
+  t.mock.method(globalThis, 'fetch', async (_url: any, options: any) => {
+    assert.equal(options?.method, undefined, '初始化只允许读取评论')
+    return { ok: true, json: async () => JSON.parse(JSON.stringify(fixtureData)) }
+  })
+  const diagnostics: any[] = []
   const router = createRouter({ history: createMemoryHistory(), routes: [
-    { path: '/projects/:uid/steps/:key', component: Panel, props: route => ({ uid: route.params.uid }) },
+    { path: '/projects/:uid/steps/:key', component: Panel, props: route => ({ uid: route.params.uid, onShowDiagnostics: (action:any) => diagnostics.push(action) }) },
   ] })
   await router.push('/projects/comments-fixture/steps/download')
-  let panel: any
+  let panel: any, processPanel: any
   const prompts: any[] = []
   const bridge = { setup() {
     const dialog = useDialog()
@@ -1157,29 +1338,29 @@ async function renderComments(t: any, seed: (panel: any) => void = () => {}) {
   app.use(router); setup(app)
   app.mixin({ created() {
     if (this.$options.__name === 'CommentStudioPanel') {
-      panel = this.$.setupState; const value = commentsFixture(); panel.state = value; panel.hydrate(value); seed(panel)
+      panel = this.$.setupState; panel.state = fixtureData; panel.hydrate(fixtureData); seed(panel)
     }
+    if (this.$options.__name === 'CommentProcessPanel') processPanel = this.$.setupState
   } })
-  return { html: await renderToString(app), panel, prompts, router }
+  return { html: await renderToString(app), panel, processPanel, prompts, router, diagnostics }
 }
 
-test('评论 UI 中文优先、原文对照安全显示，AI 建议不自动勾选', async t => {
+test('评论 UI 中文优先、原文对照安全显示，统一准备入口不自动勾选', async t => {
   const { html, panel } = await renderComments(t, panel => { panel.compare = true })
   assert.match(html, /中文评论 A/)
   assert.match(html, /Original A &lt;script&gt;/)
   assert.doesNotMatch(html, /<script>bad/)
-  assert.match(html, /全部翻译成中文/)
-  assert.equal(panel.items.length, 0)
-  assert.equal(panel.dirty, false)
-  panel.useCandidates()
+  assert.match(html, /准备目标数量评论/)
+  assert.equal(panel.items.length, 0);assert.equal(panel.dirty, false)
+  panel.toggle(panel.rows[0],true)
   assert.deepEqual(panel.items.map((row: any) => row.id), ['a'])
   assert.equal(panel.items[0].display_text, '中文评论 A')
-  assert.equal(panel.dirty, true)
+  assert.equal(panel.items[0].selection_origin,'manual');assert.equal(panel.dirty,true)
   panel.onlySuggested = true
   panel.toggle(panel.rows[1], true)
   assert.equal(panel.items.length, 2) // 隐藏项仍被选中，不能静默丢弃。
   panel.move(1, -1)
-  assert.equal(panel.items[0].id, 'b')
+  assert.equal(panel.items[0].id, 'b');assert.equal(panel.orderMode,'manual')
 })
 
 test('评论来源与统一标识一致；修改立即标项目，恢复继承回到真实模板', async t => {
@@ -1215,6 +1396,66 @@ test('评论翻译只发显式请求，重复点击合并，译文更新不覆�
   assert.equal(panel.dirty, true)
 })
 
+test('评论失败入口携带实际翻译动作，成功重读清除旧连接错误但保留真实任务失败', async t => {
+  const { panel, processPanel, diagnostics, html } = await renderComments(t, p => p.state.job={action:'translate',status:'failed',error:'模型请求失败',suggestion:'重试未完成项'})
+  assert.match(html,/获取原文.*评论评分.*按需翻译.*上屏方案/)
+  processPanel.emit('show-diagnostics',processPanel.detail.action);assert.deepEqual(diagnostics,['translate'])
+  const value=commentsFixture();value.job={action:'translate',status:'failed',error:'模型请求失败',suggestion:'重试未完成项'} as any
+  t.mock.method(globalThis,'fetch',async()=>({ok:true,json:async()=>value}))
+  panel.error='旧连接错误';await panel.load()
+  assert.equal(panel.error,'');assert.equal(panel.job.error,'模型请求失败');assert.equal(panel.job.suggestion,'重试未完成项')
+})
+
+test('评论重试只发送失败和暂缓编号，审核拦截单独说明并保留', async t => {
+  const {panel,html}=await renderComments(t,p=>{
+    p.state.rows[0].ai_issues={translate:{status:'blocked',message:'服务商拒绝'}}
+    p.state.rows[1].ai_issues={translate:{status:'failed',message:'格式错误'}}
+    p.state.rows.push({id:'c',source_hash:'c1',text:'第三条',text_zh:'',ai_issues:{translate:{status:'deferred',message:'预算用尽'}}})
+  })
+  assert.match(html,/服务商审核拦截 1 条/);assert.match(html,/暂缓处理 1 条/);assert.match(html,/处理失败 1 条/)
+  assert.match(html,/重试只补处理失败与暂缓项/)
+  const calls:any[]=[]
+  t.mock.method(globalThis,'fetch',async(url,options)=>{
+    if(options?.method)calls.push([String(url),JSON.parse(String(options.body))])
+    return {ok:true,json:async()=>commentsFixture()}
+  })
+  assert.deepEqual(panel.retryIds('translate'),['b','c']);await panel.retry('translate')
+  assert.deepEqual(calls,[['/api/projects/comments-fixture/comments/translate',{retry_failed:true,ids:['b','c']}]])
+})
+
+test('统一准备显式提交目标、手选与排除草稿，重复点击合并且不伪造本地候选结果', async t => {
+  const {panel,prompts}=await renderComments(t,p=>{
+    p.limit=2
+    p.state.available_assessments=[{id:'a',eligible:true,score:90},{id:'b',eligible:true,score:80},{id:'c',eligible:true,score:70}]
+    p.state.rows.push({id:'c',source_hash:'c1',text:'第三条',text_zh:'',ai_issues:{translate:{status:'failed'}}})
+    p.state.rows[1].review_blocked=true
+  })
+  panel.toggle(panel.rows[0],true);panel.editText(panel.items[0],'display_text','手工保留的内容')
+  panel.toggle(panel.rows[2],true);panel.toggle(panel.rows[2],false)
+  const manual=JSON.parse(JSON.stringify(panel.items[0])),value=JSON.parse(JSON.stringify(panel.state))
+  value.preparation={draft:{items:[manual],excluded_ids:[{id:'c',source_hash:'c1'}],order_mode:'chronological'},summary:{ready:1},warnings:['部分候选不可用']}
+  let resolve:any;const writes:any[]=[]
+  t.mock.method(globalThis,'fetch',(url:any,options:any)=>{
+    if(options?.method){writes.push({url:String(url),body:JSON.parse(options.body)});return new Promise(done=>{resolve=()=>done({ok:true,json:async()=>value})})}
+    return Promise.resolve({ok:true,json:async()=>String(url).endsWith('/progress')?{}:value})
+  })
+  assert.equal(writes.length,0)
+  const preparing=panel.prepareTarget();await panel.prepareTarget()
+  assert.equal(writes.length,1);assert.equal(panel.pending,'prepare')
+  assert.equal(writes[0].url,'/api/projects/comments-fixture/comments/prepare')
+  assert.equal(writes[0].body.target,2);assert.equal(writes[0].body.prompt,'保留相关的具体讨论')
+  assert.equal(writes[0].body.items[0].display_text,'手工保留的内容')
+  assert.equal(writes[0].body.items[0].selection_origin,'manual')
+  assert.deepEqual(writes[0].body.excluded_ids,[{id:'c',source_hash:'c1'}])
+  assert.equal(panel.items[0].display_text,'手工保留的内容');assert.equal(prompts.length,0)
+  resolve();await preparing
+  assert.deepEqual(panel.items.map((row:any)=>row.id),['a'])
+  assert.equal(panel.items[0].display_text,'手工保留的内容')
+  assert.equal(panel.state.rows.find((row:any)=>row.id==='b').review_blocked,true)
+  assert.equal(panel.state.rows.find((row:any)=>row.id==='c').ai_issues.translate.status,'failed')
+  assert.equal(panel.dirty,true);assert.equal(prompts.length,0,'准备结果只是草稿，尚未确认保存')
+})
+
 test('评论确认可取消；保存是独立快照，不触发合成，失败保留草稿', async t => {
   const { panel, prompts } = await renderComments(t)
   panel.toggle(panel.rows[0], true)
@@ -1237,19 +1478,24 @@ test('评论确认可取消；保存是独立快照，不触发合成，失败�
   assert.equal(panel.dirty, true)
 })
 
-test('评论草稿只在修改后拦截离开，确认合并；超长文本不静默截断', async t => {
+test('评论草稿离开确认合并；手动长文完整可用，空文仍需补齐', async t => {
   const { panel, prompts } = await renderComments(t)
   assert.equal(panel.beforeLeave(), true)
   panel.rows[0].text_zh = '长'.repeat(241)
   panel.toggle(panel.rows[0], true)
   assert.equal(panel.items[0].display_text.length, 241)
-  assert.equal(panel.invalid, true)
-  panel.confirmPlan(); assert.equal(prompts.length, 0)
+  assert.equal(panel.hasLengthWarning(panel.items[0]),true)
+  assert.equal(panel.invalid,false);assert.equal(panel.previewInvalid,false)
+  assert.equal(panel.plannedItems.length,1)
+  panel.confirmPlan();assert.equal(prompts.length,1);prompts[0].onNegativeClick()
+  panel.editText(panel.items[0],'display_text','')
+  assert.equal(panel.invalid,true);panel.confirmPlan();assert.equal(prompts.length,1,'空的当前语言正文仍阻止确认')
+  panel.editText(panel.items[0],'display_text','长'.repeat(241))
   const first = panel.beforeLeave(), second = panel.beforeLeave()
-  assert.equal(first, second); assert.equal(prompts.length, 1)
-  prompts[0].onNegativeClick(); assert.equal(await first, false)
-  assert.equal(panel.dirty, true)
-  const leave = panel.beforeLeave(); prompts[1].onPositiveClick(); assert.equal(await leave, true)
+  assert.equal(first, second);assert.equal(prompts.length,2)
+  prompts[1].onNegativeClick();assert.equal(await first,false);assert.equal(panel.dirty,true)
+  const leave = panel.beforeLeave();prompts[2].onPositiveClick();assert.equal(await leave,true)
+  assert.equal(panel.items[0].display_text.length,241)
 })
 
 test('评论旧轮询不能覆盖新读取；外部方案变化不覆盖本地草稿', async t => {
@@ -1260,8 +1506,10 @@ test('评论旧轮询不能覆盖新读取；外部方案变化不覆盖本地�
   t.mock.method(globalThis, 'fetch', () => ++count === 1 ? new Promise(done => { resolve = done })
     : Promise.resolve({ ok: true, json: async () => fresh }))
   panel.toggle(panel.rows[0], true)
-  const pending = panel.load(); await panel.load()
-  resolve({ ok: true, json: async () => old }); await pending
+  const pending = panel.load(), repeated = panel.load()
+  assert.equal(pending, repeated)
+  await Promise.resolve(); assert.equal(count, 1)
+  resolve({ ok: true, json: async () => old }); await pending; await repeated; await nextTick()
   assert.equal(panel.rows[0].text_zh, '新译文')
   assert.equal(panel.items[0].display_text, '中文评论 A')
   assert.equal(panel.revision, 'rev-0')
@@ -1297,8 +1545,8 @@ test('双语评论直接编辑两种文字，共用底色与透明控件，不�
   assert.match(html, /描边粗细/)
   assert.match(html, /评论配色预设/)
   assert.match(html, /刻度为评论开始点/)
-  assert.match(html, /定位到 00:05.0/)
-  assert.match(html, /紧凑评论列表/)
+  assert.match(html, /定位到 00:00:05.0/)
+  assert.match(html, /aria-label="评论资料列表"/)
   assert.doesNotMatch(html, /核对原文|采用当前译文/)
   assert.equal(panel.settings.position, 'top_left')
   assert.equal(panel.settings.outline_color, '#000000')
@@ -1361,45 +1609,55 @@ test('打开的真实配色弹层完整显示 16 色，分类后仅展示对应�
   }
 })
 
-test('评分缓存可即时改变前 N 条且不调用 AI，应用数量保留编辑并确认移出', async t => {
+test('改目标不调用AI或改变手选；统一准备补减自动项，最后独立确认保存', async t => {
   const { panel, prompts } = await renderComments(t, panel => {
-    panel.state.rows[1].text_zh = '中文评论 B' // 排序测试使用可上屏评论，缺译文应另行自动排除。
-    panel.state.filter = { items: [], assessments: [
-      { id: 'a', score: 80, eligible: true, reason: '共鸣', outcome: 'selected' },
-      { id: 'b', score: 90, eligible: true, reason: '幽默', outcome: 'limit' },
-    ] }
+    panel.state.rows[0].timestamp=10;panel.state.rows[1].timestamp=20
+    panel.state.rows[1].text_zh='中文评论 B'
+    panel.state.filter={items:[],assessments:[
+      {id:'a',score:80,eligible:true,reason:'共鸣',outcome:'selected'},
+      {id:'b',score:90,eligible:true,reason:'幽默',outcome:'limit'},
+    ]}
   })
-  let requests = 0
-  t.mock.method(globalThis, 'fetch', async () => { requests++; throw new Error('本地调数量不能请求接口') })
-  panel.limit = 1
-  assert.deepEqual(panel.suggestions.map((r: any) => r.id), ['b'])
-  assert.equal(panel.assessmentLabel('b'), '90 分')
-  assert.match(panel.assessmentReason('a'), /不在当前前 N 条/)
-  panel.toggle(panel.rows[0], true); panel.items[0].display_text = '保留人工改写'
-  panel.limit = 2
-  assert.equal(panel.items.length, 1) // 仅调数量不改变待上屏清单。
-  panel.useCandidates()
-  assert.deepEqual(panel.items.map((r: any) => r.id), ['b', 'a'])
-  assert.equal(panel.items[1].display_text, '保留人工改写')
-  panel.limit = 1; panel.useCandidates()
-  assert.equal(panel.items.length, 2)
-  prompts[0].onNegativeClick?.()
-  assert.equal(panel.items.length, 2)
-  panel.useCandidates(); prompts[1].onPositiveClick()
-  assert.deepEqual(panel.items.map((r: any) => r.id), ['b'])
-  panel.items[0].display_text = '原文更新前的人工改写'
-  panel.rows.find((row: any) => row.id === 'b').source_hash = 'updated-source'
-  panel.useCandidates()
-  assert.match(prompts[2].content, /替换 1 条原文已变化/)
-  assert.equal(panel.items[0].display_text, '原文更新前的人工改写')
-  prompts[2].onPositiveClick()
-  assert.equal(panel.items[0].source_hash, 'updated-source')
-  assert.equal(requests, 0)
+  let reads=0
+  t.mock.method(globalThis,'fetch',async()=>{reads++;throw new Error('本地调数量不能请求接口')})
+  panel.limit=1
+  assert.deepEqual(panel.suggestions.map((row:any)=>row.id),['b'])
+  assert.equal(panel.assessmentLabel('b'),'90 分');assert.match(panel.assessmentReason('a'),/不在当前前 N 条/)
+  panel.toggle(panel.rows[0],true);panel.editText(panel.items[0],'display_text','保留人工改写')
+  panel.limit=2
+  assert.equal(panel.items.length,1);assert.equal(reads,0)
+  const writes:any[]=[];let current=JSON.parse(JSON.stringify(panel.state))
+  t.mock.method(globalThis,'fetch',async(url:any,options:any)=>{
+    if(options?.method){
+      const body=JSON.parse(options.body);writes.push({url:String(url),body})
+      assert.ok(String(url).endsWith('/comments/prepare'))
+      const manual=body.items.filter((item:any)=>item.selection_origin==='manual')
+      const auto=body.target>1?[{id:'b',source_hash:'b1',text:'Original B',source_text:'Original B',display_text:'中文评论 B',selection_origin:'automatic',timestamp:20}]:[]
+      current={...current,preparation:{draft:{items:[...manual,...auto],excluded_ids:body.excluded_ids,order_mode:'chronological'},summary:{ready:manual.length+auto.length},warnings:[]}}
+    }
+    return {ok:true,json:async()=>String(url).endsWith('/progress')?{}:current}
+  })
+  await panel.prepareTarget()
+  assert.deepEqual(panel.items.map((row:any)=>row.id),['a','b'],'上屏按评论时间，不按评分排名')
+  assert.equal(panel.items[0].display_text,'保留人工改写');assert.equal(panel.items[0].selection_origin,'manual')
+  assert.equal(panel.items[1].selection_origin,'automatic');assert.equal(prompts.length,0)
+  panel.limit=1
+  assert.equal(panel.items.length,2,'只编辑目标不改草稿')
+  await panel.prepareTarget()
+  assert.deepEqual(panel.items.map((row:any)=>row.id),['a'],'减少目标也不移除手动保留项')
+  assert.equal(panel.items[0].display_text,'保留人工改写')
+  assert.deepEqual(writes.map(call=>call.body.target),[2,1])
+  assert.ok(writes.every(call=>call.body.items.some((item:any)=>item.id==='a' && item.display_text==='保留人工改写')))
+  panel.confirmPlan();assert.equal(prompts.length,1);assert.match(prompts[0].content,/仅保存，不会自动合成/)
+  prompts[0].onNegativeClick();assert.equal(panel.dirty,true);assert.equal(writes.length,2)
 })
 
 test('评分失败或未更新时不编造淘汰理由；修改标准不悄悄触发新评分', async t => {
   const { panel } = await renderComments(t)
-  assert.match(panel.assessmentReason('b'), /旧版筛选未记录/)
+  assert.match(panel.assessmentReason('b'), /尚无有效评分/)
+  panel.hydrate({...panel.state,overlay:{items:[{id:'a',source_hash:'a1',text:'Original A',source_text:'Original A',display_text:'已确认中文'}]}})
+  assert.equal(panel.items[0].selection_origin,'automatic','未记录来源的旧选择静默归为自动')
+  assert.equal(panel.selectionLabel(panel.items[0]),'自动选择')
   let requests = 0
   t.mock.method(globalThis, 'fetch', () => { requests++; return new Promise(() => {}) })
   panel.prompt = '只保留让人有共鸣的反馈'
@@ -1407,4 +1665,137 @@ test('评分失败或未更新时不编造淘汰理由；修改标准不悄悄�
   assert.equal(requests, 0)
   panel.state.filter_stale = true
   assert.equal(panel.suggestions.length, 0)
+})
+
+test('同Job轻量终态到慢full之间显示产物核验中，错误重试入口和未保存参数仍保留',async t=>{
+  const pinia=createPinia(),nav=useNavStore(pinia)
+  const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+  await router.push('/projects/terminal-handoff/steps/assemble')
+  const previous={key:'assemble',label:'合成成片',status:'running',job_id:19,fresh:true,selected:false,cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[]}
+  const steps=createExecutionProjection().apply([previous],[{key:'assemble',status:'done',job_id:19,progress:100,
+    execution:{schema:1,owner:'step',job_id:19,state:'completed',label:'登记结果与清理临时文件'}}]).steps
+  nav.$patch({uid:'terminal-handoff',stepsLoaded:true,steps,stepsError:'步骤状态未更新：请求超时。请重新核对。'})
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(RouterView)})})})
+  app.use(pinia);app.use(router);setup(app)
+  let reread:any;const refreshes:any[]=[]
+  t.mock.method(nav,'poll',async(...args:any[])=>{refreshes.push(args)})
+  app.mixin({created(){
+    if(this.$options.__name==='StepView')this.$.setupState.stepParametersDirty=true
+    if(this.$options.name==='Button'&&this.$slots.default?.().some((node:any)=>node.children==='重新核对'))reread=this.$.vnode.props?.onClick
+  }})
+  try {
+    const html=await renderToString(app),text=html.replace(/<[^>]*>/g,' ').replace(/\s+/g,' ')
+    assert.match(text,/任务已结束，产物核验中/);assert.match(text,/请求超时/);assert.match(text,/重新核对/)
+    assert.match(text,/步骤参数尚未保存/)
+    const toolbar=html.slice(html.indexOf('<div class="step-action-toolbar"'),html.indexOf('<nav class="workflow-stage-navigation"'))
+    assert.match(toolbar,/data-action-mode="checking"/);assert.match(toolbar,/disabled[^>]*>[\s\S]*?产物核验中/)
+    assert.doesNotMatch(toolbar,/暂停|停止|强制结束|重做本步|更多运行操作/)
+    assert.equal(nav.busy,true);assert.equal(nav.stepMap.assemble.fresh,null)
+    assert.equal(typeof reread,'function');await reread({type:'click'});assert.deepEqual(refreshes,[[true]])
+  } finally {nav.reset();disposePinia(pinia)}
+})
+
+const checkingVersion = {id:'v-check',name:'核验入口版本',dubbing:false,burn_subtitles:true,include_comments:false,overrides:{}}
+async function renderAssemblyEntry(t:any, step:any) {
+  const pinia=createPinia(),nav=useNavStore(pinia)
+  const router=createRouter({history:createMemoryHistory(),routes:[{path:'/projects/:uid/steps/:key',component:StepView}]})
+  await router.push('/projects/checking-entry/steps/assemble')
+  nav.$patch({uid:'checking-entry',stepsLoaded:true,steps:[{key:'assemble',label:'合成成片',cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[],...step}]})
+  t.mock.method(nav,'poll',async()=>{})
+  const prompts:any[]=[]
+  const Probe={setup(){useDialog().warning=((options:any)=>{prompts.push(options);return{destroy(){}}}) as any;return()=>h(RouterView)}}
+  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(Probe)})})})
+  app.use(pinia);app.use(router);setup(app)
+  let workspace:any,workspaceProps:any,preview:any,previewProps:any
+  app.mixin({created(){
+    if(this.$options.__name==='AssemblyVersionWorkspace') {
+      workspace=this.$.setupState;workspaceProps=this.$.props
+      workspace.adopt({revision:1,fingerprint:'checking-fp',defaults:{'assemble.subtitle_track':'trans'},fields:[],versions:[{...checkingVersion}]})
+      workspace.ready=true;workspace.selected=['v-check']
+    }
+    if(this.$options.__name==='AssemblyVersionPreview') {
+      preview=this.$.setupState;previewProps=this.$.props
+      preview.context={duration:60,subtitles:[],comments:[]};preview.seconds=0;preview.length=10;preview.frameOpen=true
+    }
+  }})
+  try {
+    const html=await renderToString(app)
+    return {html,workspace,workspaceProps,preview,previewProps,prompts,nav,
+      close(){if(preview?.image)URL.revokeObjectURL(preview.image);nav.reset();disposePinia(pinia)}}
+  } catch(error) {nav.reset();disposePinia(pinia);throw error}
+}
+function assemblyButtonDisabled(html:string,label:string) {
+  const button=[...html.matchAll(/<button\b([^>]*)>([\s\S]*?)<\/button>/g)]
+    .find(match=>match[2].replace(/<[^>]*>/g,'').replace(/\s+/g,' ').trim()===label)
+  assert.ok(button,`实际组件应显示按钮：${label}`)
+  return /\bdisabled(?:[\s=>]|$)/.test(button[1])
+}
+
+test('合成核验入口：已选版本和可试片范围不能绕过真实工作台禁用发起资源请求',async t=>{
+  const writes:string[]=[]
+  t.mock.method(globalThis,'fetch',async(url:any,init:any)=>{
+    if(init?.method && init.method!=='GET') {
+      writes.push(String(url))
+      if(String(url).endsWith('/plan'))return{ok:true,json:async()=>({versions:[checkingVersion],blockers:[],fingerprint:'unexpected-plan'})}
+      return{ok:false,json:async()=>({message:'测试不执行资源操作'})}
+    }
+    if(String(url).endsWith('/comments'))return{ok:true,json:async()=>({overlay_revision:'checking-overlay'})}
+    return new Promise(()=>{})
+  })
+  const page=await renderAssemblyEntry(t,{status:'checking',job_id:19,fresh:null,freshness_known:false,
+    execution:{schema:1,owner:'step',job_id:19,state:'completed'}})
+  try {
+    assert.deepEqual(page.workspace.selected,['v-check']);assert.equal(page.workspace.allDirty,false)
+    assert.equal(page.workspace.running,false,'核验不伪装物理运行')
+    assert.equal(page.preview.context.duration,60);assert.equal(page.preview.range.end,10)
+    assert.equal(page.preview.trialApplicable,true);assert.equal(page.preview.frameApplicable,true)
+    await page.workspace.generate();await page.preview.trial();await page.preview.render(true)
+    for(const prompt of page.prompts)await prompt.onPositiveClick()
+    assert.deepEqual(writes,[],'核验期间不发plan/run/preview/frame等新增资源请求')
+    assert.equal(page.workspaceProps.disabled,true);assert.equal(page.previewProps.disabled,true)
+    for(const label of ['生成勾选版本（1）','生成有声试片','重新取帧'])assert.equal(assemblyButtonDisabled(page.html,label),true,label)
+    assert.equal(page.prompts.length,0);assert.deepEqual(page.workspace.selected,['v-check'])
+  } finally {page.close()}
+})
+
+test('合成核验入口：真实full解除后恢复所选生成与试片，不靠清空选择隐藏门禁',async t=>{
+  const projection=createExecutionProjection(),previous={key:'assemble',status:'running',job_id:19,fresh:true}
+  const terminal={key:'assemble',status:'done',job_id:19,execution:{schema:1,owner:'step',job_id:19,state:'completed'}}
+  assert.equal(projection.apply([previous],[terminal]).steps[0].status,'checking')
+  const full=projection.mergeFull([{...terminal,job_id:null,fresh:false}],projection.revision)[0]
+  assert.equal(full.status,'done');assert.equal(full.execution.job_id,19)
+  const writes:string[]=[]
+  t.mock.method(globalThis,'fetch',async(url:any,init:any)=>{
+    const path=String(url)
+    if(!init?.method || init.method==='GET') {
+      if(path.endsWith('/comments'))return{ok:true,json:async()=>({overlay_revision:'checked-overlay'})}
+      return new Promise(()=>{})
+    }
+    writes.push(path)
+    if(path.endsWith('/plan'))return{ok:true,json:async()=>({versions:[checkingVersion],blockers:[],fingerprint:'checked-plan'})}
+    if(path.endsWith('/frame'))return new Response('测试帧替身')
+    if(path.endsWith('/preview'))return{ok:true,json:async()=>({status:'started',job_id:20})}
+    return{ok:false,json:async()=>({message:'测试拦截正式执行'})}
+  })
+  const page=await renderAssemblyEntry(t,full)
+  try {
+    assert.equal(page.workspaceProps.disabled,false);assert.equal(page.previewProps.disabled,false)
+    assert.deepEqual(page.workspace.selected,['v-check'])
+    for(const label of ['生成勾选版本（1）','生成有声试片','重新取帧'])assert.equal(assemblyButtonDisabled(page.html,label),false,label)
+    await page.workspace.generate();assert.equal(page.prompts.length,1)
+    assert.equal(writes.filter(path=>path.endsWith('/plan')).length,1)
+    assert.equal(writes.filter(path=>path.endsWith('/run')).length,0,'预检不是执行')
+    await page.prompts[0].onPositiveClick()
+    await page.preview.render(true);await page.preview.trial()
+    for(const suffix of ['/plan','/run','/frame','/preview'])assert.equal(writes.filter(path=>path.endsWith(suffix)).length,1,suffix)
+  } finally {page.close()}
+})
+
+test('合成核验入口：queued沿用原运行定义，不被新增checking接线笼统禁用',async t=>{
+  const page=await renderAssemblyEntry(t,{status:'queued',job_id:20,fresh:false})
+  try {
+    assert.equal(page.workspaceProps.disabled,false,'新增父门禁仅针对checking，保留排队时原编辑策略')
+    assert.equal(page.workspace.running,true)
+    assert.equal(page.workspace.actionLocked,true,'queued仍由原资源动作门禁负责')
+  } finally {page.close()}
 })

@@ -22,6 +22,16 @@ def test_create_project_scaffolding(make_project, isolated_env, pdir):
     assert len(manifest["steps"]) == 9
 
 
+def test_project_status_update_refreshes_manifest(make_project, pdir):
+    from dubforge.domain import crud
+
+    uid = make_project()
+    crud.update_project_status(crud.get_project(uid).id, 'failed')
+    assert json.loads((pdir(uid) / 'manifest.json').read_text(encoding='utf-8'))['status'] == 'failed'
+    crud.update_project_status(crud.get_project(uid).id, 'created')
+    assert json.loads((pdir(uid) / 'manifest.json').read_text(encoding='utf-8'))['status'] == 'created'
+
+
 def test_delete_project_cascades(make_project, isolated_env, pdir):
     from dubforge.domain import crud
     uid = make_project()
@@ -177,10 +187,10 @@ def test_step_param_change_alters_fingerprint(isolated_env):
     p = crud.create_project(title="指纹项目")
     fp1 = compute_fingerprint(p, "preprocess")
     config.set_key("separate.model", "htdemucs_ft")
-    try:
-        assert compute_fingerprint(p, "preprocess") != fp1
-    finally:
-        config.set_key("separate.model", "htdemucs")
+    assert compute_fingerprint(p, "preprocess") == fp1
+    from test_configuration import save
+    save('project:' + p.uid, {'separate.model': 'htdemucs_ft'})
+    assert compute_fingerprint(p, "preprocess") != fp1
 
 
 def test_segmentation_mode_alters_split_fingerprint(isolated_env):
@@ -193,7 +203,8 @@ def test_segmentation_mode_alters_split_fingerprint(isolated_env):
     cfgmod.set_key("asr.segmentation_mode", "phrase")
     transcribe_fp = compute_fingerprint(p, "transcribe")
     phrase_fp = compute_fingerprint(p, "split")
-    cfgmod.set_key("asr.segmentation_mode", "word")
+    from test_configuration import save
+    save('project:' + p.uid, {'asr.segmentation_mode': 'word'})
     assert compute_fingerprint(crud.get_project(p.uid), "transcribe") == transcribe_fp
     assert compute_fingerprint(crud.get_project(p.uid), "split") != phrase_fp
 def test_download_source_change_alters_fingerprint(isolated_env, tmp_path):

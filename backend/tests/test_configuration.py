@@ -47,22 +47,24 @@ def test_source_kind_is_not_guessed_from_template_name_and_is_shared_by_views(ma
     bind([uid], template)
     save('project:' + uid, {'assemble.subtitle_color': '#FFFFFF'})
     data = cfg.resolve(uid)
-    assert data['sources']['assemble.voice_volume'] == {'kind': 'global'}
+    assert data['sources']['assemble.voice_volume'] == {'kind': 'global', 'frozen': True}
     assert data['sources']['assemble.subtitle_color'] == {'kind': 'project'}
-    assert data['parent_sources']['assemble.subtitle_color'] == {'kind': 'series', 'name': '全局默认'}
-    assert data['sources']['comments.outline'] == {'kind': 'series', 'name': '全局默认'}
+    assert data['parent_sources']['assemble.subtitle_color'] == {'kind': 'series', 'name': '全局默认', 'frozen': True}
+    assert data['sources']['comments.outline'] == {'kind': 'series', 'name': '全局默认', 'frozen': True}
     steps = TestClient(app).get(f'/api/projects/{uid}/step_params').json()
     assert steps['sources'] == data['sources']
     assert steps['parent_sources'] == data['parent_sources']
     assert comment_studio.view(uid)['configuration']['sources'] == data['sources']
     versions_view = assembly_versions.view(uid)
-    assert versions_view['source'] == {'kind': 'series', 'name': '全局默认'}
+    assert versions_view['source'] == {'kind': 'series', 'name': '全局默认', 'frozen': True}
     assert versions_view['sources']['assemble.subtitle_color'] == {'kind': 'project'}
     current = cfg.resolve(key=template['key'])
     cfg.save(template['key'], {'revision': current['revision'], 'updates': {}, 'name': '项目设置'})
-    assert cfg.resolve(uid)['sources']['comments.outline'] == {'kind': 'series', 'name': '项目设置'}
+    assert cfg.resolve(uid)['sources']['comments.outline'] == {'kind': 'series', 'name': '全局默认', 'frozen': True}
     save('project:' + uid, reset=['assemble.subtitle_color'])
-    assert cfg.resolve(uid)['sources']['assemble.subtitle_color'] == {'kind': 'series', 'name': '项目设置'}
+    assert cfg.resolve(uid)['sources']['assemble.subtitle_color'] == {'kind': 'series', 'name': '全局默认', 'frozen': True}
+    bind([uid], template)
+    assert cfg.resolve(uid)['sources']['assemble.subtitle_color'] == {'kind': 'series', 'name': '项目设置', 'frozen': True}
 
 
 def test_explicit_equal_false_zero_and_null_are_not_inheritance(make_project):
@@ -75,17 +77,25 @@ def test_explicit_equal_false_zero_and_null_are_not_inheritance(make_project):
     assert result['values']['publish.season_id'] is None
     assert result['origins']['assemble.loudnorm']=='本项目'
     save('project:'+uid, reset=['assemble.voice_volume','assemble.loudnorm','publish.season_id'])
+    assert cfg.resolve(uid)['values']['publish.season_id'] is None
+    bind([uid], template)
     assert cfg.resolve(uid)['values']['publish.season_id']==7
 
 
-def test_existing_projects_follow_template_until_list_explicitly_overridden(make_project):
+def test_existing_projects_keep_template_baseline_until_explicitly_applied(make_project):
     first,second=make_project(),make_project(); template=cfg.create_template('同系列');bind([first,second],template)
     version=dict(id='original',name='原声',dubbing=False,burn_subtitles=False,include_comments=False,overrides={})
     save(template['key'],{'assembly.versions':[version]})
+    assert assembly_versions.catalog(first)['versions'][0]['id'] == 'dub'
+    assert assembly_versions.catalog(second)['versions'][0]['id'] == 'dub'
+    bind([first,second], template)
     assert assembly_versions.catalog(first)['versions']==[version]
     assert assembly_versions.catalog(second)['versions']==[version]
     save('project:'+first,{'assembly.versions':[{**version,'name':'本片原声'}]})
     save(template['key'],{'assembly.versions':[{**version,'name':'系列原声'}]})
+    assert assembly_versions.catalog(first)['versions'][0]['name']=='本片原声'
+    assert assembly_versions.catalog(second)['versions'][0]['name']=='原声'
+    bind([first,second], template)
     assert assembly_versions.catalog(first)['versions'][0]['name']=='本片原声'
     assert assembly_versions.catalog(second)['versions'][0]['name']=='系列原声'
 
@@ -117,8 +127,9 @@ def test_invalid_scope_edits_do_not_partially_save(make_project,updates):
 
 def test_comment_style_inherits_without_copying_content(make_project):
     from dubforge import comment_studio
-    uid=make_project();template=cfg.create_template('评论系列');bind([uid],template)
+    uid=make_project();template=cfg.create_template('评论系列')
     save(template['key'],{'comments.color':'#FFCA28','comments.start':20})
+    bind([uid],template)
     result=comment_studio.view(uid)
     assert result['defaults']['color']=='#FFCA28' and result['defaults']['start']==20
     assert result['overlay'] is None and result['rows']==[]
@@ -160,8 +171,9 @@ def test_migration_moves_values_once_and_leaves_files_and_receipts(isolated_env,
 def test_step_context_prefix_and_scalar_use_same_fixed_values(make_project):
     import threading
     from dubforge.runner import StepContext
-    uid=make_project();template=cfg.create_template('配音参数');bind([uid],template)
+    uid=make_project();template=cfg.create_template('配音参数')
     save(template['key'],{'tts.indextts25.num_beams':1,'tts.indextts25.emo_weight':0})
+    bind([uid],template)
     project=crud.get_project(uid);root=crud.project_dir(uid)
     ctx=StepContext(project,'tts',root,root/'logs/fixture.log',threading.Event())
     assert ctx.cfg('tts.indextts25')['emo_weight']==ctx.cfg('tts.indextts25.emo_weight')==0
@@ -188,6 +200,7 @@ def test_full_migration_preserves_accounts_templates_versions_and_receipts(isola
     version=dict(id='custom',name='原声',dubbing=False,burn_subtitles=True,include_comments=True,overrides={})
     with engine.begin() as conn:
         conn.exec_driver_sql('DELETE FROM configurationmigration')
+        conn.exec_driver_sql('DELETE FROM configurationscope WHERE key=?', ('project:' + uid,))
         conn.exec_driver_sql('ALTER TABLE publishaccount ADD COLUMN defaults TEXT')
         conn.exec_driver_sql('UPDATE publishaccount SET defaults=?',(json.dumps({'watermark':True,'visibility':'self'}),))
         conn.exec_driver_sql('CREATE TABLE publishtemplate (id TEXT, name TEXT, account_id TEXT, "values" TEXT, archived INTEGER)')
@@ -250,6 +263,7 @@ def test_migration_finishes_existing_scopes_and_updates_recovery_manifest(make_p
         session.add(PublishAccount(id='a',name='账号',credential='encrypted-fixture'));session.commit()
     with db.get_engine().begin() as conn:
         conn.exec_driver_sql('DELETE FROM configurationmigration')
+        conn.exec_driver_sql('UPDATE configurationscope SET baseline=?', ('{}',))
         conn.exec_driver_sql('INSERT INTO configurationmigration VALUES (1)')
         conn.exec_driver_sql('ALTER TABLE publishaccount ADD COLUMN defaults TEXT')
         conn.exec_driver_sql('UPDATE publishaccount SET defaults=?',(json.dumps({'watermark':True}),))
@@ -268,24 +282,23 @@ def test_migration_finishes_existing_scopes_and_updates_recovery_manifest(make_p
     assert cfg.resolve(uid)==data
 
 
-def test_parent_cannot_remove_versions_referenced_by_project(make_project):
+def test_parent_can_change_versions_without_altering_fixed_project_but_apply_is_validated(make_project):
     uid=make_project();template=cfg.create_template('系列');bind([uid],template)
     save('project:'+uid, {'publish.version_ids':['dub']})
     before=cfg.resolve(key=template['key'])
-    with pytest.raises(DubForgeError):save(template['key'],{'assembly.versions':[before['values']['assembly.versions'][1]]})
-    assert cfg.resolve(key=template['key'])==before
+    save(template['key'],{'assembly.versions':[before['values']['assembly.versions'][1]]})
+    assert cfg.resolve(uid)['values']['assembly.versions'][0]['id'] == 'dub'
+    with pytest.raises(DubForgeError):
+        cfg.binding_plan([uid], template['key'][7:])
 
 
 def test_edit_and_binding_blocked_while_dependent_project_runs(make_project):
-    """配置快照仍冻结，但外部编辑须等待运行结束；范围修改也不得绕过。"""
+    """运行中的步骤只冻结相关设置；范围修改仍须等待任务结束。"""
     uid=make_project();template=cfg.create_template('系列');bind([uid],template)
     step=crud.get_step(crud.get_project(uid).id,'download');step.status='running';crud.save_step(step)
     for key in ['global',template['key'],'project:'+uid]:
-        before = cfg.resolve(key=key)
-        with pytest.raises(DubForgeError) as caught:
-            save(key,{'assemble.crf':19})
-        assert caught.value.code == 'CONFIGURATION_BUSY'
-        assert cfg.resolve(key=key) == before
+        save(key,{'assemble.crf':19})
+        assert cfg.resolve(key=key)['values']['assemble.crf'] == 19
     plan=cfg.binding_plan([uid],'')
     with pytest.raises(DubForgeError) as caught:
         cfg.bind(dict(uids=[uid],template_id='',confirmed=True,fingerprint=plan['fingerprint']))

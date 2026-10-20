@@ -41,6 +41,8 @@ test('创作管理真实组件打开不自动联网，操作文字区分查询�
 test('读取稿件保留来源，审核错误安全显示，编辑不会隐式发请求',async()=>{
   const {html,page}=await render(Studio,studioProps,p=>p.setDetail(detail()))
   assert.match(html,/&lt;script&gt;/);assert.doesNotMatch(html,/<script>alert/)
+  assert.match(html,/保留原BV修订视频，请到对应项目「发布到B站」打开原发布记录，使用「更新原稿件」/)
+  assert.doesNotMatch(html,/保留原BV修订视频请到官网操作/)
   page.edit.title='新标题';page.move(1,-1)
   assert.equal(page.dirty,true);assert.deepEqual(page.order,[2,1])
   page.resetEdit();assert.equal(page.dirty,false)
@@ -64,6 +66,46 @@ test('预览与确认分开，提交只引用冻结计划ID，双击不重复发
   assert.deepEqual(calls[1].body,{confirmed:true})
   release();await pending
   assert.equal(page.modal,false)
+  // 平台详情有最终一致性窗口：旧读回不能覆盖已经确认的目标。
+  assert.equal(page.edit.title,'新标题')
+  assert.equal(page.dirty,false)
+})
+
+test('远端详情读回已匹配时刷新编辑器基线',async()=>{
+  const {page}=await render(Studio,studioProps,p=>p.setDetail(detail()))
+  const fresh=detail();fresh.settings.title='新标题'
+  mock.method(globalThis,'fetch',async(url:any,options:any)=>{
+    const path=String(url)
+    if(path.endsWith('/commit'))return respond({status:'done'})
+    if(path.endsWith('/read/detail'))return respond(fresh)
+    if(path.endsWith('/changes')){
+      const body=options?.body?JSON.parse(options.body):null
+      return respond(body?{id:'fresh-plan',bvid:BV,kind:'edit',preview:{before:detail(),after:{settings:{...detail().settings,title:'新标题'},videos:detail().videos}}}:[])
+    }
+    throw new Error(`非预期请求：${path}`)
+  })
+  page.edit.title='新标题'
+  await page.prepare('edit');await page.commit()
+  assert.equal(page.detail.settings.title,'新标题')
+  assert.equal(page.edit.title,'新标题')
+  assert.equal(page.dirty,false)
+})
+
+test('远端详情读回失败时保留确认目标且不重新提交',async()=>{
+  const {page}=await render(Studio,studioProps,p=>p.setDetail(detail()))
+  const calls:string[]=[]
+  mock.method(globalThis,'fetch',async(url:any,options:any)=>{
+    const path=String(url);calls.push(path)
+    if(path.endsWith('/commit'))return respond({status:'done'})
+    if(path.endsWith('/read/detail'))throw new Error('暂时不可用')
+    if(path.endsWith('/changes'))return respond([])
+    throw new Error(`非预期请求：${path}`)
+  })
+  page.edit.title='新标题'
+  await page.prepare('edit');await page.commit()
+  assert.equal(page.edit.title,'新标题')
+  assert.equal(page.dirty,false)
+  assert.equal(calls.filter(path=>path.endsWith('/commit')).length,1)
 })
 test('结果不明关闭确认按钮，读取恢复记录但不自动重发',async()=>{
   const {page}=await render(Studio,studioProps,p=>{p.setDetail(detail());p.preview={id:'plan',bvid:BV,preview:{before:detail(),after:{settings:detail().settings,videos:detail().videos}}};p.modal=true})

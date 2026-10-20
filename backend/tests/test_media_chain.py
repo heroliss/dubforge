@@ -97,10 +97,64 @@ def test_download_local_import_and_idempotent(make_project, isolated_env, pdir):
     assert not list((pdir / "media").glob("video.*"))
 
 
-def test_preprocess_and_transcribe_local(make_project, isolated_env, pdir):
-    """本地样片全链: download → preprocess → transcribe (demucs+whisper 真跑, 1s 样片)"""
+def test_preprocess_and_transcribe_local(make_project, isolated_env, pdir, monkeypatch):
+    """真实本地媒体链；只替换模型边界，不下载权重、不使用 GPU 或真实推理。"""
     import subprocess
-    # 2.5s 语音样片: 440Hz 正弦 (whisper 会输出空/噪声句, 断言的是链路与产物形态)
+    import sys
+    from types import SimpleNamespace
+    import torch
+    from demucs import pretrained
+    import demucs.apply
+    import soundfile as sf
+    from dubforge import config
+    from dubforge.utils.srt import parse_srt
+
+    calls = []
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: False)
+
+    class ModelBoundary:
+        samplerate = 44100
+        segment = 1.
+
+        def eval(self):
+            return self
+
+    def model(name):
+        calls.append(('separation_model', name))
+        return ModelBoundary()
+
+    def apply_model(model, mix, **kwargs):
+        assert mix.device.type == 'cpu' and kwargs['device'] == 'cpu'
+        assert kwargs['split'] is True and kwargs['progress'] is False
+        callback = kwargs['callback']
+        for offset in (0, 44100):
+            callback({'state': 'start', 'segment_offset': offset, 'shift_idx': 0})
+            callback({'state': 'end', 'segment_offset': offset, 'shift_idx': 0})
+        sources = torch.zeros((1, 4, *mix.shape[1:]), dtype=mix.dtype)
+        sources[:, -1] = mix
+        calls.append(('separation', mix.shape[-1]))
+        return sources
+
+    class WhisperBoundary:
+        def __init__(self, name, **kwargs):
+            assert kwargs == {'device': 'cpu', 'compute_type': 'int8'}
+            calls.append(('transcribe_model', name))
+
+        def transcribe(self, wav, **kwargs):
+            info = sf.info(wav)
+            assert info.samplerate == 16000 and info.channels == 1
+            assert kwargs['word_timestamps'] and kwargs['vad_filter']
+            calls.append(('transcribe', info.duration))
+            return iter([SimpleNamespace(start=0., end=2., words=[
+                SimpleNamespace(start=.1, end=.7, word='Hello'),
+                SimpleNamespace(start=1.1, end=1.8, word=' world.'),
+            ])]), SimpleNamespace(duration=info.duration, language='en')
+
+    monkeypatch.setattr(pretrained, 'get_model', model)
+    monkeypatch.setattr(demucs.apply, 'apply_model', apply_model)
+    monkeypatch.setitem(sys.modules, 'faster_whisper', SimpleNamespace(WhisperModel=WhisperBoundary))
+    config.update_config({'asr.model': 'isolated-asr-boundary', 'separate.model': 'isolated-separation-boundary'})
+    # 音轨与全部文件封装仍由真实 FFmpeg / WAV 实现处理。
     src = isolated_env / "sample.mp4"
     subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                     "-f", "lavfi", "-i", "testsrc2=size=320x240:rate=10:duration=2.5",
@@ -128,8 +182,19 @@ def test_preprocess_and_transcribe_local(make_project, isolated_env, pdir):
     assert src_srt.exists()
     tr = json.loads((pdir(uid) / "artifacts"
                      / "transcribe" / "transcribe.json").read_text(encoding="utf-8"))
-    assert tr["model"]
+    assert tr["model"] == 'isolated-asr-boundary'
     assert tr["duration"] >= 2.0
+    assert [line.text for line in parse_srt(src_srt)] == ['Hello world.']
+    assert [row[0] for row in calls] == ['separation_model', 'separation', 'transcribe_model', 'transcribe']
+    assert sf.info(audio / 'vocal.wav').samplerate == 44100
+    assert sf.info(audio / 'background.wav').samplerate == 44100
+    assert not list(pdir(uid).rglob('*.tmp'))
+    before = {key: crud.latest_job(p.id, key).id for key in ('preprocess', 'transcribe')}
+    saved = src_srt.read_bytes()
+    for key in before:
+        assert runner.start_step(uid, key)['status'] == 'skipped'
+        assert crud.latest_job(p.id, key).id == before[key]
+    assert src_srt.read_bytes() == saved and len(calls) == 4
 
 
 def _runner():
@@ -191,7 +256,7 @@ def test_transcribe_phases_and_eta_exclude_model_preparation(make_project, pdir,
     monkeypatch.setitem(sys.modules, "torch", SimpleNamespace(cuda=SimpleNamespace(is_available=lambda: False)))
     monkeypatch.setitem(sys.modules, "faster_whisper", SimpleNamespace(WhisperModel=FakeWhisper))
     step_transcribe.run(ctx)
-    assert visible()["progress_phase"] == "整理并保存字幕"
+    assert visible()["progress_phase"] == "整理并保存字幕与词级时间戳"
     assert crud.get_step(project.id, "transcribe").progress == 99
     assert ctx.eta_seconds() == 0
     assert [line.text for line in parse_srt(pdir(uid) / "srt" / "src.srt")] == ["Hello.", "World."]

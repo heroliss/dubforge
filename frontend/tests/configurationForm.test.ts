@@ -13,16 +13,126 @@ after(()=>server.close())
 const defaults={'assemble.voice_volume':1,'assemble.loudnorm':false,'publish.season_id':null,'comments.color':'#FFFFFF'}
 function data(){return {key:'project:p',name:'本项目',revision:4,fingerprint:'f4',overrides:{},defaults,values:defaults,parent_sources:Object.fromEntries(Object.keys(defaults).map(k=>[k,{kind:'series',name:'旅行系列'}])),sections:{assemble:{label:'合成',fields:[{path:'assemble.voice_volume',label:'人声音量',type:'float',min:0,max:1},{path:'assemble.loudnorm',label:'归一化',type:'bool'}]}},version_fields:[]}}
 async function render(t:any,component:any,props:any,seed?:(page:any)=>void){let page:any;const writes:any[]=[]
+ const resets:any[]=[]
  t.mock.method(globalThis,'fetch',async(url:any,options:any)=>{if(options?.body)writes.push([url,JSON.parse(options.body)]);return {ok:true,json:async()=>String(url).includes('/catalog')?{accounts:[]}:data()}})
  const app=createSSRApp({render:()=>h(NMessageProvider,null,{default:()=>h(NDialogProvider,null,{default:()=>h(component,props)})})});setup(app)
- app.mixin({created(){if(this.$options.__name===component.__name){page=this.$.setupState;if(component===Form)page.adopt({...data(),values:{...defaults,'assembly.versions':[]},defaults:{...defaults,'assembly.versions':[]}});seed?.(page)}}})
+ app.mixin({created(){if(this.$options.__name===component.__name){page=this.$.setupState;if(component===Form)page.adopt({...data(),values:{...defaults,'assembly.versions':[]},defaults:{...defaults,'assembly.versions':[]}});seed?.(page)}if(this.$options.__name==='ParameterResetButton')resets.push(this)}})
  const html=await renderToString(app);await new Promise(r=>setImmediate(r));page.busy=false
- return {page,html,writes}
+ return {page,html,writes,resets}
 }
+
+test('普通参数始终提供统一恢复入口，继承项禁用且恢复只删除自己的覆盖',async t=>{
+ const seed=(page:any)=>{page.adopt({...data(),defaults:{...defaults,'assembly.versions':[]},overrides:{'assemble.voice_volume':0},
+  parent_sources:{'assemble.voice_volume':{kind:'global',frozen:true},'assemble.loudnorm':{kind:'global',frozen:true}}});page.loading=false}
+ const {page,resets,writes}=await render(t,Form,{scope:'project:p',sections:['assemble']},seed)
+ const volume=resets.find(button=>button.$props.label==='人声音量'),normalization=resets.find(button=>button.$props.label==='归一化')
+ assert.ok(volume);assert.ok(normalization)
+ assert.equal(volume.$props.disabled,false);assert.equal(normalization.$props.disabled,true)
+ assert.equal(volume.$props.action,'恢复项目基础值')
+ seed(page);page.change('assemble.loudnorm',true)
+ volume.$emit('reset')
+ assert.equal(Object.hasOwn(page.patch,'assemble.voice_volume'),false)
+ assert.equal(page.values['assemble.voice_volume'],1)
+ assert.equal(page.patch['assemble.loudnorm'],true)
+ assert.equal(writes.length,0,'恢复只修改草稿，不自动保存')
+})
+
+test('内嵌版本各参数保留独立恢复入口，只恢复指定参数并同时遵守字段与清单锁',async t=>{
+ const versions=[{id:'v1',name:'配音版',dubbing:true,burn_subtitles:false,include_comments:false,overrides:{'assemble.voice_volume':0}}]
+ const seed=(page:any)=>{page.adopt({...data(),defaults:{...defaults,'assembly.versions':versions},version_fields:[
+  {path:'assemble.voice_volume',label:'人声音量',group:'声音',type:'float'},
+  {path:'assemble.loudnorm',label:'归一化',group:'声音',type:'bool'}]});page.loading=false}
+ const {page,resets,writes}=await render(t,Form,{scope:'project:p',sections:['assemble']},seed)
+ const versionReset=resets.find(button=>button.$props.label==='人声音量'&&button.$props.action==='恢复项目默认')
+ const inheritedReset=resets.find(button=>button.$props.label==='归一化'&&button.$props.action==='恢复项目默认')
+ assert.ok(versionReset);assert.ok(inheritedReset)
+ assert.equal(versionReset.$props.disabled,false);assert.equal(inheritedReset.$props.disabled,true)
+ seed(page)
+ t.mock.method(page.editability,'isPathLocked',(path:string)=>path==='assemble.voice_volume')
+ versionReset.$emit('reset')
+ assert.equal(page.values['assembly.versions'][0].overrides['assemble.voice_volume'],0)
+ t.mock.method(page.editability,'isPathLocked',(path:string)=>path==='assembly.versions')
+ versionReset.$emit('reset')
+ assert.equal(page.values['assembly.versions'][0].overrides['assemble.voice_volume'],0)
+ t.mock.method(page.editability,'isPathLocked',()=>false)
+ page.editVersionOverride(0,'assemble.loudnorm',true)
+ versionReset.$emit('reset')
+ assert.deepEqual({...page.values['assembly.versions'][0].overrides},{'assemble.loudnorm':true})
+ assert.equal(page.values['assembly.versions'][0].id,'v1');assert.equal(page.values['assembly.versions'][0].name,'配音版')
+ assert.equal(versions[0].overrides['assemble.voice_volume'],0,'原始清单不被修改')
+ assert.equal(writes.length,0)
+})
+
+test('内嵌版本定义逐项撤销到已保存清单，保留其他编辑与版本专用参数，新建版本无撤销基准',async t=>{
+ const versions=[{id:'v1',name:'已保存配音版',dubbing:true,burn_subtitles:true,include_comments:false,overrides:{'assemble.voice_volume':.8}}]
+ const seed=(page:any)=>{page.adopt({...data(),defaults:{...defaults,'assembly.versions':versions}});page.loading=false}
+ const {page,resets,writes}=await render(t,Form,{scope:'global',sections:['assemble']},page=>{
+  seed(page);page.editVersion(0,'name','新名字');page.editVersion(0,'dubbing',false);page.editVersion(0,'include_comments',true)
+ })
+ const nameReset=resets.find(button=>button.$props.label==='版本名称'),voiceReset=resets.find(button=>button.$props.label==='配音')
+ const subtitlesReset=resets.find(button=>button.$props.label==='烧录字幕')
+ assert.ok(nameReset);assert.ok(voiceReset);assert.ok(subtitlesReset)
+ assert.equal(nameReset.$props.disabled,false);assert.equal(voiceReset.$props.disabled,false);assert.equal(subtitlesReset.$props.disabled,true)
+ seed(page);page.editVersion(0,'name','新名字');page.editVersion(0,'dubbing',false);page.editVersion(0,'include_comments',true)
+ nameReset.$emit('reset')
+ assert.equal(page.values['assembly.versions'][0].name,'已保存配音版')
+ assert.equal(page.values['assembly.versions'][0].dubbing,false)
+ assert.equal(page.values['assembly.versions'][0].include_comments,true)
+ assert.equal(page.values['assembly.versions'][0].overrides['assemble.voice_volume'],.8)
+ page.busy=true;voiceReset.$emit('reset');assert.equal(page.values['assembly.versions'][0].dubbing,false)
+ page.busy=false;voiceReset.$emit('reset');assert.equal(page.values['assembly.versions'][0].dubbing,true)
+ page.addVersion();const index=page.values['assembly.versions'].length-1
+ assert.equal(page.versionDefinitionChanged(index,'name'),false)
+ page.restoreVersionDefinition(index,'name');assert.equal(page.values['assembly.versions'][index].name,'新版本')
+ assert.equal(writes.length,0)
+})
 test('字段显示继承来源；同值、false、0和空值仍可明确覆盖，读取不写入',async t=>{const {page,html,writes}=await render(t,Form,{scope:'project:p',sections:['assemble']});assert.match(html,/旅行系列/);assert.equal(writes.length,0)
  for(const [k,v] of Object.entries({'assemble.voice_volume':0,'assemble.loudnorm':false,'publish.season_id':null}))page.change(k,v)
  assert.equal(page.dirty,true);assert.equal(page.fieldSource('assemble.loudnorm').kind,'project');await page.save()
  assert.deepEqual(writes[0][1].updates,{'assemble.voice_volume':0,'assemble.loudnorm':false,'publish.season_id':null});assert.equal(writes[0][1].fingerprint,'f4')
+})
+test('全局与模板明确仅供新项目，已有项目保存基础值；项目恢复操作不读取最新来源', async t => {
+ const global = await render(t, Form, {scope:'global', sections:['assemble']})
+ assert.match(global.html, /已有项目的基础值与单独设置保持不变/)
+ assert.match(global.html, /主动应用最新设置/)
+ assert.doesNotMatch(global.html, /已有项目也会跟随|未覆盖的系列与项目跟随/)
+ const project = await render(t, Form, {scope:'project:p', sections:['assemble']}, page => {
+  page.adopt({...data(),overrides:{'assemble.voice_volume':0},parent_sources:{'assemble.voice_volume':{kind:'series',name:'旅行系列',frozen:true}}})
+ })
+ assert.equal(project.page.resetLabel, '恢复项目基础值')
+ assert.match(project.html, /创建或上次应用时的基础值/)
+ assert.match(project.html, /aria-label="人声音量恢复项目基础值"/)
+ project.page.inherit('assemble.voice_volume')
+ assert.equal(project.page.values['assemble.voice_volume'], 1)
+ assert.deepEqual({...project.page.patch}, {})
+})
+
+test('版本结构注明整单来源，基础版本专用参数沿来源展示且编辑后标为版本值',async t=>{
+ const seed=(page:any)=>page.adopt({...data(),defaults:{...defaults,'assembly.versions':[{id:'v1',name:'原声版',dubbing:false,burn_subtitles:true,include_comments:false,overrides:{'assemble.voice_volume':.8}}]},
+  parent_sources:{'assembly.versions':{kind:'global',frozen:true},'assemble.voice_volume':{kind:'global',frozen:true}},
+  version_fields:[{path:'assemble.voice_volume',label:'人声音量',group:'声音',type:'float'}]})
+ const {page,html}=await render(t,Form,{scope:'project:p',sections:['assemble']},seed);seed(page)
+ assert.match(html,/声音、字幕与评论开关来自整份版本清单/);assert.match(html,/已存全局值/)
+ assert.equal(page.versionFieldSource(page.values['assembly.versions'][0],'assemble.voice_volume').kind,'global')
+ page.editVersionOverride(0,'assemble.voice_volume',.6)
+ assert.equal(page.versionFieldSource(page.values['assembly.versions'][0],'assemble.voice_volume').kind,'version')
+ assert.equal(page.values['assembly.versions'][0].overrides['assemble.voice_volume'],.6)
+})
+test('项目制作参数恢复固定基础，服务字段恢复共享当前值，未冻结来源不误标为快照', async t => {
+ const seed = (page:any) => {
+  const values = {'tts.backend':'indextts25','tts.indextts25.url':'http://127.0.0.1:7860','tts.indextts25.num_beams':3}
+  page.adopt({...data(),defaults:values,overrides:{'tts.indextts25.url':'http://127.0.0.1:7861','tts.indextts25.num_beams':2},
+   parent_sources:{'tts.indextts25.url':{kind:'global'},'tts.indextts25.num_beams':{kind:'global',frozen:true}},
+   sections:{tts:{label:'配音',fields:[{path:'tts.indextts25.url',label:'服务地址',type:'str'},{path:'tts.indextts25.num_beams',label:'束搜索数量',type:'int'}]}}})
+ }
+ const project = await render(t, Form, {scope:'project:p',sections:['tts']}, seed)
+ seed(project.page)
+ assert.equal(project.page.fieldResetLabel('tts.indextts25.url'),'恢复服务设置')
+ assert.equal(project.page.fieldResetLabel('tts.indextts25.num_beams'),'恢复项目基础值')
+ assert.match(project.html,/aria-label="服务地址恢复服务设置"/)
+ assert.match(project.html,/aria-label="束搜索数量恢复项目基础值"/)
+ assert.match(project.html,/连接、代理、等待超时等共享服务设置用于之后的调用/)
+ assert.match(project.page.fieldResetHint('tts.indextts25.url'),/共享服务的当前设置/)
 })
 test('恢复继承删除覆盖键，不用上级当前值覆盖；保存失败保留草稿',async t=>{const {page,writes}=await render(t,Form,{scope:'project:p',sections:['assemble']});page.adopt({...data(),overrides:{'assemble.voice_volume':0}});page.inherit('assemble.voice_volume');assert.equal(page.values['assemble.voice_volume'],1);await page.save();assert.deepEqual(writes[0][1].reset,['assemble.voice_volume']);assert.deepEqual(writes[0][1].updates,{})
  page.change('assemble.voice_volume',.3);t.mock.method(globalThis,'fetch',async()=>({ok:false,json:async()=>({message:'继承设置已变化'})}));await page.save();assert.equal(page.patch['assemble.voice_volume'],.3);assert.equal(page.dirty,true);assert.equal(page.error,'继承设置已变化')
@@ -35,24 +145,8 @@ test('读取批量计划不运行；明确确认只提交检查通过项目，�
 function ttsData() {
  const defaults = { 'tts.backend': 'indextts25', 'tts.indextts25.timbre_audio': 'voice.wav',
   'tts.indextts25.emo_mode': 'text', 'tts.indextts25.emo_weight': 1, 'tts.indextts25.num_beams': 3 }
- return { ...data(), defaults, values: defaults, sections: { tts: { label: '配音', fields: Object.keys(defaults).map(path => ({ path, label: path, type: 'text' })) } },
-  indextts_profiles: [{ id: 'fast', name: '速度优先', values: { 'tts.indextts25.num_beams': 1, 'tts.indextts25.emo_weight': .65 } }] }
+ return { ...data(), defaults, values: defaults, sections: { tts: { label: '配音', fields: Object.keys(defaults).map(path => ({ path, label: path, type: 'text' })) } } }
 }
-
-test('全局与模板共享推荐方案：只生成明确覆盖，不复制音色/模式，不自动保存', async t => {
- for (const scope of ['global', 'series:travel']) {
-  const { page, writes } = await render(t, Form, { scope, sections: ['tts'] })
-  page.adopt(ttsData())
-  page.applyIndexProfile('fast')
-  assert.deepEqual({ ...page.patch }, { 'tts.indextts25.num_beams': 1, 'tts.indextts25.emo_weight': .6 })
-  assert.equal(page.values['tts.indextts25.timbre_audio'], 'voice.wav')
-  assert.equal(page.values['tts.indextts25.emo_mode'], 'text')
-  assert.equal(writes.length, 0)
-  await page.save()
-  assert.equal(writes[0][0], '/api/configuration/' + encodeURIComponent(scope))
-  assert.deepEqual(writes[0][1].updates, { 'tts.indextts25.num_beams': 1, 'tts.indextts25.emo_weight': .6 })
- }
-})
 
 test('音色预设受当前字段范围限制；保存中及归档模板不应用，错误后保留草稿', async t => {
  const { page } = await render(t, Form, { scope: 'series:travel', sections: ['tts'], paths: ['tts.indextts25.num_beams'] })
@@ -70,18 +164,6 @@ test('音色预设受当前字段范围限制；保存中及归档模板不应�
  page.adopt({ ...ttsData(), archived: true })
  page.applyPreset({ 'tts.indextts25.num_beams': 5 })
  assert.deepEqual({ ...page.patch }, {})
-})
-
-test('推荐方案不应用到其他配音后端；参考情感仍使用方案值', async t => {
- const { page } = await render(t, Form, { scope: 'global', sections: ['tts'] })
- page.adopt(ttsData())
- page.change('tts.backend', 'gptsovits')
- page.applyIndexProfile('fast')
- assert.equal(page.values['tts.indextts25.num_beams'], 3)
- page.change('tts.backend', 'indextts25')
- page.change('tts.indextts25.emo_mode', 'reference')
- page.applyIndexProfile('fast')
- assert.equal(page.values['tts.indextts25.emo_weight'], .65)
 })
 
 test('执行权限即时锁住字段、继承、预设和保存，已编辑草稿保留且刷新不写入',async t=>{
@@ -201,7 +283,7 @@ test('语义模式只显示目标词数，本地模式只显示字符长度；�
  t.mock.method(globalThis, 'fetch', (_url:any,options:any) => {if(options?.body)writes.push(options.body);return new Promise(() => {})})
  const fields = [
   { path:'split.use_llm', label:'启用 LLM 语义整理', type:'bool' },
-  { path:'split.target_word_count', label:'语义目标词数（约）', type:'int', depends_on:[['split.use_llm',true]] },
+  { path:'split.target_word_count', label:'语义目标词数（软参考）', type:'int', depends_on:[['split.use_llm',true]] },
   { path:'split.max_split_length', label:'本地单句长度（字符）', type:'int', depends_on:[['split.use_llm',false]] },
   { path:'split.llm_profile', label:'语义整理模型', type:'str', depends_on:[['split.use_llm',true]] },
  ]

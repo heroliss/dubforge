@@ -7,6 +7,7 @@ import pytest
 
 from conftest import mark_upstream_done
 from dubforge.domain import crud
+from dubforge import configuration
 from dubforge.pipeline import stale_explanation as stale, text_prompts
 from dubforge.pipeline.config_fingerprint import promote_compatible_fingerprints
 from dubforge.pipeline.dependencies import Dependencies
@@ -21,6 +22,12 @@ def save_split(project, text):
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(text, encoding='utf-8')
     crud.add_artifact(project.id, 'split', 'text', 'split.txt', path, str(path.relative_to(root)))
+
+
+def project_setting(project, path, value):
+    current = configuration.resolve(project.uid)
+    configuration.save('project:' + project.uid, dict(revision=current['revision'],
+        fingerprint=current['fingerprint'], updates={path: value}))
 
 
 def split_baseline(make_project):
@@ -127,7 +134,7 @@ def test_pause_threshold_changes_split_only_when_semantic_model_consumes_it(make
     project = crud.get_project(make_project(params={'step_params': {'split.use_llm': use_llm}}))
     previous = compute_fingerprint(project, 'split')
     translation = compute_fingerprint(project, 'translate')
-    config.set_key('asr.pause_threshold_seconds', 1.2)
+    project_setting(project, 'asr.pause_threshold_seconds', 1.2)
     assert (compute_fingerprint(project, 'split') != previous) is use_llm
     assert compute_fingerprint(project, 'translate') == translation
 
@@ -173,13 +180,13 @@ def test_unused_window_override_never_invalidates_full_document_segmentation(mak
 
 
 @pytest.mark.parametrize('use_llm', [True, False])
-def test_thinking_mode_only_invalidates_model_segmentation(make_project, use_llm):
+def test_thinking_mode_does_not_invalidate_finished_segmentation(make_project, use_llm):
     from dubforge import config
     project = crud.get_project(make_project(params={'step_params': {'split.use_llm': use_llm}}))
     before = {key: compute_fingerprint(project, key) for key in ('transcribe', 'split', 'translate')}
-    config.set_key('split.thinking_mode', 'follow_profile')
+    project_setting(project, 'split.thinking_mode', 'follow_profile')
     after = {key: compute_fingerprint(project, key) for key in before}
-    assert {key for key in before if before[key] != after[key]} == ({'split'} if use_llm else set())
+    assert after == before
 
 
 def test_fast_mode_fingerprint_uses_actual_request_parameters(make_project):
@@ -205,10 +212,10 @@ def test_low_and_old_fast_alias_share_effective_fingerprint(make_project, step):
     assert compute_fingerprint(project, step) == previous
 
 
-def test_translation_low_mode_changes_only_translation(make_project):
+def test_translation_thinking_mode_preserves_completed_content_identity(make_project):
     from dubforge import config
     project = crud.get_project(make_project())
     before = {key: compute_fingerprint(project, key) for key in ('transcribe', 'split', 'translate')}
-    config.set_key('translate.thinking_mode', 'follow_profile')
+    project_setting(project, 'translate.thinking_mode', 'follow_profile')
     after = {key: compute_fingerprint(project, key) for key in before}
-    assert {key for key in before if before[key] != after[key]} == {'translate'}
+    assert after == before

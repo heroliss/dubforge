@@ -53,8 +53,10 @@ class MediaContext:
         self.project, self.pdir, self.paths = project, root, paths
         self.settings = config.load_config()
         self.values = {'content_review.enabled': True, 'content_review.mute_audio': True,
+                       'content_review.audio_mode': 'all_audio',
                        'assemble.loudnorm': False, **(values or {})}
         self.task_data = {}
+        self.logs = []
 
     def cfg(self, key, default=None):
         return self.values.get(key, config.get(key, default, settings=self.settings))
@@ -68,7 +70,7 @@ class MediaContext:
         return self.paths[(step, name)]
 
     def log(self, message):
-        pass
+        self.logs.append(message)
 
     def report_progress(self, progress):
         pass
@@ -201,11 +203,11 @@ def test_burn_preparation_rebuilds_old_srt_and_shifts_safe_preview_cues(make_pro
     text = generated.read_text(encoding='utf-8-sig')
     assert '悲剧' not in text and 'tragedy' not in text
     assert source.read_bytes() == previous
-    if separate_style:
-        assert generated.suffix == '.ass' and '0:00:00.50' in text and '0:00:01.30' in text
-    else:
-        lines = parse_srt(generated)
-        assert len(lines) == 1 and lines[0].start == 0.5 and lines[0].end == 1.3
+    # 通用样式也使用同一份显式排版；裁剪时钟与内容筛查结果保持不变。
+    from dubforge.utils.ffmpeg import ass_file_filter
+    assert generated.suffix == '.ass' and graph == ass_file_filter(generated)
+    assert '0:00:00.50' in text and '0:00:01.30' in text
+    assert sum(line.startswith('Dialogue:') for line in text.splitlines()) == 1
     generated.unlink()
 
 
@@ -365,6 +367,7 @@ def test_review_fingerprint_includes_source_edits_even_for_no_subtitles_or_targe
 
 def test_version_renderer_creates_reviewed_original_only_output_and_receipt(make_project):
     from dubforge.pipeline import assembly_versions, version_render
+    config.set_key('content_review.audio_mode', 'all_audio')
     project, root, paths = _seed_text(make_project())
     ctx = MediaContext(project, root, paths)
     video, _, _ = _media(ctx)
@@ -383,3 +386,137 @@ def test_version_renderer_creates_reviewed_original_only_output_and_receipt(make
     assert stored['signature'] and stored['mute_audio'] is True
     artifact = crud.latest_artifacts(project.id, ['assemble'])['assemble/' + output.name]
     content_review_service.assert_publishable(project, artifact)
+
+
+def _tone_strength(samples, rate, start, end, frequency):
+    values = samples[round(start * rate):round(end * rate)].astype(float)
+    time = np.arange(len(values)) / rate
+    return abs(np.mean(values * np.exp(-2j * np.pi * frequency * time)))
+
+
+@pytest.mark.parametrize('dubbing,ducking', [(False, False), (True, False), (True, True)])
+def test_voice_only_preserves_background_and_removes_speech_in_real_mux(make_project, dubbing, ducking):
+    from dubforge.pipeline.step_assemble import _mux, _mux_original_sub
+    project, root, paths = _seed_text(make_project())
+    ctx = MediaContext(project, root, paths, {'content_review.audio_mode': 'voice_only',
+        'assemble.bgm_volume': 1.0, 'assemble.ducking': ducking})
+    video, voice, _ = _media(ctx)
+    output = root / 'output/voice_only.mp4'
+    if dubbing:
+        _mux(ctx, root, video, voice, output, 4.0)
+    else:
+        _mux_original_sub(ctx, video, output, 4.0, (0, 99), burn=False)
+    audio, rate = _samples(output)
+    background = _tone_strength(audio, rate, 1.3, 1.7, 150)
+    speech_frequency = 700 if dubbing else 200
+    assert background > .03
+    assert _tone_strength(audio, rate, 1.3, 1.7, speech_frequency) < background * .01
+    assert _tone_strength(audio, rate, .3, .7, speech_frequency) > .01
+    receipt = redaction.receipt(ctx)['audio_processing']
+    assert receipt['effective_mode'] == 'voice_only' and receipt['background_identity']
+    assert 'path' not in json.dumps(receipt)
+
+
+@pytest.mark.parametrize('fault', ['missing', 'short', 'zero_volume', 'disabled'])
+def test_voice_only_without_complete_background_safely_mutes_source(make_project, fault):
+    from dubforge.pipeline.step_assemble import _mux_original_sub
+    project, root, paths = _seed_text(make_project())
+    ctx = MediaContext(project, root, paths, {'content_review.audio_mode': 'voice_only'})
+    video, _, background = _media(ctx)
+    if fault == 'missing':
+        paths.pop(('preprocess', 'background.wav'))
+    elif fault == 'short':
+        subprocess.run(['ffmpeg', '-y', '-v', 'error', '-f', 'lavfi', '-i',
+                        'sine=frequency=150:duration=0.5', '-f', 'wav', str(background)], check=True)
+    elif fault == 'zero_volume':
+        ctx.values['assemble.bgm_volume'] = 0
+    else:
+        ctx.values['separate.enabled'] = False
+    output = root / 'output/fallback.mp4'
+    _mux_original_sub(ctx, video, output, 4.0, (0, 99), burn=False)
+    audio, rate = _samples(output)
+    assert _rms(audio, rate, 1.3, 1.7) < .0001
+    assert _tone_strength(audio, rate, .3, .7, 200) > .03
+    receipt = redaction.receipt(ctx)['audio_processing']
+    assert receipt['requested_mode'] == 'voice_only' and receipt['effective_mode'] == 'all_audio'
+    assert receipt['fallback_reason'] and ctx.logs and receipt['background_identity'] is None
+
+
+def test_voice_only_preview_offsets_replacement_background_and_mute_ranges(make_project):
+    from dubforge.pipeline.step_assemble import _mux_original_sub
+    project, root, paths = _seed_text(make_project())
+    ctx = MediaContext(project, root, paths, {'content_review.audio_mode': 'voice_only'})
+    video, _, _ = _media(ctx)
+    output = root / 'output/voice_preview.mp4'
+    _mux_original_sub(ctx, video, output, 2.5, (0, 99), burn=False, start=.8)
+    audio, rate = _samples(output)
+    assert _tone_strength(audio, rate, .5, .9, 150) > .03
+    assert _tone_strength(audio, rate, .5, .9, 200) < .0003
+    assert _tone_strength(audio, rate, 1.6, 2.0, 200) > .03
+
+
+def test_final_blocked_sentence_does_not_require_background_beyond_video_end(make_project):
+    from dubforge.pipeline.step_assemble import _mux_original_sub
+    project, root, paths = _seed_text(make_project(), source=[
+        dict(id=1, start=0, end=1, text='A normal sentence'),
+        dict(id=2, start=3, end=4, text='The Tiananmen Square massacre')],
+        target={1: '正常介绍', 2: '天安门广场的悲剧'})
+    ctx = MediaContext(project, root, paths, {'content_review.audio_mode': 'voice_only'})
+    video, _, _ = _media(ctx)
+    audio = redaction.audio_plan(ctx)
+    assert audio['effective_mode'] == 'voice_only' and audio['ranges'][-1]['end'] == 4
+    output = root / 'output/last_sentence.mp4'
+    _mux_original_sub(ctx, video, output, 4.0, (0, 99), burn=False)
+    samples, rate = _samples(output)
+    assert _tone_strength(samples, rate, 3.5, 3.9, 150) > .03
+    assert _tone_strength(samples, rate, 3.5, 3.9, 200) < .0003
+    assert redaction.receipt(ctx)['audio_processing']['effective_mode'] == 'voice_only'
+
+
+def test_audio_mode_changes_do_not_invalidate_unaffected_versions_or_subtitles(make_project):
+    from dubforge.pipeline import assembly_versions
+    from dubforge.runner import compute_fingerprint
+    project, _, _ = _seed_text(make_project(), source=[dict(id=1, start=0, end=1, text='A clean sentence')],
+                               target={1: '正常介绍'})
+    definition = dict(id='no-hit', name='原声版', dubbing=False, burn_subtitles=False,
+                      include_comments=False, overrides={})
+    deps = Dependencies(project)
+    version = assembly_versions.resolve(deps, definition)
+    before = assembly_versions.fingerprint(deps, version)
+    subtitle_before = compute_fingerprint(project, 'subtitles', dependencies=deps)
+    from test_configuration import save
+    save('project:' + project.uid, {'content_review.audio_mode': 'all_audio'})
+    later = Dependencies(project)
+    assert assembly_versions.fingerprint(later, assembly_versions.resolve(later, definition)) == before
+    assert compute_fingerprint(project, 'subtitles', dependencies=later) == subtitle_before
+
+
+def test_audio_mode_and_background_change_only_audio_consuming_fingerprints(make_project):
+    from dubforge.pipeline import assembly_versions
+    from dubforge.runner import compute_fingerprint
+    project, root, paths = _seed_text(make_project())
+    context = MediaContext(project, root, paths)
+    video, _, background = _media(context)
+    crud.add_artifact(project.id, 'download', 'video', video.name, video, 'media/video.mp4')
+    crud.add_artifact(project.id, 'preprocess', 'audio', 'background.wav', background,
+                      str(background.relative_to(root)))
+    step = crud.get_step(project.id, 'preprocess')
+    step.status, step.input_fingerprint = 'done', ''
+    crud.save_step(step)
+    definition = dict(id='with-hit', name='审查原声版', dubbing=False, burn_subtitles=False,
+                      include_comments=False, overrides={})
+    deps = Dependencies(project)
+    before = assembly_versions.fingerprint(deps, assembly_versions.resolve(deps, definition))
+    subtitle_before = compute_fingerprint(project, 'subtitles', dependencies=deps)
+    from test_configuration import save
+    save('project:' + project.uid, {'content_review.audio_mode': 'all_audio'})
+    all_audio = Dependencies(project)
+    assert assembly_versions.fingerprint(all_audio, assembly_versions.resolve(all_audio, definition)) != before
+    assert compute_fingerprint(project, 'subtitles', dependencies=all_audio) == subtitle_before
+    all_fingerprint = assembly_versions.fingerprint(all_audio, assembly_versions.resolve(all_audio, definition))
+    background.unlink()
+    missing = Dependencies(project)
+    assert assembly_versions.fingerprint(missing, assembly_versions.resolve(missing, definition)) == all_fingerprint
+    save('project:' + project.uid, {'content_review.audio_mode': 'voice_only'})
+    fallback = Dependencies(project)
+    assert assembly_versions.fingerprint(fallback, assembly_versions.resolve(fallback, definition)) != before

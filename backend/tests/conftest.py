@@ -14,7 +14,23 @@ def isolated_env(tmp_path, monkeypatch):
     from dubforge import db
     db.reset_engine()
     db.init_db()                      # 每个测试独立建表 (不依赖 TestClient lifespan)
+    from dubforge import tts_service
+    from types import SimpleNamespace
+    import subprocess
+
+    def forbid_model_launch(*args, **kwargs):
+        raise AssertionError('隔离测试禁止启动真实配音模型；请提供服务或进程替身')
+
+    # 只替换服务模块持有的进程接口，不能改全局 subprocess.Popen：
+    # FFmpeg 和测试自建的轻量进程仍可运行；服务专项测试可显式覆盖此替身。
+    monkeypatch.setattr(tts_service, 'subprocess', SimpleNamespace(
+        **{key: value for key, value in vars(subprocess).items() if key != 'Popen'},
+        Popen=forbid_model_launch))
     from dubforge.runner import runner
+    from dubforge import comment_studio
+    # TestClient 会反复进入应用生命周期；每个隔离测试只在旧任务收尾后重开单例。
+    runner.startup()
+    comment_studio.startup()
     # done/failed 状态早于 worker 最后的 manifest 和项目状态写入；
     # 等 Future 真正结束后再切换数据库，防止上个测试的收尾污染下个测试。
     pending = []
@@ -26,12 +42,44 @@ def isolated_env(tmp_path, monkeypatch):
         return future
 
     monkeypatch.setattr(runner._pool, "submit", tracked_submit)
+    queue_execution = runner._queue_execution
+
+    def tracked_queue(*args, **kwargs):
+        # 资源准入前的任务还没有线程池 Future，也必须等它完成才能切库。
+        future = queue_execution(*args, **kwargs)
+        pending.append(future)
+        return future
+
+    monkeypatch.setattr(runner, '_queue_execution', tracked_queue)
+    from dubforge.publishing import chapter_dispatch
+    chapter_submit = chapter_dispatch._pool.submit
+
+    def tracked_chapter_submit(*args, **kwargs):
+        future = chapter_submit(*args, **kwargs)
+        pending.append(future)
+        return future
+
+    monkeypatch.setattr(chapter_dispatch._pool, 'submit', tracked_chapter_submit)
+    from dubforge.publishing import updates as publication_updates
+    publication_updates._stop.clear()
+    update_submit = publication_updates._pool.submit
+
+    def tracked_update_submit(*args, **kwargs):
+        future = update_submit(*args, **kwargs)
+        pending.append(future)
+        return future
+
+    monkeypatch.setattr(publication_updates._pool, 'submit', tracked_update_submit)
     # runner 是跨测试的单例: 清掉重试计划/槽位/废弃标记等运行态,
     # 否则上一个测试的残留 (project_id 从 1 重新计数) 会污染后续测试。
     def _reset_runner_state():
         with runner._lock:
-            for cancel, _attempts, _at in runner._retries.values():
-                cancel.set()
+            for value in runner._retries.values():
+                # 兼容测试替身及旧进程留下的简化标记；真实值为
+                # (cancel_event, attempts, next_at) 三元组。
+                cancel = value[0] if isinstance(value, (tuple, list)) and value else None
+                if cancel is not None and hasattr(cancel, 'set'):
+                    cancel.set()
             runner._retries.clear()
             runner._held.clear()
             runner._abandoned.clear()
@@ -39,13 +87,16 @@ def isolated_env(tmp_path, monkeypatch):
     try:
         yield tmp_path
     finally:
-        _reset_runner_state()
+        chapter_dispatch.shutdown()
+        publication_updates.shutdown()
         try:
             index = 0
             while index < len(pending):   # 续跑链可能在收尾时提交下一步。
-                pending[index].result(timeout=30)
+                if not pending[index].cancelled():
+                    pending[index].result(timeout=30)
                 index += 1
         finally:
+            _reset_runner_state()
             db.reset_engine()
 
 
@@ -102,15 +153,28 @@ def wait_status(uid: str, step_key: str, statuses: set[str], timeout: float = 15
 
 @pytest.fixture(autouse=True)
 def _no_real_recycle_bin(monkeypatch):
-    """测试里删除项目不允许碰真实系统回收站 (send2trash 会把隔离环境里的
-    临时目录扔进用户回收站) —— 一律替换为普通删除。"""
+    """回收操作只模拟删除隔离数据目录内的对象，绝不触碰真实系统回收站。"""
+    import os as _os
     import shutil as _shutil
+    from pathlib import Path as _Path
+
+    def remove_isolated(path):
+        value = _os.environ.get('DUBFORGE_DATA_ROOT')
+        if not value:
+            pytest.fail('回收模拟必须声明隔离数据目录')
+        root = _Path(value).resolve()
+        target = _Path(path).resolve()
+        if target == root or not target.is_relative_to(root):
+            pytest.fail('回收模拟目标必须位于隔离数据目录内，且不能是目录根')
+        if target.is_dir():
+            _shutil.rmtree(target)
+        else:
+            target.unlink(missing_ok=True)
 
     import send2trash as _st
-    monkeypatch.setattr(_st, "send2trash", lambda p: _shutil.rmtree(p, ignore_errors=True))
-    # 单文件安全回收有独立入口，测试必须显式模拟，不触碰真实回收站。
+    monkeypatch.setattr(_st, 'send2trash', remove_isolated)
     from dubforge.utils import recycle
-    monkeypatch.setattr(recycle, '_windows_recycle', lambda p: pytest.fail('测试未声明回收模拟'))
+    monkeypatch.setattr(recycle, '_windows_recycle', remove_isolated)
 
 
 
@@ -125,6 +189,17 @@ def stub_heavy_steps(monkeypatch):
 
     from dubforge.errors import StepFailedError
     from dubforge.pipeline import steps as steps_mod
+    from dubforge import tts_service
+
+    # 重型步骤已被替身接管时，资源准备也必须隔离，避免状态机测试
+    # 因本机安装了配音工具而启动真实模型。资源管理专项测试自行提供服务替身。
+    monkeypatch.setattr(tts_service, 'status', lambda *a, **k: {
+        'online': True, 'managed': False, 'can_start': False, 'can_stop': False,
+        'status': 'online', 'backend': 'indextts25', 'message': ''})
+    monkeypatch.setattr(tts_service, 'start', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('步骤替身测试禁止启动真实配音服务')))
+    monkeypatch.setattr(tts_service, 'stop', lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError('步骤替身测试禁止停止真实配音服务')))
 
     def make_stub(key):
         def run(ctx):

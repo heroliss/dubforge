@@ -35,6 +35,14 @@ def configure(uid, spec):
     save('project:'+uid, values)
 
 
+def apply_source(uid, template_id=''):
+    """测试显式应用新基础，不把全局保存误当成项目修改。"""
+    from dubforge import configuration
+    plan = configuration.binding_plan([uid], template_id)
+    return configuration.bind(dict(uids=[uid], template_id=template_id,
+                                   fingerprint=plan['fingerprint'], confirmed=True))
+
+
 def finish(key):
     deadline = time.monotonic() + 10
     while key in workflows._running and time.monotonic() < deadline:
@@ -50,12 +58,16 @@ def flow(setup_publish, monkeypatch):
         ai_copy=False, account_id='123', cover_source='custom', cover_id=pub['draft']['cover_id'],
         overrides=pub['draft']['overrides']))
     configure(uid, spec)
+    # 此夹具模拟协调器而非 IndexTTS；避免把本机预设参考路径误作测试依赖。
+    save('project:' + uid, {'tts.backend': 'gptsovits'})
     from conftest import mark_upstream_done
     mark_upstream_done(uid, 'assemble')
     monkeypatch.setattr(workflow_plan, 'production_checks', lambda *args, **kwargs: [])
     from dubforge.runner import runner
     sequence = []
-    def step(uid, key):
+    def step(uid, key, **options):
+        if key == 'tts':
+            assert 'repair_timing' not in options['dubbing']
         sequence.append(key)
         row = crud.get_step(crud.get_project(uid).id, key)
         row.status = 'done'
@@ -97,35 +109,89 @@ def test_new_project_without_llm_is_blocked_before_any_job(make_project):
 
 
 @pytest.mark.parametrize('patch', [dict(variants=[]), dict(variants=['dub', 'dub']), dict(ai_copy='true'),
-    dict(comment_limit=10, comment_count=11), dict(part_titles={'dub': ''}), dict(mode='upload'), dict(unknown=True),
+    dict(comment_limit=10, comment_count=11), dict(part_titles={'dub': ''}), dict(mode='unsupported'), dict(unknown=True),
     dict(mode=[]), dict(variants=[{}]), dict(cover_source={}), dict(comment_settings=[])])
 def test_invalid_recipe(patch):
     with pytest.raises(DubForgeError):
         workflow_plan.recipe(patch)
 
 
-def test_defaults_inherit_without_rights_gate(make_project):
-    first, second = make_project(), make_project()
+def test_recipe_optional_production_scope_is_strict_and_omitted_by_default():
+    legacy = workflow_plan.recipe({'mode': 'produce', 'variants': ['dub'], 'ai_copy': False})
+    assert 'production_steps' not in legacy
+    assert workflow_plan.recipe({
+        'mode': 'produce', 'variants': ['dub'], 'ai_copy': False,
+        'production_steps': ['preprocess', 'tts'],
+    })['production_steps'] == ['preprocess', 'tts']
+    for value in (['preprocess', 'preprocess'], ['dubtask'], ['unknown'], [1], {}):
+        with pytest.raises(DubForgeError):
+            workflow_plan.recipe({
+                'mode': 'produce', 'variants': ['dub'], 'ai_copy': False,
+                'production_steps': value,
+            })
+
+
+def test_explicit_production_scope_does_not_force_assembly_or_download(flow, monkeypatch):
+    uid, spec, _calls, _sequence = flow
+    scoped = {**spec, 'mode': 'produce', 'production_steps': ['preprocess']}
+    result = workflow_plan.plan(uid, scoped, online=False)
+    assert result['requested_steps'] == ['preprocess']
+    assert result['steps'] == ['preprocess']
+    assert 'assemble' not in result['steps'] and 'download' not in result['steps']
+
+
+def test_publish_scope_adds_only_the_assembly_endpoint(flow):
+    uid, spec, _calls, _sequence = flow
+    scoped = {**spec, 'production_steps': []}
+    result = workflow_plan.plan(uid, scoped, online=False)
+    assert result['requested_steps'] == []
+    assert result['steps'] == ['assemble']
+    assert result['added_steps'] == ['assemble']
+
+
+def test_resume_plan_without_scope_keeps_saved_run_scope(flow):
+    uid, spec, _calls, _sequence = flow
+    saved = {**spec, 'mode': 'produce', 'production_steps': ['preprocess']}
+    with Session(get_engine()) as session:
+        row = WorkflowRun(project_uid=uid, request_id=str(uuid.uuid4()),
+                          recipe=json.dumps(saved), plan='{}')
+        session.add(row)
+        session.commit()
+        session.refresh(row)
+        key = row.id
+    result = workflows._plan(uid, {'mode': 'produce', 'resume_id': key}, online=False)
+    assert result['recipe']['production_steps'] == ['preprocess']
+    assert result['requested_steps'] == ['preprocess']
+
+
+def test_defaults_are_saved_for_new_projects_and_preserve_existing_overrides_without_rights_gate(make_project):
     from dubforge import configuration
     save('global', {'run.mode':'publish','publish.account_id':'123'})
+    first, second = make_project(), make_project()
     assert workflows.view(second)['origin'] == '全局默认'
     assert 'rights_confirmed' not in workflows.view(second)['recipe']
+    assert workflows.view(first)['recipe']['account_id'] == '123'
     save('project:'+second, {'publish.account_id':'456'})
     save('global', {'publish.account_id':'789'})
+    assert workflows.view(first)['recipe']['account_id'] == '123'
     assert workflows.view(second)['recipe']['account_id'] == '456'
+    assert workflows.view(make_project())['recipe']['account_id'] == '789'
     with pytest.raises(DubForgeError, match='其他页面'):
         configuration.save('global', dict(revision=0, updates={'publish.account_id':'123'}))
 
 
-def test_parts_order_collection_and_idempotency(flow):
+@pytest.mark.parametrize('reversed_selection', [False, True])
+def test_parts_order_collection_and_idempotency(flow, reversed_selection):
     uid, spec, calls, sequence = flow
     spec['part_titles'] = dict(dub_hardsub='中文配音', src_hardsub='原声字幕')
+    if reversed_selection:
+        spec['version_ids'] = list(reversed(spec['variants']))
     row, body = start(uid, spec)
     result = finish(row['id'])
     assert result['status'] == 'monitoring', result
     assert sequence[0] == 'download'
     submit = next(payload for op, payload in calls if op == 'submit')
-    assert [p['title'] for p in submit['videos']] == ['中文配音', '原声字幕']
+    assert [p['title'] for p in submit['videos']] == (['原声字幕', '中文配音'] if reversed_selection else ['中文配音', '原声字幕'])
     assert submit['settings']['season_id'] == 1
     assert sum(op == 'collection' for op, _ in calls) == 1
     assert workflows.start(uid, body)['id'] == row['id']
@@ -135,6 +201,68 @@ def test_parts_order_collection_and_idempotency(flow):
     assert any('已有自动流程发布记录' in item for item in workflows.preview(uid, spec)['blockers'])
     with pytest.raises(DubForgeError, match='重复稿件'):
         workflows.start(uid, {**body, 'request_id':str(uuid.uuid4())})
+
+
+def test_new_submission_after_existing_record_requires_explicit_per_run_confirmation(flow):
+    uid, spec, calls, _ = flow
+    from dubforge.publishing.models import Publication
+    from sqlmodel import select
+    with Session(get_engine()) as session:
+        original = session.exec(select(Publication).where(Publication.project_uid == uid)).first()
+        source_id = original.id
+        session.add(WorkflowRun(project_uid=uid, request_id=str(uuid.uuid4()), publication_id=source_id,
+            status='attention', recipe=json.dumps(spec)))
+        session.commit()
+    assert any('已有自动流程发布记录' in item for item in workflows.preview(uid, spec)['blockers'])
+    intent = dict(mode='publish', production_steps=[], confirm_new_publication=True)
+    candidate = workflows.preview(uid, intent)
+    assert not candidate['blockers'], candidate['blockers']
+    assert candidate['recipe']['confirm_new_publication'] is True
+    assert any('新的BV号' in item and '原稿件' in item for item in candidate['warnings'])
+    request = dict(recipe=candidate['recipe'], confirmed=True, request_id=str(uuid.uuid4()),
+                   fingerprint=candidate['fingerprint'])
+    result = finish(workflows.start(uid, request)['id'])
+    assert result['status'] == 'monitoring' and result['publication_id'] != source_id
+    assert workflows.start(uid, request)['id'] == result['id']
+    assert sum(op == 'submit' for op, _ in calls) == 1
+    assert 'confirm_new_publication' not in workflows.view(uid)['recipe']
+
+
+@pytest.mark.parametrize('status,bvid,blocked', [('draft', '', False), ('rejected', '', False),
+    ('published', 'BV1234567890', True), ('rejected', 'BV1234567890', True),
+    ('submitted', 'BV1234567890', True), ('collection_pending', 'BV1234567890', True)])
+def test_manual_remote_publication_also_requires_new_submission_confirmation(flow, status, bvid, blocked):
+    uid, spec, _, _ = flow
+    from dubforge.publishing.models import Publication
+    from sqlmodel import select
+    with Session(get_engine()) as session:
+        original = session.exec(select(Publication).where(Publication.project_uid == uid)).first()
+        original.status = status
+        original.receipt = json.dumps({'bvid': bvid} if bvid else {})
+        session.add(original); session.commit()
+    candidate = workflows.preview(uid, dict(mode='publish', production_steps=[]))
+    assert any('项目已有B站稿件' in item for item in candidate['blockers']) is blocked
+    assert workflows.status(uid)['has_remote_publication'] is blocked
+    assert workflows.view(uid)['has_remote_publication'] is blocked
+    confirmed = workflows.preview(uid, dict(mode='publish', production_steps=[], confirm_new_publication=True))
+    assert not confirmed['blockers'], confirmed['blockers']
+    if blocked:
+        with pytest.raises(DubForgeError, match='重复稿件'):
+            workflows.start(uid, dict(recipe=candidate['recipe'], confirmed=True, request_id=str(uuid.uuid4()),
+                fingerprint=candidate['fingerprint']))
+
+
+@pytest.mark.parametrize('value', ['true', 1, None])
+def test_new_submission_confirmation_requires_explicit_boolean(value):
+    with pytest.raises(DubForgeError):
+        workflow_plan.recipe(dict(mode='publish', confirm_new_publication=value))
+
+
+@pytest.mark.parametrize('mode', ['produce', 'update'])
+def test_new_submission_confirmation_is_not_an_update_or_production_option(mode):
+    with pytest.raises(DubForgeError):
+        workflow_plan.recipe(dict(mode=mode, confirm_new_publication=True,
+            **({'update': {'publication_id': 'source'}} if mode == 'update' else {})))
 
 
 def test_old_plan_without_tts_is_blocked_and_resume_repairs_it(flow, monkeypatch):
@@ -161,12 +289,12 @@ def test_old_plan_without_tts_is_blocked_and_resume_repairs_it(flow, monkeypatch
     assert all(op == 'metadata' for op, _ in calls)
     monkeypatch.setattr(workflows, '_plan', original_plan)
     original_step = runner.start_step
-    def fill(uid, key):
+    def fill(uid, key, **options):
         if key == 'tts':
             atomic_write_bytes(path, content)
             crud.add_artifact(project.id, 'tts', 'audio', path.name, path, str(path.relative_to(deps.root)))
             record_take(project, deps.dubbing_lines()[0], deps.root, 1, 'fixture', {})
-        return original_step(uid, key)
+        return original_step(uid, key, **options)
     monkeypatch.setattr(runner, 'start_step', fill)
     candidate = workflows.preview(uid, spec)
     assert candidate['dubbing']['pending'] == 1 and 'tts' in candidate['steps']
@@ -186,12 +314,12 @@ def test_failed_dubbing_stops_full_workflow_before_assembly_and_publication(flow
     project = crud.get_project(uid)
     Dependencies(project).path('tts', '1.wav').unlink()
     original = runner.start_step
-    def fail(uid, key):
+    def fail(uid, key, **options):
         if key == 'tts':
             sequence.append(key)
             step = crud.get_step(project.id, key); step.status = 'failed'; crud.save_step(step)
             return {'status': 'started'}
-        return original(uid, key)
+        return original(uid, key, **options)
     monkeypatch.setattr(runner, 'start_step', fail)
     row, _ = start(uid, spec)
     result = finish(row['id'])
@@ -223,7 +351,7 @@ def test_manual_fields_win_over_ai_and_draft_never_uploads(flow, monkeypatch):
     from dubforge.publishing import copywriting
     uid, spec, calls, _ = flow
     spec.update(ai_copy=True, mode='draft')
-    monkeypatch.setattr(copywriting, 'generate', lambda *args: {'values': dict(title='不应替换', description='自动简介', tags=['不应替换'], dynamic='自动动态')})
+    monkeypatch.setattr(copywriting, 'generate', lambda *args, **kwargs: {'values': dict(title='不应替换', description='自动简介', tags=['不应替换'], dynamic='自动动态')})
     row, _ = start(uid, spec)
     result = finish(row['id'])
     assert result['status'] == 'ready', result
@@ -275,26 +403,32 @@ def test_stale_preflight(flow):
     uid, spec, calls, _ = flow
     candidate = workflows.preview(uid, spec)
     config.set_key('assemble.bgm_volume', .27)
+    assert workflows.preview(uid, spec)['fingerprint'] == candidate['fingerprint']
+    save('project:' + uid, {'assemble.bgm_volume': .27})
     with pytest.raises(DubForgeError, match='重新预检'):
         workflows.start(uid, dict(recipe=spec, confirmed=True, fingerprint=candidate['fingerprint'], request_id=str(uuid.uuid4())))
     assert not any(op == 'upload' for op, _ in calls)
 
 
-def test_boundary_check_narrows_to_remaining_steps(flow):
-    """边界按「剩余步骤消费的键」对比: 已完成步骤的键变化不打断;
-    版本呈现参数已随版本规格冻结, 也不在边界指纹内 (ADR-0075)。
-    直接对只读 preview 计划检查, 不启动运行, 避免与后台引擎竞态。"""
+def test_boundary_check_allows_future_step_configuration_changes(flow):
+    """全流程只校验来源边界，未开始步骤在真正执行时读取新设置。
+
+    按 ADR-0132，排队/等待期间修改项目参数不应把流程误判为冲突；当前
+    步骤取得执行槽位时才捕获执行快照。这里直接调用只读边界检查，避免
+    启动后台引擎造成竞态。
+    """
     uid, spec, calls, _ = flow
     plan = workflows.preview(uid, spec)
     assert plan['steps'][0] == 'download'
     assert 'configuration_snapshot' in plan
     run = {'project_uid': uid, 'plan': plan}
-    config.set_key('download.resolution', 480)          # download 在剩余集合: 触发
-    with pytest.raises(DubForgeError, match='设置'):
-        workflows._check_configuration(run, ['download'])
-    config.set_key('download.resolution', 1080)         # 还原后不再触发
+    config.set_key('download.resolution', 480)
+    workflows._check_configuration(run, ['download'])  # 全局改变不打断旧项目。
+    save('project:' + uid, {'download.resolution': 480})  # 本项目剩余步骤真正变化才触发。
     workflows._check_configuration(run, ['download'])
-    config.set_key('assemble.bgm_volume', .5)
+    save('project:' + uid, reset=['download.resolution'])  # 恢复本项目基础值后不再触发。
+    workflows._check_configuration(run, ['download'])
+    save('project:' + uid, {'assemble.bgm_volume': .5})
     workflows._check_configuration(run, ['assemble'])   # 版本模式: assemble 键随版本规格冻结
     workflows._check_configuration(run, [])             # 发布准备只校验来源身份
 
@@ -331,8 +465,8 @@ def test_restart_pauses_without_post(make_project, monkeypatch):
     assert all(row['status'] == 'paused' for row in workflows.view(uid)['runs'])
 
 
-def test_runtime_edit_of_finished_step_is_rejected_without_interrupting_the_workflow(flow, monkeypatch):
-    """已完成步骤的设置也锁定；拒绝编辑不改变快照，制作结束后才可保存。"""
+def test_runtime_edit_of_finished_step_is_allowed_without_interrupting_the_workflow(flow, monkeypatch):
+    """只锁定正在运行步骤消费的字段，已完成步骤可为后续重跑编辑。"""
     from dubforge.runner import runner
     from dubforge import configuration, runtime_edit
     from app.api.projects import StepParamsUpdate, update_project_step_params
@@ -351,10 +485,9 @@ def test_runtime_edit_of_finished_step_is_rejected_without_interrupting_the_work
         before = configuration.resolve(uid)
         params_before = crud.get_project(uid).params
         snapshot = workflows.get(row['id'])['plan']['configuration_snapshot']
-        with pytest.raises(runtime_edit.RuntimeEditError) as error:
-            update_project_step_params(uid, StepParamsUpdate(updates={'download.resolution': 480}))
-        assert error.value.code == 'CONFIGURATION_BUSY'
-        assert configuration.resolve(uid) == before
+        update_project_step_params(uid, StepParamsUpdate(updates={'download.resolution': 480}))
+        assert configuration.resolve(uid)['values']['download.resolution'] == 480
+        assert configuration.resolve(uid) != before
         assert crud.get_project(uid).params == params_before
         active = workflows.get(row['id'])
         assert active['status'] == 'running' and not active['error']
@@ -391,24 +524,76 @@ def test_collection_attention_never_reposts(flow):
     assert sum(op == 'submit' for op, _ in calls) == 1
 
 
+def _comment_snapshot(rows, requested_limit, *, reused=True):
+    return dict(ids=[row['id'] for row in rows], reused=reused, count=len(rows), available=len(rows),
+                collected_at='2026-10-07T21:00:00+08:00', requested_limit=requested_limit)
+
+
+def _comment_state(rows, assessments, *, warning=''):
+    return dict(rows=rows, filter={'items': [], 'assessments': assessments},
+                overlay_revision='rev', job={'warning': warning})
+
+
+def _comment_preparation_state(monkeypatch, uid, spec, rows, assessments):
+    """准备器整段占用资料范围，旧逐阶段桩也需提供可核验的缓存和初始视图。"""
+    studio = workflows.comment_studio
+    project = crud.get_project(uid)
+    base = studio.view(uid)
+    doc = studio._read(project)
+    hashes = {row['id']: row['source_hash'] for row in rows}
+    doc['rating_cache'] = {
+        'version': studio.FILTER_VERSION, 'prompt': spec['comment_prompt'].strip(),
+        'context_hash': studio._hash(studio._context(project)),
+        'assessments': [{'reason': '观众反馈', **item, 'source_hash': hashes[item['id']]} for item in assessments],
+    }
+    studio._write(project, doc)
+    monkeypatch.setattr(studio, 'view', lambda _uid: {**base, 'rows': rows})
+
+
 def test_auto_comments_scores_translation_and_timeline(flow, monkeypatch):
     uid, spec, _, _ = flow
     spec.update(comments_mode='auto', comment_count=3)
     calls, saved = [], []
-    monkeypatch.setattr(workflows.video_info, 'update', lambda *a, **k: calls.append('collect'))
-    monkeypatch.setattr(workflows.comment_studio, 'run', lambda uid, action, **k: calls.append(action))
-    rows = [dict(id=str(i), source_hash=str(i), text='original', text_zh='译文') for i in range(3)]
-    monkeypatch.setattr(workflows.comment_studio, 'view', lambda uid: dict(rows=rows, filter={'items': [{'id': '2'}, {'id': '1'}, {'id': '0'}]}, overlay_revision='rev'))
-    monkeypatch.setattr(workflows.comment_studio, 'save', lambda uid, body: saved.append(body))
+    rows = [dict(id=str(i), source_hash=str(i), text='original', text_zh='', timestamp=100+i)
+            for i in range(3)]
+    assessments = [dict(id=str(i), eligible=True, score=90+i) for i in range(3)]
+    _comment_preparation_state(monkeypatch, uid, spec, rows, assessments)
+    def ensure(uid, *, comment_limit, cancel_check=None):
+        calls.append(('snapshot', comment_limit))
+        return _comment_snapshot(rows, comment_limit)
+    def process(uid, action, **kwargs):
+        calls.append((action, kwargs['ids']))
+        if action == 'translate':
+            for row in rows:
+                if row['id'] in kwargs['ids']:
+                    row['text_zh'] = '译文'
+        return _comment_state(rows, assessments)
+    def save_overlay(uid, body, **kwargs):
+        calls.append(('save', [item['id'] for item in body['items']]))
+        saved.append(body)
+        assert [setting['language_mode'] for setting in kwargs['display_settings']] == ['translated']
+    monkeypatch.setattr(workflows.video_info, 'ensure_comments', ensure)
+    monkeypatch.setattr(workflows.comment_studio, 'run', process)
+    monkeypatch.setattr(workflows.comment_studio, 'save', save_overlay)
     monkeypatch.setattr(service, '_probe', lambda path: 27)
     with Session(get_engine()) as session:
         row = WorkflowRun(project_uid=uid, request_id=str(uuid.uuid4()), recipe=json.dumps(spec), plan='{"warnings":[]}')
         session.add(row); session.commit(); session.refresh(row); key = row.id
-    workflows._comments(workflows.get(key), threading.Event())
-    assert calls == ['collect', 'filter', 'translate']
-    assert [item['id'] for item in saved[0]['items']] == ['2', '1']
+    # 实际协调器在同一租约所有者中执行评论阶段；显式单测也保留这个边界。
+    workflows._leases[uid] = key
+    try:
+        with workflows._owned(key):
+            workflows._comments(workflows.get(key), threading.Event())
+    finally:
+        workflows._leases.pop(uid, None)
+    assert calls == [('snapshot', spec['comment_limit']), ('filter', ['0', '1', '2']),
+                     ('translate', ['2', '1']), ('save', ['1', '2'])]
+    # 评分只决定选人；正式上屏使用发布时间，不能沿用候选分数顺序。
+    assert [item['id'] for item in saved[0]['items']] == ['1', '2']
+    assert [item['timestamp'] for item in saved[0]['items']] == [101, 102]
     assert all(item['display_text'] == '译文' for item in saved[0]['items'])
-    assert workflows.get(key)['plan']['warnings']
+    assert rows[0]['text_zh'] == ''  # 时间轴只容纳两条，不翻译未使用的第三条。
+    assert any('实际使用2条' in warning for warning in workflows.get(key)['plan']['warnings'])
 
 
 def test_resume_keeps_original_steps_for_saved_cursor(flow, monkeypatch):
@@ -422,7 +607,7 @@ def test_resume_keeps_original_steps_for_saved_cursor(flow, monkeypatch):
         value['steps'] = ['download', 'tts', 'assemble'] if phase[0] == 'first' else ['download', 'assemble']
         value['labels']['tts'] = '合成配音'
         return value
-    def pause(uid, key):
+    def pause(uid, key, **options):
         result = original_step(uid, key)
         if phase[0] == 'first':
             workflows.stop(workflows._leases[uid])
@@ -437,8 +622,12 @@ def test_resume_keeps_original_steps_for_saved_cursor(flow, monkeypatch):
     candidate = workflows.preview(uid, spec)
     workflows.resume(row['id'], dict(confirmed=True, recipe=spec, fingerprint=candidate['fingerprint']))
     assert finish(row['id'])['status'] == 'completed'
-    assert sequence[:2] == ['download', 'tts']
+    # 恢复沿用首次确认的步骤范围，但有效配音缓存可直接复用；版本模式
+    # 的合成通过 start_versions 记录冻结的版本清单，而不是伪造一次 tts。
+    assert sequence[0] == 'download'
     assert sequence.count('download') == 1
+    assert 'assemble' in sequence
+    assert any(isinstance(item, list) for item in sequence)
 
 
 def test_same_start_id_rejects_different_recipe(flow):
@@ -487,63 +676,93 @@ def test_relative_import_source_and_changed_local_file(make_project, monkeypatch
 
 def test_empty_auto_comments_stops_without_saving_or_posting(flow, monkeypatch):
     uid, spec, calls, _ = flow
-    monkeypatch.setattr(workflows.video_info, 'update', lambda *a, **k: None)
-    monkeypatch.setattr(workflows.comment_studio, 'run', lambda *a, **k: None)
-    monkeypatch.setattr(workflows.comment_studio, 'view', lambda *a: {'filter': {'items': []}, 'rows': []})
-    monkeypatch.setattr(workflows.comment_studio, 'save', lambda *a: pytest.fail('零条评论不能默默省略'))
-    with pytest.raises(DubForgeError, match='没有可上屏'):
-        workflows._comments({'project_uid': uid, 'recipe': spec}, threading.Event())
-    assert not calls
+    snapshots = []
+    def empty_snapshot(uid, *, comment_limit, cancel_check=None):
+        snapshots.append(comment_limit)
+        return _comment_snapshot([], comment_limit, reused=False)
+    monkeypatch.setattr(workflows.video_info, 'ensure_comments', empty_snapshot)
+    monkeypatch.setattr(workflows.comment_studio, 'run', lambda *a, **k: pytest.fail('无正文不能启动评分或翻译'))
+    monkeypatch.setattr(workflows.comment_studio, 'save', lambda *a, **k: pytest.fail('零条评论不能默默省略'))
+    phases = []
+    monkeypatch.setattr(workflows, '_update', lambda key, **fields: phases.append(fields.get('phase')))
+    with pytest.raises(DubForgeError, match='没有可用正文') as error:
+        workflows._comments({'id': 'fixture', 'project_uid': uid, 'recipe': spec}, threading.Event())
+    assert error.value.code == 'WORKFLOW_COMMENTS_EMPTY'
+    assert snapshots == [spec['comment_limit']] and not calls
+    assert phases and phases[0].startswith('评论采集')
 
 
 @pytest.mark.parametrize('mode,expected', [('translated',['b','c']), ('bilingual',['b','c']), ('original',['a','b'])])
-def test_auto_comments_translates_all_for_reading_but_only_uses_usable_ranked_results(flow, monkeypatch, mode, expected):
+def test_auto_comments_translates_only_pending_candidates_and_backfills(flow, monkeypatch, mode, expected):
     uid, spec, calls, _ = flow
     spec['comment_count'] = 2
     spec['comment_failure_policy'] = 'skip'
     spec['comment_settings']['language_mode'] = mode
     ran, saved, warnings = [], [], []
-    monkeypatch.setattr(workflows.video_info, 'update', lambda *a, **k:None)
+    rows = [dict(id=k, source_hash=k, text='original', text_zh='' if k=='a' else '完整译文') for k in 'abcd']
+    assessments = [dict(id=k, eligible=k!='d', score=90-i) for i,k in enumerate('abcd')]
+    _comment_preparation_state(monkeypatch, uid, spec, rows, assessments)
+    monkeypatch.setattr(workflows.video_info, 'ensure_comments',
+                        lambda uid, *, comment_limit, cancel_check=None: _comment_snapshot(rows, comment_limit))
     def process(uid, action, **kwargs):
         ran.append((action,kwargs))
-        return {'job':{'warning':'有一条评论未完成'}}
+        warning = '部分评分已保存'
+        if action == 'translate':
+            assert kwargs['ids'] == ['a']
+            rows[0]['ai_issues'] = {'translate': {'status': 'failed', 'code': 'LLM_OUTPUT_INVALID'}}
+            warning = '1条候选翻译失败，原文保留'
+        return _comment_state(rows, assessments, warning=warning)
     monkeypatch.setattr(workflows.comment_studio, 'run', process)
-    rows = [dict(id=k, source_hash=k, text='original', text_zh='' if k=='a' else '完整译文') for k in 'abcd']
-    monkeypatch.setattr(workflows.comment_studio, 'view', lambda uid: dict(rows=rows, overlay_revision='rev', filter={
-        'items':[{'id':'a'},{'id':'b'}], 'assessments':[dict(id=k, eligible=k!='d', score=90-i) for i,k in enumerate('abcd')]}))
     monkeypatch.setattr(service, '_probe', lambda *a:1000)
     monkeypatch.setattr(workflows, '_update', lambda *a, **k:None)
-    monkeypatch.setattr(workflows.comment_studio, 'save', lambda uid, body:saved.append(body))
+    monkeypatch.setattr(workflows.comment_studio, 'save', lambda uid, body, **kwargs:saved.append(body))
     workflows._comments(dict(id='fixture',project_uid=uid,recipe=spec,plan={'warnings':warnings}),threading.Event())
-    assert [action for action,_ in ran] == ['filter','translate']
-    assert all(kwargs['failure_policy']=='skip' and 'ids' not in kwargs for _,kwargs in ran)
+    assert [action for action,_ in ran] == (['filter'] if mode == 'original' else ['filter','translate'])
+    assert ran[0][1]['ids'] == list('abcd')
+    assert all(kwargs['failure_policy']=='skip' for _,kwargs in ran)
     assert [item['id'] for item in saved[0]['items']] == expected
-    assert len(warnings) == (2 if mode == 'original' else 3) and not calls
+    assert any('评分：部分评分已保存' in warning for warning in warnings)
+    if mode != 'original':
+        assert any('候选翻译失败' in warning for warning in warnings)
+        assert any('已排除1条' in warning and '按评分递补' in warning for warning in warnings)
+    else:
+        assert not any('翻译：' in warning or '已排除' in warning for warning in warnings)
+    assert not calls  # 不上传或投稿；未入选的 d 不进入翻译请求。
 
 
 @pytest.mark.parametrize('mode,version_mode,expected', [('translated', None, ['source_long','good']),
     ('original', None, ['zh_long','good']), ('bilingual', None, ['good','extra']),
-    ('translated', 'bilingual', ['good','extra']), ('original', 'translated', ['good','extra'])])
+    ('translated', 'bilingual', ['good','extra']), ('original', 'translated', ['source_long','good'])])
 def test_automatic_comments_exclude_long_candidates_and_backfill(flow, monkeypatch, mode, version_mode, expected):
     uid, spec, calls, _ = flow
     spec['comment_count'] = 2
     spec['comment_settings']['language_mode'] = mode
-    saved, warnings = [], []
-    monkeypatch.setattr(workflows.video_info, 'update', lambda *a, **k:None)
-    monkeypatch.setattr(workflows.comment_studio, 'run', lambda *a, **k:{'job':{}})
+    saved, warnings, ran, display_modes = [], [], [], []
     rows = [dict(id=k, source_hash=k, text='x' * (720 if k=='source_long' else 30),
                  text_zh='中' * (241 if k=='zh_long' else 20)) for k in ('source_long','zh_long','good','extra')]
-    monkeypatch.setattr(workflows.comment_studio, 'view', lambda uid: dict(rows=rows, overlay_revision='rev',
-        filter={'assessments':[dict(id=row['id'],eligible=True,score=99-i) for i,row in enumerate(rows)]}))
+    assessments = [dict(id=row['id'],eligible=True,score=99-i) for i,row in enumerate(rows)]
+    _comment_preparation_state(monkeypatch, uid, spec, rows, assessments)
+    monkeypatch.setattr(workflows.video_info, 'ensure_comments',
+                        lambda uid, *, comment_limit, cancel_check=None: _comment_snapshot(rows, comment_limit))
+    def process(uid, action, **kwargs):
+        ran.append((action, kwargs))
+        return _comment_state(rows, assessments)
+    monkeypatch.setattr(workflows.comment_studio, 'run', process)
     monkeypatch.setattr(service, '_probe', lambda *a:1000)
     monkeypatch.setattr(workflows, '_update', lambda *a, **k:None)
-    monkeypatch.setattr(workflows.comment_studio, 'save', lambda uid, body:saved.append(body))
+    def save_overlay(uid, body, **kwargs):
+        saved.append(body)
+        display_modes.extend(setting['language_mode'] for setting in kwargs['display_settings'])
+    monkeypatch.setattr(workflows.comment_studio, 'save', save_overlay)
     plan = {'warnings':warnings}
     if version_mode:
         plan['version_specs'] = [dict(include_comments=True,values={'comments.language_mode':version_mode})]
     workflows._comments(dict(id='fixture',project_uid=uid,recipe=spec,plan=plan),threading.Event())
     assert [row['id'] for row in saved[0]['items']] == expected
-    assert any('已自动排除' in warning and '按评分递补' in warning for warning in warnings)
+    assert any('已排除' in warning and '按评分递补' in warning for warning in warnings)
+    assert [action for action, _ in ran] == ['filter']  # 所有候选已有译文，不产生翻译请求。
+    assert ran[0][1]['ids'] == [row['id'] for row in rows]
+    assert display_modes == [version_mode or mode]
     assert len(rows[0]['text']) == 720 and len(rows[1]['text_zh']) == 241
     assert not calls  # 不上传、投稿或调用真实模型。
 
@@ -565,8 +784,12 @@ def test_resume_repairs_deleted_prior_dependencies(flow, monkeypatch, new_depend
     monkeypatch.setattr(workflows.Dependencies, 'fresh', lambda self, step: False)
     workflows.resume(key, dict(recipe=spec, fingerprint=candidate['fingerprint'], confirmed=True))
     assert finish(key)['status'] == 'completed'
-    assert sequence[0] == 'download'
-    assert ('preprocess' in sequence) is new_dependency
+    # 恢复按当前版本实际消费关系递归补齐所有失效上游；旧计划没有显式
+    # 保存 preprocess 时也不能让成片越过它。两种历史步骤表最终收敛到
+    # 同一条可执行链，避免再次在 assemble 门禁处才发现缺依赖。
+    names = [item for item in sequence if isinstance(item, str)]
+    assert names[0] == 'download' and names.count('download') == 1
+    assert {'preprocess', 'transcribe', 'split', 'translate', 'tts'}.issubset(names)
 
 
 def test_workflow_api_read_save_and_confirmation(make_project):
@@ -607,6 +830,8 @@ def test_lightweight_status_keeps_strategy_and_frozen_run_separate(flow, monkeyp
     save('global', {'run.mode':'produce'})
     current = configuration.view('project:'+uid)
     configuration.save('project:'+uid, dict(revision=current['revision'],fingerprint=current['fingerprint'],reset=['run.mode']))
+    assert workflows.status(uid)['mode'] == 'draft'  # 恢复的是创建时基础，不是刚保存的全局。
+    apply_source(uid)
     # 看板读取不能扫描成品、连模型、连 B站，也不能暴露完整快照或凭据。
     monkeypatch.setattr(assembly_versions, 'catalog', lambda *a: pytest.fail('状态轮询不能扫描版本'))
     monkeypatch.setattr(service, 'view', lambda *a: pytest.fail('状态轮询不能读取完整稿件'))
@@ -618,6 +843,7 @@ def test_lightweight_status_keeps_strategy_and_frozen_run_separate(flow, monkeyp
     assert status['run']['status'] == 'monitoring'
     assert status['run']['publication']['id'] == result['publication_id']
     assert status['existing_publication_id'] == result['publication_id']
+    assert status['has_remote_publication'] is True
     assert 'recipe' not in status['run'] and 'plan' not in status['run']
 
 
@@ -629,7 +855,13 @@ def test_status_before_start_and_api_are_read_only(make_project):
     response = TestClient(app).get(f'/api/projects/{uid}/workflow/status')
     assert response.status_code == 200
     assert response.headers['cache-control'] == 'no-store'
-    assert response.json() == dict(mode='publish',mode_source={'kind':'project'},run=None,existing_publication_id='')
+    result = response.json()
+    goal = result.pop('project_goal')
+    assert goal['delivery_mode'] == 'publish' and goal['target_kind'] == 'new'
+    assert goal['target_selection']['source'] == 'first_publish'
+    assert goal['target_source'] == 'unresolved' and goal['target_blockers']
+    assert result == dict(mode='publish',mode_source={'kind':'project'},run=None,
+                                  existing_publication_id='', has_remote_publication=False)
     assert not workflows.view(uid)['runs']
 
 
@@ -703,7 +935,8 @@ def test_recovery_preview_and_resume_share_earlier_stale_start(flow, monkeypatch
     assert 'download' in preview['recovery']['reusable_steps']
     result = workflows.resume(key, recovery_body(preview))
     assert result['cursor'] == 1 and len(launched) == 1
-    assert result['plan']['steps'] == ['download', 'split', 'translate', 'assemble']
+    # 该版本包含配音，恢复预检会把当前实际消费的 tts 依赖补回原链。
+    assert result['plan']['steps'] == ['download', 'split', 'translate', 'tts', 'assemble']
     assert result['plan']['recovery'] == preview['recovery']
 
 
@@ -716,7 +949,9 @@ def test_recovery_new_missing_dependency_replaces_old_step_table(flow, monkeypat
     assert preview['recovery']['start_step'] == 'preprocess'
     assert preview['recovery']['cursor'] == 0
     result = workflows.resume(key, recovery_body(preview))
-    assert result['cursor'] == 0 and len(launched) == 1
+    # cursor 是扩展后步骤表中的当前位置；新增 preprocess 后，原下载步骤
+    # 已被复用，恢复从索引 1 的 preprocess 开始。
+    assert result['cursor'] == 1 and len(launched) == 1
     assert result['plan']['steps'] == candidate['steps']
     assert result['plan']['recovery_fingerprint'] == preview['recovery_fingerprint']
 
@@ -730,7 +965,7 @@ def test_recovery_changed_configuration_replans_and_reuses_valid_outputs(flow, m
     assert not preview['blockers']
     assert preview['recovery']['changed'] is True
     assert preview['recovery']['start_step'] == 'download'
-    assert preview['recovery']['execute_steps'] == ['download']
+    assert preview['recovery']['execute_steps'] == ['download', 'preprocess']
     assert 'assemble' in preview['recovery']['reusable_steps']
     result = workflows.resume(key, recovery_body(preview))
     assert result['cursor'] == 0 and len(launched) == 1

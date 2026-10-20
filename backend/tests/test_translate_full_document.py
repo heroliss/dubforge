@@ -1,5 +1,6 @@
 """全文优先翻译及真实上下文分窗；所有模型请求均在隔离目录内模拟。"""
 import hashlib
+import json
 import re
 from types import SimpleNamespace
 
@@ -14,7 +15,10 @@ from dubforge.utils.lineprotocols import parse_numbered_lines, serialize_timed_l
 
 @pytest.fixture
 def context(isolated_env, tmp_path, monkeypatch):
-    values = {'translate.max_context_tokens': 200_000, 'translate.target_language': '简体中文'}
+    # Existing planner tests explicitly exercise token budgeting; disable the
+    # optional safety cap here and cover the default cap in dedicated tests.
+    values = {'translate.max_context_tokens': 200_000, 'translate.max_window_lines': 0,
+              'translate.target_language': '简体中文'}
     root = tmp_path / 'project'
     output = root / 'translate'
     output.mkdir(parents=True)
@@ -23,13 +27,18 @@ def context(isolated_env, tmp_path, monkeypatch):
     monkeypatch.setattr(llm, 'describe_selection', lambda _: '隔离模拟模型')
     profiles = [dict(name='冻结配置', base_url='https://fixture.invalid/v1', api_key='fixture',
                      model='fixture-model', params={'temperature': 0.2})]
+    def write_json(name, value):
+        # 真实步骤还会保存对齐审查旁车；测试同样保留它，不跳过审查。
+        from dubforge.utils.fs import atomic_write_bytes
+        atomic_write_bytes(output / name, json.dumps(value, ensure_ascii=False).encode('utf-8'))
+        return output / name
     return SimpleNamespace(force=False, pdir=root, values=values, source=source, output=output,
         profiles=profiles, llm_profile_snapshot=lambda _selected: profiles,
         cfg=lambda key, default=None: values.get(key, default), check_cancel=lambda: None,
         check_pause=lambda: None, log=logs.append, logs=logs, llm_trace=lambda *_a, **_kw: None,
         report_progress=lambda *_a: None, upstream=lambda *_a: source,
         artifact_dir=lambda: output, register_file=lambda *args: registered.append(args),
-        registered=registered)
+        write_json=write_json, registered=registered)
 
 
 def lines(count=81, text='source'):
@@ -70,22 +79,23 @@ def seed(context, rows):
 def test_faithful_system_has_short_priorities_and_style_never_overrides_final_source(context):
     context.values['translate.style_prompt'] = '接地气，可以用网络流行语，网络梗等'
     system = st._base_system(context, 'florp → florp')
-    priorities = [system.index(label) for label in ('同编号保真', '事实优先', '原文已定稿', '再求自然')]
+    priorities = [system.index(label) for label in ('同编号保真', '自然表达', '残句处理')]
     assert priorities == sorted(priorities)
-    assert '没有音频，不再猜改ASR' in system
-    assert '疑似实词或专名无法确定时保留原词' in system
-    assert '上下文只用于消歧或确定已有指代' in system
-    assert '半句保留半句' in system
-    assert '不能为了流畅搬动信息' in system
-    assert '不把含糊、未说完的内容变成肯定或否定' in system
-    assert '不把外币泛化成无币种的钱' in system
-    assert '不倒置比较方向或省略币种' in system
+    assert '原文已定稿，翻译阶段不再纠错' in system
+    assert '不再纠错、拆分或合并编号' in system
+    assert '无法确定的实词或专名保留原词' in system
+    assert '上下文用于理解指代、语气和术语' in system
+    assert '保留未说完和不确定的含义' in system
+    assert '不把信息提前、延后或重复到其他编号' in system
+    assert '保留人物、事实、数字、币种、单位、否定、程度和比较关系' in system
+    assert '在本行含义内调整语序、句式和惯用表达' in system
+    assert '不要求逐词直译' in system
     assert '可纠正明显的识别错误' not in system
     assert '结合整体语境和常识' not in system
-    assert system.index('风格和网络梗不能添加') < system.index('翻译风格要求：')
+    assert system.index('风格和本地化服从保真') < system.index('翻译风格要求：')
     assert context.values['translate.style_prompt'] in system and 'florp → florp' in system
     context.values['translate.style_prompt'] = ''
-    assert len(st._base_system(context, '')) <= 1_100
+    assert len(st._base_system(context, '')) <= 650
     assert len(st.ADAPTIVE_ALIGNMENT_GUIDANCE) <= 120
 
 
@@ -99,9 +109,9 @@ def test_real_run_keeps_doubtful_final_source_and_full_document_single_call(cont
     assert len(calls) == 1 and not calls[0]['review'] and not calls[0]['handoff']
     body = calls[0]['prompt'].split('【待翻译原文】\n', 1)[1].split('\n\n【', 1)[0]
     assert body == '\n'.join(st._timed_source(row) for row in rows)
-    assert '同编号保真' in calls[0]['system'] and '没有音频，不再猜改ASR' in calls[0]['system']
+    assert '同编号保真' in calls[0]['system'] and '翻译阶段不再纠错' in calls[0]['system']
     assert list(parse_numbered_lines((context.output / 'translate.txt').read_text(encoding='utf-8'))) == list(range(1, 7))
-    assert len(context.registered) == 1
+    assert [row[0] for row in context.registered] == ['translate.txt', 'alignment_audit.json']
 
 
 def test_full_translation_explains_function_words_but_preserves_source_ids_and_times(context, monkeypatch):
@@ -119,12 +129,11 @@ def test_full_translation_explains_function_words_but_preserves_source_ids_and_t
     body = calls[0]['prompt'].split('【待翻译原文】\n', 1)[1].split('\n\n【', 1)[0]
     assert body == '\n'.join(st._timed_source(row) for row in rows)
     system = calls[0]['system']
-    assert '联合前后原文理解the/a/an、I、and' in system
-    assert '例如译成中文时，冠词通常不必单独落字' in system
-    assert '不能借下一句补出本句缺少的名词、动词或事实' in system
+    assert '功能词按目标语言自然处理' in system
+    assert '不机械保留源文或音译' in system
+    assert '不借邻句补实词或补齐事实' in system
     assert '长静音两侧不强接' in system
-    assert 'The Hague' in system and 'grade A' in system and 'type I' in system
-    assert '不能套用功能词省略规则' in system
+    assert '专名和字母不能按功能词省略' in system
     assert list(parse_numbered_lines((context.output / 'translate.txt').read_text(encoding='utf-8'))) == calls[0]['ids']
 
 
@@ -135,6 +144,32 @@ def test_planner_keeps_realistic_316_lines_as_one_full_document(context):
     assert [len(chunk) for chunk in chunks] == [316]
     assert [row['id'] for chunk in chunks for row in chunk] == list(range(1, 317))
     assert sum(st._line_cost(row) for row in rows) > 2_000
+
+
+def test_planner_applies_configured_line_cap_after_token_budget(context):
+    """行数上限是 token 预算之外的安全边界，且不拆开字幕行。"""
+    context.values['translate.max_window_lines'] = 100
+    rows = lines(250)
+    chunks = st._plan_translation_windows(context, rows, '系统', 150_000)
+    assert [len(chunk) for chunk in chunks] == [100, 100, 50]
+    assert [row['id'] for chunk in chunks for row in chunk] == list(range(1, 251))
+
+
+def test_planner_zero_line_cap_keeps_token_only_policy(context):
+    context.values['translate.max_window_lines'] = 0
+    rows = lines(250)
+    chunks = st._plan_translation_windows(context, rows, '系统', 150_000)
+    assert chunks == [rows]
+
+
+def test_planner_defaults_to_one_hundred_lines_when_setting_is_absent():
+    from types import SimpleNamespace
+
+    ctx = SimpleNamespace(cfg=lambda _key, default=None: default,
+                          check_cancel=lambda: None)
+    rows = lines(205)
+    chunks = st._plan_translation_windows(ctx, rows, '系统', 150_000)
+    assert [len(chunk) for chunk in chunks] == [100, 100, 5]
 
 
 def test_long_document_with_more_than_2000_source_tokens_stays_whole_when_it_fits(context):
@@ -168,13 +203,62 @@ def test_real_run_whole_document_one_request_and_registers_complete_output(conte
     assert not calls[0]['handoff']
     assert '参考第' not in calls[0]['prompt'] and not calls[0]['review']
     assert list(parse_numbered_lines((context.output / 'translate.txt').read_text(encoding='utf-8'))) == list(range(1, count + 1))
-    assert len(context.registered) == 1
+    assert [row[0] for row in context.registered] == ['translate.txt', 'alignment_audit.json']
 
 
 def test_full_document_fit_overrides_conservative_body_budget(context):
     """决定分窗的是真实完整请求，不是预先扣掉摘要的粗估正文预算。"""
     rows = lines(316)
     assert st._plan_translation_windows(context, rows, '系统', 1) == [rows]
+
+
+@pytest.mark.parametrize('cancelled', [False, True])
+def test_partial_window_failure_preserves_previous_complete_translation(context, monkeypatch, cancelled):
+    from dubforge.pipeline import translation_preview
+    seed(context, lines(2))
+    context.job_id = 41
+    complete = context.output / 'translate.txt'
+    previous = '1. 旧完整译文一\n2. 旧完整译文二\n'
+    complete.write_text(previous, encoding='utf-8')
+
+    def interrupted(_ctx, chunks, system, p_from, p_to, on_partial, **kwargs):
+        on_partial({1: '本次第一句'}, 1, 2)
+        assert complete.read_text(encoding='utf-8') == previous
+        assert translation_preview.read(context.pdir, 41)['text'] == '1. 本次第一句\n'
+        assert translation_preview.read(context.pdir, 40) is None
+        raise StepCancelled('测试取消') if cancelled else StepFailedError('第二窗口失败')
+
+    monkeypatch.setattr(st, '_run_chunks_sequential', interrupted)
+    with pytest.raises(StepCancelled if cancelled else StepFailedError):
+        st.run(context)
+    assert complete.read_text(encoding='utf-8') == previous
+    assert context.registered == []
+    assert translation_preview.read(context.pdir, 41)['completed'] == 1
+
+
+def test_complete_translation_replaces_old_result_and_clears_only_current_preview(context, monkeypatch):
+    from dubforge.pipeline import translation_preview
+    seed(context, lines(2))
+    context.job_id = 41
+    (context.output / 'translate.txt').write_text('1. 旧一\n2. 旧二\n', encoding='utf-8')
+    install_model(monkeypatch)
+    st.run(context)
+    assert set(parse_numbered_lines((context.output / 'translate.txt').read_text(encoding='utf-8'))) == {1, 2}
+    assert translation_preview.read(context.pdir, 41) is None
+    assert [row[0] for row in context.registered] == ['translate.txt', 'alignment_audit.json']
+
+
+@pytest.mark.parametrize('content', [b'{broken', b'\xff\xfe'])
+def test_corrupt_translation_cache_is_a_miss_and_is_rebuilt(context, monkeypatch, content):
+    rows = lines(2)
+    calls = install_model(monkeypatch)
+    st._translate_window(context, rows, '系统', '', 1, 1)
+    cache = list((context.pdir / 'cache' / 'translate').glob('*.json'))
+    assert len(cache) == 1
+    cache[0].write_bytes(content)
+    st._translate_window(context, rows, '系统', '', 1, 1)
+    assert len(calls) == 2
+    assert isinstance(json.loads(cache[0].read_text(encoding='utf-8')), dict)
 
 
 def test_full_request_keeps_long_silence_between_original_ids(context, monkeypatch):
@@ -246,7 +330,7 @@ def test_translation_prepares_low_profiles_without_mutating_frozen_chain(context
     assert effective[1]['params'] == original[1]['params']
     assert context.profiles == original
     assert '只提交一份最终译文' in calls[0]['system']
-    assert '最后一行结束即结束响应' in calls[0]['system']
+    assert '最后一条所需内容结束即结束响应' in calls[0]['system']
     assert 'fixture' not in '\n'.join(context.logs)
     st.run(context)
     assert len(calls) == 1
@@ -356,13 +440,16 @@ def test_failed_later_window_keeps_success_cache_and_retries_only_missing_window
     calls = install_model(monkeypatch, respond)
     with pytest.raises(StepFailedError): st.run(context)
     assert not context.registered
-    assert list(parse_numbered_lines((context.output / 'translate.txt').read_text(encoding='utf-8'))) == [line['id'] for line in planned[0]]
-    assert len(list((context.pdir / 'cache' / 'translate').glob('*.json'))) == 1
+    from dubforge.pipeline import translation_preview
+    assert not (context.output / 'translate.txt').exists()
+    partial = translation_preview.read(context.pdir, 0)
+    assert list(parse_numbered_lines(partial['text'])) == [line['id'] for line in planned[0]]
+    assert len(list((context.pdir / 'cache' / 'translate').glob('*.json'))) == 2
     failing[0] = False; previous = len(calls)
     st.run(context)
     assert len(calls) == previous + len(planned) - 1
     assert all(call['ids'][0] >= second_first for call in calls[previous:])
-    assert len(context.registered) == 1
+    assert [row[0] for row in context.registered] == ['translate.txt', 'alignment_audit.json']
 
 
 def test_structure_failure_uses_existing_bounded_children_and_fresh_qa(context, monkeypatch):
@@ -378,6 +465,21 @@ def test_structure_failure_uses_existing_bounded_children_and_fresh_qa(context, 
     assert all('错序' not in call['prompt'] for call in calls[1:])
 
 
+def test_large_context_safe_missing_line_keeps_one_bounded_retry(context, monkeypatch):
+    rows = lines(81)
+
+    def respond(info, calls):
+        if len(calls) == 1:
+            return '\n'.join(f'{i}. 译文{i}' for i in range(1, 81))
+
+    calls = install_model(monkeypatch, respond)
+    translated, _ = st._translate_window(context, rows, '系统', '', 1, 1, context_safe=True)
+    assert list(translated) == list(range(1, 82))
+    assert len(calls) == 2
+    assert calls[0]['ids'] == list(range(1, 82))
+    assert calls[1]['ids'] == [81]
+
+
 def test_full_document_structure_failure_limits_recovery_source_tokens_and_total_calls(context, monkeypatch):
     rows = lines(81, 'natural source ' * 15)
     def respond(info, _calls):
@@ -385,12 +487,15 @@ def test_full_document_structure_failure_limits_recovery_source_tokens_and_total
     calls = install_model(monkeypatch, respond)
     translated, _ = st._translate_window(context, rows, '系统', '', 1, 1, context_safe=True)
     assert list(translated) == list(range(1, 82))
-    child_calls = calls[3:]
+    # 大窗口结构失败后最多保留一次短重试，随后进入小窗口恢复；
+    # 不再把同一个 81 行窗口完整发送三次。
+    assert len(calls) >= 3 and all(call['ids'] == list(range(1, 82)) for call in calls[:2])
+    child_calls = calls[2:]
     assert child_calls and len(calls) <= st.MAX_ADAPTIVE_VALIDATION_ATTEMPTS
     for call in child_calls:
         assert len(call['ids']) <= st.MAX_ADAPTIVE_WINDOW_LINES
         assert sum(st._line_cost(rows[i - 1]) for i in call['ids']) <= st.MAX_ADAPTIVE_SOURCE_TOKENS
-    assert sum(call['review'] for call in calls) == len(child_calls) // 2
+    assert any(call['review'] for call in child_calls)
 
 
 def test_missing_edge_line_repair_keeps_both_window_reference_and_valid_handoff(context, monkeypatch):

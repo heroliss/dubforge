@@ -156,15 +156,15 @@ def test_missing_actual_output_is_proven_without_history(baseline):
     assert find(result, 'output.translate.txt')['after'] == '文件缺失'
 
 
-def test_upstream_stale_is_named_without_claiming_unknown_previous_settings(baseline):
+def test_upstream_status_alone_does_not_invalidate_unchanged_consumer(baseline):
     uid, _ = baseline
     step = crud.get_step(crud.get_project(uid).id, 'split')
     step.status = 'stale'; crud.save_step(step)
     result = report(uid)
-    change = next(c for c in result['changes'] if c.get('upstream_step') == 'split')
-    assert change['category'] == 'upstream' and change['before_known'] is False
-    assert change['after'] == '上游需更新'
-    assert '语义整理' in change['message']
+    # 只有 split 的实际产物被替换/失效时，translate 才会重新核对输入；
+    # 单独改写步骤状态不能证明文件内容变化，也不能误报下游过期。
+    assert result['fresh'] is True
+    assert not any(c.get('upstream_step') == 'split' for c in result['changes'])
 
 
 def test_credentials_urls_paths_headers_and_unknown_restored_fields_never_leak(baseline):

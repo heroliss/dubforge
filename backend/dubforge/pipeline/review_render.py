@@ -15,15 +15,16 @@ from dubforge import comment_studio, configuration, config, video_info
 from dubforge.domain import crud
 from dubforge.domain.models import Artifact
 from dubforge.errors import DubForgeError
+from dubforge.pipeline.render_resources import bounded_ffmpeg_command, ffmpeg_failure, preflight_render
 from dubforge.pipeline import assembly_versions as versions, content_redaction, dubbing_session
 from dubforge.pipeline.assembly_models import AssemblyResult
 from dubforge.pipeline.dependencies import Dependencies
 from dubforge.pipeline.video_source import resolve_video
 from dubforge.utils.fs import atomic_replace, atomic_write_bytes
 
-RENDER_VERSION = 'review-render-v1'
+RENDER_VERSION = 'review-render-v2'
 _DEFINITION_KEYS = ('id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides')
-_REVIEW_KEYS = ('content_review.enabled', 'content_review.mute_audio',
+_REVIEW_KEYS = ('content_review.enabled', 'content_review.mute_audio', 'content_review.audio_mode',
                 'content_review.blocked_terms', 'content_review.blocked_ranges')
 
 
@@ -74,6 +75,14 @@ def _file(deps, art, *, verify_hash):
 def _snapshot(record):
     try:
         raw = json.loads(record.snapshot)
+        if not isinstance(raw, dict):
+            raise ValueError()
+        if raw.get('partial'):
+            raise ReviewRenderError('该成片包含局部修订，请在“合成成片”基于它继续局部修订，或完整生成新的版本。',
+                                    code='REVIEW_RENDER_PARTIAL_UNSUPPORTED')
+        if raw.get('output_cuts'):
+            raise ReviewRenderError('所选成片已应用片段剪辑，不能复用旧混音生成审查修订版；请在“合成成片”按当前剪辑方案重新生成',
+                                    code='REVIEW_RENDER_CUTS_UNSUPPORTED')
         definition = versions.validate({k: raw[k] for k in _DEFINITION_KEYS})
         if definition['id'] != record.version_id or not isinstance(raw['values'], dict):
             raise ValueError()
@@ -114,9 +123,31 @@ class _Context:
     def upstream(self, step, name):
         return self.deps.upstream(step, name)
 
+    def run_subprocess(self, command):
+        """声音测量与处理也接受同一取消信号，不遗留 FFmpeg 子进程。"""
+        process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, encoding='utf-8', errors='replace')
+        try:
+            while True:
+                _cancel(getattr(self, '_audio_cancel', None))
+                try:
+                    out, err = process.communicate(timeout=.25)
+                    return process.returncode, out, err
+                except subprocess.TimeoutExpired:
+                    continue
+        finally:
+            if process.poll() is None:
+                from dubforge.runner import StepContext
+                StepContext._kill_proc(process)
+                process.wait(timeout=10)
+
 
 def _prepare(deps, art, record, *, verify_hash, encoder='libx264'):
     snapshot = _snapshot(record)
+    from dubforge.pipeline.output_cuts import snapshot as cuts_snapshot
+    if cuts_snapshot(deps):
+        raise ReviewRenderError('当前已启用片段剪辑，不能使用旧审查修订流程；请在“合成成片”按当前剪辑方案重新生成',
+                                code='REVIEW_RENDER_CUTS_UNSUPPORTED')
     if art.project_id != deps.project.id or art.step_key != 'assemble' or art.kind != 'video' or art.sha256 != record.artifact_hash:
         raise ReviewRenderError('只能修订本项目登记的正式成片', code='REVIEW_RENDER_SOURCE')
     old = _file(deps, art, verify_hash=verify_hash)
@@ -131,7 +162,9 @@ def _prepare(deps, art, record, *, verify_hash, encoder='libx264'):
         raise ReviewRenderError('原视频没有本项目的独立下载或导入登记，不能用成片画面代替', code='REVIEW_RENDER_SOURCE')
     _file(deps, source, verify_hash=verify_hash)
     values = {**snapshot['values'], **{k: deps.cfg(k, default) for k, default in zip(
-        _REVIEW_KEYS, (True, True, '', ''), strict=True)}}
+        _REVIEW_KEYS, (True, True, 'voice_only', '', ''), strict=True)}}
+    from dubforge.pipeline.audio_quality import DEFAULTS as AUDIO_DEFAULTS
+    values = {**AUDIO_DEFAULTS, **values}
     frozen = {**snapshot, 'values': values}
     ctx = _Context(deps.for_version(frozen))
     if not ctx.cfg('content_review.enabled', True):
@@ -149,21 +182,29 @@ def _prepare(deps, art, record, *, verify_hash, encoder='libx264'):
             comment_studio.display_lines(item, overlay['settings'])
     files = [source, art, *(a for key, a in deps.arts.items() if key in {
         'split/split.txt', 'translate/translate.txt', 'transcribe/src.srt'})]
+    audio = content_redaction.audio_plan(ctx)
+    background_art = ctx.deps.arts.get('preprocess/background.wav') if audio['background'] is not None else None
+    if background_art:
+        files.append(background_art)
     guards = [dict(id=a.id, step=a.step_key, name=a.name, sha256=a.sha256,
                    size=a.size, rel_path=a.rel_path) for a in files]
     for item in files:
         _file(deps, item, verify_hash=verify_hash)
-    mute = content_redaction.audio_filter(ctx)
+    mute = audio['filter']
     recipe = dict(schema=RENDER_VERSION, source_artifact_id=art.id, video_artifact_id=source.id,
         inputs=guards, definition={k: snapshot[k] for k in ('dubbing', 'burn_subtitles', 'include_comments')},
         values=values, source_comment_settings=(snapshot.get('comment_overlay') or {}).get('settings'),
         current_comment_plan=current_overlay, comment_overlay=overlay,
         review_receipt=content_redaction.receipt(ctx), audio_filter=mute,
+        audio_processing=content_redaction.audio_fingerprint(ctx),
         encoder=dict(name=encoder, preset='p4' if encoder == 'h264_nvenc' else 'medium',
             rate_control='vbr' if encoder == 'h264_nvenc' else 'crf',
             quality_parameter='cq' if encoder == 'h264_nvenc' else 'crf', quality_value=values['assemble.crf'],
             note='NVENC CQ沿用冻结CRF数值作为本次选择，不代表与软件编码同等质量。' if encoder == 'h264_nvenc' else '软件CRF编码'))
-    return dict(ctx=ctx, snapshot=frozen, art=art, video=video, old=old, overlay=overlay,
+    if overlay:
+        # 原始 0 值无法区分旧自动窄版与当前可用全宽；成功配方保存实际规则。
+        recipe['comment_width_rule'] = 'available-area-v1'
+    return dict(ctx=ctx, snapshot=frozen, art=art, video=video, old=old, overlay=overlay, audio=audio,
                 recipe=recipe, fingerprint=versions.digest(recipe))
 
 
@@ -176,39 +217,200 @@ def _state_signature(uid):
                             configuration.resolve(uid)['fingerprint'], config.load_config()])
 
 
-def is_current(deps, version, record=None, verify_hash=False):
-    """独立修订有效性；此结果不得用于正规生产步骤的缓存跳过。"""
+def _revision_reason(code, message, **extra):
+    return dict(code=code, message=message, **extra)
+
+
+def _range_label(rows):
+    """只展示核实的数值时段，不返回用户备注或正文。"""
+    if not rows:
+        return '无屏蔽时段'
+    parts = [f'{float(r["start"]):g}–{float(r["end"]):g} 秒' for r in rows[:6]]
+    return '；'.join(parts) + (f'（共 {len(rows)} 段）' if len(rows) > 6 else '')
+
+
+def _manual_range_label(value):
+    try:
+        return _range_label(content_redaction.merge_ranges(content_redaction.parse_ranges(value or '')))
+    except (DubForgeError, TypeError, ValueError):
+        return '历史时段无法核对'
+
+
+def _revision_audio(recipe):
+    """旧修订只做全静音；没有实际处理时不因新默认策略而失效。"""
+    if not recipe.get('audio_filter'):
+        return None
+    audio = recipe.get('audio_processing') or recipe.get('review_receipt', {}).get('audio_processing')
+    if audio is None:
+        return dict(effective_mode='all_audio')
+    if not isinstance(audio, dict) or audio.get('effective_mode') not in {'voice_only', 'all_audio'}:
+        raise ValueError('修订声音记录格式无效')
+    result = dict(effective_mode=audio['effective_mode'])
+    if audio['effective_mode'] == 'voice_only':
+        result['background_identity'] = audio.get('background_identity')
+        result['bgm_volume'] = audio.get('bgm_volume', recipe['values'].get('assemble.bgm_volume', 1))
+    return result
+
+
+def _revision_overlay(overlay):
+    if not overlay:
+        return None
+    settings = comment_studio.render_fingerprint_plan(overlay)['settings']
+    return dict(settings=settings, items=[dict(lines=comment_studio.display_lines(item, overlay['settings']),
+        author=(item.get('author') or '匿名观众')[:48] if settings['show_author'] else None)
+        for item in overlay['items']])
+
+
+def _revision_recipe(recipe):
+    """摘要先核验原始记录，再比较实际使用的配方；不重写旧记录。"""
+    required = {'schema', 'source_artifact_id', 'video_artifact_id', 'inputs', 'definition', 'values',
+                'comment_overlay', 'review_receipt', 'audio_filter', 'encoder'}
+    if not isinstance(recipe, dict) or not required <= recipe.keys():
+        raise ValueError('修订配方缺少历史')
+    if recipe['schema'] not in {'review-render-v1', 'review-render-v2'}:
+        raise ValueError('修订配方版本无法核对')
+    if not isinstance(recipe['inputs'], list) or not recipe['inputs']:
+        raise ValueError('修订输入历史无效')
+    result = copy.deepcopy(recipe)
+    result['schema'] = 'review-render-effects-v1'
+    # 当前计划的样式随后被冻结样式覆盖；实际消费的内容与时序由 overlay 核验。
+    result.pop('current_comment_plan', None)
+    result.pop('source_comment_settings', None)
+    if recipe['comment_overlay']:
+        # 旧显式宽度没有改变；仅缺少规则记录的旧自动宽度需要重新制作。
+        result['comment_width_rule'] = recipe.get('comment_width_rule',
+            'legacy-auto' if not recipe['comment_overlay']['settings'].get('width_percent')
+            else 'available-area-v1')
+        if 'comments.width_percent' in result['values']:
+            result['values']['comments.width_percent'] = result['values']['comments.width_percent'] or 100
+    result['comment_overlay'] = _revision_overlay(recipe['comment_overlay'])
+    result['audio_processing'] = _revision_audio(recipe)
+    result['values'].pop('content_review.audio_mode', None)
+    if result['values'].get('assemble.final_loudness_mode', 'off') == 'off':
+        from dubforge.pipeline.audio_quality import FINAL_KEYS
+        for key in FINAL_KEYS:
+            result['values'].pop(key, None)
+    result['review_receipt'].pop('audio_processing', None)
+    return result
+
+
+def _revision_values(version, audio):
+    active = versions.active_values(version)
+    # 旧混音已冻结，这三个开关不会在独立修订中再次应用。
+    for key in ('assemble.voice_volume', 'assemble.ducking', 'assemble.loudnorm'):
+        active.pop(key, None)
+    if not audio or audio['effective_mode'] != 'voice_only':
+        active.pop('assemble.bgm_volume', None)
+    active = {k: v for k, v in active.items() if k in {f['path'] for f in versions.fields()}}
+    if version['include_comments']:
+        settings = {**comment_studio.DEFAULT_SETTINGS,
+            **{k.removeprefix('comments.'): v for k, v in version['values'].items() if k.startswith('comments.')}}
+        normalized = comment_studio.render_fingerprint_plan(dict(settings=settings, items=[]))['settings']
+        active.update({'comments.' + k: v for k, v in normalized.items() if 'comments.' + k in version['values']})
+    return active
+
+
+def _recipe_reasons(old, new):
+    reasons = []
+    old_audio, new_audio = _revision_audio(old), _revision_audio(new)
+    mode = lambda a: a['effective_mode'] if a else 'unchanged'
+    if mode(old_audio) != mode(new_audio):
+        labels = dict(all_audio='全部声音静音', voice_only='仅屏蔽人声、保留分离背景', unchanged='不处理声音')
+        reasons.append(_revision_reason('REVIEW_AUDIO_MODE_CHANGED', '声音处理方式已更新', changes=[
+            dict(label='实际声音处理', before=labels[mode(old_audio)], after=labels[mode(new_audio)])]))
+    elif old_audio != new_audio:
+        reasons.append(_revision_reason('REVIEW_BACKGROUND_CHANGED', '修订实际使用的分离背景或背景音量已变化'))
+    old_values, new_values = old['values'], new['values']
+    if old_values.get('content_review.blocked_ranges', '') != new_values.get('content_review.blocked_ranges', ''):
+        reasons.append(_revision_reason('REVIEW_MANUAL_RANGES_CHANGED', '人工屏蔽时段已修改或清空', changes=[
+            dict(label='人工屏蔽时段', before=_manual_range_label(old_values.get('content_review.blocked_ranges')),
+                 after=_manual_range_label(new_values.get('content_review.blocked_ranges')))]))
+    if old_values.get('content_review.blocked_terms', '') != new_values.get('content_review.blocked_terms', ''):
+        reasons.append(_revision_reason('REVIEW_BLOCKED_TERMS_CHANGED', '屏蔽词设置已修改'))
+    old_review, new_review = old['review_receipt'], new['review_receipt']
+    if old_review.get('ranges') != new_review.get('ranges') or old['audio_filter'] != new['audio_filter']:
+        reasons.append(_revision_reason('REVIEW_EFFECT_CHANGED', '实际屏蔽的字幕或声音时段已变化', changes=[
+            dict(label='文字屏蔽时段', before=_range_label(old_review.get('ranges', [])),
+                 after=_range_label(new_review.get('ranges', [])))]))
+    guards = lambda recipe: {(r['step'], r['name']): r for r in recipe['inputs']}
+    old_inputs, new_inputs = guards(old), guards(new)
+    changed = {key[0] for key in old_inputs.keys() | new_inputs.keys() if old_inputs.get(key) != new_inputs.get(key)}
+    for steps, code, message in [({'download'}, 'REVIEW_SOURCE_VIDEO_CHANGED', '登记的原视频已变化'),
+        ({'assemble'}, 'REVIEW_ORIGINAL_OUTPUT_CHANGED', '修订所复用的旧成片或混音已变化'),
+        ({'transcribe', 'split', 'translate'}, 'REVIEW_TEXT_CHANGED', '实际用于字幕或审查的文字资料已变化')]:
+        if changed & steps:
+            reasons.append(_revision_reason(code, message))
+    if _revision_overlay(old['comment_overlay']) != _revision_overlay(new['comment_overlay']):
+        reasons.append(_revision_reason('REVIEW_COMMENTS_CHANGED', '实际烧录的评论内容、时序或样式已变化'))
+    if old_review.get('signature') != new_review.get('signature') and not changed & {'transcribe', 'split', 'translate'}:
+        if not any(r['code'] in {'REVIEW_MANUAL_RANGES_CHANGED', 'REVIEW_BLOCKED_TERMS_CHANGED', 'REVIEW_EFFECT_CHANGED'} for r in reasons):
+            reasons.append(_revision_reason('REVIEW_TEXT_CHANGED', '字幕校对文字或审查依据已变化'))
+    if _revision_recipe(old) != _revision_recipe(new) and not reasons:
+        reasons.append(_revision_reason('REVIEW_RECIPE_CHANGED', '修订实际使用的制作设置或审查处理已变化'))
+    return reasons
+
+
+def revision_state(deps, version, record=None, verify_hash=False):
+    """独立修订的只读诊断；只返回安全标签、数值，不输出路径或正文。"""
+    reasons = []
+    failed = lambda code, message: dict(current=False, reasons=[_revision_reason(code, message)])
     try:
         record = record or versions.results(deps.project.uid).get(version['id'])
         snapshot = json.loads(record.snapshot) if record else {}
-        repair_info = snapshot.get('review_render')
-        if not repair_info or repair_info.get('schema') != RENDER_VERSION:
-            return False
+        info = snapshot.get('review_render')
+        if not isinstance(info, dict) or not isinstance(info.get('recipe'), dict):
+            return failed('REVIEW_HISTORY_MISSING', '修订缺少可核验的生成配方，请重新生成成片')
+        recipe = info['recipe']
+        if (versions.digest(recipe) != record.fingerprint or info.get('fingerprint') != record.fingerprint
+                or info.get('schema') != recipe.get('schema') or info.get('source_artifact_id') != recipe.get('source_artifact_id')
+                or info.get('encoder') != recipe.get('encoder')):
+            return failed('REVIEW_HISTORY_INVALID', '修订生成记录与保存的摘要不一致，请重新生成成片')
+        _revision_recipe(recipe)
         art = next((a for a in deps.arts.values() if a.id == record.artifact_id), None)
         if not art or art.sha256 != record.artifact_hash:
-            return False
+            return failed('REVIEW_OUTPUT_CHANGED', '修订文件的登记已丢失或文件身份已变化')
         _file(deps, art, verify_hash=verify_hash)
-        original = next((a for a in deps.arts.values() if a.id == repair_info['source_artifact_id']), None)
+        original = next((a for a in deps.arts.values() if a.id == info['source_artifact_id']), None)
         original_record = next((r for r in versions.results(deps.project.uid).values()
                                 if original and r.artifact_id == original.id), None)
         if not original or not original_record:
-            return False
+            return failed('REVIEW_ORIGINAL_OUTPUT_MISSING', '缺少本次修订所复用的旧成片或成功记录')
         prepared = _prepare(deps, original, original_record, verify_hash=verify_hash,
-                            encoder=repair_info.get('encoder', {}).get('name', 'libx264'))
-        if prepared['fingerprint'] != record.fingerprint or prepared['fingerprint'] != repair_info['fingerprint']:
-            return False
-        keys = {f['path'] for f in versions.fields()}
+                            encoder=info.get('encoder', {}).get('name', 'libx264'))
+        reasons.extend(_recipe_reasons(recipe, prepared['recipe']))
+        # 摘要中的无关工作区样式变化不代表画面变化；其余消费差异仍必须阻断。
+        if _revision_recipe(recipe) != _revision_recipe(prepared['recipe']) and not reasons:
+            reasons.append(_revision_reason('REVIEW_RECIPE_CHANGED', '修订的实际制作配方已变化'))
         if any(version[k] != snapshot[k] for k in ('dubbing', 'burn_subtitles', 'include_comments')):
-            return False
-        if any(version['values'].get(k) != snapshot['values'].get(k) for k in keys if k in snapshot['values']):
-            return False
+            reasons.append(_revision_reason('REVIEW_VERSION_CHANGED', '成片版本的声音、字幕或评论选择已变化'))
+        # 两边按当前实际消费范围比较值；新增声音策略自身由上面的模式差异解释。
+        audio = _revision_audio(prepared['recipe'])
+        old_values = _revision_values(snapshot, audio)
+        new_values = _revision_values(version, audio)
+        if old_values != new_values:
+            labels = {f['path']: f['label'] for f in versions.fields()}
+            changed = [labels[k] for k in sorted(old_values.keys() | new_values.keys()) if old_values.get(k) != new_values.get(k)]
+            reasons.append(_revision_reason('REVIEW_VERSION_SETTINGS_CHANGED', '本版本实际使用的设置已变化：' + '、'.join(changed)))
         if verify_hash:
             media, original_media = _media(_path(deps, art)), _media(prepared['video'])
             if not media['video'] or not media['audio'] or abs(media['duration'] - original_media['duration']) > .25:
-                return False
-        return True
-    except (DubForgeError, OSError, ValueError, KeyError, TypeError):
-        return False
+                reasons.append(_revision_reason('REVIEW_MEDIA_INVALID', '修订文件的时长、画面或音轨无法与原视频对应'))
+        return dict(current=not reasons, reasons=reasons)
+    except (DubForgeError, OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+        if isinstance(exc, ReviewRenderError) and exc.code == 'REVIEW_RENDER_CUTS_UNSUPPORTED':
+            return failed('REVIEW_RENDER_CUTS_UNSUPPORTED', exc.message)
+        if isinstance(exc, ReviewRenderError) and exc.code == 'REVIEW_RENDER_SOURCE_CHANGED':
+            return failed('REVIEW_FILE_MISSING_OR_CHANGED', '原视频、旧成片、修订文件或文字文件缺失，或内容与登记不一致')
+        if isinstance(exc, DubForgeError) and exc.code in {'COMMENTS_NOT_CONFIRMED', 'COMMENTS_REVIEW_EMPTY', 'COMMENTS_DISPLAY_TEXT'}:
+            return failed('REVIEW_COMMENTS_UNAVAILABLE', '当前没有可用的已确认评论方案，请先核对上屏评论')
+        if isinstance(exc, ReviewRenderError) and exc.code == 'REVIEW_RENDER_DISABLED':
+            return failed('REVIEW_DISABLED', '当前内容审查已关闭，请核对设置后重新生成成片')
+        return failed('REVIEW_HISTORY_INVALID', '修订生成记录或当前输入无法核验，请重新生成成片')
+
+
+def is_current(deps, version, record=None, verify_hash=False):
+    """保留原布尔接口；独立修订不能用于正规生产步骤的缓存跳过。"""
+    return revision_state(deps, version, record, verify_hash)['current']
 
 
 def _idle(project, marker=None):
@@ -250,6 +452,8 @@ def _render(prepared, folder, total, *, progress, cancel, index, count, version_
     from dubforge.pipeline.subtitle_style import prepare_subtitle_lines, video_canvas
     from dubforge.pipeline.version_render import subtitle_lines
     ctx = prepared['ctx']
+    preflight_render(ctx, folder)
+    ctx._audio_cancel = cancel
     filters = []
     if prepared['snapshot']['burn_subtitles']:
         lines = subtitle_lines(ctx, prepared['snapshot'])
@@ -259,8 +463,27 @@ def _render(prepared, folder, total, *, progress, cancel, index, count, version_
         filters.append(graph)
     out = folder / 'video.mp4.tmp'
     cmd = ['ffmpeg', '-y', '-hide_banner', '-progress', 'pipe:1', '-nostats',
-           '-i', str(prepared['video']), '-i', str(prepared['old']),
-           '-map', '0:v:0', '-map', '1:a:0', '-map_metadata', '-1', '-map_chapters', '-1']
+           '-i', str(prepared['video']), '-i', str(prepared['old'])]
+    background_label = None
+    if prepared['audio']['background'] is not None:
+        cmd += ['-i', str(prepared['audio']['background'])]
+        background_label = '2:a:0'
+    reference, treatment = None, None
+    master = None
+    if ctx.cfg('assemble.final_loudness_mode', 'off') != 'off':
+        from dubforge.pipeline.audio_quality import measure_mix, final_gain
+        reference_graph = (content_redaction.apply_audio_review(prepared['audio'], '1:a:0', background_label=background_label)
+                           if prepared['recipe']['audio_filter'] else '[1:a:0]anull[reviewed_audio]')
+        if ctx.cfg('assemble.final_loudness_mode', 'off') == 'uniform':
+            from dubforge.pipeline.audio_master import prepare_master
+            master = prepare_master(ctx, cmd, [reference_graph], '[reviewed_audio]', duration=total)
+            reference, treatment = master['reference'], master['processing']
+            cmd += ['-i', str(master['path'])]
+            master_input = cmd.count('-i') - 1
+        else:
+            reference = measure_mix(ctx, cmd, [reference_graph], '[reviewed_audio]', duration=total)
+            treatment = final_gain(ctx, reference)
+    cmd += ['-map', '0:v:0', '-map_metadata', '-1', '-map_chapters', '-1']
     if filters:
         encoder = prepared['recipe']['encoder']
         cmd += ['-vf', ','.join(filters), '-c:v', encoder['name'], '-preset', encoder['preset']]
@@ -268,15 +491,28 @@ def _render(prepared, folder, total, *, progress, cancel, index, count, version_
                 if encoder['name'] == 'h264_nvenc' else ['-crf', str(encoder['quality_value'])])
     else:
         cmd += ['-c:v', 'copy']
-    if prepared['recipe']['audio_filter']:
-        cmd += ['-af', prepared['recipe']['audio_filter'], '-c:a', 'aac', '-b:a', '192k']
+    if master is not None:
+        cmd += ['-map', f'{master_input}:a:0', '-c:a', 'aac', '-b:a', '192k']
+    elif prepared['recipe']['audio_filter'] or treatment is not None:
+        graph = (content_redaction.apply_audio_review(prepared['audio'], '1:a:0', background_label=background_label)
+                 if prepared['recipe']['audio_filter'] else '[1:a:0]anull[reviewed_audio]')
+        audio_output = '[reviewed_audio]'
+        if treatment is not None:
+            from dubforge.pipeline.audio_quality import gain_filter
+            addition, audio_output = gain_filter(audio_output, treatment)
+            graph += ';' + addition
+        cmd += ['-filter_complex', graph, '-map', audio_output, '-c:a', 'aac', '-b:a', '192k']
     else:
-        cmd += ['-c:a', 'copy']
+        cmd += ['-map', '1:a:0', '-c:a', 'copy']
     cmd += ['-t', f'{total:.6f}', '-movflags', '+faststart', '-f', 'mp4', str(out)]
     lines = queue.Queue()
-    with tempfile.TemporaryFile() as errors:
-        proc = subprocess.Popen(cmd, cwd=folder, stdout=subprocess.PIPE, stderr=errors,
-                                text=True, encoding='utf-8', errors='replace')
+    with tempfile.TemporaryFile(dir=folder) as errors:
+        try:
+            proc = subprocess.Popen(bounded_ffmpeg_command(cmd), cwd=folder, stdout=subprocess.PIPE, stderr=errors,
+                                    text=True, encoding='utf-8', errors='replace')
+        except OSError as exc:
+            raise ffmpeg_failure(exc, output_dir=folder, fallback_code='REVIEW_RENDER_FFMPEG',
+                                 message='审查修订编码失败，请检查 FFmpeg 日志') from exc
         def pump():
             try:
                 for line in proc.stdout:
@@ -302,14 +538,20 @@ def _render(prepared, folder, total, *, progress, cancel, index, count, version_
                                   percent=100 * (index + seconds / total) / count))
             if proc.wait() != 0:
                 errors.seek(0)
-                raise ReviewRenderError('审查修订编码失败，请检查 FFmpeg 日志', code='REVIEW_RENDER_FFMPEG',
-                                        detail=errors.read()[-2000:].decode('utf-8', 'replace'))
+                raise ffmpeg_failure(errors.read()[-4000:], output_dir=folder,
+                                     fallback_code='REVIEW_RENDER_FFMPEG',
+                                     message='审查修订编码失败，请检查 FFmpeg 日志')
         finally:
             if proc.poll() is None:
                 from dubforge.runner import StepContext
                 StepContext._kill_proc(proc)
                 proc.wait(timeout=10)
             reader.join(timeout=5)
+    from dubforge.pipeline.audio_quality import finalize
+    prepared['audio_report'] = finalize(ctx, out, reference=reference, applied=treatment)
+    from dubforge.pipeline.audio_comparison import augment_report
+    prepared['audio_report'] = augment_report(ctx, prepared['audio_report'], prepared['video'],
+                                              duration=total, full_duration=total)
     return out
 
 
@@ -377,12 +619,14 @@ def repair(uid, artifact_ids, *, progress=None, cancel=None, encoder='libx264'):
                 final = output / filename
                 if final.exists():
                     raise ReviewRenderError('修订目标文件已存在但无法验证有效，请保留旧文件并另行核对', code='REVIEW_RENDER_CONFLICT')
+                generated_at = datetime.now(timezone.utc).isoformat()
                 snapshot = {**item['snapshot'], **item['definition'], 'comment_overlay': item['overlay'],
+                    'generated_at': generated_at,
                     'content_review_receipt': item['recipe']['review_receipt'],
                     'review_render': dict(schema=RENDER_VERSION, source_artifact_id=item['art'].id,
                         fingerprint=item['fingerprint'], recipe=item['recipe'], encoder=item['recipe']['encoder'],
-                        created_at=datetime.now(timezone.utc).isoformat(timespec='seconds'),
-                        note='基于当前文字和已有混音的审查修订；未重新进行语义整理、翻译或语音合成。')}
+                        created_at=generated_at,
+                        note='基于当前文字和已有混音的审查修订；命中段按当前模式处理并补回可用分离背景，未重新进行语义整理、翻译或语音合成。')}
                 receipt = folder / 'receipt.json.tmp'
                 atomic_write_bytes(receipt, json.dumps(snapshot['review_render'], ensure_ascii=False, indent=2).encode())
                 pending.append((item, encoded, final, receipt, snapshot, _sha(encoded)))
@@ -419,6 +663,8 @@ def repair(uid, artifact_ids, *, progress=None, cancel=None, encoder='libx264'):
                             if final.exists() or final_receipt.exists():
                                 raise ReviewRenderError('修订文件名已占用，结果未保存', code='REVIEW_RENDER_CONFLICT')
                             atomic_replace(encoded, final); changed_files.append(final)
+                            from dubforge.pipeline.audio_quality import write_report, report_path
+                            write_report(final, item['audio_report']); changed_files.append(report_path(final))
                             atomic_replace(receipt, final_receipt); changed_files.append(final_receipt)
                             repaired.append(dict(source_artifact_id=item['art'].id, artifact_id=art.id,
                                 version_id=item['version_id'], path=str(final), sha256=sha,

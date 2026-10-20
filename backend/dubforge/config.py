@@ -56,6 +56,16 @@ DB_FILE_NAME = "dubforge.db"
 
 # 默认配置 (config.yaml 缺失/缺键时生效; 模板见 config.example.yaml)
 DEFAULTS: dict[str, Any] = {
+    "run": {"mode": "draft"},
+    "assembly": {"target_version_ids": None},  # 空值表示尚未明确选择项目制作目标。
+    "publish": {
+        "project_target": None,  # 原BV只保存在本项目配置，禁止全局或模板继承。
+        # 只用于新发布流程；已确认稿件的章节策略仍以其冻结快照为准。
+        "chapters_enabled": True,
+        "chapters_translate": True,
+        "chapters_permanent": True,
+        "chapters_instruction": "",
+    },
     "llm": {
         # OpenAI 兼容接口 (智谱/GLM 等); 翻译与分句语义切共用
         # 多组 API 配置池: 按顺序降级 (旧版单 base_url/api_key 自动兼容)
@@ -97,9 +107,12 @@ DEFAULTS: dict[str, Any] = {
     "split": {
         "use_llm": True,             # 启用 LLM 语义整理
         "llm_profile": "",           # 空=跟随全局降级链；填写配置组名称可固定该组
-        # 模型上下文硬限；全文一次提交并为完整输出预留空间，默认使用 0.2M。
-        # 界面允许按服务商能力调到最高 1M。
+        # 模型上下文硬限；短稿可全文提交，长稿按核心词数分块并为完整输出预留空间。
+        # 默认使用 0.2M，界面允许按服务商能力调到最高 1M。
         "llm_context_tokens": 200_000,
+        "llm_chunk_target_words": 500,
+        "llm_chunk_overlap_words": 80,
+        "llm_chunk_max_retries": 3,
         "thinking_mode": "low",      # 支持的模型请求低思考档位；其他模型使用简短任务引导
         "target_word_count": 10,     # LLM 语义软目标；中文按自然语义词理解，不按字符机械切分
         "max_split_length": 22,      # 仅关闭 LLM 时的本地字符断句设置；保留旧值含义
@@ -107,7 +120,8 @@ DEFAULTS: dict[str, Any] = {
     },
     "content_review": {
         "enabled": True,          # 输出前按本地规则检查中英文字，命中整句不展示
-        "mute_audio": True,       # 同时静音命中时段的完整混音，覆盖两种语言与背景串音
+        "mute_audio": True,       # 对命中时段应用音频屏蔽
+        "audio_mode": "voice_only", # voice_only=保留分离背景；all_audio=完整混音静音
         "blocked_terms": "",      # 补充屏蔽词，每行一个；不修改识别原稿或译文
         "blocked_ranges": "",     # 人工核定时段，每行 开始秒-结束秒:原因，使用源视频时间轴
     },
@@ -122,28 +136,39 @@ DEFAULTS: dict[str, Any] = {
         "llm_profile": "",            # 空=跟随全局降级链；填写配置组名称可固定该组
         "thinking_mode": "low",      # 仅本步骤请求低思考档位；follow_profile保留模型参数
         "max_context_tokens": 200000,  # 单次翻译总预算; 界面允许按服务商能力调到 1M
+        "max_window_lines": 100,       # token 预算之外的单窗口字幕行数安全上限; 0=仅按 token 分窗
         "custom_terms_path": "",     # 术语表 xlsx (src/dst/备注 三列)
     },
     "tts": {
         "backend": "indextts25",
         "tolerance": 0.4,          # 兼容旧任务标记；当前 UI、超长判断和重试不使用
+        "placement": {
+            "enabled": True,
+            "auto_repair": True,  # 先排布，仍有冲突才有限缩短；保留原声音历史
+            "max_shift_seconds": 2.0,  # 每句相对源时间允许的最大前后移动
+            "window_lines": 9,         # 整段原速不可行后的局部缩时分析窗口
+            "inter_sentence_gap": 0.08,  # 相邻配音间预留的呼吸间隔
+        },
         "indextts25": {
             "url": "http://127.0.0.1:7860/",
             "project_dir": "",       # index-tts 项目根 (空=自动查找)
             "lang": "ZH",
             # 双维度参考 (沿用工作台验证过的语义):
-            #   preset=自定义参考 / stable=视频开头切片 / dynamic=每句原声 / vector=情感向量(仅情感)
+            #   preset=自定义参考 / stable=指定句原声 / dynamic=每句原声 / vector=情感向量(仅情感)
             "timbre_mode": "preset",
             "timbre_audio": "",
+            "timbre_reference_line_id": 1,  # stable 模式固定使用指定源句，默认第一句
             "emo_mode": "preset",
             "emo_audio": "",
+            "emo_reference_line_id": 1,  # 音色与情感可分别选取源句
             "emo_weight": 1.0,
             "emo_vector": [0, 0, 0, 0, 0, 0, 0, 0],  # 喜怒哀惧厌恶低落惊喜平静
             "emo_text": "",         # 文本情感模式；留空按待合成文本理解
             "emo_random": False,    # 向量/文本情感的随机采样
             "duration_factor": 1.0,
             "duration_retry_factors": "0.7, 0.5",  # 配音超出可用时长时逐次缩短；留空关闭
-            "request_timeout_seconds": 300,  # 单次模型请求（含服务排队）上限；不改变已有音频指纹
+            "dynamic_reference_max_seconds": 5.0,  # dynamic 音色/情感参考上限；模型服务最多读取 15 秒
+            "request_timeout_seconds": 600,  # 单次模型请求（含服务排队）上限；不改变已有音频指纹
             # IndexTTS WebUI 高级推理参数 (预设应用与逐句合成共用)
             "do_sample": True,
             "top_p": 0.8,
@@ -168,10 +193,19 @@ DEFAULTS: dict[str, Any] = {
         "voice_volume": 1.0,        # 人声音量，与配音编辑页共用
         "ducking": True,            # 人声段自动压低背景音 (sidechaincompress)
         "loudnorm": True,           # EBU R128 响度归一
+        "final_loudness_mode": "off",  # off 保留混音；normalize 保留动态；uniform 统一响度并在必要时控制峰值
+        "final_loudness_lufs": -16.0,
+        "final_true_peak_db": -1.5,
+        "sentence_leveling": False,  # 保守均衡明显句间差异，默认保留原表现
+        "sentence_leveling_max_db": 3.0,
         "burn_subtitles": False,    # 烧录字幕 (默认外挂)
         "subtitle_track": "trans",  # source/trans/bilingual，仅烧录时需要
         "subtitle_font": "Microsoft YaHei",
         "subtitle_size": 48,        # 字号、描边与边距按 1080 高画面等比例缩放
+        "subtitle_auto_fit": True,  # 长字幕优先缩小字号，再按宽度上限换行。
+        "subtitle_shrink_width_percent": 80,  # 超过画面此宽度时尝试缩小字号。
+        "subtitle_wrap_width_percent": 90,  # 缩至下限后可用的宽度上限，再长则换行。
+        "subtitle_min_size": 32,
         "subtitle_color": "#FFFFFF",
         "subtitle_outline_color": "#000000",
         "subtitle_outline": 2,
@@ -179,25 +213,29 @@ DEFAULTS: dict[str, Any] = {
         "subtitle_source_style_enabled": False,  # 关闭时原文跟随译文样式。
         "subtitle_source_font": "Microsoft YaHei",
         "subtitle_source_size": 40,
+        "subtitle_source_min_size": 28,
         "subtitle_source_color": "#FFFFFF",
         "subtitle_source_outline_color": "#000000",
         "subtitle_source_outline": 2,
         "subtitle_background_color": "#000000",
         "subtitle_background_opacity": 0,  # 0 完全透明；不改变旧字幕的无底色效果
         "crf": 18,
+        "video_encoder": "software",
+        "nvenc_cq": 18,
     },
     "comments": {
         "failure_policy": "skip",  # 单条内容失败继续；鉴权、网络和存储错误仍暂停。
         # 仅作为新评论方案的起点；已确认方案及已保存全流程配方使用自己的快照。
         "overlay": {
             "start": 5.0, "interval": 15.0, "duration": 6.0,
-            "position": "top_left", "font_size": 36, "margin": 60,
-            "width_percent": 0,  # 0 自动；其他值为评论最大宽度占画面宽度的百分比。
+            "position": "top_left", "font_size": 36, "min_font_size": 18, "margin": 60,
+            "width_percent": 0,  # 0 自动同 100%，使用扣除边距后的可用宽度；其他值限制占画面宽度。
+            "height_percent": 30,  # 软高度；缩至最小字号后仍放不下时允许完整文字向下延伸。
             "show_author": False, "language_mode": "translated", "source_first": False,
             "color": "#FFFFFF", "outline_color": "#000000", "outline": 2,
             "background_color": "#000000", "background_opacity": 50,
             "font": "Microsoft YaHei", "source_style_enabled": False,
-            "source_font": "Microsoft YaHei", "source_font_size": 30,
+            "source_font": "Microsoft YaHei", "source_font_size": 30, "source_min_font_size": 18,
             "source_color": "#FFFFFF", "source_outline_color": "#000000", "source_outline": 2,
         },
     },
@@ -237,7 +275,8 @@ DEFAULTS: dict[str, Any] = {
         "step_timeout_seconds": {
             "download": 3600, "preprocess": 1800, "transcribe": 3600,
             "split": 1800, "translate": 3600, "subtitles": 600,
-            "dubtask": 600, "tts": 7200, "assemble": 3600,
+            # 长视频配音/双版本编码可能跨越数小时；暂停和排队不计入。
+            "dubtask": 600, "tts": 43200, "assemble": 43200,
         },
     },
     "server": {
@@ -248,7 +287,7 @@ DEFAULTS: dict[str, Any] = {
         "data_root": "",
     },
     "paths": {
-        # HuggingFace 模型缓存; 空=自动复用 VideoLingo-Workspace 的 vl_cache (省数GB下载)
+        # HuggingFace 模型缓存；空值优先使用 HF_HOME，否则使用当前数据目录/hf。
         "hf_home": "",
     },
 }
@@ -359,7 +398,21 @@ def update_config(updates: dict[str, Any]) -> None:
                     raise ConfigError(f"配置路径不是对象: {p}")
                 node = node[p]
             node[parts[-1]] = copy.deepcopy(value)
-        _deep_merge(DEFAULTS, user)  # 已知配置段必须保持对象结构，完整校验后才能写入。
+        merged = _deep_merge(DEFAULTS, user)  # 已知配置段必须保持对象结构，完整校验后才能写入。
+        if any(key == 'assemble' or key.startswith('assemble.subtitle_') for key in updates):
+            # 点分局部更新也要核对合并后的宽度关系；不依赖调用方是否已校验。
+            # 校验器内部同时处理样式规则，失败时整个批次保持原文件。
+            from dubforge.pipeline.step_params import validate_numeric_updates
+            subtitle_values = {f'assemble.{key}': value for key, value in merged['assemble'].items()
+                               if key.startswith('subtitle_')}
+            # 合并将旧 null 视为跟随默认；本次明确写入的空值仍应报错，不能静默保存。
+            section_updates = updates.get('assemble')
+            if isinstance(section_updates, dict):
+                subtitle_values.update({f'assemble.{key}': value for key, value in section_updates.items()
+                                        if key.startswith('subtitle_')})
+            subtitle_values.update({key: value for key, value in updates.items()
+                                    if key.startswith('assemble.subtitle_')})
+            validate_numeric_updates(subtitle_values)
         try:
             data = yaml.safe_dump(user, allow_unicode=True, sort_keys=False).encode("utf-8")
             atomic_write_bytes(cp, data)
@@ -381,16 +434,13 @@ def db_path() -> Path:
 
 
 def resolve_hf_home() -> Path:
-    """HF 模型缓存目录解析: 显式配置 > 已有环境变量 > 复用 VideoLingo vl_cache > data/hf"""
+    """HF 模型缓存目录：显式配置 > HF_HOME > 当前数据目录/hf。"""
     explicit = get("paths.hf_home")
     if explicit:
         return Path(explicit)
     env = os.environ.get("HF_HOME")
     if env:
         return Path(env)
-    sibling = REPO_ROOT.parent / "VideoLingo-Workspace" / "vl_cache" / "hf"
-    if sibling.is_dir():
-        return sibling
     return data_root() / "hf"
 
 

@@ -1,7 +1,7 @@
 """统一配置 API；运行检查不另存配方。"""
 from fastapi import APIRouter, Depends
 from app.api.publishing import same_origin
-from dubforge import configuration
+from dubforge import configuration, configuration_trash
 
 router = APIRouter(prefix='/api/configuration', tags=['configuration'], dependencies=[Depends(same_origin)])
 
@@ -14,6 +14,16 @@ def templates():
 @router.post('/templates')
 def create(body: dict):
     return configuration.create_template(body.get('name'))
+
+
+@router.get('/templates/trash')
+def deleted_templates():
+    return configuration_trash.list_deleted()
+
+
+@router.post('/templates/trash/{backup_id}/restore')
+def restore_template(backup_id: str, body: dict):
+    return configuration_trash.restore(backup_id, body)
 
 
 @router.post('/binding-plan')
@@ -55,3 +65,8 @@ def archive(key: str, body: dict):
 @router.put('/{key}')
 def save(key: str, body: dict):
     return configuration.save(key, body)
+
+
+@router.delete('/{key}')
+def delete_template(key: str, body: dict):
+    return configuration_trash.delete(key, body)

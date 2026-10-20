@@ -1,0 +1,67 @@
+{
+  "input": "project-space.jpg",
+  "input_sha256": "5b33b122faf9bad9924da0e9b8c23a95688d2148abd687f6b7fd39ad2f7b2251",
+  "output_sha256": "2dc423e40600255e54bb8da94d1610725f350c3d8f5000bc38777be96a5a009e",
+  "original_size": {
+    "width": 2560,
+    "height": 1271
+  },
+  "crop": {
+    "left": 620,
+    "top": 80,
+    "width": 1550,
+    "height": 835
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 620,
+      "top": 80,
+      "width": 1550,
+      "height": 835
+    },
+    "marks": [
+      {
+        "number": 1,
+        "target": {
+          "x": 76,
+          "y": 636,
+          "width": 222,
+          "height": 45
+        },
+        "label": {
+          "x": 48,
+          "y": 658
+        },
+        "arrow": false
+      },
+      {
+        "number": 2,
+        "shape": "ellipse",
+        "target": {
+          "x": 25,
+          "y": 440,
+          "width": 24,
+          "height": 24
+        },
+        "label": {
+          "x": 90,
+          "y": 415
+        }
+      },
+      {
+        "number": 3,
+        "target": {
+          "x": 1396,
+          "y": 430,
+          "width": 134,
+          "height": 42
+        },
+        "label": {
+          "x": 1340,
+          "y": 451
+        }
+      }
+    ]
+  }
+}

@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { useConfigurationEditability } from '../utils/configurationEditability'
 import { showStepError, stepDisplayStatus } from '../utils/stepFeedback'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 import { dependencyActionLabel, runPlannedSteps } from '../utils/runPlan'
@@ -12,12 +11,15 @@ import {
   NSpace, NTable, NTag, NText, NTooltip, useMessage, useDialog,
 } from 'naive-ui'
 import {
-  useNavStore, STEP_ORDER, NAV_STEP_ORDER, STATUS_TAG, STATUS_TEXT,
-  formatEta, formatProgressDetail,
+  useNavStore, STEP_ORDER, STATUS_TAG, STATUS_TEXT,
+  formatEta,
 } from '../stores/nav'
 import MediaInfo from '../components/MediaInfo.vue'
+import VideoControls from '../components/VideoControls.vue'
 import FilePathLink from '../components/FilePathLink.vue'
-import ProgressActivity from '../components/ProgressActivity.vue'
+import ExecutionProgress from '../components/ExecutionProgress.vue'
+import { executionForStep, workflowExecutionStep } from '../utils/executionProgress'
+import { executionEtaSeconds } from '../utils/executionEta'
 import PublicationProgress from '../components/PublicationProgress.vue'
 import FreshnessDetails from '../components/FreshnessDetails.vue'
 import { freshnessStatus, needsFreshnessDetails } from '../utils/freshness'
@@ -26,9 +28,11 @@ import WorkflowPanel from '../components/WorkflowPanel.vue'
 import ChainStatus from '../components/ChainStatus.vue'
 import ProjectTemplateBinding from '../components/ProjectTemplateBinding.vue'
 import { fmtSize } from '../utils/format'
-import { WORKFLOW_OPEN, WORKFLOW_BUSY, workflowRunStage } from '../utils/workflow'
-import { useSmoothProgressMap } from '../utils/smoothProgress'
+import { WORKFLOW_OPEN, WORKFLOW_BUSY, supersedingPublicationUpdate, workflowPublication, workflowRunStage } from '../utils/workflow'
 import { createLatestRefresh, releaseMedia, vReleaseMedia } from '../utils/preview'
+import { releaseBatchLockMessage } from '../utils/releaseBatch'
+import { WORKFLOW_STAGES, stageNumber, stagePath } from '../utils/workflowStages'
+import { publicationUpdateProgress } from '../utils/publicationUpdate'
 
 const route = useRoute()
 const router = useRouter()
@@ -36,49 +40,14 @@ const message = useMessage()
 const dialog = useDialog()
 const nav = useNavStore()
 const uid = route.params.uid as string
-const editability = useConfigurationEditability(() => `project:${uid}`)
-const selectionLocked = computed(() => nav.busy || nav.autoStepsSaving || editability.locked.value)
+const automaticCurrentStep = computed(() => WORKFLOW_BUSY.includes(nav.workflow?.run?.status)
+  ? workflowExecutionStep(nav.workflow?.run, nav.workflowPlan, nav.steps)?.key : null)
 // 后端与前端共用完整管线定义，工作台位于配音计划与批量配音之间。
 const orderedSteps = computed(() => STEP_ORDER.map(k => nav.stepMap[k]).filter(Boolean))
-const displayedSteps = computed(() => NAV_STEP_ORDER.map(k => nav.stepMap[k]).filter(Boolean))
-const smoothProgress = useSmoothProgressMap(
-  () => orderedSteps.value.map((s: any) => ({
-    key: s.key, progress: s.progress, status: s.status,
-  })),
-)
-const formatProgress = (value: unknown) => {
-  const n = Number(value)
-  return `${(Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0).toFixed(1)}%`
-}
+const displayedSteps = computed(() => WORKFLOW_STAGES.filter(stage=>stage.kind!=='publication').map(stage=>
+  stage.kind==='comments'?{key:stage.key,label:stage.label}:nav.stepMap[stage.key]?{...nav.stepMap[stage.key],label:stage.label}:null).filter(Boolean))
 
-const isAuto = (key: string) => (nav.autoSteps ? nav.autoSteps.includes(key) : true)
-async function toggleAuto(key: string, val: boolean) {
-  if (selectionLocked.value) return
-  const prev = nav.autoSteps ? [...nav.autoSteps] : null
-  const set = new Set(nav.autoSteps ?? [...STEP_ORDER])
-  if (val) set.add(key)
-  else set.delete(key)
-  const submitted = STEP_ORDER.filter(k => set.has(k))
-  const ticket = ++nav.autoStepsVersion
-  nav.autoStepsSaving = true
-  try {
-    if (editability.observing.value && !await editability.canEdit()) {
-      message.info(editability.reason.value || '运行中不能修改步骤勾选'); return
-    }
-    if (nav.uid !== uid || nav.autoStepsVersion !== ticket || nav.busy) return
-    nav.autoSteps = submitted
-    const r = await fetch(`/api/projects/${uid}/auto_steps`, {
-      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ steps: submitted }),
-    })
-    if (!r.ok) { const value = await r.json(); throw new Error(value.message || '勾选保存失败') }
-    if (nav.uid === uid && nav.autoStepsVersion === ticket) nav.steps = nav.steps.map(step => ({ ...step, selected: submitted.includes(step.key) }))
-  } catch (error: any) {
-    if (nav.uid === uid && nav.autoStepsVersion === ticket) nav.autoSteps = prev
-    message.error(error.message || '勾选保存失败，请重新读取确认当前勾选')
-  } finally {
-    if (nav.uid === uid && nav.autoStepsVersion === ticket) { nav.autoStepsVersion++; nav.autoStepsSaving = false }
-  }
-}
+
 
 // ---- 原视频 ----
 const media = ref<any>({ found: false })
@@ -91,7 +60,16 @@ const mediaLoader = createLatestRefresh(async signal => {
   if (!r.ok) throw new Error('读取媒体信息失败')
   return r.json()
 }, value => { media.value = value; mediaFailed = false }, () => { mediaFailed = true })
-onUnmounted(() => mediaLoader.cancel())
+const sourceChapters = ref<any[]>([])
+// 原视频章节与资料面板共用 download/video-info 的只读快照；不重复触发抓取。
+const videoInfoLoader = createLatestRefresh(async signal => {
+  const r = await fetch(`/api/projects/${uid}/steps/download/video-info`, { cache: 'no-store', signal })
+  if (!r.ok) throw new Error('读取视频章节失败')
+  const payload = await r.json()
+  const rows = payload?.info?.content?.chapters
+  return Array.isArray(rows) ? rows : []
+}, value => { sourceChapters.value = value }, () => { sourceChapters.value = [] })
+onUnmounted(() => { mediaLoader.cancel(); videoInfoLoader.cancel() })
 // 项目目录是否还在磁盘上 (被移走/删除 → 头部标注)
 const dirMissing = computed(() => nav.dirMissing)
 const mediaVersion = computed(() => {
@@ -100,14 +78,18 @@ const mediaVersion = computed(() => {
 })
 let lastMediaSignature = ''
 watch(() => nav.stepMap.download, download => {
-  if (downloadRunning.value) { mediaLoader.cancel(); return }
+  if (downloadRunning.value) { mediaLoader.cancel(); videoInfoLoader.cancel(); sourceChapters.value = []; return }
   const signature = `${download?.status}:${mediaVersion.value}`
   const changed = signature !== lastMediaSignature
   lastMediaSignature = signature
   if (changed || mediaFailed || (!media.value.found && download?.status === 'done')) {
     void mediaLoader.refresh(changed)
   }
+  if (!downloadRunning.value && media.value.found && changed) void videoInfoLoader.refresh(true)
 }, { immediate: true })
+watch(() => `${media.value.found}:${mediaVersion.value}`, (signature, previous) => {
+  if (!downloadRunning.value && media.value.found && signature !== previous) void videoInfoLoader.refresh(true)
+})
 const videoSrc = computed(() =>
   media.value.found ? `/api/projects/${uid}/workbench/video?v=${mediaVersion.value}` : '')
 
@@ -170,6 +152,15 @@ async function reveal() {
 // 总览只保留“怎么继续”的动作；暂停/强制结束等精细控制放在步骤详情页。
 const busyKey = ref('')
 const cancelPending = ref<Record<string, boolean>>({})
+const editorSyncChecking = ref(false)
+const subtitleExportOptional = computed(() => {
+  const saved = nav.autoSteps, plan = nav.workflowPlan, run = nav.workflow?.run
+  const knownPlan = !!run?.id && plan?.id === run.id && Array.isArray(plan.steps)
+    && plan.steps.every((key: unknown) => typeof key === 'string' && key.trim())
+  // 当前冻结范围或保存清单显式包含时保留待运行；身份不明不能推断为可选。
+  if ((knownPlan && plan.steps.includes('subtitles')) || (Array.isArray(saved) && saved.includes('subtitles'))) return false
+  return Array.isArray(saved) || knownPlan
+})
 
 // 后端完成取消后释放本地锁；否则快速重跑时会把上一次的取消状态带过去。
 watch(() => orderedSteps.value.map((s: any) => `${s.key}:${s.status}:${!!s.cancelling}`).join('|'), () => {
@@ -195,31 +186,22 @@ function statusTagType(step: any): 'default' | 'success' | 'error' | 'warning' |
   return STATUS_TAG[stepDisplayStatus(step)] || 'default'
 }
 function runTitle(step: any): string {
+  if (nav.archived) return '恢复后运行'
   if (['failed', 'interrupted', 'stopped'].includes(step?.status)) return '重新运行'
   if (step?.status === 'done') return '更新结果'
   return '运行'
 }
 function editorTaskText(step: any): string {
+  if (step?.key === 'subtitles' && step.status === 'pending' && subtitleExportOptional.value) return '按需导出'
   return statusText(step)
 }
 function editorTaskType(step: any): 'default' | 'success' | 'error' | 'warning' | 'info' {
   return statusTagType(step)
 }
 
-// 依赖项会重复出现在多个下游步骤里；总览顶部只提示一次。
-const selectedBlockers = computed(() => {
-  const seen = new Set<string>()
-  return STEP_ORDER.filter(k => k !== 'dubtask' && isAuto(k))
-    .flatMap(k => blockersOf(k))
-    .filter((item: any) => {
-      const id = `${item.step}/${item.name}`
-      if (seen.has(id)) return false
-      seen.add(id)
-      return true
-    })
-})
-
 async function run(step: any, force = false) {
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
+  if (nav.busy) return
   if (busyKey.value === step.key || mapCancel(step.key)) return
   busyKey.value = step.key
   await stopPreviewForRun(step.key)
@@ -241,19 +223,25 @@ async function run(step: any, force = false) {
 }
 
 async function runSelection(includeDependencies = false, onlyKey?: string) {
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
   if (nav.busy || nav.autoStepsSaving || dirMissing.value) return
-  const steps = onlyKey ? [onlyKey] : STEP_ORDER.filter(k => k !== 'dubtask' && isAuto(k))
-  if (!steps.length) { message.info('请先勾选步骤'); return }
+  const steps = onlyKey ? [onlyKey] : []
+  if (!steps.length) return
   await runPlannedSteps(uid, [...steps], includeDependencies, message, dialog,
     async (plan) => { await stopPreviewForRun(plan.includes('download') ? 'download' : plan[0]) },
-    async () => { previewSuspended.value = false; await nav.poll() })
+    async () => { previewSuspended.value = false; await nav.poll() }, () => nav.archived)
 }
 
 // 字幕导出和逐句配音属于同一个编辑工作流；同步时一并带到最新。
 async function runEditorWorkflow() {
-  await runPlannedSteps(uid, ['subtitles', 'tts'], true, message, dialog,
-    async () => { await stopPreviewForRun('tts') },
-    async () => { previewSuspended.value = false; await nav.poll() })
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
+  if (nav.busy || dirMissing.value || editorSyncChecking.value) return
+  editorSyncChecking.value = true
+  try {
+    await runPlannedSteps(uid, ['subtitles', 'tts'], true, message, dialog,
+      async () => { await stopPreviewForRun('tts') },
+      async () => { previewSuspended.value = false; await nav.poll() }, () => nav.archived)
+  } finally { editorSyncChecking.value = false }
 }
 
 function mapCancel(key: string): boolean {
@@ -310,9 +298,19 @@ function clearCancel(key: string) {
 
 // 项目动态状态 (running/queued 时附带步骤 key, 头部胶囊可点击直达该步骤页)
 const headerStatus = computed(() => {
+  const batch = nav.releaseBatch
+  if (batch && ['running','pausing','stopping'].includes(batch.status)) return {
+    text: `顺序发布 · 第 ${batch.position}/${batch.total} 项${batch.phase ? ' · '+batch.phase : ''}`,
+    type: batch.status === 'running' ? 'info' : 'warning', key: null,
+  }
   const flow = nav.workflow?.run
   if (flow && WORKFLOW_OPEN.includes(flow.status)) return {
     text: `${workflowRunStage(flow).text} · ${flow.phase}`, type: workflowRunStage(flow).tone, key: null,
+  }
+  const update = publicationUpdateProgress(nav.publication)
+  if (update && (update.active || ['failed', 'unknown', 'paused'].includes(update.status))) return {
+    text: `${update.text}${update.progress !== null ? ` · ${Math.round(update.progress)}%` : ''}`,
+    type: update.active ? 'info' : update.status === 'failed' ? 'error' : 'warning', key: null,
   }
   const run = orderedSteps.value.find((s: any) => s.status === 'running')
   const que = orderedSteps.value.find((s: any) => s.status === 'queued')
@@ -322,6 +320,28 @@ const headerStatus = computed(() => {
                                                : `正在「${run.label}」…`)
                         : `「${que.label}」排队中…`,
              type: run ? 'info' : 'warning', key: active.key as string | null }
+  }
+  if (flow && ['completed','ready'].includes(flow.status)) return {
+    text: flow.status==='completed'?'上次项目运行已完成':workflowRunStage(flow).text,
+    type: 'success', key: null,
+  }
+  // 导航的持久化项目状态可能来自上次失败；未取得步骤事实时不能据此判断当前失败。
+  if (!nav.stepsLoaded) {
+    if (orderedSteps.value.some((step:any)=>step.status==='failed')) return {
+      text: '有失败步骤', type: 'error', key: null,
+    }
+    if (flow && ['failed','attention','paused'].includes(flow.status)) {
+      if (supersedingPublicationUpdate(nav.workflow, nav.publication)) {
+        const delivery = workflowPublication(nav.workflow, nav.publication)
+        return { text: delivery.text, type: delivery.tone, key: null }
+      }
+      const stage = workflowRunStage(flow)
+      return { text: `${stage.text} · ${flow.phase || '项目运行'}`, type: stage.tone, key: null }
+    }
+    return {
+      text: nav.stepsError || nav.workflowError || nav.projectError ? '运行状态待核对' : '正在读取运行状态',
+      type: nav.stepsError || nav.workflowError || nav.projectError ? 'warning' : 'default', key: null,
+    }
   }
   const map: Record<string, [string, string]> = {
     done: ['制作已完成', 'success'], failed: ['有失败步骤', 'error'],
@@ -336,7 +356,7 @@ const headerStatus = computed(() => {
   <div class="workspace-page pipeline-page">
     <n-alert v-if="nav.stepsError || nav.projectError" type="error" style="margin-bottom: 16px">
       {{ nav.stepsError || nav.projectError }}
-      <template #action><n-button size="small" @click="nav.poll()">重试</n-button></template>
+      <template #action><n-button size="small" @click="nav.poll(true)">重试</n-button></template>
     </n-alert>
     <n-spin v-if="!nav.stepsLoaded && !nav.stepsError" size="small" description="正在读取步骤状态…" style="margin-bottom: 16px" />
     <div class="page-head">
@@ -361,9 +381,13 @@ const headerStatus = computed(() => {
         </n-tooltip>
       </div>
     </div>
-    <ProjectTemplateBinding :uids="[uid]" />
-    <WorkflowPanel :uid="uid" />
-    <ChainStatus v-if="nav.chain" :uid="uid" :chain="nav.chain" style="margin-top: 12px" />
+    <ProjectTemplateBinding :uids="[uid]" @changed="refreshInBackground(() => nav.poll())" />
+    <WorkflowPanel :uid="uid" @started="nav.poll()" />
+    <n-alert v-if="nav.releaseBatch && ['running','pausing','stopping'].includes(nav.releaseBatch.status)" type="info" style="margin-top:12px">
+      {{ releaseBatchLockMessage(nav.releaseBatch) }}
+      <router-link :to="`/#release-batch-${nav.releaseBatch.id}`">查看批次进度 →</router-link>
+    </n-alert>
+    <ChainStatus v-if="nav.chain" :uid="uid" :chain="nav.chain" hide-recovery style="margin-top: 12px" />
     <!-- ============ 原视频 ============ -->
     <n-card size="small" title="原视频" style="margin-top: 16px">
       <template #header-extra>
@@ -376,9 +400,11 @@ const headerStatus = computed(() => {
       </template>
       <div class="prev-row" v-if="media.found">
         <div class="vid-col">
-          <video v-if="videoSrc && !downloadRunning && !previewSuspended" ref="videoEl" v-release-media
-                 :key="videoSrc" class="vid" :src="videoSrc" controls preload="metadata"
-                 @loadedmetadata="onMeta" />
+          <div v-if="videoSrc && !downloadRunning && !previewSuspended" class="video-shell">
+            <video ref="videoEl" v-release-media :key="videoSrc" class="vid" :src="videoSrc" preload="metadata"
+                   @loadedmetadata="onMeta" />
+            <VideoControls :media="videoEl" :chapters="sourceChapters" :duration="media.duration" :frame-rate="media.fps" />
+          </div>
           <n-empty v-else-if="downloadRunning || previewSuspended" description="正在更新视频，完成后自动刷新预览" />
         </div>
         <div class="info">
@@ -389,30 +415,24 @@ const headerStatus = computed(() => {
                size="small" style="margin: 8px 0" />
     </n-card>
 
-    <!-- ============ 步骤清单 (勾选 + 一个“下一步”动作) ============ -->
+    <!-- 各步骤的状态、配置入口与局部制作操作。 -->
     <n-card size="small" style="margin-top: 14px"
             title="步骤进度与手动制作">
-      <template #header-extra>
-        <n-button secondary :disabled="nav.busy || nav.autoStepsSaving || dirMissing || !nav.requiredStepCount" @click="runSelection(!!selectedBlockers.length)">仅运行勾选制作步骤（{{ nav.requiredStepCount }}）…</n-button>
-      </template>
-      <n-text depth="3" style="display:block; margin-bottom:12px; font-size:12px; line-height:1.8">
-        运行中不能修改勾选；空闲时勾选立即保存但不启动；手动制作不上传、不投稿。完整流程使用上方「自动运行」，不受此处勾选影响。
-        <span v-if="editability.locked.value" role="status">{{ editability.reason.value }}</span>
-      </n-text>
-      <div class="project-progress-summary"><span>手动勾选</span><n-progress type="line" :percentage="nav.requiredStepCount ? Math.round(nav.requiredDoneCount / nav.requiredStepCount * 100) : 0" :show-indicator="false"/><strong>{{ nav.requiredDoneCount }} / {{ nav.requiredStepCount }}</strong><span>项制作任务已就绪</span></div>
-      <ProgressActivity :activity="nav.currentActivity" />
+      <n-text depth="3" style="display:block; margin-bottom:12px; font-size:12px; line-height:1.8">各步骤保存处理参数与可选功能；项目运行按目标成片自动补齐依赖。下方的单步操作只更新对应制作结果。{{ nav.archived ? '已归档项目需先恢复后才能运行。' : '' }}</n-text>
       <div class="rows">
-        <div v-for="(s, index) in displayedSteps" :key="s.key" class="row">
-          <span class="step-index">{{ String(index + 1).padStart(2, '0') }}</span>
-          <template v-if="s.key === 'tts'">
+        <div v-for="s in displayedSteps" :key="s.key" class="row">
+          <span class="step-index">{{ String(stageNumber(s.key)).padStart(2, '0') }}</span>
+          <template v-if="s.key==='comments'">
+            <router-link class="lbl steplink" :to="stagePath(uid,'comments')">上屏评论</router-link>
+            <n-tag size="small" :type="nav.commentsDisplay.type" :title="nav.commentsDisplay.detail">{{ nav.commentsDisplay.label }}</n-tag>
+            <span class="comment-stage-note">供启用评论叠加的成片版本共用；自动准备与手动准备复用同一流程。</span>
+            <span class="ops"><n-button size="small" secondary @click="router.push(stagePath(uid,'comments'))">选择与确认评论 →</n-button></span>
+          </template>
+          <template v-else-if="s.key === 'tts'">
             <router-link class="lbl steplink" title="进入字幕与配音页" :to="`/projects/${uid}/steps/tts`">字幕与配音</router-link>
             <span class="editor-tasks">
               <span v-for="task in ['subtitles', 'tts']" :key="task" class="editor-task">
-                <n-checkbox size="small" :checked="isAuto(task)"
-                            :disabled="selectionLocked"
-                            @update:checked="(v: boolean) => toggleAuto(task, v)">
-                  {{ task === 'tts' ? '合成配音' : '导出字幕' }}
-                </n-checkbox>
+                <span :title="task === 'subtitles' ? '单独生成可下载的字幕文件；成片烧录按目标版本设置执行。' : ''">{{ task === 'tts' ? '合成配音' : '单独导出字幕' }}</span>
                 <FreshnessDetails v-if="needsFreshnessDetails(nav.stepMap[task])" :uid="uid" :step-key="task" :label="nav.stepMap[task].label"
                                   :status-text="editorTaskText(nav.stepMap[task])" :summary="nav.stepMap[task].freshness_reason" />
                 <n-tag v-else-if="nav.stepMap[task]" size="small"
@@ -422,14 +442,11 @@ const headerStatus = computed(() => {
               </span>
             </span>
             <n-button size="small" type="primary" secondary
-                      :disabled="nav.busy || dirMissing" @click="runEditorWorkflow">同步字幕与配音…</n-button>
+                      :loading="editorSyncChecking" :disabled="nav.archived || nav.busy || dirMissing || editorSyncChecking"
+                      @click="runEditorWorkflow">{{ editorSyncChecking ? '正在检查同步范围' : '同步字幕与配音' }}</n-button>
             <n-button size="small" @click="router.push(`/projects/${uid}/steps/tts`)">编辑与导出</n-button>
           </template>
           <template v-else>
-            <n-checkbox size="small" class="select-box" :checked="isAuto(s.key)"
-                        :disabled="selectionLocked"
-                        :aria-label="`选择${s.label}`"
-                        @update:checked="(v: boolean) => toggleAuto(s.key, v)" />
             <router-link class="lbl steplink" title="进入该步骤页" :to="`/projects/${uid}/steps/${s.key}`">{{ s.label }}</router-link>
             <FreshnessDetails v-if="needsFreshnessDetails(s)" :uid="uid" :step-key="s.key" :label="s.label"
                               :status-text="statusText(s)" :summary="s.freshness_reason" />
@@ -437,20 +454,6 @@ const headerStatus = computed(() => {
                    :type="statusTagType(s)" :title="statusText(s)">
               {{ statusText(s) }}
             </n-tag>
-            <span class="pbar" v-if="s.status === 'running'">
-              <span v-if="s.progress_indeterminate" class="pbar-eta" :title="formatProgressDetail(s)">{{ s.progress_phase }}</span>
-              <template v-else>
-                <span class="pbar-inner">
-                  <n-progress type="line" :percentage="smoothProgress[s.key] || 0" :show-indicator="false" :aria-label="`${s.label}进度`" />
-                  <span class="pbar-value" :title="formatProgressDetail(s)">
-                    {{ s.progress_estimated ? '预计 ' : '' }}{{ formatProgress(smoothProgress[s.key]) }}
-                  </span>
-                </span>
-                <span v-if="formatEta(s.eta_seconds, s.eta_scope)" class="pbar-eta">
-                  {{ formatEta(s.eta_seconds, s.eta_scope) }}
-                </span>
-              </template>
-            </span>
             <span class="err" v-if="showStepError(s)" :title="s.error.message">⚠ {{ s.error.message }}</span>
             <span class="ops">
               <n-button v-if="s.status === 'running' || s.status === 'queued'"
@@ -462,12 +465,12 @@ const headerStatus = computed(() => {
               <n-button v-else-if="s.key === 'assemble'" size="small" type="primary" secondary
                         @click="router.push(`/projects/${uid}/steps/assemble`)">选择成品方案 →</n-button>
               <n-button v-else-if="blockersOf(s.key).length" size="small" type="info" secondary
-                        :disabled="nav.busy || dirMissing"
+                        :disabled="nav.archived || nav.busy || dirMissing"
                         @click="runSelection(true, s.key)">
                 {{ dependencyActionLabel(blockersOf(s.key)) }}
               </n-button>
               <n-button v-else-if="s.status !== 'done' || !s.fresh" size="small" type="primary" secondary
-                        :disabled="nav.busy || dirMissing"
+                        :disabled="nav.archived || nav.busy || dirMissing"
                         :loading="busyKey === s.key"
                         :title="runTitle(s)"
                         @click="run(s)">
@@ -475,10 +478,10 @@ const headerStatus = computed(() => {
               </n-button>
             </span>
           </template>
-          <ProgressActivity v-if="['running','queued'].includes(s.status)" class="row-activity" :activity="nav.activityFor(s.key)" />
+          <ExecutionProgress v-if="s.key!=='comments' && automaticCurrentStep !== s.key" class="row-activity" :execution="executionForStep(s)" :percentage="['running','queued'].includes(s.status) ? s.progress : null" :estimated="s.progress_estimated" :indeterminate="s.progress_indeterminate" :eta="['running','queued'].includes(s.status) ? formatEta(executionEtaSeconds(s),s.eta_scope) : ''" :activity="nav.activityFor(s.key)" compact />
         </div>
         <div class="row publication-step">
-          <span class="step-index">{{ String(NAV_STEP_ORDER.length + 1).padStart(2, '0') }}</span>
+          <span class="step-index">{{ String(stageNumber('publish')).padStart(2, '0') }}</span>
           <router-link class="lbl steplink" :to="`/projects/${uid}/publish`">发布到B站</router-link>
           <n-tag size="small" :type="nav.publicationDisplay.tone" :title="nav.publicationDisplay.note">{{ nav.publicationDisplay.text }}</n-tag>
           <span class="publish-note">{{ nav.publicationDisplay.note }}</span>
@@ -528,15 +531,17 @@ const headerStatus = computed(() => {
 
 <style scoped>
 .project-files-table { overflow-x:auto; }.file-description { color:var(--df-muted); font-size:12px; }.project-files-table td { vertical-align:top; }
-.project-progress-summary { display: flex; align-items: center; gap: 14px; padding: 16px 20px; background: var(--df-panel); border: 1px solid var(--df-border); border-radius: 12px; color: var(--df-muted); font-size: 12px; }
-.project-progress-summary .n-progress { flex: 1; }
-.project-progress-summary strong { color: var(--df-text); white-space: nowrap; }
+.project-progress-summary { display: flex; align-items: center; gap: 12px; min-width: 0; margin-bottom: 6px; padding: 14px 16px; background: var(--df-bg); border: 1px solid var(--df-border); border-radius: 10px; color: var(--df-muted); font-size: 12px; }
+.project-progress-summary .n-progress { flex: 1; min-width: 50px; }
+.project-progress-summary > span:first-child { white-space: nowrap; }
+.project-progress-summary strong { color: var(--df-text); white-space: nowrap; font-variant-numeric: tabular-nums; }
 .step-index { color: #788aa0; font-size: 12px; font-variant-numeric: tabular-nums; min-width: 26px; }
 .editor-tasks { display: flex; flex-wrap: wrap; gap: 10px 20px; flex: 1; }
 .editor-task { display: flex; gap: 8px; align-items: center; }
 /* 预览行: 视频列贴内容宽, 信息列吃掉剩余; 窄屏上下堆叠 */
 .prev-row { display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap; }
 .vid-col { flex: 0 1 auto; min-width: 0; }
+.video-shell { position: relative; min-width: 0; }
 .info { flex: 1 1 320px; min-width: 0; }
 @media (max-width: 900px) {
   .prev-row { flex-direction: column; flex-wrap: nowrap; }
@@ -552,6 +557,7 @@ const headerStatus = computed(() => {
   border-radius: 8px;
   background: #000;
 }
+.comment-stage-note{font-size:12px;color:var(--df-muted);flex:1;min-width:180px;line-height:1.7}
 .rows { display: flex; flex-direction: column; }
 .publication-step { border-top: 1px solid var(--df-border); }
 .publish-note { font-size: 11px; color: var(--df-muted); }
@@ -572,16 +578,7 @@ const headerStatus = computed(() => {
   white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
 }
 .ops { display: flex; align-items: center; gap: 8px; margin-left: auto; }
-.row-activity { flex-basis:100%; padding-left:34px; box-sizing:border-box; margin-top:0; }
-.pbar { display: grid; gap: 4px; flex: 0 1 240px; min-width: 0; max-width: 100%; line-height: 1.5; }
-/* 百分比与进度条并排，预计时间独占下一行；文字不覆盖轨道，容器变窄可自然换行。 */
-.pbar-inner { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px; min-width: 0; }
-.pbar-inner :deep(.n-progress) { min-width: 0; }
-.pbar-eta { font-size: 11px; color: var(--df-muted); overflow-wrap: anywhere; }
-.pbar-value {
-  color: var(--df-text); font-size: 11px; white-space: nowrap;
-  font-variant-numeric: tabular-nums;
-}
+.row > .row-activity { flex: 1 1 calc(100% - 34px); min-width: 0; margin: 2px 0 0 34px; box-sizing: border-box; }
 .page-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
 .project-heading { min-width: 0; }
 .eyebrow { display: block; font-size: 11px; letter-spacing: .08em; text-transform: uppercase; }
@@ -592,7 +589,9 @@ const headerStatus = computed(() => {
   .ops { flex: 1 1 100%; justify-content: flex-end; flex-wrap: wrap; }
 }
 @media (max-width: 650px) {
+  .project-progress-summary { padding: 12px; }
   .project-progress-summary > span:last-child { display: none; }
+  .row > .row-activity { flex-basis: 100%; margin-left: 0; }
   .page-head { flex-direction: column; }
   .header-status { justify-content: flex-start; }
   .ops { justify-content: flex-start; padding-left: 28px; }

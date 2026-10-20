@@ -3,6 +3,7 @@ import vue from '@vitejs/plugin-vue'
 
 // 开发期端口由启动脚本通过环境变量传入；直接 npm run dev 时使用默认值。
 // 生产期: npm run build 产物由 FastAPI 托管 (见 backend/app/main.py)
+// 裸启动与 config.example.yaml 保持一致；非默认端口请显式传入环境变量。
 const backendPort = Number(process.env.DUBFORGE_BACKEND_PORT || 8600)
 const frontendPort = Number(process.env.DUBFORGE_FRONTEND_PORT || 5273)
 

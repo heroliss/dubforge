@@ -1,12 +1,10 @@
 """真实项目配置与登记产物的恢复边界，不调用模型、编码或发布。"""
 import json
 
-import pytest
-
 from conftest import mark_upstream_done
 from dubforge import chain_recovery, config, configuration
 from dubforge.domain import crud
-from dubforge.errors import DubForgeError
+from test_configuration import save
 from dubforge.pipeline import assembly_versions
 from dubforge.pipeline.recovery import RecoveryDependencies
 from dubforge.workflow_plan import configuration_stamp
@@ -55,25 +53,24 @@ def test_version_override_does_not_follow_unconsumed_global_setting(make_project
     chain_recovery.check_execution(uid, plan['execution'], ['assemble'])
 
 
-def test_consumed_global_render_setting_requires_new_confirmation(make_project):
+def test_project_render_setting_is_read_when_remaining_step_starts(make_project):
     uid, plan = prepared_chain(make_project, burn=True)
     original = current_version_fingerprint(uid)
     config.set_key('assemble.crf', 19)
+    assert current_version_fingerprint(uid) == original
+    chain_recovery.check_execution(uid, plan['execution'], ['assemble'])
+    save('project:' + uid, {'assemble.crf': 19})
     assert current_version_fingerprint(uid) != original
-    with pytest.raises(DubForgeError) as error:
-        chain_recovery.check_execution(uid, plan['execution'], ['assemble'])
-    assert error.value.code == 'CHAIN_PLAN_CHANGED'
+    chain_recovery.check_execution(uid, plan['execution'], ['assemble'])
 
 
 def test_independent_subtitle_export_keeps_its_own_configuration_boundary(make_project):
     uid, plan = prepared_chain(make_project, steps=['subtitles', 'assemble'])
     original = current_version_fingerprint(uid)
-    config.set_key('subtitles.min_duration', 1.3)
+    save('project:' + uid, {'subtitles.min_duration': 1.3})
     # 原片版本不读取字幕导出，但显式选用的独立导出仍消费此参数。
     assert current_version_fingerprint(uid) == original
-    with pytest.raises(DubForgeError) as error:
-        chain_recovery.check_execution(uid, plan['execution'], ['subtitles', 'assemble'])
-    assert error.value.code == 'CHAIN_PLAN_CHANGED'
+    chain_recovery.check_execution(uid, plan['execution'], ['subtitles', 'assemble'])
 
 
 def test_legacy_execution_snapshot_keeps_its_confirmed_settings_contract(make_project):
@@ -81,7 +78,5 @@ def test_legacy_execution_snapshot_keeps_its_confirmed_settings_contract(make_pr
     deps = RecoveryDependencies(crud.get_project(uid))
     legacy = dict(configuration_stamps={'assemble': configuration_stamp(deps, steps=['assemble'])},
         version_definitions_digest=assembly_versions.digest(assembly_versions.catalog(uid)['versions']))
-    config.set_key('assemble.crf', 19)
-    with pytest.raises(DubForgeError) as error:
-        chain_recovery.check_execution(uid, legacy, ['assemble'])
-    assert error.value.code == 'CHAIN_PLAN_CHANGED'
+    save('project:' + uid, {'assemble.crf': 19})
+    chain_recovery.check_execution(uid, legacy, ['assemble'])

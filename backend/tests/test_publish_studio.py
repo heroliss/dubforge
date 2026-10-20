@@ -20,9 +20,9 @@ BV = 'BV1234567890'
 
 @pytest.fixture
 def env(make_project, monkeypatch):
-    uid = make_project()
     # 本组仅核对远端修改协议；占位文件没有字幕，实际内容审查由独立用例覆盖。
     config.set_key('content_review.enabled', False)
+    uid = make_project()
     with Session(db.get_engine()) as s:
         s.add(PublishAccount(id='123', name='测试账号', credential='fixture'))
         s.add(PublishAccount(id='456', name='另一个账号', credential='fixture'))
@@ -55,6 +55,21 @@ def plan_edit(env):
     return studio.prepare('123', dict(bvid=BV, kind='edit', values={'description': '新简介'}, order=[2, 1]))
 
 
+def test_detail_read_passes_cancel_without_sending_edit(env, monkeypatch):
+    stopped = threading.Event()
+    calls = []
+    def remote(operation, payload, **kwargs):
+        assert operation == 'studio_detail' and payload['bvid'] == BV
+        assert kwargs['cancel'] is stopped
+        calls.append(operation)
+        stopped.set()
+        raise transport.TransportError('操作已暂停')
+    monkeypatch.setattr(transport, 'call', remote)
+    with pytest.raises(transport.TransportError, match='操作已暂停'):
+        studio.read('123', 'detail', {'bvid': BV}, cancel=stopped)
+    assert calls == ['studio_detail']
+
+
 def test_preview_is_read_only_and_confirmation_consumes_frozen_plan_once(env):
     preview = plan_edit(env)
     assert [op for op, _ in env.calls] == ['studio_detail']
@@ -72,7 +87,7 @@ def test_preview_is_read_only_and_confirmation_consumes_frozen_plan_once(env):
     assert writes[0]['values'] == {'description': '新简介'}
 
 
-@pytest.mark.parametrize('change', [dict(kind='delete'),dict(values={'copyright':1}),dict(order=[1]),
+@pytest.mark.parametrize('change', [dict(kind='delete'),dict(values={'copyright':0}),dict(order=[1]),
     dict(order=[1,1]), dict(order=[True,2]), dict(order=[3,2]), dict(values={'tags': []}), dict(values={'title': ''}),
     dict(publication_id='other'), dict(bvid='../config.yaml'), dict(kind={}), dict(kind=[])])
 def test_invalid_edits_and_deleting_or_replacing_parts_rejected(env, change):
@@ -111,15 +126,47 @@ def test_timeout_durable_no_replay_and_read_only_reconciliation(env, monkeypatch
     assert studio.reconcile('123',plan['id'],{})['status'] == 'done'
 
 
-@pytest.mark.parametrize('code',['PUBLISH_WRITE_NOT_SENT','PUBLISH_WRITE_REJECTED','PUBLISH_REMOTE_CHANGED'])
+def test_preflight_failure_persists_safe_stage_for_diagnosis(env, monkeypatch):
+    plan = plan_edit(env)
+    def preflight_failure(op, payload, **kwargs):
+        if op == 'studio_write':
+            raise transport.TransportError('尚未发送修改请求，请重新预览', code='PUBLISH_WRITE_NOT_SENT',
+                                            detail={'stage': 'validate', 'secret': 'must-not-persist'})
+        return env.remote(op, payload, **kwargs)
+    monkeypatch.setattr(transport, 'call', preflight_failure)
+    with pytest.raises(DubForgeError, match='编辑参数检查'):
+        studio.commit('123', plan['id'], {'confirmed': True})
+    assert '编辑参数检查' in studio.changes('123')[0]['error']
+    assert 'must-not-persist' not in studio.changes('123')[0]['error']
+
+
+@pytest.mark.parametrize('code',['PUBLISH_WRITE_NOT_SENT','PUBLISH_WRITE_REJECTED','PUBLISH_REMOTE_CHANGED',
+                                 'PUBLISH_REMOTE_OWNERSHIP','PUBLISH_RESPONSE_UNSUPPORTED'])
 def test_definite_failure_requires_new_preview_not_replay(env,monkeypatch,code):
     plan=plan_edit(env)
-    monkeypatch.setattr(transport,'call',lambda *a,**k: (_ for _ in ()).throw(transport.TransportError('明确失败',code=code)))
+    monkeypatch.setattr(transport,'call',lambda *a,**k: (_ for _ in ()).throw(
+        transport.TransportError('明确失败',code=code,detail={'stage':'validate','secret':'不应返回'})))
     with pytest.raises(DubForgeError):
         studio.commit('123',plan['id'],{'confirmed':True})
-    assert studio.changes('123')[0]['status'] == 'failed'
+    record = studio.changes('123')[0]
+    assert record['status'] == 'failed'
+    if code == 'PUBLISH_WRITE_NOT_SENT':
+        assert '失败阶段：编辑参数检查' in record['error']
+        assert '不应返回' not in record['error']
     with pytest.raises(DubForgeError):
         studio.commit('123',plan['id'],{'confirmed':True})
+
+
+def test_preflight_failure_persists_sanitized_stage(env, monkeypatch):
+    plan = plan_edit(env)
+    monkeypatch.setattr(transport, 'call', lambda *a, **k: (_ for _ in ()).throw(
+        transport.TransportError('平台响应结构不完整', code='PUBLISH_RESPONSE_UNSUPPORTED',
+                                  detail={'stage': 'validate', 'secret': 'discard'})))
+    with pytest.raises(DubForgeError) as exc:
+        studio.commit('123', plan['id'], {'confirmed': True})
+    assert '编辑参数检查' in str(exc.value)
+    row = studio.changes('123')[0]
+    assert row['status'] == 'failed' and '编辑参数检查' in row['error']
 
 
 def test_inflight_blocks_parallel_commit_plan_and_manual_release(env,monkeypatch):
@@ -216,6 +263,125 @@ def test_collection_preview_and_template_import_preserve_other_settings(env):
 def test_read_whitelist_bounded_before_network(env,action,body):
     with pytest.raises(DubForgeError):studio.read('123',action,body)
     assert not env.calls
+
+
+def test_chapters_read_accepts_optional_part_and_uses_read_only_worker(env, monkeypatch):
+    def remote(operation, payload=None, **kwargs):
+        assert operation == 'studio_chapters'
+        assert payload['bvid'] == BV and payload['cid'] == 2
+        return dict(bvid=BV, parts=[dict(cid=2, title='配音', duration=80, items=[
+            dict(start_time=0, end_time=10, title='开场')])], items=[
+                dict(start_time=0, end_time=10, title='开场')], total=1,
+            source='bilibili.view_points')
+    monkeypatch.setattr(transport, 'call', remote)
+    result = studio.read('123', 'chapters', {'bvid': BV, 'cid': 2})
+    assert result['source'] == 'bilibili.view_points'
+    assert result['items'][0]['title'] == '开场'
+    with pytest.raises(DubForgeError):
+        studio.read('123', 'chapters', {'bvid': BV, 'cid': -1})
+
+
+def test_native_chapter_prepare_commit_and_reconcile_are_frozen_and_scoped(env, monkeypatch):
+    current = [{'from': 0, 'to': 10, 'content': '原章节'}]
+    proposed = [{'from': 0, 'to': 10, 'content': '新章节'}]
+    prepared = dict(bvid=BV, aid=10, cid=1, rules=dict(limit=10, stay=5, space=0),
+                    current=current, current_permanent=False, cards=proposed, permanent=True,
+                    snapshot=dict(target=dict(bvid=BV, aid=10, cid=1),
+                                  rules=dict(limit=10, stay=5, space=0), cards=current,
+                                  permanent=False, fingerprint='chapter-fp'), fingerprint='chapter-fp')
+
+    def remote(operation, payload=None, **kwargs):
+        env.calls.append((operation, copy.deepcopy(payload)))
+        if operation == 'studio_detail':
+            return copy.deepcopy(env.detail)
+        if operation == 'studio_chapter_prepare':
+            assert payload['aid'] == 10 and payload['cid'] == 1
+            return copy.deepcopy(prepared)
+        if operation == 'studio_chapter_write':
+            assert payload['prepared']['fingerprint'] == 'chapter-fp'
+            return dict(bvid=BV, aid=10, cid=1, accepted=True, verified=True,
+                        cards=proposed, permanent=True)
+        if operation == 'studio_chapter_read':
+            return dict(bvid=BV, aid=10, cid=1, cards=proposed, permanent=True)
+        pytest.fail(f'未声明网络请求：{operation}')
+
+    monkeypatch.setattr(transport, 'call', remote)
+    plan = studio.prepare('123', dict(bvid=BV, kind='chapters', values={
+        'aid': 10, 'cid': 1, 'items': [dict(start_time=0, end_time=10, title='新章节')], 'permanent': True}))
+    assert plan['kind'] == 'chapters' and plan['preview']['after']['permanent'] is True
+    assert studio.commit('123', plan['id'], {'confirmed': True})['status'] == 'done'
+    assert [op for op, _ in env.calls].count('studio_chapter_write') == 1
+
+    with pytest.raises(DubForgeError):
+        studio.prepare('123', dict(bvid=BV, kind='chapters', values={
+            'aid': 10, 'cid': 1, 'items': [dict(start_time=0, end_time=4, title='过短')], 'permanent': True}))
+
+
+@pytest.mark.parametrize('code,expected', [
+    ('PUBLISH_CHAPTER_TIME', 'failed'),
+    ('PUBLISH_CHAPTER_OVERLAP', 'failed'),
+    ('PUBLISH_CHAPTER_INTERVAL', 'failed'),
+    ('PUBLISH_TRANSPORT', 'unknown'),
+    ('PUBLISH_WORKER_TIMEOUT', 'unknown'),
+    ('PUBLISH_CHAPTER_UNKNOWN', 'unknown'),
+])
+def test_chapter_write_preflight_boundary_errors_are_definite_but_network_failure_remains_unknown(
+        env, monkeypatch, code, expected):
+    """worker 明确写前拒绝时可重新预览；可能已发送的失败始终保留核对保护。"""
+    rules = dict(limit=10, stay=5, space=0)
+    current = [{'from': 0, 'to': 10, 'content': '旧章节'}]
+    proposed = [{'from': 0, 'to': 10, 'content': '新章节'}]
+    prepared = dict(bvid=BV, aid=10, cid=1, rules=rules, current=current,
+                    current_permanent=False, cards=proposed, permanent=True,
+                    snapshot=dict(target=dict(bvid=BV, aid=10, cid=1), rules=rules,
+                                  cards=current, permanent=False, fingerprint='chapter-preflight-fp'),
+                    fingerprint='chapter-preflight-fp')
+    writes = []
+
+    def remote(operation, payload=None, **kwargs):
+        if operation == 'studio_chapter_prepare':
+            return copy.deepcopy(prepared)
+        if operation == 'studio_chapter_write':
+            writes.append(copy.deepcopy(payload))
+            raise transport.TransportError('章节校验或连接失败', code=code, detail={'stage': 'validate'})
+        return env.remote(operation, payload, **kwargs)
+
+    monkeypatch.setattr(transport, 'call', remote)
+    body = dict(bvid=BV, kind='chapters', values=dict(aid=10, cid=1,
+                items=[dict(start_time=0, end_time=10, title='新章节')], permanent=True))
+    plan = studio.prepare('123', body)
+    with pytest.raises(DubForgeError) as error:
+        studio.commit('123', plan['id'], {'confirmed': True})
+    assert error.value.code == (code if expected == 'failed' else 'PUBLISH_CHAPTER_UNKNOWN')
+    with Session(db.get_engine()) as session:
+        row = session.get(PublishChange, plan['id'])
+        assert row.status == expected
+    assert len(writes) == 1
+
+    # 无论哪类失败都不能重放旧计划；明确未发送才允许生成新的计划。
+    with pytest.raises(DubForgeError):
+        studio.commit('123', plan['id'], {'confirmed': True})
+    assert len(writes) == 1
+    if expected == 'failed':
+        replacement = studio.prepare('123', body)
+        assert replacement['id'] != plan['id'] and replacement['status'] == 'prepared'
+    else:
+        with pytest.raises(DubForgeError) as blocked:
+            studio.prepare('123', body)
+        assert blocked.value.code == 'PUBLISH_WRITE_UNKNOWN'
+    assert len(writes) == 1
+
+
+@pytest.mark.parametrize('values', [
+    {'aid': 10, 'cid': 1, 'items': [dict(start_time=0, end_time=10, title='标题\n非法')], 'permanent': True},
+    {'aid': 10, 'cid': 1, 'items': [dict(start_time=0, end_time=10, title='一' * 17)], 'permanent': True},
+    {'aid': 10, 'cid': 1, 'items': [dict(start_time=0, end_time=10, title='甲'),
+                                   dict(start_time=5, end_time=15, title='乙')], 'permanent': True},
+])
+def test_native_chapter_shape_rejected_before_remote_prepare(env, values):
+    with pytest.raises(DubForgeError):
+        studio.prepare('123', dict(bvid=BV, kind='chapters', values=values))
+    assert not any(op == 'studio_chapter_prepare' for op, _ in env.calls)
 
 
 def test_malformed_template_fields_and_reconciliation_body_have_domain_errors(env):

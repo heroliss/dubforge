@@ -19,6 +19,172 @@ def _setup(make_project, pdir, count=4):
     return uid, ctx, lines, answer
 
 
+def test_semantic_chunk_plan_keeps_core_contiguous_and_context_overlapping():
+    lines = [SubLine(i + 1, float(i * 2), float(i * 2 + 1), f"word{i} word{i + 1}")
+             for i in range(12)]
+    words = [{"start": float(i * 2), "end": float(i * 2 + 1), "word": f"word{i}"}
+             for i in range(12)]
+    plan = step_split._semantic_chunk_plan(lines, words, 4, 2, .5)
+    assert len(plan) >= 3
+    assert [(item[0], item[1]) for item in plan] == [
+        (0, 4), (4, 8), (8, 12)]
+    assert plan[1][2] < plan[1][0]
+    assert plan[0][3] > plan[0][1]
+
+
+def test_semantic_chunk_plan_zero_overlap_does_not_extend_core():
+    lines = [SubLine(i + 1, float(i), float(i + .5), f"word{i}")
+             for i in range(8)]
+    words = [{"start": float(i), "end": float(i + .5), "word": f"word{i}"}
+             for i in range(8)]
+    plan = step_split._semantic_chunk_plan(lines, words, 2, 0, .6)
+    assert [(item[0], item[1]) for item in plan] == [(0, 2), (2, 4), (4, 6), (6, 8)]
+
+
+def _seam_fixture():
+    lines = [
+        SubLine(1, 0.0, 1.0, "I want to"),
+        SubLine(2, 1.0, 1.8, "go home"),
+        SubLine(3, 1.8, 2.8, "This is done."),
+    ]
+    parts = [
+        {"text": "I want to", "start": 0.0, "end": 1.0},
+        {"text": "go home", "start": 1.0, "end": 1.8},
+        {"text": "This is done.", "start": 1.8, "end": 2.8},
+    ]
+    plan = [(0, 1, 0, 2), (1, 3, 0, 3)]
+    return lines, parts, plan
+
+
+def test_chunk_boundary_candidates_only_flag_connected_dependent_tail():
+    lines, parts, plan = _seam_fixture()
+    candidates = step_split._chunk_boundary_candidates(lines, parts, plan, .6)
+    assert len(candidates) == 1
+    assert candidates[0]["left_index"] == 0
+    assert candidates[0]["right_index"] == 1
+
+    # A real long pause suppresses reconciliation even if the left text is a
+    # dependent fragment; an independent short answer is also left untouched.
+    paused = [
+        SubLine(1, 0.0, 1.0, "I want to"),
+        SubLine(2, 3.0, 3.8, "go home"),
+    ]
+    paused_parts = [
+        {"text": "I want to", "start": 0.0, "end": 1.0},
+        {"text": "go home", "start": 3.0, "end": 3.8},
+    ]
+    assert not step_split._chunk_boundary_candidates(
+        paused, paused_parts, [(0, 1, 0, 1), (1, 2, 0, 2)], .6)
+    independent = [
+        SubLine(1, 0.0, 1.0, "Are you there?"),
+        SubLine(2, 1.0, 1.2, "yes"),
+    ]
+    independent_parts = [
+        {"text": "Are you there?", "start": 0.0, "end": 1.0},
+        {"text": "yes", "start": 1.0, "end": 1.2},
+    ]
+    assert not step_split._chunk_boundary_candidates(
+        independent, independent_parts, [(0, 1, 0, 1), (1, 2, 0, 2)], .6)
+
+
+def test_chunk_boundary_reconciliation_splices_successful_local_review(make_project, pdir, monkeypatch):
+    uid, ctx = _ctx(make_project, pdir, lines=[
+        (0.0, 1.0, "I want to"), (1.0, 1.8, "go home"),
+        (1.8, 2.8, "This is done."),
+    ])
+    lines, parts, plan = _seam_fixture()
+    calls = []
+
+    def review(*args, **kwargs):
+        calls.append(kwargs)
+        return [{"text": "I want to go home.", "start": 0.0, "end": 1.8},
+                {"text": "This is done.", "start": 1.8, "end": 2.8}]
+
+    monkeypatch.setattr(step_split, "_llm_resegment_full_document", review)
+    result = step_split._reconcile_chunk_boundaries(
+        ctx, lines, [], parts, plan, 50, 15, 0, .6)
+    assert len(calls) == 1
+    assert "当前候选字幕" in calls[0]["boundary_review"]
+    assert [item["text"] for item in result] == ["I want to go home.", "This is done."]
+
+
+def test_chunk_boundary_reconciliation_failure_keeps_original_parts(make_project, pdir, monkeypatch):
+    uid, ctx = _ctx(make_project, pdir, lines=[
+        (0.0, 1.0, "I want to"), (1.0, 1.8, "go home"),
+        (1.8, 2.8, "This is done."),
+    ])
+    lines, parts, plan = _seam_fixture()
+
+    def review(*args, **kwargs):
+        raise ValueError("local model output is invalid")
+
+    monkeypatch.setattr(step_split, "_llm_resegment_full_document", review)
+    result = step_split._reconcile_chunk_boundaries(
+        ctx, lines, [], parts, plan, 50, 15, 0, .6)
+    assert result is parts
+    assert [item["text"] for item in result] == ["I want to", "go home", "This is done."]
+    assert "局部复核失败" in (pdir(uid) / "logs" / "split.log").read_text(encoding="utf-8")
+
+
+def test_chunk_boundary_reconciliation_rejects_local_omission(make_project, pdir, monkeypatch):
+    uid, ctx = _ctx(make_project, pdir, lines=[
+        (0.0, 1.0, "I want to"), (1.0, 1.8, "go home"),
+        (1.8, 2.8, "This is done."),
+    ])
+    lines, parts, plan = _seam_fixture()
+
+    monkeypatch.setattr(step_split, "_llm_resegment_full_document",
+                        lambda *args, **kwargs: [{
+                            "text": "I want to go home.", "start": 0.0, "end": 1.8}])
+    result = step_split._reconcile_chunk_boundaries(
+        ctx, lines, [], parts, plan, 50, 15, 0, .6)
+    assert [item["text"] for item in result] == ["I want to", "go home", "This is done."]
+    assert "疑似遗漏接缝附近原文" in (pdir(uid) / "logs" / "split.log").read_text(encoding="utf-8")
+
+
+def test_long_srt_without_word_artifact_still_uses_chunks(make_project, pdir, monkeypatch):
+    uid, ctx, lines, _ = _setup(make_project, pdir, 500)
+    calls = []
+
+    def chunked(*args):
+        calls.append(args)
+        return []
+
+    monkeypatch.setattr(step_split, '_llm_resegment_chunked', chunked)
+    assert step_split._llm_resegment(ctx, lines, 50, 15, 2, []) == []
+    assert len(calls) == 1 and calls[0][-1] == []
+
+
+def test_chunk_failure_retries_locally_and_resume_reuses_accepted_blocks(make_project, pdir, monkeypatch):
+    from dubforge import config
+    config.set_key('split.llm_chunk_target_words', 100)
+    config.set_key('split.llm_chunk_overlap_words', 0)
+    config.set_key('split.llm_chunk_max_retries', 3)
+    uid, ctx, lines, _ = _setup(make_project, pdir, 55)
+    plan = step_split._semantic_chunk_plan(lines, [], 100, 0, .6)
+    assert len(plan) == 3
+    answers = ['\n'.join(f'{i}. {x.start:.2f}-{x.end:.2f}: {x.text}'
+                         for i, x in enumerate(lines[start:end], 1))
+               for start, end, _, _ in plan]
+    # 第二块始终输出坏格式时，只耗尽当前块的三次尝试，第一块保留缓存。
+    calls = _responses(monkeypatch, answers[0], 'invalid candidate')
+    with pytest.raises(StepFailedError):
+        step_split._llm_resegment_chunked(ctx, lines, 50, 15, 2, [])
+    assert len(calls) == 4
+    assert len(list((pdir(uid) / 'cache/split').glob('*.json'))) == 1
+    assert all('窗口前上下文' not in prompt and '窗口后上下文' not in prompt
+               for prompt, _ in calls)
+    assert '上下文重叠约0词' in (pdir(uid) / 'logs/split.log').read_text(encoding='utf-8')
+
+    calls = _responses(monkeypatch, *answers[1:])
+    ctx.force = True
+    ctx.task_data = {'resume_split_cache': True}
+    result = step_split._llm_resegment_chunked(ctx, lines, 50, 15, 2, [])
+    assert len(calls) == 2
+    assert [part['text'] for part in result] == [line.text for line in lines]
+    assert len(list((pdir(uid) / 'cache/split').glob('*.json'))) == 3
+
+
 def test_full_document_is_sent_once_even_with_old_window_override(make_project, pdir, monkeypatch):
     from dubforge import config
     config.set_key('split.window_max_chars', 10)
@@ -41,7 +207,9 @@ def test_unused_character_setting_does_not_change_semantic_cache(make_project, p
     config.set_key('split.max_split_length', 100)
     assert step_split._llm_resegment(ctx, lines, 100, 7, 0, []) == before
     assert len(calls) == 1
-    config.set_key('split.target_word_count', 12)
+    from dubforge import configuration
+    current = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=current['revision'], updates={'split.target_word_count': 12}))
     # 运行会固定配置快照；新设置在下一次步骤上下文中消费。
     ctx = StepContext(crud.get_project(uid), 'split', pdir(uid),
                       pdir(uid) / 'logs/split.log', threading.Event())
@@ -96,7 +264,9 @@ def test_separated_uncertain_starter_keeps_real_silence_without_full_retry(make_
 
 def test_retry_keeps_full_original_and_never_expands_request_tree(make_project, pdir, monkeypatch):
     uid, ctx, lines, answer = _setup(make_project, pdir)
-    bad = answer.replace('\n2. ', '\n1. ')
+    # 保留行格式，但让第二句时间倒退，触发真实时间轴校验。
+    bad = answer.replace('1. 0.00-2.00:', '1. 1.00-2.00:')
+    bad = bad.replace('\n2. 3.00-5.00:', '\n2. 0.00-5.00:')
     calls = _responses(monkeypatch, bad, answer)
     expected = step_split._llm_resegment(ctx, lines, 50, 15, 2, [])
     assert len(calls) == 2
@@ -109,7 +279,9 @@ def test_retry_keeps_full_original_and_never_expands_request_tree(make_project, 
 
 def test_two_invalid_full_responses_fail_without_bisection(make_project, pdir, monkeypatch):
     uid, ctx, lines, answer = _setup(make_project, pdir)
-    calls = _responses(monkeypatch, answer.replace('\n2. ', '\n1. '))
+    bad = answer.replace('1. 0.00-2.00:', '1. 1.00-2.00:')
+    bad = bad.replace('\n2. 3.00-5.00:', '\n2. 0.00-5.00:')
+    calls = _responses(monkeypatch, bad)
     with pytest.raises(StepFailedError) as error:
         step_split._llm_resegment(ctx, lines, 50, 15, 2, [])
     assert error.value.code == 'LLM_OUTPUT_INVALID'
@@ -163,15 +335,33 @@ def test_ambiguous_explanation_never_discards_numbered_content(raw):
         step_split._parse_timed_protocol(raw, 0, 2)
 
 
-def test_response_cache_is_revalidated_against_numbered_structure(make_project, pdir, monkeypatch):
+def test_response_cache_is_revalidated_against_timeline_structure(make_project, pdir, monkeypatch):
     uid, ctx, lines, answer = _setup(make_project, pdir)
     calls = _responses(monkeypatch, answer)
     expected = step_split._llm_resegment(ctx, lines, 50, 15, 2, [])
     cache = next((pdir(uid) / 'cache/split').glob('*.json'))
-    cache.write_text(json.dumps({'kind': 'response', 'raw': answer.replace('\n2. ', '\n1. ')}), encoding='utf-8')
+    bad = answer.replace('1. 0.00-2.00:', '1. 1.00-2.00:')
+    bad = bad.replace('\n2. 3.00-5.00:', '\n2. 0.00-5.00:')
+    cache.write_text(json.dumps({'kind': 'response', 'raw': bad}), encoding='utf-8')
     assert step_split._llm_resegment(ctx, lines, 50, 15, 2, []) == expected
     assert len(calls) == 2
     assert json.loads(cache.read_text(encoding='utf-8'))['raw'] == answer
+
+
+def test_full_step_normalizes_nonconsecutive_model_numbers(make_project, pdir, monkeypatch):
+    from test_text_chain import read_split
+
+    uid, ctx, lines, answer = _setup(make_project, pdir)
+    # 序号仅是模型的行标记；有效时间轴仍应通过，并由整步输出连续编号。
+    irregular = answer.replace('\n2. ', '\n17. ').replace('\n3. ', '\n17. ')
+    calls = _responses(monkeypatch, irregular)
+
+    from dubforge.pipeline import step_split
+    step_split.run(ctx)
+
+    assert len(calls) == 1
+    result = read_split(uid)
+    assert [row['id'] for row in result['lines']] == [1, 2, 3, 4]
 
 
 def test_postprocessing_cannot_change_already_accepted_model_candidate(make_project, pdir, monkeypatch):

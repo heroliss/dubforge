@@ -66,16 +66,26 @@ def test_real_changes_still_invalidate_actual_plan(completed, change):
     elif change == 'file_changed':
         path.write_bytes(b'changed size')
     elif change == 'settings':
-        config.set_key('assemble.crf', 33)
+        from test_configuration import save
+        save('project:' + uid, {'assemble.crf': 28})
     elif change == 'subtitle_missing':
         (crud.project_dir(uid) / 'srt/trans.srt').unlink()
     else:
-        step = crud.get_step(project.id, 'subtitles'); step.status = 'stale'; crud.save_step(step)
+        # 仅改变上游登记文件才算真正的上游变化；手工把状态改成 stale
+        # 不应再把旧产物级联标成过期。
+        subtitle = crud.project_dir(uid) / 'srt/trans.srt'
+        subtitle.write_text('changed upstream subtitle', encoding='utf-8')
     state = Dependencies(project).assembly_state()
     assert not state['fresh']
     assert state['reason']
     if change.startswith('file_'):
         assert state['label'] == '成品文件缺失'
+
+
+def test_global_render_defaults_do_not_invalidate_completed_project(completed):
+    _, project, _, _, _, _ = completed
+    config.set_key('assemble.crf', 28)
+    assert Dependencies(project).display_fresh('assemble')
 
 
 def test_preview_does_not_replace_formal_plan_and_never_hides_failed_run(completed):

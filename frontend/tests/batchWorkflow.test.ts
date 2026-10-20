@@ -8,6 +8,7 @@ import { createSSRApp, h } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { setup } from '@css-render/vue3-ssr'
 import { createMemoryHistory, createRouter } from 'vue-router'
+import { defaultDubbingRunPolicy } from '../src/utils/dubbingRunPolicy.ts'
 
 let server:ViteDevServer, Panel:any
 before(async()=>{
@@ -26,7 +27,8 @@ async function render(seed:(p:any)=>void=()=>{}){
   const app=createSSRApp({render:()=>h(Panel,{uids:['one','two']})})
   app.use(router);setup(app)
   app.mixin({created(){if(this.$options.__name==='BatchWorkflow'){page=this.$.setupState;seed(page)}}})
-  const html=await renderToString(app);return {page,html}
+  const context:any={}
+  const html=await renderToString(app,context)+Object.values(context.teleports || {}).join('');return {page,html}
 }
 test('批量打开仅预检，不要求权利勾选且不启动任何项目',async t=>{
   const {page}=await render();const calls:any[]=[]
@@ -34,7 +36,7 @@ test('批量打开仅预检，不要求权利勾选且不启动任何项目',asy
     calls.push([url,JSON.parse(String(options?.body))]);return {ok:true,json:async()=>({items:[item('one','publish'),item('two','draft')]})}
   })
   await page.open()
-  assert.deepEqual(calls,[['/api/configuration/batch-plan',{uids:['one','two'],mode:null}]])
+  assert.deepEqual(calls,[['/api/configuration/batch-plan',{uids:['one','two'],target_driven:true}]])
   assert.equal(page.ready.length,2);assert.equal(page.publishCount,1)
   assert.equal(page.confirmLabel,'确认运行 2 个项目并投稿 1 个')
   const source=readFileSync(new URL('../src/components/BatchWorkflow.vue',import.meta.url),'utf8')
@@ -48,6 +50,16 @@ test('投稿数量只统计检查通过的项目，纯制作或草稿明确显�
   assert.equal(page.confirmLabel,'确认运行 2 个项目（不投稿）')
   page.items=[item('one','publish'),item('two','publish')]
   assert.equal(page.confirmLabel,'确认运行 2 个项目并投稿 2 个')
+})
+
+test('批量保留每个项目的上传和原稿终点，不把上传等待算成投稿',async()=>{
+  const upload=item('one','upload')
+  const update=item('two','update');update.plan.recipe={...update.plan.recipe,delivery_mode:'upload'} as any
+  const {page}=await render(page=>page.items=[upload,update])
+  assert.equal(page.ready.length,2);assert.equal(page.publishCount,0)
+  assert.equal(page.confirmLabel,'确认运行 2 个项目（不投稿）')
+  page.items=[{...update,plan:{...update.plan,recipe:{...update.plan.recipe,delivery_mode:'publish'}}}]
+  assert.equal(page.publishCount,1)
 })
 test('点击后才确认冻结清单，跳过受阻项目，双击不会重复启动',async t=>{
   const rows=[item('one','publish'),item('two','produce'),item('blocked','publish',['缺少封面'])]
@@ -100,4 +112,13 @@ test('预检失败清空旧结果，不允许用过期清单启动',async t=>{
   await page.inspect();await page.start()
   assert.equal(page.ready.length,0);assert.equal(page.publishCount,0)
   assert.equal(page.error,'预检失败');assert.deepEqual(calls,['/api/configuration/batch-plan'])
+})
+
+test('批量检查使用统一可读发布目标，运行回执保留项目标题',async t=>{
+  const {page,html}=await render(page=>{page.show=true;page.items=[{...item('one','publish'),title:'标题项目',
+    plan:{...item('one','publish').plan,recipe:{mode:'publish',part_titles:{a:'原声版'},account_id:'12'},settings:{season_id:34,section_id:56},
+      settings_display:{account_id:'12',season_id:34,section_id:56,season_title:'旅行合集',section_title:'正篇'}}}]})
+  assert.match(html,/旅行合集/);assert.match(html,/正篇/);assert.match(html,/class="target-id"/)
+  t.mock.method(globalThis,'fetch',async()=>({ok:true,json:async()=>({items:[{uid:'one',run_id:'run-one'}]})}))
+  await page.start();assert.equal(page.results[0].title,'标题项目')
 })

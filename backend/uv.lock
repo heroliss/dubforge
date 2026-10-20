@@ -262,7 +262,6 @@ wheels = [
 
 [[package]]
 name = "dubforge"
-version = "0.1.0"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
@@ -321,7 +320,7 @@ requires-dist = [
     { name = "torch", marker = "extra == 'asr'", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torch", marker = "extra == 'separation'", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu126" },
     { name = "torchaudio", marker = "extra == 'separation'", specifier = ">=2.6", index = "https://download.pytorch.org/whl/cu126" },
-    { name = "uvicorn", extras = ["standard"], specifier = ">=0.30" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.36" },
     { name = "yt-dlp", specifier = ">=2025.9.26" },
 ]
 provides-extras = ["asr", "separation"]

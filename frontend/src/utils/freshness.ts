@@ -5,6 +5,7 @@ export const FRESHNESS_CATEGORIES:Record<string,string>={
 export type FreshnessChange={category:string;key:string;label:string;before:string|null;after:string|null;before_known:boolean;
   origin_before:{kind:string;label:string}|null;origin_after:{kind:string;label:string}|null;message:string;sensitive:boolean}
 export type FreshnessStep={key:string;label:string;status:string;fresh:boolean|null;freshness_label:string;freshness_reason:string;history_available:boolean|null;summary:string;
+  settings_changed:boolean;upstream_changed:boolean;artifact_missing:boolean;
   changes:FreshnessChange[];warnings:string[];affected_steps:{key:string;label:string}[]}
 export type FreshnessReport={project_uid:string;steps:FreshnessStep[];warnings:string[]}
 
@@ -27,6 +28,7 @@ export function normalizeFreshnessReport(value:any):FreshnessReport|null {
     key:text(step.key),label:text(step.label),status:text(step.status),fresh:typeof step.fresh==='boolean'?step.fresh:null,
     freshness_label:text(step.freshness_label),freshness_reason:text(step.freshness_reason),
     history_available:typeof step.history_available==='boolean'?step.history_available:null,summary:text(step.summary),
+    settings_changed:step.settings_changed===true,upstream_changed:step.upstream_changed===true,artifact_missing:step.artifact_missing===true,
     changes:(Array.isArray(step.changes)?step.changes:[]).filter((change:any)=>change && typeof change==='object').map((change:any)=>{
       const sensitive=change.sensitive===true || sensitivePath.test(String(change.key || ''))
       const known=change.before_known===true

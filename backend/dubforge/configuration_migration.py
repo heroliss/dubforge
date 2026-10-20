@@ -7,6 +7,44 @@ from pathlib import Path
 
 VERSION = 2
 
+
+def freeze_project_baselines(engine):
+    """仅补旧项目缺失基线；保留当前有效值，不推断产物当年的制作设置。"""
+    from sqlmodel import Session, select
+    from dubforge import configuration, config
+    from dubforge.configuration_models import ConfigurationScope
+    from dubforge.domain.models import Project
+    from dubforge.pipeline.step_params import RUNTIME_PARAM_PATHS
+    changed = []
+    with configuration.gate, Session(engine) as session:
+        settings = config.load_config()
+        allowed = set(configuration.defaults(settings)) - RUNTIME_PARAM_PATHS
+        for uid in session.exec(select(Project.uid)).all():
+            row = session.get(ConfigurationScope, 'project:' + uid)
+            if row is None:
+                row = ConfigurationScope(key='project:' + uid, name='本项目')
+            previous = configuration.read_baseline(row.baseline, settings=settings)
+            if previous is not None:
+                raw = json.loads(row.baseline)
+                missing = allowed - set(raw['values'])
+                if not missing:
+                    continue
+                current = configuration.capture_baseline(session, row.parent, settings=settings)
+                data = dict(schema=1, values={**{k: current['values'][k] for k in missing}, **raw['values']},
+                            origins={**{k: current['origins'][k] for k in missing}, **raw['origins']},
+                            sources={**{k: current['sources'][k] for k in missing}, **raw['sources']},
+                            configured=sorted(set(raw['configured']) | (set(current['configured']) & missing)))
+            else:
+                data = configuration.capture_baseline(session, row.parent, settings=settings)
+            configuration._validate(json.loads(row.values), {**configuration.defaults(settings), **data['values']},
+                                    historical=True, settings=settings)
+            row.baseline = configuration._json(data)
+            session.add(row)
+            changed.append(uid)
+        session.commit()
+    return changed
+
+
 def migrate(engine):
     from dubforge.configuration import defaults, _validate, ConfigurationError
     from dubforge.pipeline.assembly_versions import legacy_version
@@ -152,8 +190,9 @@ def migrate(engine):
                     **scopes.get(doc['parent'], {}).get('values', {})}
             _validate(values, base)
             revision = existing[key]['revision'] + 1 if key in existing else 1
-            conn.exec_driver_sql('INSERT INTO configurationscope (key,name,parent,"values",revision,archived) VALUES (?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET name=excluded.name,parent=excluded.parent,"values"=excluded."values",revision=excluded.revision,archived=excluded.archived',
-                                 (key, doc['name'], doc['parent'], json.dumps(values, ensure_ascii=False), revision, doc['archived']))
+            conn.exec_driver_sql('INSERT INTO configurationscope (key,name,parent,"values",baseline,revision,archived) VALUES (?,?,?,?,?,?,?) ON CONFLICT(key) DO UPDATE SET name=excluded.name,parent=excluded.parent,"values"=excluded."values",revision=excluded.revision,archived=excluded.archived',
+                                 (key, doc['name'], doc['parent'], json.dumps(values, ensure_ascii=False),
+                                  existing.get(key, {}).get('baseline') or '{}', revision, doc['archived']))
         for row in rows('publication'):
             draft = decode(row['draft'])
             template = scopes.get('series:' + draft.get('template_id', ''))

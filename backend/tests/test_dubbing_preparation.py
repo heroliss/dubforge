@@ -42,6 +42,7 @@ def prepared(make_project, monkeypatch):
         return out
 
     monkeypatch.setattr(tts_gptsovits, "synth", synth)
+    monkeypatch.setattr(tts_gptsovits, 'is_online', lambda *_args, **_kwargs: True)
     return uid, project, calls
 
 
@@ -98,6 +99,22 @@ def test_parameter_changes_preserve_recorded_versions_for_comparison(prepared):
         assert Dependencies(crud.get_project(uid)).fresh("tts")
 
 
+def test_snapshot_audio_remains_previewable_when_upstream_step_is_stale(prepared):
+    """句级快照已核对时，不因上游步骤的无关 stale 状态误报预览无声。"""
+    from app.main import app
+    uid, project, _ = prepared
+    with TestClient(app) as client:
+        base = f"/api/projects/{uid}/workbench"
+        assert synthesize(client, base + "/lines/1/synthesize", json={}).status_code == 200
+        split = crud.get_step(project.id, 'split')
+        split.status = 'stale'
+        crud.save_step(split)
+        state = client.get(base + '?probe=false').json()
+        line = next(row for row in state['lines'] if row['id'] == 1)
+        assert line['wav']['exists'] is True
+        assert line['wav']['stale'] is False
+
+
 def test_forced_resynthesis_requires_listening_again(prepared):
     from app.main import app
     uid, _, _ = prepared
@@ -115,9 +132,8 @@ def test_forced_resynthesis_requires_listening_again(prepared):
 def test_trial_reports_real_missing_and_stale_inputs(prepared):
     from app.main import app
     uid, project, _ = prepared
-    translate = crud.get_step(project.id, "translate")
-    translate.status = "stale"
-    crud.save_step(translate)
+    translate_path = Dependencies(project).path("translate", "translate.txt")
+    translate_path.write_text(translate_path.read_text(encoding="utf-8").replace("你好", "您好"), encoding="utf-8")
     with TestClient(app) as client:
         base = f"/api/projects/{uid}/workbench"
         state = client.get(base + "?probe=false").json()
@@ -171,7 +187,11 @@ def index_prepared(prepared, monkeypatch):
     from app.main import app
     uid, project, calls = prepared
     ref = crud.project_dir(uid) / 'reference.wav'
-    atomic_write_bytes(ref, b'reference')
+    audio = io.BytesIO()
+    with wave.open(audio, 'wb') as wav:
+        wav.setparams((1, 2, 32000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(b'\x00\x10' * 32000)
+    atomic_write_bytes(ref, audio.getvalue())
     client = TestClient(app)
     config.set_key('tts.indextts25.duration_factor', 1.0)
     client.put(f'/api/projects/{uid}/step_params', json={'updates': {
@@ -183,6 +203,7 @@ def index_prepared(prepared, monkeypatch):
         received.append(kwargs)
         return tts_gptsovits.synth(url, text, out, lang)
     monkeypatch.setattr(tts_indextts25, 'synth', synth)
+    monkeypatch.setattr(tts_indextts25, 'is_online', lambda *_args, **_kwargs: True)
     return client, uid, received
 
 
@@ -350,7 +371,10 @@ def test_pipeline_reports_current_line_and_progress_skipping_cached_lines(index_
         assert reported.wait(10)
         state = client.get(base + '?probe=false').json()
         assert state['active_line'] == 2 and state['active_progress'] == .9
-        assert synthesize(client, base + '/lines/1/synthesize', json={'force': True}).json()['code'] == 'PIPELINE_BUSY'
+        assert state['lines'][0]['wav']['exists'] and len(callbacks) == 1
+        # ADR-0176允许显式生成追加队列；未新增意图时仍跳过缓存句，文字编辑继续互斥。
+        editing = client.put(base + '/lines/1/text', json={'text': '运行中修改文字'})
+        assert editing.status_code == 400 and editing.json()['code'] == 'CONFIGURATION_BUSY'
     finally:
         release.set()
     wait_status(uid, 'tts', {'failed' if failure else 'done'})
@@ -368,33 +392,27 @@ def test_volume_save_and_voice_selection_do_not_overwrite_each_other(index_prepa
     from dubforge.pipeline import dubbing_session
 
     client, uid, _ = index_prepared
-    volume_writing, selection_waiting, release = Event(), Event(), Event()
-    from dubforge import configuration
-    check_idle, edit = configuration._check_idle, dubbing_session.edit
-
-    def slow_check(session, key):
-        if not volume_writing.is_set():
-            volume_writing.set()
-            assert release.wait(10)
-        return check_idle(session, key)
+    selection_holding, release = Event(), Event()
+    edit = dubbing_session.edit
 
     @contextmanager
     def tracked_edit(project):
-        selection_waiting.set()
         with edit(project):
+            # selection 先拿到与配置保存共用的编辑锁并保持一小段时间；
+            # 另一请求必须等待，才能证明两类参数不会读改写互相覆盖。
+            selection_holding.set()
+            assert release.wait(10)
             yield
 
-    monkeypatch.setattr(configuration, '_check_idle', slow_check)
     monkeypatch.setattr(dubbing_session, 'edit', tracked_edit)
     with ThreadPoolExecutor(max_workers=2) as pool:
-        volume = pool.submit(client.put, f'/api/projects/{uid}/step_params',
-                             json={'updates': {'assemble.voice_volume': .45}})
+        selection = pool.submit(client.put, f'/api/projects/{uid}/workbench/lines/1/selection',
+                                json={'source': 'dub', 'take': None})
         try:
-            assert volume_writing.wait(10)
-            selection = pool.submit(client.put, f'/api/projects/{uid}/workbench/lines/1/selection',
-                                    json={'source': 'dub', 'take': None})
-            assert selection_waiting.wait(10)
-            assert not selection.done(), '参数读改写尚未完成时，选择保存必须等待共同的锁'
+            assert selection_holding.wait(10)
+            volume = pool.submit(client.put, f'/api/projects/{uid}/step_params',
+                                 json={'updates': {'assemble.voice_volume': .45}})
+            assert not volume.done(), '选择保存持有编辑锁时，参数保存必须等待共同的锁'
         finally:
             release.set()
         assert volume.result(timeout=10).status_code == 200

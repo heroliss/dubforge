@@ -117,6 +117,67 @@ def test_guard_contract_retry_is_fresh_and_within_one_validation_budget(isolated
     assert len(aborted) == 1 and aborted[0]['detail']['content_excerpt'].startswith('MODEL INTERNAL')
 
 
+def test_budget_retry_can_rotate_to_next_profile(isolated_env, monkeypatch):
+    calls = []
+
+    def fake_chat(prompt, system=None, temperature=None, log=lambda m: None,
+                  profile=None, cancel_check=None, trace=None,
+                  messages=None, response_guard_factory=None):
+        calls.append(profile)
+        if len(calls) == 1:
+            raise ResponseGuardError('思考超限', code='LLM_OUTPUT_BUDGET')
+        return '1. 正文'
+
+    monkeypatch.setattr(llm, 'chat', fake_chat)
+    profiles = [PROFILE, BACKUP]
+    result = llm.chat_validated(
+        '完整原文', parser=lambda raw: raw, profile=profiles, max_retries=2,
+        retry_profile=lambda error, attempt, current: profiles[1:]
+        if error.code == 'LLM_OUTPUT_BUDGET' else current)
+    assert result == '1. 正文'
+    assert calls == [profiles, profiles[1:]]
+
+
+def test_budget_retry_stops_when_profile_does_not_change(isolated_env, monkeypatch):
+    calls = []
+
+    def fake_chat(prompt, system=None, temperature=None, log=lambda m: None,
+                  profile=None, cancel_check=None, trace=None,
+                  messages=None, response_guard_factory=None):
+        calls.append(profile)
+        raise ResponseGuardError('思考超限', code='LLM_OUTPUT_BUDGET',
+                                 detail={'channel': 'reasoning'})
+
+    monkeypatch.setattr(llm, 'chat', fake_chat)
+    profile = [PROFILE]
+    with pytest.raises(ResponseGuardError) as error:
+        llm.chat_validated(
+            '完整原文', parser=lambda raw: raw, profile=profile, max_retries=5,
+            retry_profile=lambda _error, _attempt, current: current)
+    assert len(calls) == 1
+    assert error.value.detail['validation_attempts'] == 1
+    assert error.value.detail['guard_validation_failures'] == 1
+
+
+def test_parser_failure_with_retry_profile_keeps_normal_retry_path(isolated_env, monkeypatch):
+    calls = []
+
+    def fake_chat(prompt='', system=None, temperature=None, log=lambda m: None,
+                  profile=None, cancel_check=None, trace=None,
+                  messages=None, response_guard_factory=None):
+        calls.append(profile)
+        return '候选正文'
+
+    monkeypatch.setattr(llm, 'chat', fake_chat)
+    with pytest.raises(llm.StepFailedError) as error:
+        llm.chat_validated(
+            '完整原文', parser=lambda _raw: (_ for _ in ()).throw(ValueError('格式不合格')),
+            profile=[PROFILE], max_retries=2,
+            retry_profile=lambda _error, _attempt, current: current)
+    assert len(calls) == 2
+    assert error.value.code == 'LLM_OUTPUT_INVALID'
+
+
 @pytest.mark.parametrize('plain', [True, False])
 def test_exhausted_response_budget_keeps_code_and_never_sends_huge_loop_to_retry(isolated_env, monkeypatch, plain):
     calls, traces = [], []

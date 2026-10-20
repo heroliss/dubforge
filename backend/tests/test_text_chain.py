@@ -4,6 +4,7 @@ import json
 import pytest
 
 from conftest import mark_upstream_done, wait_status
+from test_configuration import save as save_settings
 from dubforge.utils.lineprotocols import parse_numbered_lines, parse_timed_lines
 from dubforge.utils.srt import SubLine, write_srt
 
@@ -55,7 +56,7 @@ def _mock_llm(monkeypatch, responder):
                             max_retries=3, temperature=None,
                             log=lambda m: None, profile=None,
                             cancel_check=None, trace=None, retry_prompt=None,
-                            retry_request=None, retry_context=None,
+                            retry_request=None, retry_context=None, retry_profile=None,
                             failure_label="输出", response_guard_factory=None):
         last_error = None
         last_raw = ""
@@ -150,9 +151,7 @@ def test_split_chinese_text_preserves_characters(make_project, isolated_env, pdi
     uid = make_project()
     text = "这是一个很长的中文句子，需要在自然标点附近拆开，同时保留全部内容。"
     _seed_transcribe(uid, [(0.0, 6.0, text)])
-    import dubforge.config as cfgmod
-    cfgmod.set_key("split.use_llm", False)
-    cfgmod.set_key("split.max_split_length", 12)
+    save_settings('project:' + uid, {'split.use_llm': False, 'split.max_split_length': 12})
 
     assert _run_until(uid, "split") == "done"
     data = read_split(uid)
@@ -173,6 +172,43 @@ def test_split_output_lines_are_trimmed():
     result = _normalized_split_lines(data)
     assert [x["text"] for x in result] == ["first line", "second line"]
     assert result[0]["start"] == 0.0 and result[1]["end"] == 2.0
+
+
+def test_adjacent_semantic_merge_joins_english_continuation_but_preserves_sentences():
+    from dubforge.pipeline.step_split import _merge_adjacent_semantic_parts
+
+    parts = [
+        {"text": "we are going to be making", "start": 0.0, "end": 1.8},
+        {"text": "not one, but two game engines.", "start": 1.8, "end": 4.6},
+        {"text": "That is enough.", "start": 4.6, "end": 6.0},
+    ]
+    result = _merge_adjacent_semantic_parts(parts, pause=.6, max_duration=7)
+    assert [row["text"] for row in result] == [
+        "we are going to be making not one, but two game engines.",
+        "That is enough.",
+    ]
+
+
+def test_adjacent_semantic_merge_does_not_merge_complete_cjk_sentences():
+    from dubforge.pipeline.step_split import _merge_adjacent_semantic_parts
+
+    result = _merge_adjacent_semantic_parts([
+        {"text": "这是第一句", "start": 0.0, "end": 2.0},
+        {"text": "接着是第二句", "start": 2.0, "end": 4.0},
+    ], pause=.6, max_duration=7)
+    assert len(result) == 2
+
+
+def test_split_output_rejects_cross_chunk_time_overlap():
+    from dubforge.errors import StepFailedError
+    from dubforge.pipeline.step_split import _normalized_split_lines
+
+    with pytest.raises(StepFailedError, match="时间重叠") as exc:
+        _normalized_split_lines([
+            {"id": 1, "text": "first", "start": 0.0, "end": 1.2},
+            {"id": 2, "text": "second", "start": 1.0, "end": 2.0},
+        ])
+    assert exc.value.code == "SPLIT_TIMELINE_INVALID"
 
 
 def test_rule_split_avoids_tiny_english_punctuation_fragments():
@@ -220,7 +256,6 @@ def test_split_timed_protocol_parser_accepts_corrected_text():
     "1. 0.00-1.00: 第一行\n没有前缀",
     "1. 1.00-0.50: 时间倒置",
     "1. 0.00-1.00: ",
-    "2. 0.00-1.00: 序号错误",
 ])
 def test_split_timed_protocol_structural_errors_do_not_guess(raw):
     from dubforge.pipeline.step_split import _parse_timed_protocol
@@ -247,15 +282,22 @@ def test_split_timed_protocol_tolerates_harmless_format_issues():
     assert any("超出窗口" in item for item in warnings)
 
 
+def test_split_timed_protocol_reports_large_out_of_window_timestamp():
+    """整行时间越过源音频范围时，报出边界和原值，避免误导为零时长。"""
+    from dubforge.pipeline.step_split import _parse_timed_protocol
+
+    raw = "1. 2.00-3.00: first\n2. 3.10-4.20: second"
+    with pytest.raises(ValueError, match="第 2 行时间超出输入范围 0-3 秒：3.1-4.2"):
+        _parse_timed_protocol(raw, 0.0, 3.0)
+
+
 def test_split_uses_duration_as_secondary_boundary(make_project, isolated_env, pdir):
     """字数不超限但语音过慢时，也按时长给拆分步骤一个机会。"""
     uid = make_project()
     text = "这是一个语速很慢但长度并不太长的句子"
     _seed_transcribe(uid, [(0.0, 12.0, text)])
-    import dubforge.config as cfgmod
-    cfgmod.set_key("split.use_llm", False)
-    cfgmod.set_key("split.max_split_length", 22)
-    cfgmod.set_key("split.max_segment_seconds", 5)
+    save_settings('project:' + uid, {'split.use_llm': False, 'split.max_split_length': 22,
+                                    'split.max_segment_seconds': 5})
 
     assert _run_until(uid, "split") == "done"
     data = read_split(uid)
@@ -286,8 +328,7 @@ def test_split_llm_resegments_whole_window_once(make_project, isolated_env,
                 "2. 4.00-6.00: 最后一句")
 
     _mock_llm(monkeypatch, responder)
-    import dubforge.config as cfgmod
-    cfgmod.set_key("asr.segmentation_mode", "word")
+    save_settings('project:' + uid, {'asr.segmentation_mode': 'word'})
     assert _run_until(uid, "split") == "done"
     data = read_split(uid)
     assert len(calls) == 1
@@ -317,8 +358,7 @@ def test_split_llm_phrase_mode_omits_word_timeline(make_project, isolated_env,
         return "1. 0.00-3.50: 这是第一句，接着是第二句。"
 
     _mock_llm(monkeypatch, responder)
-    import dubforge.config as cfgmod
-    cfgmod.set_key("asr.segmentation_mode", "phrase")
+    save_settings('project:' + uid, {'asr.segmentation_mode': 'phrase'})
     assert _run_until(uid, "split") == "done"
     assert len(calls) == 1
     assert read_split(uid)['count'] == 1
@@ -397,14 +437,54 @@ def test_split_llm_prompt_gives_autonomous_semantic_guidance():
     assert [body.index(line) for line in expected] == sorted(body.index(line) for line in expected)
     assert "保留源语言" in prompt
     assert '可以改变ASR行数' in guidance
-    assert '不确定处保留原意' in guidance
+    assert '不确定时保留原意' in guidance
     assert '结合全文语境和常识' in guidance
     assert '不要求逐词照抄' in guidance
     assert '英文按单词、中文按自然语义词' in guidance
     assert '作为软参考' in guidance
-    assert '长停顿前的半句可以保留' in guidance
+    assert '真实未说完的表达按声学边界保留' in guidance
     assert '无台词区间必须留空' in guidance
     assert "序号. 开始秒-结束秒: 原文片段" in prompt
+
+
+def test_long_word_timeline_keeps_explicit_thinking_on_request_copy():
+    """词级全文提示过长时仍沿用当前思考设置，不能改写全局模型配置。"""
+    from dubforge.pipeline.step_split import _bound_long_semantic_profiles
+
+    profiles = [{
+        'name': '智谱',
+        'model': 'glm-5.3-flash',
+        'base_url': 'https://open.bigmodel.cn/api/paas/v4',
+        'params': {
+            'reasoning_effort': 'low',
+            'thinking': {'type': 'enabled', 'clear_thinking': False},
+        },
+    }]
+    original = profiles[0]['params']['thinking'].copy()
+    logs = []
+    bounded = _bound_long_semantic_profiles(profiles, 120_001, log=logs.append)
+    assert bounded is profiles
+    assert bounded[0]['params']['thinking'] == original
+    assert '保留当前模型思考设置' in logs[0]
+
+
+def test_short_semantic_prompt_keeps_explicit_thinking_on_request_copy():
+    from dubforge.pipeline.step_split import _bound_long_semantic_profiles
+
+    profiles = [{'params': {'thinking': {'type': 'enabled'}}}]
+    bounded = _bound_long_semantic_profiles(profiles, 119_999)
+    assert bounded == profiles and bounded is profiles
+
+
+def test_chunk_semantic_prompt_keeps_explicit_thinking_even_when_short():
+    """500词分块也沿用当前模型思考设置，不按请求长度关闭思考。"""
+    from dubforge.pipeline.step_split import _bound_long_semantic_profiles
+
+    profiles = [{'params': {'thinking': {'type': 'enabled', 'budget_tokens': 10000}}}]
+    bounded = _bound_long_semantic_profiles(profiles, 14_000, force=True)
+    assert bounded is profiles
+    assert bounded[0]['params']['thinking'] == {
+        'type': 'enabled', 'budget_tokens': 10000}
 
 
 def test_correction_guidance_survives_structural_retry_and_translation():
@@ -421,8 +501,8 @@ def test_correction_guidance_survives_structural_retry_and_translation():
     assert '不要求逐词照抄' in repair
     assert repair.split('【全文时间轴输入】\n', 1)[1] == timeline
     assert '原文已定稿' in translated
-    assert '没有音频，不再猜改ASR' in translated
-    assert '疑似实词或专名无法确定时保留原词' in translated
+    assert '翻译阶段不再纠错' in translated
+    assert '无法确定的实词或专名保留原词' in translated
     assert '可纠正明显的识别错误' not in translated
     for prompt in (repair, translated):
         assert "yuan" not in prompt and "yen" not in prompt
@@ -531,8 +611,7 @@ def test_split_repairs_duration_guard_boundary_by_default(make_project,
         return "1. 0.00-13.00: 这一段是同一句话的前半部分后半部分"
 
     _mock_llm(monkeypatch, responder)
-    import dubforge.config as cfgmod
-    cfgmod.set_key("split.max_segment_seconds", 20)
+    save_settings('project:' + uid, {'split.max_segment_seconds': 20})
     assert _run_until(uid, "split") == "done"
     data = read_split(uid)
     assert len(data["lines"]) == 1
@@ -586,10 +665,8 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
         return output
     _mock_llm(monkeypatch, responder)
 
-    import dubforge.config as cfgmod
-    cfgmod.set_key("split.use_llm", False)
-    cfgmod.set_key("split.max_split_length", 80)
-    cfgmod.set_key("translate.max_context_tokens", 200_000)
+    save_settings('project:' + uid, {'split.use_llm': False, 'split.max_split_length': 80,
+                                    'translate.max_context_tokens': 200_000})
 
     from dubforge.domain import crud as _crud
     def _rr(key):
@@ -617,17 +694,16 @@ def test_translate_chunked_tier_and_cache(make_project, isolated_env, monkeypatc
 def test_same_path_term_changes_retranslate_through_nonforced_step_entry(make_project, isolated_env, monkeypatch):
     """外层过期后，实际系统提示也改变窗口缓存，不能拿旧术语译文假装重新完成。"""
     from openpyxl import Workbook
-    from dubforge import config
 
     uid = make_project()
     _seed_transcribe(uid, [(0.0, 2.0, 'station')])
-    config.set_key('split.use_llm', False)
     path = isolated_env / 'terms.xlsx'
     book = Workbook()
     book.active.append(['src', 'dst', 'note'])
     book.active.append(['station', '车站', '交通'])
     book.save(path)
-    config.set_key('translate.custom_terms_path', str(path))
+    save_settings('project:' + uid, {'split.use_llm': False,
+                                    'translate.custom_terms_path': str(path)})
     systems = []
 
     def responder(prompt, system):
@@ -719,10 +795,14 @@ def test_subtitles_outputs(make_project, isolated_env, monkeypatch, pdir):
 
 def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pdir):
     """全文超出真实容量才分窗，按顺序传递摘要且原编号正确归位。"""
+    # 使用界面允许的最小容量和更长素材触发分窗；项目在创建时保存基础值。
+    from dubforge import config
+    config.update_config({'split.use_llm': False, 'split.max_split_length': 80,
+                          'translate.max_context_tokens': 16_000})
     uid = make_project()
     lines = [(float(i) * 2, float(i) * 2 + 1.5,
               f"sentence number {i} about topic")
-             for i in range(200)]
+             for i in range(1_000)]
     _seed_transcribe(uid, lines)
 
     calls = []
@@ -740,11 +820,6 @@ def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pd
         return ""
     _mock_llm(monkeypatch, responder)
 
-    import dubforge.config as cfgmod
-    cfgmod.set_key("split.use_llm", False)
-    cfgmod.set_key("split.max_split_length", 80)
-    cfgmod.set_key("translate.max_context_tokens", 10_000)
-
     assert _run_until(uid, "split") == "done"
     assert _run_until(uid, "translate") == "done"
     assert len(calls) > 1
@@ -752,8 +827,9 @@ def test_translate_sequential_chunks(make_project, isolated_env, monkeypatch, pd
     assert "###HANDOFF###" in prompts[0] and "###HANDOFF###" not in prompts[-1]
     data = read_translate(uid)
     dsts = {line["id"]: line["dst"] for line in data["lines"]}
-    assert list(dsts) == list(range(1, 201))
+    assert list(dsts) == list(range(1, 1_001))
     assert dsts[3] == "译3" and dsts[200] == "译200"
+    assert dsts[1_000] == "译1000"
 
 
 def test_translate_chunk_planner_uses_context_budget():
@@ -765,6 +841,15 @@ def test_translate_chunk_planner_uses_context_budget():
     chunks = _chunk_lines(lines, token_budget=150_000)
     assert len(chunks) == 1
     assert sum(len(line["text"]) for line in chunks[0]) > 12_000
+
+
+def test_translate_chunk_lines_can_apply_optional_safe_line_cap():
+    from dubforge.pipeline.step_translate import _chunk_lines
+
+    rows = [{"id": i + 1, "text": "short subtitle"} for i in range(205)]
+    chunks = _chunk_lines(rows, token_budget=150_000, max_lines=100)
+    assert [len(chunk) for chunk in chunks] == [100, 100, 5]
+    assert [row["id"] for chunk in chunks for row in chunk] == list(range(1, 206))
 
 
 def test_translate_window_prompt_only_requests_handoff_when_needed():
@@ -811,22 +896,23 @@ def test_translate_prompt_prefers_autonomous_natural_translation(style):
     prompt = _window_prompt([{"id": 1, "text": "hello"}], "", 1, 1)
 
     assert '同编号保真' in system
-    assert '风格和网络梗不能添加笑点' in system
-    assert '不能为了流畅搬动信息' in system
+    assert '风格和本地化服从保真，不新增事实、笑点或评价' in system
+    assert '不把信息提前、延后或重复到其他编号' in system
+    assert '在本行含义内调整语序、句式和惯用表达' in system
     assert '结合整体语境和常识' not in system
     assert "用于字幕和配音" in system
-    assert "按每句标注的时长控制长度" in system
-    assert "短句优先简洁表达" in system
+    assert "参考每句时长" in system
+    assert "在保留原意的前提下简洁表达" in system
     assert "句末省略逗号、句号" in system
     assert "问号、感叹号、省略号" in system
     assert "句中标点按需保留" in system
-    assert "句子数量、标号及顺序保持一致" in system
-    assert "每句译文非空，不加空行" in system
+    assert "编号、行数和顺序保持一致" in system
+    assert "每句译文非空" in system and '不加空行' in system
     assert "术语参考：" in system
     assert "hello = 你好" in system
     assert "直接返回编号文本" in prompt
     assert "请优先按用户风格组织表达" not in system
-    assert "可充分润色和本地化" not in system
+    assert '不要求逐词直译' in system
     if style.strip():
         assert f"翻译风格要求：\n{style.strip()}" in system
     else:
@@ -1064,8 +1150,8 @@ def test_translate_window_chooses_local_fresh_retry(monkeypatch, tmp_path, last_
     assert calls[1]["messages"] is None
     assert calls[0]["system"] == calls[1]["system"]
     assert "用四川方言，幽默一点" in calls[1]["system"]
-    assert '没有音频，不再猜改ASR' in calls[1]['system']
-    assert '事实优先' in calls[1]['system']
+    assert '翻译阶段不再纠错' in calls[1]['system']
+    assert '保留人物、事实' in calls[1]['system']
     assert "每句译文非空" in calls[1]["system"]
     assert "句末省略逗号、句号" in calls[1]["system"]
     assert len(calls[1]["prompt"]) < len(calls[0]["prompt"])

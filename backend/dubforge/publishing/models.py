@@ -18,8 +18,11 @@ class Publication(SQLModel, table=True):
     snapshot: str = '{}'
     transfers: str = '{}'
     receipt: str = '{}'
+    chapter_sync: str = '{}'  # 章节交付单独持久化，不能改写已确认投稿快照或稿件状态。
     progress: float = 0
     error: str = ''
+    archived_at: datetime.datetime | None = Field(default=None, index=True)
+    deleted_at: datetime.datetime | None = Field(default=None, index=True)
     created_at: datetime.datetime = Field(default_factory=now)
     updated_at: datetime.datetime = Field(default_factory=now)
 
@@ -56,3 +59,23 @@ class PublishChange(SQLModel, table=True):
     result: str = '{}'
     error: str = ''
     created_at: datetime.datetime = Field(default_factory=now)
+
+
+class PublicationUpdate(SQLModel, table=True):
+    """原BV更新任务；冻结新成片与后处理范围，保留原发布历史。"""
+    id: str = Field(default_factory=lambda: uuid.uuid4().hex, primary_key=True)
+    source_publication_id: str = Field(index=True)
+    project_uid: str = Field(index=True)
+    account_id: str = Field(index=True)
+    bvid: str = Field(index=True)
+    status: str = Field(default='prepared', index=True)
+    phase: str = '更新方案已就绪，等待确认'
+    fingerprint: str = ''
+    plan: str = '{}'
+    preview: str = '{}'
+    execution: str = '{}'
+    error: str = ''
+    error_code: str = ''
+    progress: float = 0
+    created_at: datetime.datetime = Field(default_factory=now)
+    updated_at: datetime.datetime = Field(default_factory=now)

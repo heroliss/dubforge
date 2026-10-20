@@ -13,7 +13,7 @@ const bundle = await build({
   stdin: { contents: descriptor.scriptSetup!.content + `
     export { profiles, form, markApplied, isDirty, rootDirty, displayDirty, concDirty,
       applySettings, applyConc, applyDisplay, delProfile, route, router, dialog, sections,
-      section, selectedScope, visited, productionDirty, productionBusy, warnUnload, loadSettings, editability, settingsLocked, applyRoot, addProfile, move };`,
+      section, selectedScope, visited, productionDirty, productionBusy, accountDirty, accountBusy, warnUnload, loadSettings, editability, settingsLocked, applyRoot, addProfile, move, testOne, testConnection };`,
     loader: 'ts', resolveDir: fileURLToPath(new URL('../src/views', import.meta.url)) },
   bundle: true, write: false, format: 'esm', platform: 'node',
   plugins: [{ name: 'page-test-boundary', setup(build) {
@@ -70,6 +70,19 @@ test('删除最后一组也标记未保存；非法 JSON 阻止发送', async t 
   assert.equal(page.isDirty.value, true)
   page.delProfile(0)
   assert.equal(page.isDirty.value, true)
+})
+
+test('非对象 JSON 保留草稿并阻止保存、单组及全部连通测试', async t => {
+  const { page, requests } = await fixture(t)
+  for (const json of ['[]', 'null', '1', '"text"']) {
+    page.profiles.value[0].paramsJson = json
+    await page.applySettings()
+    await page.testOne(0)
+    await page.testConnection()
+    assert.equal(requests.length, 0)
+    assert.equal(page.isDirty.value, true)
+    assert.equal(page.profiles.value[0].paramsJson, json)
+  }
 })
 
 test('慢保存期间的新编辑继续显示未保存', async t => {
@@ -160,9 +173,9 @@ test('显示偏好保存失败保留草稿；慢保存不吞掉新输入，重�
   assert.equal(page.displayDirty.value, true)
 })
 
-test('只有三个设置分类；URL 直达模板，分类切换保留制作草稿而无需确认', async t => {
+test('制作、B站账号、模型与运行四个设置分类；分类切换保留制作草稿而无需确认', async t => {
   const { page, requests } = await fixture(t)
-  assert.deepEqual(page.sections.value.map((s:any) => s.label), ['制作与发布', '模型与服务', '运行与存储'])
+  assert.deepEqual(page.sections.value.map((s:any) => s.label), ['制作与发布', 'B站账号', '模型与服务', '运行与存储'])
   assert.equal(page.section.value, 'production')
   assert.equal(page.selectedScope.value, 'global')
   page.route.query = { section: 'production', template: 'travel' }
@@ -215,6 +228,9 @@ test('默认制作页不请求系统配置，只有进入系统分类才按需�
     return new Response(JSON.stringify(url === '/api/settings' ? { llm: { profiles: [] }, server: {}, runner: {} } : {}))
   })
   assert.equal(reads.length, 0)
+  page.route.query = { section: 'bilibili' }
+  await new Promise(resolve => setImmediate(resolve))
+  assert.equal(reads.includes('/api/settings'), false)
   page.route.query = { section: 'runtime' }
   await new Promise(resolve => setImmediate(resolve))
   assert.equal(reads.filter(url => url === '/api/settings').length, 1)
@@ -223,4 +239,37 @@ test('默认制作页不请求系统配置，只有进入系统分类才按需�
   assert.equal(reads.filter(url => url === '/api/settings').length, 1)
   assert.equal(page.visited.value.has('production'), true)
   assert.equal(page.visited.value.has('runtime'), true)
+})
+
+test('B站稿件草稿在分类间保留；更换账号上下文或离开需确认，取消不丢编辑', async t => {
+  const { page } = await fixture(t)
+  page.route.query = { section: 'bilibili', account: '7', manage: 'studio', project: 'project-one' }
+  page.accountDirty.value = true
+  assert.equal(page.sections.value.find((item:any) => item.key === 'bilibili').dirty, true)
+  assert.equal(page.router.update({ query: { ...page.route.query, section: 'models' } }), true)
+  assert.equal(page.dialog.prompts.length, 0)
+  assert.equal(page.accountDirty.value, true)
+  const switching = page.router.update({ query: { section: 'bilibili', account: '8', manage: 'studio' } })
+  page.dialog.prompts.at(-1).onNegativeClick()
+  assert.equal(await switching, false)
+  const leaving = page.router.leave()
+  page.dialog.prompts.at(-1).onClose()
+  assert.equal(await leaving, false)
+  assert.equal(page.accountDirty.value, true)
+  let prevented = false
+  page.warnUnload({ preventDefault() { prevented = true }, returnValue: 'x' })
+  assert.equal(prevented, true)
+})
+
+test('B站请求执行中阻止更换账号与退出；仅切分类不销毁正在执行的区域', async t => {
+  const { page } = await fixture(t)
+  page.route.query = { section: 'bilibili', account: '7' }
+  page.accountBusy.value = true
+  assert.equal(page.router.leave(), false)
+  assert.equal(page.router.update({ query: { section: 'bilibili', account: '8' } }), false)
+  assert.equal(page.router.update({ query: { section: 'runtime', account: '7' } }), true)
+  assert.equal(page.dialog.prompts.length, 0)
+  let prevented = false
+  page.warnUnload({ preventDefault() { prevented = true }, returnValue: 'x' })
+  assert.equal(prevented, true)
 })

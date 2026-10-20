@@ -16,7 +16,8 @@ _PRIVATE = re.compile(r'(^|[._/])(api_key|password|credential|authorization|cook
 _PROMPT_LABELS = {'correction_prompt': '转录纠错与语义整理提示词版本',
                   'semantic_segmentation': '语义分句质量规则版本',
                   'translation_windows': '翻译分块与衔接策略版本',
-                  'translation_prompt': '翻译提示词版本', 'content_review.version': '内容筛查规则版本'}
+                  'translation_prompt': '翻译提示词版本', 'content_review.version': '内容筛查规则版本',
+                  'output_cuts_renderer': '剪辑渲染规则（尾帧修复）'}
 
 
 def _digest(value):
@@ -138,18 +139,30 @@ def _payload_entries(deps, key, payload, *, current=False):
         sha = cfg['custom_terms_file']
         _add(entries, 'glossary.contents', '术语表文件内容', sha, 'glossary',
              display='术语表文件无法读取' if sha == 'unavailable' else f'文件摘要 {str(sha)[:12]}')
+    from dubforge.translation_context import FIELDS
+    context = cfg.get('translation_context', {})
+    if isinstance(context, dict):
+        for name, sha in context.items():
+            if name in FIELDS:
+                _add(entries, 'translation_context.' + name, '翻译背景 · ' + FIELDS[name][0],
+                     sha, 'glossary' if name == 'terms' else 'text',
+                     origin=dict(kind='project' if current else 'execution',
+                                 label='项目背景资料' if current else '生成时采用的背景资料'),
+                     display=f'内容摘要 {str(sha)[:12]}')
     for name, label, category in [('reference_files', '参考音频文件版本', 'parameter'),
                                   ('line_settings', '逐句配音设置', 'parameter'),
-                                  ('platform_subtitle', '已确认的平台字幕', 'text')]:
+                                  ('platform_subtitle', '已确认的平台字幕', 'text'),
+                                  ('output_cuts', '成片删除范围', 'parameter')]:
         if name in cfg:
             _add(entries, 'input_state.' + name, label, cfg[name], category, hashed=True)
     for name, label in _PROMPT_LABELS.items():
-        raw = cfg if name == 'content_review.version' else payload
+        raw = cfg if name in {'content_review.version', 'output_cuts_renderer'} else payload
         if name in raw:
             _add(entries, 'rule.' + name, label, raw[name], 'prompt')
     for name, label, category in [('subtitle_edits', '字幕校对文字与时间轴', 'text'),
                                   ('content_review_edits', '内容筛查使用的校对记录', 'text'),
-                                  ('dubbing_edit', '成片声源与配音版本选择', 'parameter')]:
+                                  ('dubbing_edit', '成片声源与配音版本选择', 'parameter'),
+                                  ('audio_line_gains', '逐句成片音量修正', 'parameter')]:
         if name in payload:
             _add(entries, 'text.' + name, label, payload[name], category, hashed=True)
     deps._explanation_step = key
@@ -175,10 +188,30 @@ def _version_entries(deps, versions, *, current=False):
         scoped._explanation_step = 'assemble'
         prefix = 'version.' + version['id'] + '.'
         label = _safe_text(version['name']) + ' · '
+        if version.get('timeline'):
+            from dubforge.pipeline.assembly_timeline import load_plan
+            value = load_plan(deps, version)
+            _add(entries, prefix + 'timeline_edit', label + '成片删除与恢复方案',
+                 dict(plan=value['fingerprint'], media=[row['sha256'] for row in value['media']]),
+                 'parameter', hashed=True, display=value['summary'])
+            continue
+        if version.get('update'):
+            from dubforge.pipeline.assembly_updates import load_plan
+            value = load_plan(deps, version)
+            _add(entries, prefix + 'selected_update', label + '本次勾选的成片改动',
+                 dict(plan=value['fingerprint'], baseline=value['base_sha256'], changes=value['change_ids']),
+                 'parameter', hashed=True, display=value['summary'])
+            continue
         _parameter_entries(entries, av.active_values(version), scoped, prefix=prefix, label_prefix=label,
                            current=current, origins=version.get('origins', {}))
         for dimension, title in [('dubbing', '配音'), ('burn_subtitles', '烧录字幕'), ('include_comments', '叠加评论')]:
             _add(entries, prefix + dimension, label + title, version[dimension])
+        cuts = version.get('output_cuts')
+        _add(entries, prefix + 'output_cuts', label + '成片删除范围', cuts or {}, 'parameter', hashed=True,
+             display=f'删除 {len(cuts["ranges"])} 段，共 {cuts["source_duration"] - cuts["output_duration"]:.2f} 秒' if cuts else '不删除片段')
+        if cuts:
+            from dubforge.pipeline.output_cuts import RENDER_VERSION
+            _add(entries, prefix + 'rule.output_cuts_renderer', label + '剪辑渲染规则（尾帧修复）', RENDER_VERSION, 'prompt')
         _input_entries(entries, [f'{p}/{n}:{scoped.arts[f"{p}/{n}"].sha256 if f"{p}/{n}" in scoped.arts else "missing"}'
                                for p, n, _ in scoped.inputs('assemble')], scoped, prefix=prefix, label_prefix=label)
         keys = {'text', 'start', 'end'} if version['dubbing'] else set()
@@ -212,16 +245,21 @@ def capture(deps, key, *, fingerprint=None, scope='full', incomplete_comments=Fa
         raise DubForgeError('制作步骤不存在', code='STEP_UNKNOWN')
     if scope in {'all', 'default'}:
         scope = 'full'
-    from dubforge.runner import fingerprint_payload, compute_fingerprint
+    from dubforge.runner import fingerprint_payload
+    from dubforge.utils.input_fingerprint import fingerprint_digest
     if scope == 'versions' and key == 'assemble' and deps.assembly_versions:
         from dubforge.pipeline import assembly_versions as av
         entries = _version_entries(deps, deps.assembly_versions, current=_current)
         actual = 'versions:' + av.digest([av.fingerprint(deps, v) for v in deps.assembly_versions])
         selection = {'version_ids': [v['id'] for v in deps.assembly_versions]}
-        incomplete_comments |= any(v['include_comments'] and not v.get('comment_overlay') for v in deps.assembly_versions)
+        incomplete_comments |= any(v['include_comments'] and not v.get('comment_overlay')
+                                   and not v.get('timeline') and not v.get('update') for v in deps.assembly_versions)
     else:
-        entries = _payload_entries(deps, key, fingerprint_payload(deps.project, key, dependencies=deps), current=_current)
-        actual = compute_fingerprint(deps.project, key, dependencies=deps)
+        # 说明和摘要消费同一份已核验输入，避免一条逐句输入在本次捕获中重复扫描。
+        # 不缓存身份或有效性；下一次 capture/compute 仍重新核验实际文件。
+        payload = fingerprint_payload(deps.project, key, dependencies=deps)
+        actual = fingerprint_digest(payload)
+        entries = _payload_entries(deps, key, payload, current=_current)
         if scope == 'outputs' and fingerprint and fingerprint.startswith('outputs:'):
             actual = 'outputs:' + actual
         selection = {'variants': deps.assemble_variants} if scope == 'outputs' else {}
@@ -288,10 +326,13 @@ def _valid_key(name):
         return False
     if name in _fields():
         return True
+    from dubforge.translation_context import FIELDS
+    if name in {'translation_context.' + key for key in FIELDS}:
+        return True
     if re.fullmatch(r'llm\.profile\.\d+\.(model|temperature|top_p|max_tokens|provider)', name):
         return True
     if name in {'glossary.contents', 'input_state.reference_files', 'input_state.line_settings', 'input_state.platform_subtitle',
-                'text.subtitle_edits', 'text.content_review_edits', 'text.dubbing_edit',
+                'text.subtitle_edits', 'text.content_review_edits', 'text.dubbing_edit', 'text.audio_line_gains',
                 'source.kind', 'source.size', 'source.mtime_ns', 'source.missing', 'source.identity'}:
         return True
     if name in {'rule.' + key for key in _PROMPT_LABELS}:
@@ -317,7 +358,7 @@ def _safe_previous(name, entry):
         child = match[1]
     field = _fields().get(child)
     hashed = (field is not None and (field.type == 'text' or child.endswith(('_path', '_audio')))
-              or child.startswith(('text.', 'input_state.')) or child in {'source.identity', 'voices'}
+              or child.startswith(('text.', 'input_state.', 'translation_context.')) or child in {'source.identity', 'voices'}
               or bool(re.fullmatch(r'llm\.profile\.\d+\.provider', child)))
     if not hashed:
         return entry
@@ -413,5 +454,14 @@ def explain(deps, key, stored=None):
         changes = [_change('baseline.unavailable', '生成输入', 'unknown', message='当前输入无法完整核对，请先检查设置与上游文件。')]
         summary = changes[0]['message']
         warnings.append('无法完整比较当前输入，未推断或补写历史参数。')
+    settings_changed = any(
+        c.get('category') in {'parameter', 'model', 'prompt', 'glossary', 'text'}
+        and not str(c.get('key', '')).startswith(('input.', 'required.', 'source.'))
+        for c in changes)
+    upstream_changed = any(
+        c.get('category') in {'upstream', 'missing'}
+        or str(c.get('key', '')).startswith(('input.', 'required.', 'source.', 'output.'))
+        for c in changes)
     return dict(step=key, fresh=fresh, history_available=previous is not None,
+                settings_changed=settings_changed, upstream_changed=upstream_changed,
                 summary=_safe_text(summary, 500), changes=changes, warnings=warnings)

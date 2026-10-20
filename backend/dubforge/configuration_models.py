@@ -5,7 +5,8 @@ from sqlmodel import Field, SQLModel
 class ConfigurationScope(SQLModel, table=True):
     key: str = Field(primary_key=True)  # global / series:<id> / project:<uid>
     name: str = ''
-    parent: str = ''  # 项目可绑定一个 series 范围；系列固定继承全局。
+    parent: str = ''  # 项目基础值的应用来源；系列仍继承全局，项目只共享其运行连接。
     values: str = '{}'
+    baseline: str = '{}'  # 项目创建或主动应用来源时的基础值；人工覆盖仍放在 values。
     revision: int = 0
     archived: bool = False

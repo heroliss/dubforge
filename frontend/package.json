@@ -1,11 +1,12 @@
 {
   "name": "dubforge-frontend",
   "private": true,
-  "version": "0.1.0",
+  "version": "1.0.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "test": "node --experimental-strip-types --test tests/*.test.ts",
+    "test": "node --max-old-space-size=1536 --experimental-strip-types --test --test-concurrency=1 tests/*.test.ts",
+    "typecheck": "tsc --noEmit",
     "build": "vite build",
     "preview": "vite preview"
   },

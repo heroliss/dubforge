@@ -25,8 +25,11 @@ let generation = 0, disposed = false, mounted = false, timer: ReturnType<typeof 
 const sourceKey = computed(() => String(props.publication?.id || ''))
 const active = computed(() => updateIsActive(task.value))
 const prepared = computed(() => task.value?.status === 'prepared')
+const deliveryMode = computed(() => task.value?.delivery_mode || task.value?.snapshot?.delivery_mode || 'publish')
+const localDraft = computed(() => prepared.value && deliveryMode.value==='draft')
+const uploaded = computed(() => task.value?.status==='uploaded' && deliveryMode.value==='upload')
 const needsReconcile = computed(() => requestUnknown.value || updateNeedsReconcile(task.value))
-const locked = computed(() => !!props.disabled || loading.value || writing.value || active.value || prepared.value || needsReconcile.value)
+const locked = computed(() => !!props.disabled || loading.value || writing.value || active.value || prepared.value || uploaded.value || needsReconcile.value)
 const remoteParts = computed(() => context.value?.remote?.videos || [])
 const replacementSupported = computed(() => context.value?.remote?.edit_supported !== false)
 const candidates = computed(() => context.value?.candidates || [])
@@ -63,6 +66,8 @@ const stages = computed(() => updateStages(task.value))
 const progress = computed(() => updateProgress(task.value))
 const progressLabel = computed(() => {
   if (!task.value) return ''
+  if (uploaded.value) return '替换文件已上传，等待确认提交原稿更新'
+  if (localDraft.value) return '本地更新方案已准备，尚未上传或提交'
   if (prepared.value) return '方案已检查，等待确认'
   if (task.value.status === 'completed') return '更新已完成并核验'
   if (task.value.status === 'failed') return '部分阶段未完成'
@@ -88,12 +93,14 @@ const taskSummary = computed(() => task.value?.status === 'failed' && ['complete
   : task.value?.status === 'waiting' ? '更新已提交，正在等待B站转码或审核；此时尚不能确认全部同步完成。'
   : task.value?.status === 'unknown' || requestUnknown.value ? '请求可能已经到达B站。先核对实际结果，避免重复提交。'
   : task.value?.status === 'completed' ? '本次范围已完成并回读核验，原BV保持不变。'
+  : uploaded.value ? '替换视频文件已上传，B站原稿尚未提交更新。确认后才会替换指定分P并同步已选资料。'
+  : localDraft.value ? '只准备本地更新方案；需要上传或提交时，在发布步骤修改交付方式，再从总览重新预检。'
   : task.value?.status === 'paused' ? '已保存执行断点，继续时复用已完成的上传和同步结果。' : '')
 
 watch(writing, value => emit('busy-change', value), { immediate: true })
 watch(edited, value => emit('dirty-change', value), { immediate: true })
 watch(active, () => schedule(), { immediate: true })
-watch(() => active.value || prepared.value || needsReconcile.value, value => emit('active-change', value), { immediate: true })
+watch(() => active.value || prepared.value && !localDraft.value || needsReconcile.value, value => emit('active-change', value), { immediate: true })
 watch(sourceKey, reset)
 function reset() {
   generation++; clearTimeout(timer); expanded.value = false; context.value = null
@@ -193,9 +200,10 @@ async function prepare() {
   } catch (e: any) { if (!disposed && ticket === generation) error.value = e.message || '更新方案检查失败，请调整后重试' }
   finally { if (!disposed && ticket === generation) writing.value = false }
 }
-async function perform(action: 'start' | 'retry' | 'reconcile' | 'pause') {
+async function perform(action: 'start' | 'submit' | 'retry' | 'reconcile' | 'pause') {
   if (!task.value?.id || writing.value || loading.value || disposed) return
-  if (action === 'start' && (!prepared.value || props.disabled || needsReconcile.value)) return
+  if (action === 'start' && (!prepared.value || localDraft.value || props.disabled || needsReconcile.value)) return
+  if (action === 'submit' && (!uploaded.value || props.disabled || needsReconcile.value)) return
   if (action === 'retry' && (props.disabled || !['failed', 'paused'].includes(task.value.status) || needsReconcile.value)) return
   if (action === 'reconcile' && !needsReconcile.value && task.value?.status !== 'waiting') return
   if (action === 'pause' && !active.value) return
@@ -238,7 +246,7 @@ async function newAttempt() {
   finally { if (!disposed && ticket === generation) loading.value = false }
 }
 function discard() { if (!writing.value && !active.value) { edited.value = false; error.value = ''; context.value = null; task.value = null; expanded.value = false } }
-function openAutomaticUpdate(){if(!locked.value && !edited.value)emit('automatic-update')}
+function openAutomaticUpdate(){if(!props.disabled && !loading.value && !writing.value && !active.value && !needsReconcile.value && !edited.value)emit('automatic-update')}
 function schedule() {
   clearTimeout(timer)
   if (mounted && !disposed && active.value) timer = setTimeout(async () => { await refreshTask(); schedule() }, error.value ? 12000 : 5000)
@@ -253,8 +261,8 @@ onBeforeUnmount(() => { disposed = true; generation++; clearTimeout(timer); emit
 
 <template>
   <section id="publication-original-update" class="original-update publication-panel" aria-label="更新原稿件（保留原BV）">
-    <div class="update-heading"><div><h3>更新原稿件 <span>保留原BV</span></h3><p>选择要替换的成片与要同步的资料，检查后统一确认。</p></div><div class="update-entry-actions"><n-button v-if="!expanded && !task" type="primary" :loading="loading" :disabled="disabled || loading" @click="openEditor">选择现有成片与资料</n-button><n-button secondary :disabled="locked || edited" @click="openAutomaticUpdate">设置自动更新流程…</n-button></div></div>
-    <p v-if="!expanded && !task" class="muted update-entry-note">成片已准备好时直接选择；需要重新制作时，自动流程可从任意步骤开始并更新此稿件。</p>
+    <div class="update-heading"><div><h3>更新原稿件 <span>保留原BV</span></h3><p>选择要替换的成片与要同步的资料，检查后统一确认。</p></div><div class="update-entry-actions"><n-button v-if="!expanded && !task" type="primary" :loading="loading" :disabled="disabled || loading" @click="openEditor">选择现有成片与资料</n-button><n-button secondary :disabled="disabled || loading || writing || active || needsReconcile || edited" @click="openAutomaticUpdate">设置项目交付目标…</n-button></div></div>
+    <p v-if="!expanded && !task" class="muted update-entry-note">成片已准备好时直接选择；需要重新制作时，在本页项目发布设置中保存交付目标，再从总览运行项目。</p>
     <p v-if="disabled && (!task || prepared)" class="muted" role="status">{{ disabledReason || '当前有未完成操作或未保存修改，请先处理后再更新原稿件。' }}</p>
     <div v-if="expanded || task" class="update-body">
       <div class="update-target"><n-tag size="small" type="info" :bordered="false">{{ publication.receipt?.bvid }}</n-tag><span>{{ context?.source?.account_name || publication.snapshot?.account_name }} · {{ context?.source?.title || publication.snapshot?.settings?.title }}</span></div>
@@ -279,10 +287,19 @@ onBeforeUnmount(() => { disposed = true; generation++; clearTimeout(timer); emit
           <p class="update-progress-facts">已完成 {{ progress.completed }} / {{ progress.total }} 个阶段<template v-if="progress.active"> · 当前：{{ progress.active.label }}</template><template v-if="progress.active?.estimated"> · 阶段进度按已完成分P估算</template></p>
         </section>
         <p v-if="taskSummary" class="task-summary">{{ taskSummary }}</p><p v-if="task.phase && !prepared" class="task-summary">{{ task.phase }}<template v-if="task.execution?.total_bytes > 0"> · {{ fmtSize(task.execution.loaded_bytes || 0) }} / {{ fmtSize(task.execution.total_bytes) }}</template><template v-if="task.execution?.current_part"> · 第 {{ task.execution.current_part }} 个替换视频</template></p><ExecutionProgress v-if="task.execution?.delivery?.execution" :execution="task.execution.delivery.execution" compact /><n-alert v-if="task.error" type="warning" :show-icon="false" class="update-alert">{{ task.error }}</n-alert>
-        <div v-if="prepared" class="update-confirmation"><h4>确认本次范围</h4><p v-if="hasDubbing" class="warning">本次包含AI配音。创作声明按下方已检查的差异执行；没有声明差异时保留B站现有值，请核对是否符合平台要求。</p><p>原稿 <strong>{{ task.bvid || publication.receipt?.bvid }}</strong> · {{ context?.source?.account_name || publication.snapshot?.account_name }}。{{ previews.filter((part: any) => part.replaced).length }} 个分P替换；其他分P与未选设置保留。</p></div>
+        <div v-if="prepared || uploaded" class="update-confirmation"><h4>{{ localDraft?'本地准备范围':uploaded?'确认提交已上传的更新':'确认本次范围' }}</h4><p v-if="hasDubbing" class="warning">本次包含AI配音。创作声明按下方已检查的差异执行；没有声明差异时保留B站现有值，请核对是否符合平台要求。</p><p>原稿 <strong>{{ task.bvid || publication.receipt?.bvid }}</strong> · {{ context?.source?.account_name || publication.snapshot?.account_name }}。{{ previews.filter((part: any) => part.replaced).length }} 个分P替换；其他分P与未选设置保留。</p></div>
         <ol v-if="!prepared" class="update-stages" aria-label="原稿更新执行进度"><li v-for="stage in stages" :key="stage.key" :data-stage-status="stage.status"><span class="stage-dot" aria-hidden="true"></span><strong>{{ stage.label }}</strong><n-text class="update-stage-state" :type="executionStatusType(stage.status)" :depth="executionStatusType(stage.status) === 'default' ? 3 : undefined" :data-status-type="executionStatusType(stage.status)">{{ stage.text }}<template v-if="stage.progress !== null"> · {{ stage.estimated ? '约 ' : '' }}{{ Math.round(stage.progress) }}%</template></n-text><div v-if="stage.progress !== null && stage.status !== 'skipped'" class="stage-progress"><n-progress type="line" :percentage="stage.progress" :show-indicator="false" :processing="stage.status === 'running' || stage.status === 'active'" :status="stage.status === 'failed' ? 'error' : stage.status === 'completed' || stage.status === 'success' ? 'success' : 'default'" /><span>{{ stage.estimated ? '估算' : '阶段' }}</span></div><p v-if="stage.error">{{ stage.error }}</p></li></ol>
         <details v-if="previews.length || differences.length || chapterParts.length || warnings.length" :open="prepared" class="checked-plan"><summary>{{ prepared ? '已检查的更新清单' : '本次已确认的更新清单' }}</summary><div v-for="(part,index) in previews" :key="part.old_cid || index" class="planned-part"><strong>P{{ index + 1 }} · {{ part.title }}</strong><n-tag size="small" :type="part.replaced ? 'info' : 'default'" :bordered="false">{{ part.replaced ? '替换视频' : '保留原视频' }}</n-tag><p v-if="part.replaced">{{ updateDuration(part.old_duration) }} → {{ updateDuration(part.new_duration) }} · {{ part.version_generated_name || part.version_name || part.artifact_name || '所选成片' }}</p><p v-if="part.timeline_note" class="timeline-note">{{ part.timeline_note }}</p></div><div v-for="difference in differences" :key="difference.key" class="copy-difference"><strong>{{ difference.label }}</strong><div><small>当前B站</small><p>{{ difference.before }}</p></div><div><small>更新后</small><p>{{ difference.after }}</p></div></div><div v-if="chapterParts.length" class="planned-chapters"><div class="chapter-heading"><h4>{{ chapterDelivered ? '本次已整理章节' : '按新成片时间轴待整理的章节' }}</h4><n-button size="small" quaternary @click="copyChapters">复制章节清单</n-button></div><details v-for="(part,index) in chapterParts" :key="part.old_cid || part.cid || index"><summary>P{{ index + 1 }} · {{ part.title }} · {{ part.items?.length || 0 }} 章</summary><ChapterAdaptationSummary v-if="part.adaptation" :value="part.adaptation" :local="false" /><p v-if="part.timeline_note || part.timeline?.label">{{ part.timeline_note || part.timeline?.label }}</p><ol><li v-for="(item,itemIndex) in part.items || []" :key="itemIndex"><time>{{ updateDuration(item.start_time) }}</time>{{ item.title }}</li></ol></details></div><p v-if="task.preview?.collection?.enabled" class="planned-collection">目标合集：{{ task.preview.collection.season_id ? task.preview.collection.season_title || task.preview.collection.title || '名称暂未返回' : '移出当前合集' }}<template v-if="task.preview.collection.section_title"> · {{ task.preview.collection.section_title }}</template></p><ul v-if="warnings.length" class="plan-warnings"><li v-for="(warning,index) in warnings" :key="index">{{ typeof warning === 'string' ? warning : warning.message }}</li></ul></details>
-        <div class="update-actions"><n-button v-if="prepared && !needsReconcile" type="primary" :loading="writing" :disabled="disabled || writing" @click="perform('start')">确认更新原稿件</n-button><n-button v-if="prepared && !needsReconcile" secondary :disabled="writing" @click="revise">返回调整</n-button><n-button v-if="needsReconcile || task.status === 'waiting'" type="primary" secondary :loading="writing" :disabled="writing" @click="perform('reconcile')">核对平台结果</n-button><n-button v-if="['failed','paused'].includes(task.status) && !needsReconcile" type="primary" :loading="writing" :disabled="writing || disabled" @click="perform('retry')">{{ task.status === 'paused' ? '继续原稿更新' : '仅重试未完成步骤' }}</n-button><n-button v-if="active" secondary :disabled="writing" @click="perform('pause')">{{ task.status === 'waiting' ? '暂停自动跟进' : '暂停更新' }}</n-button><n-button v-if="['completed','failed','paused'].includes(task.status) && !needsReconcile" quaternary :disabled="writing || loading || disabled" @click="newAttempt">准备另一次更新</n-button></div>
+        <div class="update-actions">
+          <n-button v-if="uploaded && !needsReconcile" type="primary" :loading="writing" :disabled="disabled || writing" @click="perform('submit')">确认提交原稿更新</n-button>
+          <n-button v-if="localDraft" secondary :disabled="disabled || writing" @click="openAutomaticUpdate">去发布步骤调整交付方式</n-button>
+          <n-button v-if="prepared && !localDraft && !needsReconcile" type="primary" :loading="writing" :disabled="disabled || writing" @click="perform('start')">{{ deliveryMode==='upload'?'确认上传替换文件':'确认更新原稿件' }}</n-button>
+          <n-button v-if="prepared && !localDraft && !needsReconcile" secondary :disabled="writing" @click="revise">返回调整</n-button>
+          <n-button v-if="needsReconcile || task.status === 'waiting'" type="primary" secondary :loading="writing" :disabled="writing" @click="perform('reconcile')">核对平台结果</n-button>
+          <n-button v-if="['failed','paused'].includes(task.status) && !needsReconcile" type="primary" :loading="writing" :disabled="writing || disabled" @click="perform('retry')">{{ task.status === 'paused' ? '继续原稿更新' : '仅重试未完成步骤' }}</n-button>
+          <n-button v-if="active" secondary :disabled="writing" @click="perform('pause')">{{ task.status === 'waiting' ? '暂停自动跟进' : '暂停更新' }}</n-button>
+          <n-button v-if="['completed','failed','paused'].includes(task.status) && !needsReconcile" quaternary :disabled="writing || loading || disabled" @click="newAttempt">准备另一次更新</n-button>
+        </div>
       </div>
       <div v-if="history.length > 1" class="update-history"><label>更新历史</label><n-select :value="historyId" :options="history" :disabled="writing || edited || active" aria-label="原稿更新历史" @update:value="selectHistory" /></div>
     </div>

@@ -63,8 +63,8 @@ test('保留BV更新是独立主入口，打开记录不会自动调用远端或
   assert.equal(result.page.context, null); assert.equal(result.page.task, null)
 })
 
-test('需要重新制作时显式进入同一自动预检，活动或已编辑方案不允许绕过',async()=>{
-  const result=await render();assert.match(result.html,/设置自动更新流程/)
+test('需要重新制作时返回发布步骤设置交付目标，活动或已编辑方案不允许绕过',async()=>{
+  const result=await render();assert.match(result.html,/设置项目交付目标/)
   result.page.openAutomaticUpdate();assert.deepEqual(result.events.filter(item=>item[0]==='automatic-update'),[['automatic-update']])
   result.page.edited=true;result.page.openAutomaticUpdate();assert.equal(result.events.filter(item=>item[0]==='automatic-update').length,1)
   result.page.edited=false;result.page.task=plan('uploading');result.page.openAutomaticUpdate();assert.equal(result.events.filter(item=>item[0]==='automatic-update').length,1)
@@ -74,7 +74,7 @@ test('已有成片是主入口，四个更新范围与唯一检查入口同处�
   const buttons = [...closed.html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(match => match[0])
   assert.match(buttons[0], /n-button--primary-type/)
   assert.match(buttons[0], /选择现有成片与资料/)
-  assert.match(buttons[1], /设置自动更新流程/)
+  assert.match(buttons[1], /设置项目交付目标/)
   assert.doesNotMatch(buttons[1], /n-button--primary-type/)
   assert.doesNotMatch(closed.html, /<small>原稿更新<\/small>/)
   const result = await render(p => { p.seed(context()); p.expanded = true; p.selectField('title', true) })
@@ -251,7 +251,7 @@ test('帮助页将保留BV换片引导至原记录更新流程，区分另发新
   const HelpView = (await server.ssrLoadModule('/src/views/HelpView.vue')).default
   const app = createSSRApp({render:()=>h(HelpView)}); setup(app)
   const html = await renderToString(app)
-  assert.match(html,/打开原发布记录，使用「更新原稿件」检查替换视频与同步范围/)
+  assert.match(html,/到项目「发布到B站」保存原稿目标、替换分P和同步范围，预检后确认执行/)
   assert.match(html,/章节按新成片时间轴处理/); assert.match(html,/另发新稿会创建新BV/)
   assert.doesNotMatch(html,/需要替换原BV视频请到B站创作中心/)
 })

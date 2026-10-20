@@ -10,6 +10,7 @@ import { setup } from '@css-render/vue3-ssr'
 import { createPinia, disposePinia } from 'pinia'
 import { createMemoryHistory, createRouter } from 'vue-router'
 import { NMessageProvider, NDialogProvider } from 'naive-ui'
+import { defaultDubbingRunPolicy } from '../src/utils/dubbingRunPolicy.ts'
 
 let server: ViteDevServer, Panel: any, Projects: any
 before(async () => {
@@ -31,7 +32,7 @@ const plan = (changes: any = {}) => ({ targets: ['download', 'translate'], steps
   effects: [], ...changes })
 async function render(t: any, component = Panel, seed: (page: any) => void = () => {}, started?: () => any) {
   let page: any
-  const emitted: any[] = [], pinia = createPinia()
+  const emitted: any[] = [], bindings: any[] = [], pinia = createPinia()
   const router = createRouter({ history: createMemoryHistory(), routes: [{ path: '/', component: { render: () => null } }] })
   await router.push('/')
   const app = createSSRApp({ render: () => h(NMessageProvider, null, {
@@ -41,6 +42,7 @@ async function render(t: any, component = Panel, seed: (page: any) => void = () 
   }) })
   app.use(pinia); app.use(router); setup(app)
   app.mixin({ created() {
+    if (this.$options.__name === 'ProjectTemplateBinding') bindings.push({ uids: [...this.$props.uids], disabled: this.$props.disabled })
     if (this.$options.__name === (component === Panel ? 'ProjectStepRun' : 'ProjectsView')) {
       page = this.$.setupState; seed(page)
     }
@@ -48,7 +50,7 @@ async function render(t: any, component = Panel, seed: (page: any) => void = () 
   const context: any = {}
   const html = await renderToString(app, context) + Object.values(context.teleports || {}).join('')
   t.after(() => { page.close?.(); disposePinia(pinia) })
-  return { page, html, emitted }
+  return { page, html, emitted, bindings }
 }
 function fixtures(t: any, adjust: (uid: string, path: string, body: any) => any = () => undefined) {
   const calls: any[] = []
@@ -77,11 +79,28 @@ test('打开只读取最新项目与计划，保存勾选按制作顺序冻结�
   ] })) : undefined)
   await page.open([targets[0]], '单项目')
   assert.deepEqual(calls.map(call => [call.method, call.uid, call.path]), [['GET', 'one', ''], ['POST', 'one', '/run_plan']])
-  assert.deepEqual(calls[1].body, { steps: ['download', 'translate', 'assemble'], include_dependencies: false })
+  assert.deepEqual(calls[1].body, { steps: ['download', 'translate', 'assemble'], include_dependencies: false, dubbing:defaultDubbingRunPolicy() })
   assert.deepEqual(page.items[0].steps, ['download', 'translate', 'assemble'])
   assert.equal(page.items[0].title, '最新标题one')
   assert.equal(page.ready.length, 1); assert.equal(page.canConfirm, true)
   assert.equal(starts(calls).length, 0, '打开和预检不启动制作')
+})
+
+test('显式全部重做使最新项目可执行，单独冻结每项目策略与计划指纹',async t=>{
+  const {page}=await render(t)
+  const calls=fixtures(t,(uid,path,body)=>!path && uid!=='run_many'
+    ? reply(detail(uid,{steps:[step('tts',{status:'done',fresh:true}),step('assemble',{status:'done',fresh:true})]}))
+    : path==='/run_plan' ? reply(plan({steps:['tts','assemble'],fingerprint:'fp-'+uid,
+      dubbing:{policy:body.dubbing,generate:body.dubbing.mode==='all'?8:0,reuse:body.dubbing.mode==='all'?0:8}})) : undefined)
+  await page.open(targets);assert.equal(page.canConfirm,false)
+  const policy={...defaultDubbingRunPolicy(),mode:'all',target:'slot',slot:3}
+  page.onDubbingChange(policy);assert.equal(page.canConfirm,false)
+  for(let i=0;i<40&&page.busy;i++)await Promise.resolve()
+  assert.equal(page.canConfirm,true);assert.ok(page.items.every((item:any)=>!item.allFresh))
+  await page.confirmStart()
+  const body=starts(calls)[0].body
+  assert.deepEqual(body.dubbing_by_uid,{one:policy,two:policy})
+  assert.deepEqual(body.plan_fingerprints_by_uid,{one:'fp-one',two:'fp-two'})
 })
 
 test('无勾选与全部最新明确不可确认，不产生制作启动请求', async t => {
@@ -105,6 +124,7 @@ test('运行、排队、制作链和完整流程忙或目录缺失项目不进�
     chain: { chain: { state: 'active', remaining: ['download'] } },
     workflowQueued: { workflow_status: 'queued' }, workflowRunning: { workflow_status: 'running' },
     workflowStopping: { workflow_status: 'stopping' }, missing: { dir_exists: false },
+    releaseWaiting: { release_batch: { id:'batch',status:'running',position:2,total:3 } },
   }
   const calls = fixtures(t, (uid, path) => !path && values[uid] ? reply(detail(uid, values[uid])) : undefined)
   await page.open(Object.keys(values).map(uid => ({ uid, title: uid })))
@@ -126,7 +146,8 @@ test('单项依赖受阻不妨碍其他项目，取消勾选只缩小确认清�
   assert.equal(page.canConfirm, false)
   await page.confirmStart(); assert.equal(starts(calls).length, 0)
   page.items[0].selected = true; await page.confirmStart()
-  assert.deepEqual(starts(calls)[0].body, { uids: ['one'], steps_by_uid: { one: ['download', 'translate'] } })
+  assert.deepEqual(starts(calls)[0].body, { uids: ['one'], steps_by_uid: { one: ['download', 'translate'] },
+    dubbing_by_uid:{one:defaultDubbingRunPolicy()},plan_fingerprints_by_uid:{} })
 })
 
 test('依赖补齐是显式重检，新增步骤和影响来自实际计划而非静默扩大选择', async t => {
@@ -165,14 +186,37 @@ test('确认双击仅发送一次，发送快照不随抽屉草稿或目标数�
   })) }) : undefined)
   await page.open(input)
   const pending = page.confirmStart(); await page.confirmStart()
+  for (let i = 0; i < 20 && !starts(calls).length; i++) await Promise.resolve()
   assert.equal(page.busy, true); assert.equal(starts(calls).length, 1)
   page.items[0].plan.steps.push('assemble'); page.items[1].selected = false; input.push({ uid: 'hidden', title: '后来加入' })
   assert.deepEqual(starts(calls)[0].body, { uids: ['one', 'two'], steps_by_uid: {
     one: ['download', 'translate'], two: ['download', 'translate'],
-  } })
+  },dubbing_by_uid:{one:defaultDubbingRunPolicy(),two:defaultDubbingRunPolicy()},plan_fingerprints_by_uid:{} })
   release(); await pending
   assert.equal(page.busy, false)
   await page.confirmStart(); assert.equal(starts(calls).length, 1)
+})
+
+test('归档项目保持可查看但不请求制作计划，活跃项目仍可确认', async t => {
+  const { page } = await render(t)
+  const calls = fixtures(t, (uid, path) => uid === 'one' && !path ? reply(detail(uid, { archived: true })) : undefined)
+  await page.open(targets)
+  assert.deepEqual(page.ready.map((item: any) => item.uid), ['two'])
+  assert.match(page.items[0].blockers.join('；'), /已归档.*恢复/)
+  assert.ok(calls.every(call => call.uid !== 'one' || call.path !== '/run_plan'))
+  await page.confirmStart()
+  assert.deepEqual(starts(calls)[0].body.uids, ['two'])
+})
+
+test('旧制作抽屉提交前重读归档状态，只启动仍活跃的项目', async t => {
+  const { page } = await render(t)
+  let archived = false
+  const calls = fixtures(t, (uid, path) => uid === 'one' && !path ? reply(detail(uid, { archived })) : undefined)
+  await page.open(targets); assert.equal(page.ready.length, 2)
+  archived = true; await page.confirmStart()
+  assert.deepEqual(starts(calls)[0].body.uids, ['two'])
+  assert.equal(page.items[0].resultKind, 'skipped'); assert.match(page.items[0].result, /已归档.*恢复/)
+  assert.equal(page.items[1].resultKind, 'started')
 })
 
 test('部分项目启动而另一项跳过，逐项回执保留，不自动再次发送成功或跳过项', async t => {
@@ -239,8 +283,8 @@ test('重新检查依赖模式取消旧计划，迟到旧计划不能撤销新�
   assert.equal(starts(calls).length, 0)
 })
 
-test('列表单项目与含隐藏选择的批量入口共享抽屉，待制作范围不因存在失败项缩成仅失败', async t => {
-  const opened: any[] = []
+test('单项目走恢复检查、多项目走统一批次，待制作范围含失败项并保留隐藏选择', async t => {
+  const opened: any[] = [], batches: any[] = []
   const { page, html } = await render(t, Projects, page => {
     page.projects = [
       { uid: 'one', title: '当前创建项目', status: 'created', dir_exists: true, steps: [step('download')] },
@@ -250,30 +294,91 @@ test('列表单项目与含隐藏选择的批量入口共享抽屉，待制作�
     page.searchText = '当前'; page.sel = new Set(['hidden'])
   })
   page.stepRun = { open: (items: any[], scope: string) => { opened.push({ items, scope }) } }
+  page.projectBatchPanel = { open: (items: any[]) => { batches.push(items) } }
   page.runSelected()
   assert.deepEqual(opened[0].items, [{ uid: 'hidden', title: '筛选隐藏的选择' }])
   assert.match(opened[0].scope, /所选.*1/)
   page.runAllPending()
-  assert.deepEqual(new Set(opened[1].items.map((item: any) => item.uid)), new Set(['one', 'two']))
+  assert.deepEqual(new Set(batches[0].map((item: any) => item.uid)), new Set(['one', 'two']))
+  assert.equal(opened.length, 1, '多项目不再逐项使用旧运行抽屉')
   page.runProject(page.projects[0])
-  assert.deepEqual(opened[2].items, [{ uid: 'one', title: '当前创建项目' }])
+  assert.deepEqual(opened[1].items, [{ uid: 'one', title: '当前创建项目' }])
   page.projects[0].title = '稍后改变'
-  assert.equal(opened[2].items[0].title, '当前创建项目', '确认抽屉持有点击时范围快照')
-  assert.match(html, /运行制作步骤…/)
-  assert.match(html, /运行所选项目的制作步骤（1）…/)
-  assert.doesNotMatch(html, /批量运行制作步骤（2）…/, '已选择项目时只呈现所选范围入口')
+  assert.equal(opened[1].items[0].title, '当前创建项目', '确认抽屉持有点击时范围快照')
+  assert.equal(batches[0].find((item: any) => item.uid === 'one').title, '当前创建项目', '批次入口也持有明确选择快照')
+  assert.match(html, /运行项目…/)
+  assert.match(html, /运行所选项目（1）…/)
+  assert.doesNotMatch(html, /运行待制作项目（2）…/, '已选择项目时只呈现所选范围入口')
   assert.doesNotMatch(html, /核对运行步骤/)
 })
 
-test('制作状态仍是created的暂停自动流程卡片保留恢复检查，也明确区分制作运行入口', async t => {
+test('制作状态仍是created的暂停完整流程只保留统一运行入口，不重复展示恢复按钮', async t => {
   const { html } = await render(t, Projects, page => {
     page.projects = [{ uid: 'paused', title: '暂停自动流程', status: 'created', workflow_status: 'paused',
       dir_exists: true, chain: null, steps: [step('download')] }]
   })
-  assert.match(html, /检查恢复方案/)
-  assert.match(html, /运行制作步骤…/)
-  assert.match(html, /批量运行制作步骤（1）…/)
+  assert.doesNotMatch(html, /检查恢复方案/)
+  assert.match(html, /运行项目…/)
+  assert.match(html, /运行待制作项目（1）…/)
   assert.doesNotMatch(html, /核对运行步骤/)
+})
+
+test('统一批量入口包含筛选隐藏的有效选择，单选保留恢复入口，归档或删除中不打开',async t=>{
+  const {page,html}=await render(t,Projects,page=>{
+    page.projects=[{uid:'one',title:'可见项目',status:'created',dir_exists:true,steps:[]},
+      {uid:'hidden',title:'筛选隐藏项目',status:'created',dir_exists:true,steps:[]},
+      {uid:'saved',title:'已归档快照',archived:true,status:'created',dir_exists:true,steps:[]}]
+    page.sel=new Set(['one','hidden','saved']);page.searchText='可见'
+  })
+  const opened:any[]=[],singles:any[]=[]
+  page.projectBatchPanel={open:(items:any[])=>opened.push(items)};page.stepRun={open:(items:any[])=>singles.push(items)}
+  page.runSelected();assert.deepEqual(opened[0],[{uid:'one',title:'可见项目'},{uid:'hidden',title:'筛选隐藏项目'}])
+  assert.match(html,/批量运行（3）/);assert.doesNotMatch(html,/顺序发布（|按顺序发布所选|按项目设置批量运行/)
+  page.sel=new Set(['one']);page.runSelected();assert.equal(opened.length,1);assert.deepEqual(singles[0],[{uid:'one',title:'可见项目'}])
+  page.sel=new Set(['one','hidden']);page.archiveScope='archived';page.runSelected();assert.equal(opened.length,1)
+  page.archiveScope='active';page.deletingUids=new Set(['one']);page.openProjectBatch(page.projects);assert.equal(opened.length,1)
+})
+
+test('等待前项的批次项目保留批次进度入口，不能单项运行或归档',async t=>{
+  const target={uid:'future',title:'后续项目',status:'created',dir_exists:true,steps:[],release_batch:{id:'batch',status:'running',position:2,total:3,phase:'等待前项完成'}}
+  const {page,html}=await render(t,Projects,page=>{page.projects=[target]})
+  assert.equal(page.projectBusy(target),true);assert.equal(page.pendingInView.length,0)
+  assert.match(html,/查看进度/);assert.doesNotMatch(html,/运行项目…/)
+  assert.match(html.replace(/<[^>]*>/g,''),/顺序发布 · 第 2\/3 项/);assert.match(html,/等待前项完成/);assert.match(html,/\/#release-batch-batch/)
+  let opened=0;page.stepRun={open:()=>opened++};page.runProject(target);assert.equal(opened,0)
+  const visited:any[]=[];t.mock.method(page.router,'push',(path:any)=>{visited.push(path);return Promise.resolve()})
+  page.showProjectProgress(target);assert.deepEqual(visited,[{path:'/',hash:'#release-batch-batch'}])
+})
+
+for (const group_status of ['queued','running','pausing','stopping','attention']) {
+  test(`统一批次${group_status}项目卡片保留父批次进度，禁止单独运行与绑定模板`,async t=>{
+    const target={uid:'owned',title:'统一批次中的项目',status:'created',dir_exists:true,steps:[],
+      project_batch:{batch_id:'parent',group_id:'collection',status:'running',group_status,position:2,total:3,phase:'等待本组合集顺序核验'},
+      release_batch:{id:'child',status:'running',position:2,total:3,phase:'子任务进度'}}
+    const {page,html,bindings}=await render(t,Projects,page=>{page.projects=[target]})
+    assert.equal(page.projectBusy(target),true);assert.equal(page.pendingInView.length,0)
+    assert.equal(page.projectMenu(target).find((item:any)=>item.key==='archive').disabled,true)
+    assert.equal(page.projectMenu(target).find((item:any)=>item.key==='rename').disabled,true)
+    assert.deepEqual(bindings,[{uids:['owned'],disabled:true}])
+    assert.match(html,/查看进度/);assert.match(html,/批量运行 · 等待本组合集顺序核验/);assert.match(html,/\/#project-batch-parent/)
+    assert.doesNotMatch(html,/运行项目…|\/#release-batch-child|顺序发布 · 第/)
+    let opened=0;page.stepRun={open:()=>opened++};page.runProject(target);assert.equal(opened,0)
+    const visited:any[]=[];t.mock.method(page.router,'push',(path:any)=>{visited.push(path);return Promise.resolve()})
+    page.showProjectProgress(target);assert.deepEqual(visited,[{path:'/',hash:'#project-batch-parent'}])
+  })
+}
+
+test('统一批次暂停后项目可编辑和进入单项目检查，同时保留父批次定位入口',async t=>{
+  const target={uid:'paused',title:'已暂停的批次项目',status:'created',dir_exists:true,steps:[step('download')],
+    project_batch:{batch_id:'parent',group_id:'collection',status:'paused',group_status:'paused',position:1,total:2,phase:'本组已暂停'}}
+  const {page,html,bindings}=await render(t,Projects,page=>{page.projects=[target]})
+  assert.equal(page.projectBusy(target),false);assert.equal(page.pendingInView.length,1)
+  assert.equal(page.projectMenu(target).find((item:any)=>item.key==='archive').disabled,false)
+  assert.equal(page.projectMenu(target).find((item:any)=>item.key==='rename').disabled,false)
+  assert.deepEqual(bindings,[{uids:['paused'],disabled:false}])
+  assert.match(html,/运行项目…/);assert.match(html,/\/#project-batch-parent/)
+  const opened:any[]=[];page.stepRun={open:(items:any[])=>opened.push(items)};page.runProject(target)
+  assert.deepEqual(opened,[[{uid:'paused',title:'已暂停的批次项目'}]])
 })
 
 test('239个逐句配音依赖汇总为两类，实际抽屉仅显示两行问题及完整步骤顺序', async t => {

@@ -269,10 +269,38 @@ def test_autodiscovery_and_ambiguous_installations(launcher, tmp_path, monkeypat
     values["tts.gptsovits.project_dir"] = ""
     found.rename(tmp_path / "GPT-SoVITS-v2")
     assert tts_service.status(values.get)["can_start"]
-    another = tmp_path / "VideoLingo-Workspace/GPT-SoVITS-v3/api_v2.py"
+    another = tmp_path / "GPT-SoVITS-v3/api_v2.py"
     another.parent.mkdir(parents=True)
     another.touch()
     assert "多个" in tts_service.status(values.get)["message"]
+
+
+@pytest.mark.parametrize('relative', ['VideoLingo-Workspace/GPT-SoVITS-v3', '共享模型/自定义安装位置'])
+def test_explicit_service_location_keeps_existing_installations(launcher, tmp_path, monkeypatch, relative):
+    """安装位置由用户明确指定时，不受其他程序目录名或自动发现规则影响。"""
+    values, spawn, _, root = launcher
+    destination = tmp_path / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    root.rename(destination)
+    monkeypatch.setattr(config, 'REPO_ROOT', tmp_path / 'DubForge')
+    values.update({'tts.backend': 'gptsovits', 'tts.gptsovits.project_dir': str(destination)})
+    assert tts_service._launch_settings(values.get)[3] == destination.resolve()
+    assert (destination / 'runtime/python.exe').is_file()
+    spawn.assert_not_called()
+
+
+def test_autodiscovery_does_not_search_other_application_directories(launcher, tmp_path, monkeypatch):
+    values, spawn, _, root = launcher
+    destination = tmp_path / 'VideoLingo-Workspace/GPT-SoVITS-v3'
+    destination.parent.mkdir()
+    root.rename(destination)
+    monkeypatch.setattr(config, 'REPO_ROOT', tmp_path / 'DubForge')
+    values.update({'tts.backend': 'gptsovits', 'tts.gptsovits.project_dir': ''})
+    with pytest.raises(ServiceStartError, match='未找到服务安装目录'):
+        tts_service._launch_settings(values.get)
+    assert (destination / 'api_v2.py').is_file()
+    assert (destination / 'runtime/python.exe').is_file()
+    spawn.assert_not_called()
 
 
 def test_api_uses_saved_project_backend_and_port(launcher, make_project):

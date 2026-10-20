@@ -10,6 +10,14 @@ from dubforge import config, configuration
 from dubforge.errors import DubForgeError
 
 
+def test_configuration_hides_legacy_empty_dubbing_plan_section():
+    sections = configuration.schema()
+    assert 'dubtask' not in sections
+    assert sections['tts']['label'] == '字幕与配音'
+    assert sections['tts']['fields']
+
+
+
 def _save(key, updates=None, reset=None):
     current = configuration.resolve(key=key)
     return configuration.save(key, dict(revision=current['revision'], fingerprint=current['fingerprint'],
@@ -29,9 +37,9 @@ def test_semantic_defaults_and_example_have_same_soft_targets(isolated_env):
 
 @pytest.mark.parametrize('use_llm', [True, False])
 def test_legacy_character_and_duration_values_are_not_converted(make_project, use_llm):
-    uid = make_project()
     config.update_config({'split.use_llm': use_llm, 'split.max_split_length': 20,
                           'split.max_segment_seconds': 8.0})
+    uid = make_project()
     before = config.config_path().read_bytes()
     values = configuration.resolve(uid)['values']
     assert values['split.use_llm'] is use_llm
@@ -49,7 +57,7 @@ def test_project_api_exposes_distinct_word_and_character_fields(make_project):
     split = response.json()['steps']['split']
     fields = {field['path']: field for field in split['fields']}
     words, characters = fields['split.target_word_count'], fields['split.max_split_length']
-    assert words['label'] == '语义目标词数（约）'
+    assert words['label'] == '语义目标词数（软参考）'
     assert words['depends_on'] == [['split.use_llm', True]]
     assert characters['depends_on'] == [['split.use_llm', False]]
     assert characters['label'] == '本地单句长度（字符）'

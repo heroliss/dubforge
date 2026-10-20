@@ -20,9 +20,22 @@ def test_single_request_has_bounded_wait_and_does_not_fake_server_cancellation(m
     job.done.return_value = False
     job.result.side_effect = TimeoutError()
     with pytest.raises(tts_requests.RequestTimeout, match='300 秒'):
-        tts_indextts25._result_with_progress(job, lambda value: None)
+        tts_indextts25._result_with_progress(job, lambda value: None, timeout_seconds=300)
     job.cancel.assert_not_called()
-    assert job.result.call_count == 1
+    assert job.result.call_count == 2
+
+
+def test_request_timeout_keeps_last_progress_and_phase(monkeypatch):
+    clock = iter([0, 0, 301])
+    monkeypatch.setattr(tts_indextts25.time, 'monotonic', lambda: next(clock))
+    job = Mock()
+    job.status.return_value = SimpleNamespace(progress_data=[SimpleNamespace(progress=.8)])
+    job.done.return_value = False
+    job.result.side_effect = TimeoutError()
+    with pytest.raises(tts_requests.RequestTimeout) as caught:
+        tts_indextts25._result_with_progress(job, lambda value: None, timeout_seconds=300)
+    assert caught.value.detail['last_progress'] == .8
+    assert caught.value.detail['phase'] == '等待服务端结果'
 
 
 @pytest.mark.parametrize('error', [StepCancelled('主动停止'), StepTimeout('步骤超时')])

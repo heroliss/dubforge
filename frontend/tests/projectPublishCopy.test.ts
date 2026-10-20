@@ -3,7 +3,7 @@ import test, { before, after } from 'node:test'
 import { fileURLToPath } from 'node:url'
 import { createServer, type ViteDevServer } from 'vite'
 import vue from '@vitejs/plugin-vue'
-import { createSSRApp, createRenderer, h, nextTick, reactive, ssrContextKey } from 'vue'
+import { createSSRApp, createRenderer, getCurrentInstance, h, nextTick, reactive, ssrContextKey } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 import { setup } from '@css-render/vue3-ssr'
 import { NMessageProvider, NDialogProvider } from 'naive-ui'
@@ -64,13 +64,42 @@ async function clientAssistant(t: any, page: any) {
   const Logic = { ...Assistant, render: () => null, ssrRender: undefined }
   const app = host.createApp({ render: () => h(Logic, {
     ...props, onApply: (value: any) => page.applyCopy(value), onBusyChange: (busy: boolean) => {
-      events.push(busy); page.copyBusy = busy
+      events.push(busy); page.copyBusyChanged(busy)
     },
   }) })
   app.provide(ssrContextKey, {})
   app.mixin({ created() { if (this.$options.__name === 'PublishCopyAssistant') assistant = this.$.setupState } })
   app.mount({ children: [] }); t.after(() => app.unmount()); await nextTick()
   return { assistant, assistantProps: props, busyEvents: events }
+}
+
+async function clientForm(t: any) {
+  let page: any, assistant: any
+  const timers: Function[] = []
+  t.mock.method(globalThis, 'setInterval', ((fn: Function) => { timers.push(fn); return timers.length }) as any)
+  t.mock.method(globalThis, 'clearInterval', () => {})
+  // 真实挂载父表单与助手，包含运行权限共享器的定时读取和 busy 事件绑定。
+  const AssistantLogic = { ...Assistant, render: () => null, ssrRender: undefined }
+  const Logic = { ...Form, ssrRender: undefined, render() {
+    const state = getCurrentInstance()!.setupState
+    return state.data ? h(AssistantLogic, {
+      projectUid: state.projectUid, revision: state.data.revision, fingerprint: state.data.fingerprint,
+      contentFingerprint: state.copyPreview?.content_fingerprint, values: state.publishValues,
+      disabled: !!(state.locked || state.copyLoading || !state.copyPreview || state.copyContextChanged),
+      onApply: state.applyCopy, onBusyChange: state.copyBusyChanged,
+    }) : null
+  } }
+  const app = host.createApp({ render: () => h(NMessageProvider, null, {
+    default: () => h(Logic, { scope: 'project:p', sections: ['publication'] }),
+  }) })
+  app.provide(ssrContextKey, {})
+  app.mixin({ created() {
+    if (this.$options.__name === 'ConfigurationForm') page = this.$.setupState
+    if (this.$options.__name === 'PublishCopyAssistant') assistant = this.$.setupState
+  } })
+  app.mount({ children: [] }); t.after(() => app.unmount())
+  await settle(); await nextTick()
+  return { page, assistant, timers }
 }
 
 async function render(t: any, { scope = 'project:p', cfg = configuration(), base = preview() } = {}) {
@@ -115,7 +144,7 @@ test('自动基础只补未配置字段，项目及父层显式空值优先，�
   assert.deepEqual(result.values.tags, ['模板标签']); assert.equal(result.values.source, 'https://example.com/video')
   assert.equal(base.source, '')
   assert.equal(result.sources.source.kind, 'content')
-  assert.equal(copyRestoreLabels(preview({ parent_configured: ['publish.title'] })).title, '恢复继承')
+  assert.equal(copyRestoreLabels(preview({ parent_configured: ['publish.title'] })).title, '恢复项目基础值')
   assert.equal(copyRestoreLabels(preview()).title, '恢复自动填充')
 })
 
@@ -222,6 +251,73 @@ test('生成中仍可手工编辑但不可保存；重复点击只发一次，�
   assert.deepEqual(busyEvents.slice(-2), [true, false])
 })
 
+test('真实父表单轮询锁不使成功候选失效，结束重新核对权限后才允许应用', { timeout: 5000 }, async t => {
+  let reads = 0, releaseCopy: any, releasePermission: any
+  t.mock.method(globalThis, 'fetch', (url: any) => {
+    const path = String(url)
+    if (path.endsWith('/editability')) {
+      reads++
+      if (reads >= 3) return new Promise(resolve => releasePermission = resolve)
+      return Promise.resolve(response({ locked: reads === 2, reason: reads === 2 ? '项目发布文案正在生成' : '' }))
+    }
+    if (path.endsWith('/suggest')) return new Promise(resolve => releaseCopy = resolve)
+    if (path.endsWith('/copy-preview')) return Promise.resolve(response(preview()))
+    if (path.endsWith('/catalog')) return Promise.resolve(response({ accounts: [] }))
+    return Promise.resolve(response(configuration()))
+  })
+  const { page, assistant, timers } = await clientForm(t)
+  assert.equal(page.editability.observing.value, true); assert.equal(reads, 1)
+  page.copyBusyChanged(false); assert.equal(reads, 1, '初始化false不发多余权限读取')
+  const pending = assistant.generate(); await nextTick()
+  assert.equal(page.pending, true)
+  timers[0](); await settle(); await nextTick()
+  assert.equal(page.locked, true)
+  releaseCopy(response(candidate())); await pending; await nextTick()
+  assert.equal(reads, 3, '生成完成立即只读刷新权限')
+  assert.ok(assistant.suggestion); assert.equal(assistant.error, ''); assert.equal(assistant.stale, false)
+  assert.equal(page.pending, false); assistant.apply(); assert.equal(page.dirty, false)
+  const visual = createSSRApp({ render: () => h(Assistant, {
+    projectUid: 'p', revision: 4, fingerprint: 'cfg4', contentFingerprint: 'video4',
+    values: page.publishValues, disabled: true,
+  }) })
+  visual.mixin({ created() {
+    if (this.$options.__name === 'PublishCopyAssistant') {
+      const state = this.$.setupState as any; state.suggestion = candidate(); state.base = state.signature
+    }
+  } })
+  const html = await renderToString(visual)
+  assert.match(html, /候选已生成；正在核对编辑权限或项目仍有任务/)
+  assert.match(html, /候选标题/); assert.match(html, /disabled[^>]*>[\s\S]*?应用所选文案/)
+  releasePermission(response({ locked: false })); await settle(); await nextTick()
+  assert.equal(page.locked, false); assistant.apply(); assert.equal(page.patch['publish.title'], '候选标题')
+  page.copyBusyChanged(false); assert.equal(reads, 3, '重复false不再次刷新')
+})
+
+test('轮询锁定时真实文案变化仍拒绝迟到候选，取消后也不强制解锁', { timeout: 5000 }, async t => {
+  let locked = false, reads = 0, release: any
+  t.mock.method(globalThis, 'fetch', (url: any) => {
+    const path = String(url)
+    if (path.endsWith('/editability')) { reads++; return Promise.resolve(response({ locked, reason: '项目发布文案正在生成' })) }
+    if (path.endsWith('/suggest')) return new Promise(resolve => release = resolve)
+    if (path.endsWith('/copy-preview')) return Promise.resolve(response(preview()))
+    if (path.endsWith('/catalog')) return Promise.resolve(response({ accounts: [] }))
+    return Promise.resolve(response(configuration()))
+  })
+  const { page, assistant, timers } = await clientForm(t)
+  // 共用状态可能保留上个测试的短期可编辑缓存，明确取得本次状态。
+  await page.editability.refresh(); await nextTick()
+  const pending = assistant.generate(); page.change('publish.title', '真实修改'); await nextTick()
+  locked = true; timers[0](); await settle(); await nextTick()
+  release(response(candidate())); await pending; await settle(); await nextTick()
+  assert.equal(assistant.suggestion, null); assert.match(assistant.error, /项目资料已变化/)
+  assert.equal(page.patch['publish.title'], '真实修改'); assert.equal(page.locked, true)
+  locked = false; await page.editability.refresh(); await nextTick()
+  const cancelled = assistant.generate(); locked = true
+  const previousReads = reads; assistant.cancel(); await settle(); await nextTick()
+  assert.equal(reads, previousReads + 1); assert.equal(page.locked, true)
+  release(response(candidate())); await cancelled; assert.equal(assistant.suggestion, null)
+})
+
 test('取消等待及切项目拒绝迟到候选，新请求不受旧请求finally干扰', { timeout: 5000 }, async t => {
   const { page } = await render(t)
   const { assistant, assistantProps } = await clientAssistant(t, page)
@@ -236,6 +332,24 @@ test('取消等待及切项目拒绝迟到候选，新请求不受旧请求final
   assert.equal(requests[2].signal.aborted, true)
   requests[2].resolve(response(candidate())); await third
   assert.equal(assistant.suggestion, null); assert.equal(assistant.busy, false)
+})
+
+test('发布文案由后端统一控制生成时限，前端不追加五分钟截止但仍可取消等待', async t => {
+  const { page } = await render(t)
+  const { assistant } = await clientAssistant(t, page)
+  const timeoutValues: number[] = [], timeLimit = AbortSignal.timeout.bind(AbortSignal)
+  t.mock.method(AbortSignal, 'timeout', (milliseconds: number) => { timeoutValues.push(milliseconds); return timeLimit(milliseconds) })
+  let signal: AbortSignal | undefined, finish: any
+  t.mock.method(globalThis, 'fetch', (_url: any, options: any) => {
+    signal = options.signal
+    return new Promise(resolve => { finish = resolve })
+  })
+  const pending = assistant.generate()
+  assert.ok(signal instanceof AbortSignal);assert.equal(signal.aborted,false)
+  assert.equal(timeoutValues.includes(300000),false)
+  assistant.cancel();assert.equal(signal.aborted,true)
+  finish(response(candidate()));await pending
+  assert.equal(assistant.suggestion,null);assert.equal(assistant.busy,false)
 })
 
 test('基础资料刷新使旧候选过期，配置或内容版本不一致的回执不可应用', async t => {

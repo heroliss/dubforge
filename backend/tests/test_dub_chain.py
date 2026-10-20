@@ -1,6 +1,7 @@
 """M3a 配音链测试: dubtask 估算纯函数 / mock 合成全链 / workbench API"""
 import json
 import subprocess
+import wave
 from pathlib import Path
 
 import pytest
@@ -115,11 +116,17 @@ def _mock_backend(monkeypatch, ref_dir: Path | None = None, fail_ids=()):
     """mock IndexTTS synth: 生成 0.8s 正弦 wav; 指定句可失败"""
     from dubforge.backends import tts_indextts25
     if ref_dir is not None:
-        from dubforge import config
+        from test_configuration import save
         ref = ref_dir / "tts_ref.wav"
-        ref.write_bytes(b"test reference")
-        config.set_key("tts.indextts25.timbre_audio", str(ref))
-        config.set_key("tts.indextts25.emo_audio", str(ref))
+        with wave.open(str(ref), 'wb') as stream:
+            stream.setnchannels(1)
+            stream.setsampwidth(2)
+            stream.setframerate(32000)
+            stream.writeframes(b'\0\0' * 32000)
+        project = next(p for p in crud.list_projects()
+                       if crud.project_dir_by_project(p).resolve() == ref_dir.resolve())
+        save('project:' + project.uid, {'tts.indextts25.timbre_audio': str(ref),
+                                       'tts.indextts25.emo_audio': str(ref)})
 
     def fake_synth(url, text, out_path, lang, **kw):
         if kw.get("line_id") in fail_ids:
@@ -144,6 +151,8 @@ def _mock_backend(monkeypatch, ref_dir: Path | None = None, fail_ids=()):
         return out_path
 
     monkeypatch.setattr(tts_indextts25, "synth", synth_wrapper)
+    # 桩已经提供全部语音输出，服务探测也必须隔离，不能尝试启动真实模型。
+    monkeypatch.setattr(tts_indextts25, "is_online", lambda *args, **kwargs: True)
 
 
 import os

@@ -1,42 +1,53 @@
 <script setup lang="ts">
 import FilePathLink from '../components/FilePathLink.vue'
-import ProgressActivity from '../components/ProgressActivity.vue'
-import CommentDiagnostics from '../components/CommentDiagnostics.vue'
+import ExecutionProgress from '../components/ExecutionProgress.vue'
+import { executionForStep } from '../utils/executionProgress'
+import { executionEtaSeconds } from '../utils/executionEta'
+import { dubbingTaskState } from '../utils/dubbingTaskState'
+import WorkflowStageNavigation from '../components/WorkflowStageNavigation.vue'
+import LlmConversationPanel from '../components/LlmConversationPanel.vue'
+import { stepConversationState, formatLlmEventTime } from '../utils/llmConversation'
 import ContentReviewPanel from '../components/ContentReviewPanel.vue'
 import FreshnessDetails from '../components/FreshnessDetails.vue'
 import BatchWorkflowResume from '../components/BatchWorkflowResume.vue'
 import { stoppingLabel } from '../utils/progressActivity'
 import { refreshInBackground } from '../utils/backgroundRefresh'
 import { dependencyActionLabel, runPlannedSteps } from '../utils/runPlan'
+import { createDraftLeaveGuard } from '../utils/draftLeaveGuard'
 import { showStepError, stepDisplayStatus } from '../utils/stepFeedback'
 import { WORKFLOW_BUSY } from '../utils/workflow'
+import { commentFailure, commentWorkspaceLink } from '../utils/commentWorkflow'
 // 步骤专属页: 说明 / 状态 / 依赖门禁 / 本步配置 / 完整日志 / 产物清单 / 运行操作
 // 由左侧流程导航进入, 一页只专注一个步骤; 依赖未就绪时明确指出并禁用运行
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from 'vue'
-import { useRoute, useRouter, onBeforeRouteLeave } from 'vue-router'
+import { useRoute, useRouter, onBeforeRouteLeave, onBeforeRouteUpdate } from 'vue-router'
 import {
-  NAlert, NButton, NCard, NCheckbox, NDescriptions, NDescriptionsItem, NEmpty, NForm, NFormItem,
-  NGrid, NGridItem as NGi, NH1, NLayoutContent, NPopover, NProgress, NSpace, NSpin, NTag, NText,
+  NAlert, NButton, NCard, NCheckbox, NDropdown, NDescriptions, NDescriptionsItem, NEmpty, NForm, NFormItem,
+  NGrid, NGridItem as NGi, NH1, NLayoutContent, NPopover, NSpace, NSpin, NTag, NText,
   NTooltip, NSelect, useDialog, useMessage,
 } from 'naive-ui'
 import MediaInfo from '../components/MediaInfo.vue'
 import VideoPreview from '../components/VideoPreview.vue'
 import AudioTracksPlayer from '../components/AudioTracksPlayer.vue'
 import AssemblyVersionWorkspace from '../components/AssemblyVersionWorkspace.vue'
-import AssembleOutputsPanel from '../components/AssembleOutputsPanel.vue'
+import AssemblyDeliveryPanel from '../components/AssemblyDeliveryPanel.vue'
 import VideoInfoPanel from '../components/VideoInfoPanel.vue'
 import ProjectParameterForm from '../components/ProjectParameterForm.vue'
+import TranslationContextPanel from '../components/TranslationContextPanel.vue'
 import { SUBTITLE_STYLE_PATHS, subtitleSettingsLink, subtitleStyleSummary } from '../utils/subtitleWorkspace'
+import { mapOutputCutChapters } from '../utils/outputCuts'
 import StepHeader from '../components/StepHeader.vue'
+import WorkflowPanel from '../components/WorkflowPanel.vue'
 import AutoRunBadge from '../components/AutoRunBadge.vue'
 import DubbingPanel from '../components/DubbingPanel.vue'
 import DependencyNotice from '../components/DependencyNotice.vue'
 import { fmtSize } from '../utils/format'
+import { formatTimecode } from '../utils/timecode'
 import { outputChoice, type AssemblyChoice } from '../utils/actionScope'
 import { useNavStore, STEP_ORDER, STEP_LABELS, STATUS_TAG, STATUS_TEXT, STATUS_HINTS,
-         FRESHNESS_HINTS, formatEta, formatProgressDetail } from '../stores/nav'
-import { useSmoothProgress } from '../utils/smoothProgress'
+         FRESHNESS_HINTS, formatEta } from '../stores/nav'
 import { createLatestRefresh, finalVideoKind, finalVideoLabel, latestFinalVideo, releaseMediaIn, vReleaseMedia } from '../utils/preview'
+import { wrapCueText } from '../utils/subtitlePreview'
 
 const route = useRoute()
 const router = useRouter()
@@ -46,43 +57,66 @@ const nav = useNavStore()
 
 const uid = route.params.uid as string
 const key = route.params.key as string
-const detailSection = ref(key === 'tts' ? 'logs' : 'parameters')
+const detailSection = ref(['tts','assemble'].includes(key) ? 'logs' : 'parameters')
+const assemblyReviewExpanded=ref(false)
 const pageVisible = ref(typeof document === 'undefined' || document.visibilityState !== 'hidden')
 const llmSection = ref<HTMLElement|null>(null)
-async function showLlmDiagnostics(){detailSection.value='llm';await nextTick();llmSection.value?.scrollIntoView({behavior:'smooth',block:'start'})}
 watch(()=>route.hash,value=>{if(value==='#llm-conversation')detailSection.value='llm'},{immediate:true})
 
+const projectExecution = ref<InstanceType<typeof WorkflowPanel>|null>(null)
+const localRunOptions = computed(()=>[...(key==='assemble'?[]:[{label:'运行到此步…',key:'through'}]),{label:'从此继续项目…',key:'continue'}])
+async function localRunAction(action:string) {
+  if(nav.archived || nav.busy || nav.dirMissing || busy.value || dubbingBusy.value)return
+  if(parametersDirty.value || dubbingDirty.value || reviewDirty.value || reviewBusy.value || assemblyPending.value){message.warning('请先保存当前步骤的修改，再检查运行方案');return}
+  if(action==='through')await runWithDependencies()
+  else if(action==='continue')await projectExecution.value?.open('',key)
+}
 const step = computed(() => nav.stepMap[key])
+const execution = computed(() => {
+  const value = executionForStep(step.value)
+  if (!value) return null
+  const extra = key === 'download' ? downloadProgressText.value : ''
+  return extra ? {...value, detail:[value.detail,extra].filter(Boolean).join(' · ')} : value
+})
 const displayStatus = computed(() => step.value ? stepDisplayStatus(step.value) : 'pending')
 const stepIdx = STEP_ORDER.indexOf(key as any)
 const dubbingBusy = ref(false), dubbingDirty = ref(false)
-const parametersDirty = ref(false)
+const dubbingPanel = ref<InstanceType<typeof DubbingPanel> | null>(null)
+const dubbingDocumentLines = ref<number | null>(null)
+const dubbingTaskSummary = computed(() => dubbingTaskState(step.value?.synthesis_task, dubbingDocumentLines.value,
+  step.value?.job_id ?? step.value?.execution?.job_id))
+function dubbingContentLoaded(value: { uid: string; lines: number }) {
+  if (value.uid === uid) dubbingDocumentLines.value = value.lines
+}
+const stepParametersDirty = ref(false), translationDirty = ref(false), translationBusy = ref(false)
+const parametersDirty = computed(() => stepParametersDirty.value || translationDirty.value || translationBusy.value)
 const reviewDirty = ref(false), reviewBusy = ref(false)
+const assemblyDirty = ref(false), assemblyBusy = ref(false)
+const assemblyPending = computed(() => assemblyDirty.value || assemblyBusy.value)
+const assemblyWorkspace = ref<InstanceType<typeof AssemblyVersionWorkspace>|null>(null)
+const projectParametersRefresh = ref(0), assemblySettingsRefresh = ref(0)
+function assemblySettingsSaved() { projectParametersRefresh.value++; refreshInBackground(() => nav.poll()) }
+function stepParametersSaved() { if (key === 'assemble') assemblySettingsRefresh.value++; refreshInBackground(() => nav.poll()) }
 function reviewBeforeUnload(event: BeforeUnloadEvent) {
-  if (reviewDirty.value || reviewBusy.value) { event.preventDefault(); event.returnValue = '' }
+  if (reviewDirty.value || reviewBusy.value || translationDirty.value || translationBusy.value) { event.preventDefault(); event.returnValue = '' }
 }
 onMounted(() => window.addEventListener('beforeunload', reviewBeforeUnload))
 onUnmounted(() => window.removeEventListener('beforeunload', reviewBeforeUnload))
-onBeforeRouteLeave(() => {
-  if (reviewBusy.value) { message.warning('正在保存或刷新内容审查，请稍候再离开'); return false }
-  if (!reviewDirty.value) return true
-  return new Promise<boolean>(resolve => dialog.warning({ title: '审查设置尚未保存', content: '离开会放弃当前审查设置修改。', positiveText: '放弃修改并离开', negativeText: '继续编辑', onPositiveClick: () => resolve(true), onNegativeClick: () => resolve(false), onClose: () => resolve(false), onMaskClick: () => resolve(false) }))
-})
+const draftLeave = createDraftLeaveGuard(() => ({
+  busyReason: translationBusy.value ? '正在读取或保存翻译背景，请稍候再离开'
+    : reviewBusy.value ? '正在保存或刷新内容审查，请稍候再离开' : '',
+  dirty: translationDirty.value || reviewDirty.value,
+  title: translationDirty.value ? '翻译背景尚未保存' : '审查设置尚未保存',
+  content: translationDirty.value ? '离开会放弃当前背景与术语修改。' : '离开会放弃当前审查设置修改。',
+}), text => message.warning(text), options => { dialog.warning(options) })
+onBeforeRouteLeave(draftLeave.leave)
+onBeforeRouteUpdate(draftLeave.update)
 const outputsArea = ref<HTMLElement | null>(null)
 const assemblyChoice = ref<AssemblyChoice>(outputChoice('src'))
 function chooseOutputs() {
   outputsArea.value?.scrollIntoView({ behavior: 'smooth', block: 'start' })
   outputsArea.value?.focus({ preventScroll: true })
 }
-const smoothProgress = useSmoothProgress(
-  () => step.value?.progress,
-  () => step.value?.status,
-)
-const formatProgress = (value: unknown) => {
-  const n = Number(value)
-  return `${(Number.isFinite(n) ? Math.max(0, Math.min(100, n)) : 0).toFixed(1)}%`
-}
-
 // 后端按当前设置解析所需文件，界面与执行器使用相同规则。
 const blockers = computed(() => step.value?.unready_inputs ?? [])
 // 字幕与配音是同一个编辑页；上游变化后把导出文件和逐句音频一起带到最新。
@@ -99,8 +133,9 @@ const editorBlockers = computed(() => {
 })
 const actionBlockers = computed(() => key === 'tts' ? editorBlockers.value : blockers.value)
 async function runWithDependencies() {
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
   if (nav.busy) return
-  if (parametersDirty.value || dubbingDirty.value || reviewDirty.value || reviewBusy.value) { message.warning('请先保存参数和审查设置，再确认运行范围'); return }
+  if (parametersDirty.value || dubbingDirty.value || reviewDirty.value || reviewBusy.value || assemblyPending.value) { message.warning('请先保存参数、审查与成片剪辑设置，再确认运行范围'); return }
   const targets = key === 'tts' ? ['subtitles', 'tts'] : [key]
   await runPlannedSteps(uid, targets, true, message, dialog,
     async (steps) => {
@@ -108,11 +143,11 @@ async function runWithDependencies() {
         releaseMediaIn(previewRoot.value); previewSuspended.value = true; await nextTick()
       }
     },
-    async () => { previewSuspended.value = false; await nav.poll() })
+    async () => { previewSuspended.value = false; await nav.poll() }, () => nav.archived || assemblyPending.value)
 }
 const running = computed(() => step.value?.status === 'running' || step.value?.status === 'queued')
-const canRun = computed(() => !!step.value && !running.value
-  && blockers.value.length === 0 && !dirMissing.value && !dubbingBusy.value && !dubbingDirty.value && !parametersDirty.value && !reviewDirty.value && !reviewBusy.value)
+const canRun = computed(() => !!step.value && !running.value && !nav.archived
+  && blockers.value.length === 0 && !dirMissing.value && !dubbingBusy.value && !dubbingDirty.value && !parametersDirty.value && !reviewDirty.value && !reviewBusy.value && !assemblyPending.value)
 
 // 项目目录不在磁盘上 (被移走/删除) → 禁用运行, 从回收站还原后恢复
 const dirMissing = computed(() => nav.dirMissing)
@@ -128,8 +163,9 @@ const dialogAction = ref<'stop' | 'force' | 'rerun' | null>(null)
 // 顶部操作区只允许存在一种状态分支。集中计算后用互斥模板渲染，
 // 避免停止信号和后端轮询不同步时同时出现两个结束/运行按钮。
 const actionMode = computed<
-  'running' | 'cancelling' | 'deps' | 'chain-hold' | 'fill-voice' | 'fresh-done' | 'run'
+  'checking' | 'running' | 'cancelling' | 'deps' | 'chain-hold' | 'fill-voice' | 'fresh-done' | 'run'
 >(() => {
+  if (step.value?.status === 'checking') return 'checking'
   if (running.value && (step.value?.cancelling || cancelPending.value)) return 'cancelling'
   if (running.value) return 'running'
   // 链挂起在本步 (失败/停止/中断): 重试默认续跑剩余计划 (ADR-0072)。
@@ -149,8 +185,9 @@ watch(() => [step.value?.status, step.value?.cancelling] as const, ([status, can
 })
 
 async function run(force = false, resumeChain = false) {
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
   if (nav.busy) return
-  if (busy.value || cancelPending.value || forceBusy.value || dubbingBusy.value || dubbingDirty.value || parametersDirty.value || reviewDirty.value || reviewBusy.value) return
+  if (busy.value || cancelPending.value || forceBusy.value || dubbingBusy.value || dubbingDirty.value || parametersDirty.value || reviewDirty.value || reviewBusy.value || assemblyPending.value) return
   if (key === 'assemble') { chooseOutputs(); return }
   busy.value = true
   if (key !== 'tts') {
@@ -177,19 +214,22 @@ async function run(force = false, resumeChain = false) {
 }
 
 function rerunDialog() {
+  if (nav.archived) { message.info('项目已归档，请先恢复项目后再运行。'); return }
   if (busy.value || dialogAction.value) return
+  if (key === 'tts') { void dubbingPanel.value?.regenerateAll(); return }
   dialogAction.value = 'rerun'
   const downstream = nav.steps.filter(s => (step.value?.affected_steps ?? []).includes(s.key))
     .filter((s: any) => s.status === 'done' || s.status === 'stale')
-  const extra = key === 'tts'
-    ? '范围是全项目中选用配音的句子，与下方勾选句子无关。将重新生成当前配音版本，已满意版本也会重做；其他版本保留。'
+  const resumeSplitCache = key === 'split' && ['failed', 'interrupted'].includes(String(step.value?.status || ''))
+  const extra = resumeSplitCache
+      ? '这是失败恢复：会重新校验并写入最终产物，已通过校验的语义分块按输入和参数指纹复用；未命中的分块重新请求模型。外部原文件不删除。'
     : '将清理本步骤可重建的中间产物并重新生成，使用已保存的参数；外部原文件不删除。'
   dialog.warning({
-    title: key === 'tts' ? '确认重做全项目配音' : `确认重做「${step.value.label}」`,
+    title: `确认重做「${step.value.label}」`,
     content: extra + (downstream.length
       ? `下游 ${downstream.length} 个步骤将被标记为「已过期」（需要重跑）。`
       : ''),
-    positiveText: key === 'tts' ? '重做全项目配音' : '确认重做',
+    positiveText: '确认重做',
     negativeText: '取消',
     onPositiveClick: async () => {
       dialogAction.value = null
@@ -478,6 +518,15 @@ watch(running, syncLogPolling, { immediate: true })
 // ---- LLM 实时会话: 仅翻译/语义整理步骤显示，按请求聚合发送内容、思考和模型输出 ----
 const LLM_TRACE_POLL_MS = 400
 const llmStep = computed(() => key === 'split' || key === 'translate')
+const splitSemanticDescription = computed(() => {
+  const cfg = step.value?.cfg?.split ?? {}
+  const targetValue = Number(cfg.llm_chunk_target_words ?? 500)
+  const target = Math.max(100, Math.round(Number.isFinite(targetValue) ? targetValue : 500))
+  const overlap = Math.max(0, Math.round(Number(cfg.llm_chunk_overlap_words ?? 80)))
+  const retryValue = Number(cfg.llm_chunk_max_retries ?? 3)
+  const retries = Math.min(5, Math.max(1, Math.round(Number.isFinite(retryValue) ? retryValue : 3)))
+  return `短稿一次整理；长稿自动按约${target}词分块，块间保留约${overlap}词上下文；每块独立校验，最多尝试${retries}次。`
+})
 const llmReferenceDistance = ref(500)
 const llmReferenceSpeed = ref(360)
 let llmDisplayRevision = 0
@@ -690,207 +739,15 @@ const LLM_VALIDATION_METHODS: Record<string, string> = {
   split: '校验方法：逐行匹配“序号. 开始秒-结束秒: 片段” → 连续编号、非空片段，兼容无害空白与注释 → 检查最终有效时间与真实长静音 → 检查明显大段遗漏、台词搬移或重复抄写 → 内容纠错变化提示复核',
 }
 const llmValidationMethod = () => LLM_VALIDATION_METHODS[key] || '校验方法：提取 JSON → 检查结构、字段与步骤业务规则'
-const formatLlmTime = (ts: unknown) => {
-  const text = String(ts || '')
-  const match = text.match(/T(\d{2}:\d{2}:\d{2})/)
-  return match ? match[1] : text
-}
-const llmMessageState = computed(() => {
-  const rows: any[] = []
-  const assistantByRequest = new Map<string, any>()
-  const reasoningByRequest = new Map<string, any>()
-  const retryInfo = new Map<string, { maxAttempt: number, total: number, failures: string[] }>()
-  // Chat Completions 的重试是一次新的 HTTP 请求。为了让模型知道此前任务，请求体
-  // 会重复携带 system/历史消息；界面按内容去重，只保留这些消息第一次出现的顺序。
-  const seenContext = new Set<string>()
-  const retryMeta = (event: any) => {
-    const group = String(event.retry_group || '')
-    if (!group) return null
-    const attempt = Number(event.retry_attempt) || 1
-    const total = Number(event.retry_total) || 1
-    const info = retryInfo.get(group) || { maxAttempt: 1, total, failures: [] }
-    info.maxAttempt = Math.max(info.maxAttempt, attempt)
-    info.total = Math.max(info.total, total)
-    if (event.event === 'validation_error' && event.content) info.failures.push(String(event.content))
-    retryInfo.set(group, info)
-    return { group, attempt, total }
-  }
-  for (const event of llmEvents.value) {
-    const retry = retryMeta(event)
-    const requestId = String(event.request_id || '')
-    if (event.event === 'json_repair') {
-      rows.push({
-        id: `json-repair-${rows.length}`, requestId, role: 'json_repair',
-        kind: 'repaired', content: String(event.content || ''),
-        status: '已本地修复', ts: event.ts,
-        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-        retryTotal: retry?.total || 1,
-      })
-    } else if (event.event === 'retry_strategy') {
-      rows.push({
-        id: `strategy-${rows.length}`, requestId, role: 'strategy',
-        kind: event.mode === 'fresh' ? 'fresh' : 'conversation',
-        content: String(event.content || ''),
-        status: '已选择', ts: event.ts,
-        retryAttempt: Number(event.retry_attempt) || 1,
-        retryTotal: Number(event.retry_total) || 1,
-      })
-    } else if (event.event === 'merge_summary') {
-      rows.push({
-        id: `merge-${rows.length}`, requestId, role: 'merge',
-        kind: 'success', content: String(event.content || ''),
-        status: '合并完成', ts: event.ts,
-      })
-    } else if (event.event === 'request') {
-      const role = event.role === 'system' ? 'system' : 'user'
-      const content = String(event.content || '')
-      // 只去重同一个逻辑请求内重复携带的上下文；不同窗口允许出现相同 role。
-      const contextKey = retry ? `${retry.group}:${role}:${content}` : ''
-      if (contextKey && seenContext.has(contextKey)) continue
-      if (contextKey) seenContext.add(contextKey)
-      rows.push({
-        id: `${requestId}-${rows.length}`,
-        requestId, role, content,
-        profile: event.profile || '', model: event.model || '',
-        status: '等待首字节', ts: event.ts,
-        inputChars: Number(event.input_chars) || 0,
-        requestKind: content.includes('局部修复请求')
-          ? 'line-repair'
-          : (retry?.attempt || 1) > 1 ? 'format-repair' : 'initial',
-        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-        retryTotal: retry?.total || 1,
-      })
-    } else if (event.event === 'assistant_delta') {
-      let row = assistantByRequest.get(requestId)
-      if (!row) {
-        row = { id: `${requestId}-assistant`, requestId, role: 'assistant',
-          content: '', profile: event.profile || '', model: '',
-          status: '生成中', ts: event.ts,
-          retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-          retryTotal: retry?.total || 1 }
-        rows.push(row)
-        assistantByRequest.set(requestId, row)
-      }
-      row.content += String(event.content || '')
-      row.status = '生成中'
-    } else if (event.event === 'reasoning_delta') {
-      let row = reasoningByRequest.get(requestId)
-      if (!row) {
-        row = { id: `${requestId}-reasoning`, requestId, role: 'reasoning',
-          content: '', profile: event.profile || '', model: '',
-          status: '思考中', ts: event.ts,
-          retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-          retryTotal: retry?.total || 1 }
-        rows.push(row)
-        reasoningByRequest.set(requestId, row)
-      }
-      row.content += String(event.content || '')
-      row.status = '思考中'
-    } else if (event.event === 'assistant_response') {
-      let row = assistantByRequest.get(requestId)
-      if (!row) {
-        row = { id: `${requestId}-assistant`, requestId, role: 'assistant',
-          content: '', profile: event.profile || '', model: '',
-          status: '已完成', ts: event.ts,
-          retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-          retryTotal: retry?.total || 1 }
-        rows.push(row)
-        assistantByRequest.set(requestId, row)
-      }
-      row.content = String(event.content || '')
-      row.status = '已完成'
-      row.model = event.model || row.model
-      row.outputChars = Number(event.output_chars) || row.content.length
-      const startedAt = Date.parse(String(row.ts || ''))
-      const finishedAt = Date.parse(String(event.ts || ''))
-      if (Number.isFinite(startedAt) && Number.isFinite(finishedAt)) {
-        row.elapsedMs = Math.max(0, finishedAt - startedAt)
-      }
-      const reasoning = reasoningByRequest.get(requestId)
-      if (reasoning) {
-        reasoning.status = '思考完成'
-        const reasoningStart = Date.parse(String(reasoning.ts || ''))
-        if (Number.isFinite(reasoningStart) && Number.isFinite(finishedAt)) {
-          reasoning.elapsedMs = Math.max(0, finishedAt - reasoningStart)
-        }
-      }
-    } else if (event.event === 'validation_error' || event.event === 'validation_success') {
-      const eventText = String(event.content || '')
-      const parseFailure = event.event === 'validation_error'
-        && /未找到.*JSON|JSONDecodeError/i.test(eventText)
-      rows.push({
-        id: `validation-${rows.length}`, requestId, role: 'validation',
-        kind: event.event === 'validation_error' ? 'error' : 'success',
-        content: parseFailure
-          ? `JSON 解析失败：${eventText || '未知原因'}`
-          : event.event === 'validation_error'
-            ? `校验失败：${eventText || '未知原因'}\n${llmValidationMethod()}`
-            : `${eventText || '校验通过'}\n${llmValidationMethod()}`,
-        status: parseFailure ? 'JSON 需修复' : event.event === 'validation_error' ? '需自动修复' : '已通过',
-        ts: event.ts,
-        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-        retryTotal: retry?.total || 1,
-      })
-    } else if (event.event === 'fallback') {
-      rows.push({
-        id: `fallback-${rows.length}`, requestId, role: 'fallback',
-        kind: 'warning',
-        content: String(event.content || '已回退本地规则切分'),
-        status: '已回退',
-        ts: event.ts,
-        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-        retryTotal: retry?.total || 1,
-      })
-    } else if (event.event === 'request_aborted') {
-      for (const row of rows) {
-        if (row.requestId === requestId) {
-          row.aborted = true
-          row.status = '本次候选未采用'
-        }
-      }
-      const reason = String(event.content || '响应偏离任务要求或超过请求时限，已关闭本地连接。')
-      const code = event.code ? `\n错误码：${String(event.code)}` : ''
-      const confirmation = event.server_confirmed === false
-        ? '\n已关闭本地连接；服务端停止计算或计费尚未确认。' : ''
-      rows.push({ id: `aborted-${rows.length}`, requestId, role: 'aborted', kind: 'error', aborted: true,
-        content: `${reason}${code}\n本次候选未采用。${confirmation}`,
-        status: '本次候选未采用', ts: event.ts, code: event.code, detail: event.detail,
-        retryGroup: retry?.group || '', retryAttempt: retry?.attempt || 1,
-        retryTotal: retry?.total || 1 })
-    } else if (event.event === 'request_cancelled') {
-      for (const row of rows) {
-        if (row.requestId === requestId) row.status = '本地已取消'
-      }
-      rows.push({ id: `cancelled-${rows.length}`, requestId, role: 'cancellation', kind: 'warning',
-        content: String(event.content || '本地请求已取消；服务端停止计算尚未确认'),
-        status: '本地已取消 · 服务端未确认', ts: event.ts })
-    } else if (event.event === 'status') {
-      for (const row of rows) {
-        if (row.requestId === requestId
-            && ['system', 'user', 'reasoning'].includes(row.role)) {
-          row.status = String(event.content || '')
-        }
-      }
-    }
-  }
-  for (const row of rows) {
-    const info = row.retryGroup ? retryInfo.get(row.retryGroup) : null
-    if (info) {
-      row.retryFailures = info.failures.length
-      row.retryMaxAttempt = info.maxAttempt
-    }
-  }
-  // 不再“只显示最后一次尝试”：完整对话按时间线展示，用户能看到首轮大输出
-  // 和后续短修复输出之间的关系；重复携带的历史上下文已在上面被去重。
-  return { allRows: rows, visibleRows: rows, retryInfo }
-})
+const formatLlmTime = formatLlmEventTime
+const llmMessageState = computed(() => stepConversationState(llmEvents.value, llmValidationMethod()))
 const llmMessages = computed(() => llmMessageState.value.visibleRows)
 watch([llmMessages, llmCanAnimate], syncLlmAnimations)
 const llmRetryCount = computed(() =>
   Array.from(llmMessageState.value.retryInfo.values())
     .filter((info: any) => info.maxAttempt > 1).length)
 const llmRoleLabel = (row: any) => ({
-  system: '系统提示',
+  system: '系统提示', history: '历史回复',
   user: row.requestKind === 'line-repair' ? '小片段重译请求'
     : row.requestKind === 'format-repair' ? '格式修复请求' : '发送内容',
   reasoning: '模型思考',
@@ -1083,6 +940,35 @@ const extraCfgRows = computed(() => cfgRows.value.filter(row => !editablePaths.v
 
 // ---- download 页媒体信息 (视频右侧信息栏) ----
 const media = ref<any>({ found: false })
+// 视频资料面板与原视频预览共享同一份只读章节快照；章节仅用于本地跳转标记，
+// 发布到 B 站仍由发布设置中的显式章节选项控制。
+const previewChapters = ref<any[]>([])
+const downloadInfo = ref<any | null>(null)
+const downloadChapters = computed(() => key === 'download'
+  ? (downloadInfo.value?.content?.chapters ?? [])
+  : previewChapters.value)
+const downloadDuration = computed(() => Number(downloadInfo.value?.source?.duration)
+  || Number(media.value?.duration) || 0)
+const downloadProgressDetail = computed(() => key === 'download'
+  ? (step.value?.progress_detail || {}) : {})
+function formatDownloadRate(value: unknown): string {
+  const rate = Number(value)
+  if (!Number.isFinite(rate) || rate <= 0) return ''
+  if (rate >= 1024 * 1024) return `${(rate / (1024 * 1024)).toFixed(1)} MB/s`
+  if (rate >= 1024) return `${(rate / 1024).toFixed(1)} KB/s`
+  return `${Math.round(rate)} B/s`
+}
+const downloadProgressText = computed(() => {
+  const detail = downloadProgressDetail.value
+  const loaded = Number(detail.loaded), total = Number(detail.total)
+  const parts: string[] = []
+  const rate = formatDownloadRate(detail.speed_bps)
+  if (rate) parts.push(`下载速度 ${rate}`)
+  if (Number.isFinite(loaded) && loaded >= 0 && Number.isFinite(total) && total > 0) {
+    parts.push(`${fmtSize(loaded)} / ${fmtSize(total)}`)
+  }
+  return parts.join(' · ')
+})
 let mediaFailed = false
 let mediaSignature = ''
 const mediaLoader = createLatestRefresh(async (signal) => {
@@ -1090,6 +976,13 @@ const mediaLoader = createLatestRefresh(async (signal) => {
   if (!r.ok) throw new Error('读取媒体信息失败')
   return r.json()
 }, (value) => { media.value = value; mediaFailed = !value.found }, () => { mediaFailed = true })
+const chapterLoader = createLatestRefresh(async (signal) => {
+  const r = await fetch(`/api/projects/${uid}/steps/download/video-info`, { cache: 'no-store', signal })
+  if (!r.ok) throw new Error('读取视频章节失败')
+  const value = await r.json()
+  const rows = value?.info?.content?.chapters
+  return Array.isArray(rows) ? rows : []
+}, value => { previewChapters.value = value }, () => { previewChapters.value = [] })
 if (key === 'download') {
   watch(step, (value) => {
     if (value?.status !== 'done') {
@@ -1106,7 +999,15 @@ if (key === 'download') {
     }
   }, { immediate: true })
 }
-onUnmounted(() => mediaLoader.cancel())
+if (key !== 'download') {
+  const readChapterSignature = () => (nav.stepMap.download?.artifacts ?? [])
+    .map((a: any) => `${a.name}:${a.sha256 || a.size || ''}`).join('|')
+  watch(readChapterSignature, (signature, previous) => {
+    if (!signature) { chapterLoader.cancel(); previewChapters.value = []; return }
+    if (signature !== previous || !previewChapters.value.length) void chapterLoader.refresh(signature !== previous)
+  }, { immediate: true })
+}
+onUnmounted(() => { mediaLoader.cancel(); chapterLoader.cancel() })
 
 // ---- 产出预览: 按步骤类型直接预览对应产物 (视频/音频/文本) ----
 const AUDIO_LABEL: Record<string, string> = {
@@ -1156,6 +1057,13 @@ const assembleSubtitlePath = computed(() => key === 'assemble'
 
 // 成片页可预览所有已生成组合; source 是原片, dub_full 是尚无成片时的音频兜底。
 const selectedAssembleOutput = ref('')
+const outputPreviewChapters = computed(() => {
+  if (key !== 'assemble' || selectedAssembleOutput.value === 'source') return downloadChapters.value
+  const art = (step.value?.artifacts ?? []).find((row: any) => row.name === selectedAssembleOutput.value)
+  // 试片缺少完整源轴范围，不能把原片章节时间直接叠在短片上。
+  if (!art || art.name.startsWith('preview_')) return []
+  return mapOutputCutChapters(downloadChapters.value, art.output_cuts)
+})
 const assembleOutputOptions = computed(() => {
   if (key !== 'assemble') return []
   const arts = (step.value?.artifacts ?? []).filter((a: any) => a.exists !== false)
@@ -1257,6 +1165,9 @@ const preview = computed(() => {
     subtitles: [subtitleTrack.value, 'source.srt', 'trans.srt', 'bilingual.srt'],
   }
   const name = (textArts[key] ?? []).find(has)
+  if (key === 'translate' && !name && (running.value || step.value?.partial_preview_job_id)) {
+    return { kind: 'text', name: 'translate.txt', version: `job-${step.value?.partial_preview_job_id || step.value?.job_id}` }
+  }
   return name ? { kind: 'text', name, version: artifactVersion(artInfo(name)) } : null
 })
 const subtitleArtifactName = computed(() => {
@@ -1268,14 +1179,23 @@ const previewTextRaw = ref('')
 let previewTextName = ''
 let previewTextTimer: number | undefined
 const previewTextFailed = ref(false)
+const translationPreviewState = ref('')
+const translationPreviewCount = ref('')
+function textPreviewUrl(name: string) {
+  const url = `/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(name)}/raw`
+  return key === 'translate' && name === 'translate.txt' ? `${url}?preview=true` : url
+}
 const textLoader = createLatestRefresh(async (signal) => {
   const name = subtitleArtifactName.value!
-  const r = await fetch(`/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(name)}/raw`,
+  const r = await fetch(textPreviewUrl(name),
     { cache: 'no-store', signal })
   if (!r.ok) throw new Error('读取失败')
-  return { name, raw: await r.text() }
-}, ({ name, raw }) => {
+  return { name, raw: await r.text(), state: r.headers.get('X-DubForge-Preview') || '',
+    count: `${r.headers.get('X-DubForge-Completed') || ''}/${r.headers.get('X-DubForge-Total') || ''}` }
+}, ({ name, raw, state, count }) => {
   previewTextFailed.value = false
+  translationPreviewState.value = state
+  translationPreviewCount.value = count
   if (name !== previewTextName || raw !== previewTextRaw.value) {
     let display = raw
     if (name === 'words.json') {
@@ -1310,6 +1230,8 @@ function loadText(name: string | null, refresh = false) {
     previewTextRaw.value = ''
     previewTextName = ''
     previewTextFailed.value = false
+    translationPreviewState.value = ''
+    translationPreviewCount.value = ''
     return
   }
   return textLoader.refresh(!refresh)
@@ -1359,20 +1281,14 @@ function srtToVtt(raw: string): string {
     if (timeIndex < 0) continue
     const timing = rows[timeIndex].replace(/,/g, '.')
     const text = rows.slice(timeIndex + 1).join('\n').trim()
-    if (text) cues.push(`${cues.length + 1}\n${timing}\n${text}`)
+    if (text) cues.push(`${cues.length + 1}\n${timing}\n${wrapCueText(text)}`)
   }
   return `WEBVTT\n\n${cues.join('\n\n')}\n`
 }
 
 function jsonToVtt(raw: string, minDuration = 0): string {
   const data = JSON.parse(raw)
-  const fmt = (seconds: number) => {
-    const total = Math.max(0, Number(seconds) || 0)
-    const h = Math.floor(total / 3600)
-    const m = Math.floor((total % 3600) / 60)
-    const s = (total % 60).toFixed(3).padStart(6, '0')
-    return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s}`
-  }
+  const fmt = fmtVttSeconds
   // words.json 是 [{start,end,word}]; split/translate 均使用行协议预览。
   // 词级预览每个词一个 cue；只用于视频预览，不改写正式字幕产物。
   if (Array.isArray(data) && data.some((item: any) => item && 'word' in item)) {
@@ -1382,7 +1298,7 @@ function jsonToVtt(raw: string, minDuration = 0): string {
       .map((word: any, i: number) => {
         const start = Number(word.start)
         const end = Math.max(Number(word.end), start + Math.max(0, minDuration))
-        return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${String(word.word).trim()}`
+        return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${wrapCueText(String(word.word).trim())}`
       })
     return `WEBVTT\n\n${cues.join('\n\n')}\n`
   }
@@ -1393,7 +1309,7 @@ function jsonToVtt(raw: string, minDuration = 0): string {
     .map((line: any, i: number) => {
       const start = Number(line.start)
       const end = Math.max(Number(line.end), start + Math.max(0, minDuration))
-      return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${String(line.dst ?? line.text).trim()}`
+      return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${wrapCueText(String(line.dst ?? line.text).trim())}`
     })
   return `WEBVTT\n\n${cues.join('\n\n')}\n`
 }
@@ -1408,7 +1324,7 @@ function timedTextToVtt(raw: string, minDuration = 0): string {
       const start = Number(match[2])
       const end = Math.max(Number(match[3]), start + Math.max(0, minDuration))
       const text = match[4].trim()
-      return text ? `${match[1]}\n${fmtVttSeconds(start)} --> ${fmtVttSeconds(end)}\n${text}` : ''
+      return text ? `${match[1]}\n${fmtVttSeconds(start)} --> ${fmtVttSeconds(end)}\n${wrapCueText(text)}` : ''
     })
     .filter(Boolean)
   return `WEBVTT\n\n${cues.join('\n\n')}\n`
@@ -1440,7 +1356,7 @@ function translationTextToVtt(translationRaw: string, timingRaw: string,
       const text = match[2].trim()
       const end = Math.max(timing.end, timing.start + Math.max(0, minDuration))
       return text
-        ? `${match[1]}\n${fmtVttSeconds(timing.start)} --> ${fmtVttSeconds(end)}\n${text}`
+        ? `${match[1]}\n${fmtVttSeconds(timing.start)} --> ${fmtVttSeconds(end)}\n${wrapCueText(text)}`
         : ''
     })
     .filter(Boolean)
@@ -1448,18 +1364,15 @@ function translationTextToVtt(translationRaw: string, timingRaw: string,
 }
 
 function fmtVttSeconds(seconds: number): string {
-  const total = Math.max(0, Number(seconds) || 0)
-  const h = Math.floor(total / 3600)
-  const m = Math.floor((total % 3600) / 60)
-  const s = (total % 60).toFixed(3).padStart(6, '0')
-  return `${String(h).padStart(2, '0')}:${String(m).padStart(2, '0')}:${s}`
+  return formatTimecode(Number.isFinite(seconds) ? Math.max(0, seconds) : 0, 3)
 }
 
 const subtitleLoader = createLatestRefresh(async (signal) => {
   const name = subtitleArtifactName.value!
-  const r = await fetch(`/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(name)}/raw`,
+  const r = await fetch(textPreviewUrl(name),
     { cache: 'no-store', signal })
   if (!r.ok) throw new Error('读取字幕产物失败')
+  if (r.headers.get('X-DubForge-Preview') === 'waiting') return null
   const raw = await r.text()
   let vtt: string
   if (key === 'translate' && name === 'translate.txt') {
@@ -1477,6 +1390,7 @@ const subtitleLoader = createLatestRefresh(async (signal) => {
   if (!vtt.includes('-->')) throw new Error('字幕产物尚未生成完整')
   return vtt
 }, (vtt) => {
+  if (vtt === null) { subtitlePreviewError.value = ''; return }
   if (vtt !== subtitleVtt) {
     const previousUrl = subtitlePreviewUrl.value
     subtitlePreviewUrl.value = URL.createObjectURL(new Blob([vtt], { type: 'text/vtt' }))
@@ -1541,13 +1455,17 @@ onUnmounted(() => {
   <div class="workspace-page step-page">
     <n-alert v-if="nav.stepsError || nav.projectError" type="error" style="margin-bottom: 16px">
       {{ nav.stepsError || nav.projectError }}
-      <template #action><n-button size="small" @click="nav.poll()">重试</n-button></template>
+      <n-button size="small" @click="nav.poll(true)">重新核对</n-button>
     </n-alert>
     <div v-if="step">
       <StepHeader :title="step.label" :description="step.description">
         <template #status>
           <span class="header-badges">
             <!-- 按状态切换整个提示组件，trigger 必须始终有一个实际元素。 -->
+            <n-tag v-if="step.settings_changed" size="small" type="warning" :bordered="false"
+                   title="本步骤的设置相对上次产物发生了变化">本步设置已改</n-tag>
+            <n-tag v-if="step.upstream_changed" size="small" type="warning" :bordered="false"
+                   title="上游产物相对本步骤上次运行发生了变化">上游产物已变</n-tag>
             <n-tooltip v-if="!['done','stale'].includes(step.status)" trigger="hover" :delay="200" placement="top">
               <template #trigger>
                 <n-tag size="small" :type="STATUS_TAG[displayStatus] || 'default'"
@@ -1571,10 +1489,11 @@ onUnmounted(() => {
           </span>
         </template>
         <template #actions>
-        <n-space class="step-action-toolbar" :data-action-mode="actionMode">
+        <div class="step-action-toolbar" :data-action-mode="actionMode" role="group" aria-label="本步骤操作">
           <n-button size="small" quaternary title="在文件浏览器中打开本步骤目录"
                     @click="revealStep">📁</n-button>
-          <template v-if="actionMode === 'running'">
+          <n-button v-if="actionMode === 'checking'" disabled>产物核验中</n-button>
+          <template v-else-if="actionMode === 'running'">
             <n-tag v-if="nav.chainRunning" size="small" type="info" :bordered="false"
                    title="本步完成后自动继续剩余计划">⛓ 续跑中</n-tag>
             <n-button size="small" secondary :loading="pauseBusy"
@@ -1591,8 +1510,9 @@ onUnmounted(() => {
           </template>
           <n-button v-else-if="key === 'tts' && route.query.panel === 'subtitles'" secondary
                     @click="router.replace({ query: { ...route.query, panel: undefined } })">返回校对与配音</n-button>
+          <n-button v-else-if="key === 'assemble' && actionMode!=='chain-hold'" type="primary" :disabled="nav.archived || nav.busy || dirMissing" @click="chooseOutputs">选择成品方案</n-button>
           <n-button v-else-if="actionMode === 'deps'" type="primary"
-                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
+                    :loading="busy" :disabled="nav.archived || nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy || assemblyPending"
                     @click="runWithDependencies">
             {{ key === 'tts' ? '同步全项目字幕与配音…' : dependencyActionLabel(actionBlockers) + '…' }}
           </n-button>
@@ -1600,63 +1520,59 @@ onUnmounted(() => {
             <n-tag size="small" type="warning" :bordered="false"
                    :title="'自动运行计划已挂起, 剩余 ' + (nav.chain?.remaining.length || 0) + ' 步'">⛓ 计划挂起</n-tag>
             <BatchWorkflowResume :projects="[{ uid, title: nav.title || uid }]" kind="chain" label="检查恢复方案…"
-              :disabled="busy || nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
+              :disabled="busy || nav.archived || nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy || assemblyPending"
               @resumed="nav.poll()" />
-            <n-button secondary :loading="busy" :disabled="nav.busy || !canRun || dirMissing"
-                      title="只重跑本步, 不继续剩余计划 (计划保留挂起)"
-                      @click="run(false)">仅重试本步</n-button>
+            <n-button secondary :loading="busy" :disabled="nav.archived || nav.busy || !canRun || dirMissing"
+                      :title="key === 'tts' ? '补齐待配音句子，保留有效音频与手动声源选择；计划保持挂起' : '只重跑本步，不继续剩余计划（计划保留挂起）'"
+                      @click="run(false)">{{ key === 'tts' ? '仅补齐配音' : '仅重试本步' }}</n-button>
           </template>
-          <n-button v-else-if="key === 'assemble'" type="primary" @click="chooseOutputs">选择成品方案</n-button>
-          <n-button v-else-if="actionMode === 'fill-voice'" type="primary" :loading="busy"
-                    :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
-                    @click="run(false)">补齐全项目配音</n-button>
+          <template v-else-if="key === 'tts'">
+            <n-button v-if="actionMode !== 'fresh-done'" type="primary" :loading="busy"
+                      :disabled="nav.archived || nav.busy || !canRun || dirMissing"
+                      title="补齐待配音的句子，保留已生成的有效音频；手动选用原声或空位的句子保持当前声源。"
+                      @click="run(false)">补齐未完成配音</n-button>
+            <n-button secondary :disabled="nav.archived || nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy || !dubbingPanel?.canRegenerateAll"
+                      title="使用已保存参数生成全部句子；默认覆盖当前槽，需要对比不同声音时可选择新槽。"
+                      @click="rerunDialog()">生成全部配音…</n-button>
+          </template>
           <n-button v-else-if="actionMode === 'fresh-done'" secondary
-                    :loading="busy" :disabled="nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
-                    :title="key === 'tts'
-                      ? '重做全项目中选用配音的句子，与下方勾选无关；执行前再次确认'
+                    :loading="busy" :disabled="nav.archived || nav.busy || dirMissing || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy"
+                    :title="key === 'split' && ['failed', 'interrupted'].includes(String(step.status || ''))
+                        ? '失败恢复会复用已通过校验的分块；未命中的分块重新请求模型'
                       : '忽略缓存并重新生成本步产物'"
-                    @click="rerunDialog()">{{ key === 'tts' ? '重做全项目配音…' : '重做本步产物…' }}</n-button>
+                    @click="rerunDialog()">重做本步产物…</n-button>
           <n-button v-else type="primary" :loading="busy"
-                    :disabled="nav.busy || !canRun || dirMissing"
+                    :disabled="nav.archived || nav.busy || !canRun || dirMissing"
                     @click="run(false)">
-            {{ key === 'tts' ? '生成全项目配音' : ['done', 'stale', 'failed', 'interrupted'].includes(step.status) ? '重新运行本步' : '运行本步' }}
+            {{ ['done', 'stale', 'failed', 'interrupted'].includes(step.status) ? '重新运行本步' : '运行本步' }}
           </n-button>
-        </n-space>
+          <n-dropdown v-if="!running && actionMode !== 'checking'" :options="localRunOptions" trigger="click" @select="localRunAction"><n-button :disabled="nav.archived || nav.busy || dirMissing || busy || dubbingBusy || dubbingDirty || parametersDirty || reviewDirty || reviewBusy || assemblyPending">更多运行操作</n-button></n-dropdown>
+        </div>
         </template>
       </StepHeader>
+      <WorkflowStageNavigation :uid="uid" :stage="key" />
+      <WorkflowPanel ref="projectExecution" :uid="uid" headless @started="nav.poll()" />
       <n-alert v-if="WORKFLOW_BUSY.includes(nav.workflow?.run?.status)" type="info" :show-icon="false" style="margin-bottom:14px">
         自动流程正在执行：{{ nav.workflow.run.phase }}。单步重跑暂不可用；停止完整流程请回总览。
         <template #action><n-button size="small" @click="router.push(`/projects/${uid}#automatic-workflow`)">查看完整流程</n-button></template>
       </n-alert>
       <n-alert v-if="parametersDirty" type="warning" :show-icon="false" style="margin-bottom: 14px">
-        参数尚未保存，运行入口已暂停。请在「步骤参数」保存后再生成；不会自动用旧参数运行。
-        <template #action><n-button size="small" @click="detailSection = 'parameters'">查看未保存参数</n-button></template>
+        <template v-if="translationBusy">翻译背景资料正在读取或保存，运行入口暂时暂停，请稍候。</template>
+        <template v-else>步骤参数{{ key === 'translate' ? '或背景资料' : '' }}尚未保存，运行入口已暂停。请在「步骤参数」保存修改后再生成；不会自动用旧设置运行。</template>
+        <template #action><n-button size="small" @click="detailSection = 'parameters'">{{ translationDirty || translationBusy ? '查看背景资料' : '查看未保存参数' }}</n-button></template>
       </n-alert>
       <n-text v-if="key === 'tts' && route.query.panel !== 'subtitles'" depth="3" style="display:block;margin-bottom:14px;font-size:12px">
-        顶部操作作用于全项目；只处理部分句子，请使用下方「生成勾选句配音」。字幕显示模式只影响试听，不决定是否烧录成片。
+        <template v-if="actionMode === 'deps'">请先同步上游内容，再保存配音参数并重新生成。</template>
+        <template v-else-if="actionMode === 'chain-hold'">自动计划已挂起，可先检查恢复方案。</template>
+        <template v-else>保存配音参数后，点击「生成全部配音」选择目标槽；默认覆盖当前槽，需要对比不同声音时可主动选择新槽。</template>
+        仅更新部分句子可在下方勾选生成。字幕显示模式只影响试听。
       </n-text>
-      <n-tag v-if="running && step.pausing && !step.cancelling && !cancelPending" size="small" type="warning"
-             :bordered="false" style="margin-left: 10px">
-        {{ paused ? '已暂停 · 等待继续' : '正在暂停 · 当前处理完成后暂停' }}
-      </n-tag>
-      <div v-if="running && !step.progress_indeterminate" class="step-progress" style="margin-top: 12px">
-        <n-progress type="line" :percentage="smoothProgress" :show-indicator="false"
-                    :height="14" :processing="!paused" />
-        <span class="step-progress-value">{{ step.progress_estimated ? '预计 ' : '' }}{{ formatProgress(smoothProgress) }}</span>
-        <span v-if="formatEta(step?.eta_seconds, step?.eta_scope)" class="step-progress-eta">{{
-          formatEta(step?.eta_seconds, step?.eta_scope) }}</span>
+      <div v-if="key !== 'tts' || route.query.panel !== 'subtitles' || running" class="step-runtime">
+        <ExecutionProgress :execution="execution" :percentage="running ? step.progress : null" :progress-label="key==='assemble'?'合成步骤':undefined" :estimated="step.progress_estimated" :indeterminate="step.progress_indeterminate" :eta="running ? formatEta(executionEtaSeconds(step),step.eta_scope) : ''" :activity="running ? nav.activityFor(key) : null" :compact="key==='assemble'" />
+        <n-text v-if="key === 'tts' && dubbingTaskSummary && (running || (route.query.panel !== 'subtitles' && dubbingTaskSummary.selected))" depth="3" class="runtime-meta">
+          <template v-if="dubbingTaskSummary?.rangePending">配音范围待准备<span v-if="dubbingTaskSummary.documentLines"> · 已有文稿 {{ dubbingTaskSummary.documentLines }} 句</span><span v-else> · 正在核对文稿内容</span>；取得执行资源后核定实际生成与复用范围。</template><template v-else>本次{{ dubbingTaskSummary?.selected ? '所选' : '配音' }} {{ dubbingTaskSummary?.total }} 句<span v-if="!running && dubbingTaskSummary?.completed !== null"> · 已完成 {{ dubbingTaskSummary?.completed }} 句</span><span v-if="dubbingTaskSummary?.failed"> · 失败 {{ dubbingTaskSummary.failed }} 句</span></template><span v-if="running"> · {{ step.status==='queued' ? '排队后自动继续，可切换页面查看' : '后台执行，刷新或切换页面可继续查看' }}</span>
+        </n-text>
       </div>
-
-      <n-text v-if="key === 'tts' && step.synthesis_task && (running || (route.query.panel !== 'subtitles' && step.synthesis_task.scope === 'selected'))" depth="3" style="display:block;margin-top:8px;font-size:12px">
-        本次{{ step.synthesis_task.scope === 'selected' ? '所选' : '配音' }} {{ step.synthesis_task.total }} 句 · 已完成 {{ step.synthesis_task.completed }} 句<span v-if="step.synthesis_task.failed"> · 失败 {{ step.synthesis_task.failed }} 句</span><span v-if="running"> · 后台执行，刷新或切换页面可继续查看</span>
-      </n-text>
-
-      <div v-if="running && step.progress_phase" style="display:flex;align-items:center;gap:8px;margin-top:8px">
-        <n-spin v-if="step.progress_indeterminate && !paused" :size="14" />
-        <n-text depth="3" style="font-size:12px">{{ formatProgressDetail(step) }}</n-text>
-      </div>
-
-      <ProgressActivity v-if="running" :activity="nav.activityFor(key)" />
 
       <!-- 幽灵项目门禁: 目录缺失时明确禁用并说明 -->
       <n-alert v-if="dirMissing" type="error" style="margin-top: 14px"
@@ -1680,28 +1596,49 @@ onUnmounted(() => {
         <n-text depth="3" style="font-size: 12px">
           请查看步骤日志中的具体原因与文件保留、清理记录。
         </n-text>
+        <n-text v-if="step.error.code === 'LLM_OUTPUT_BUDGET'"
+                depth="3" style="display:block;font-size:12px;margin-top:6px">
+          这是响应正文超过本步骤安全上限触发的停止；本次候选不会写入，系统不会重复发送相同配置的请求。
+          模型思考内容不按字符数截断，仍由请求总时限兜底。
+        </n-text>
+        <n-text v-if="step.error.code === 'TTS_REQUEST_TIMEOUT' && step.error.detail"
+                depth="3" style="display:block;font-size:12px;margin-top:6px">
+          本地等待阶段：{{ step.error.detail.phase || '服务端请求' }}；
+          已等待 {{ Number(step.error.detail.elapsed_seconds || 0).toFixed(1) }} 秒
+          <span v-if="typeof step.error.detail.last_progress === 'number'">
+            · 最后已知进度 {{ Math.round(step.error.detail.last_progress * 100) }}%
+          </span>。服务端可能仍在收尾，重试前请等待配音服务恢复空闲。
+        </n-text>
+        <div v-if="key==='assemble' && commentFailure(step.error)" class="comment-recovery-links"><RouterLink :to="commentWorkspaceLink(uid)">核对评论与上屏方案 →</RouterLink><RouterLink :to="commentWorkspaceLink(uid,true)">查看评论 AI 日志 →</RouterLink></div>
       </n-alert>
 
-      <ContentReviewPanel v-if="key === 'tts' || key === 'assemble'" :key="uid" :uid="uid"
-                          :disabled="dirMissing || nav.busy || dubbingBusy"
+      <details v-if="key==='assemble'" class="assembly-review-context" :open="assemblyReviewExpanded || reviewDirty || reviewBusy" @toggle="assemblyReviewExpanded=($event.target as HTMLDetailsElement).open">
+        <summary><strong>内容审查与屏蔽</strong><span>{{ reviewDirty?'有未保存调整':reviewBusy?'正在处理…':'规则与人工屏蔽，作用于所有成片版本' }}</span></summary>
+        <ContentReviewPanel :key="uid" :uid="uid" :disabled="nav.archived || dirMissing" @dirty-change="reviewDirty=$event" @busy-change="reviewBusy=$event" @saved="refreshInBackground(()=>nav.poll())" />
+      </details>
+      <ContentReviewPanel v-else-if="key === 'tts'" :key="uid" :uid="uid"
+                          :disabled="nav.archived || dirMissing"
                           @dirty-change="reviewDirty = $event" @busy-change="reviewBusy = $event"
                           @saved="refreshInBackground(() => nav.poll())" />
 
       <!-- 产出预览: 有对应产物时直接展示 -->
       <div ref="previewRoot">
-      <DubbingPanel v-if="key === 'tts'" :key="uid" :uid="uid" :suspended="previewSuspended || mediaRebuilding"
-                    @busy-change="dubbingBusy = $event" @dirty-change="dubbingDirty = $event" />
+      <DubbingPanel v-if="key === 'tts'" ref="dubbingPanel" :key="uid" :uid="uid" :suspended="previewSuspended || mediaRebuilding"
+                    @busy-change="dubbingBusy = $event" @dirty-change="dubbingDirty = $event" @content-loaded="dubbingContentLoaded" />
       <section v-if="key === 'assemble'" ref="outputsArea" tabindex="-1" aria-label="正式成品方案">
-      <AssemblyVersionWorkspace :key="uid" :uid="uid" :disabled="nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy" />
-      <AssembleOutputsPanel :uid="uid" history-only
+      <AssemblyVersionWorkspace ref="assemblyWorkspace" :key="uid" :uid="uid" :partial-request="route.query.partial_request" :refresh-token="assemblySettingsRefresh" :disabled="nav.archived || step.status === 'checking' || dirMissing || parametersDirty || reviewDirty || reviewBusy"
+                                @dirty-change="assemblyDirty = $event" @busy-change="assemblyBusy = $event"
+                                @saved="assemblySettingsSaved" />
+      <AssemblyDeliveryPanel :uid="uid"
                             :artifacts="step.artifacts ?? []"
                             :source-path="assembleSourcePath"
                             :subtitle-path="assembleSubtitlePath"
                             :subtitle-name="assembleSubtitleName"
-                            :disabled="nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy" @choice-change="assemblyChoice = $event"
+                            :disabled="nav.archived || nav.busy || dirMissing || parametersDirty || reviewDirty || reviewBusy || assemblyPending"
+                            :preview="preview" :options="assembleOutputOptions" v-model:selected="selectedAssembleOutput" :chapters="outputPreviewChapters" :suspended="previewSuspended || mediaRebuilding"
                             @recycle-active="value => { if (value) releaseMediaIn(previewRoot); previewSuspended = value }" />
       </section>
-      <n-card v-if="key !== 'tts' && preview && !previewSuspended && !mediaRebuilding" size="small" title="产出预览" style="margin-top: 14px">
+      <n-card v-if="!['tts','assemble'].includes(key) && preview && !previewSuspended && !mediaRebuilding" size="small" title="产出预览" style="margin-top: 14px">
         <n-select v-if="key === 'subtitles'" v-model:value="subtitleTrack" :options="subtitleOptions"
                   style="max-width:300px; margin-bottom:12px" />
         <n-select v-if="key === 'assemble'" v-model:value="selectedAssembleOutput"
@@ -1715,7 +1652,7 @@ onUnmounted(() => {
           {{ (step.artifacts ?? []).find((a: any) => a.name === subtitleArtifactName)?.path }}
         </button>
         <template v-if="subtitleVideo">
-          <VideoPreview :key="subtitleVideo" class="vid" :src="subtitleVideo">
+          <VideoPreview :key="subtitleVideo" class="vid" :src="subtitleVideo" :chapters="downloadChapters">
             <track v-if="subtitlePreviewUrl" :key="subtitlePreviewUrl"
                    kind="subtitles" label="当前步骤字幕"
                    srclang="und" :src="subtitlePreviewUrl" @load="onSubtitleLoaded" default />
@@ -1724,7 +1661,7 @@ onUnmounted(() => {
             语音转文字、语义整理、翻译和字幕导出页面会叠加当前步骤生成的字幕；可拖动进度检查文字与时间轴是否同步。
             <template v-if="key === 'transcribe' && transcribePreviewMode === 'word'">当前为词级预览：视频字幕和下方时间轴均来自 words.json，按词级时间戳逐个显示；正式的 src.srt 短语产物仍保留在产物清单中。</template>
             <template v-else-if="key === 'transcribe'">当前为短语级预览：视频字幕和下方文本使用识别后的短语锚点；词级时间轴仍保存在 words.json 中。</template>
-            <template v-else-if="key === 'translate'">当前为译文预览：视频字幕和下方文本均来自 translate.txt 的编号译文；翻译重跑后会自动刷新。</template>
+            <template v-else-if="key === 'translate'">视频字幕与下方文本使用同一份译文预览；整轮成功后才更新完整译文。</template>
             <template v-if="running">步骤运行中会自动检查新产物并刷新字幕（约每 1.5 秒一次）。</template>
           </n-text>
           <n-alert v-if="subtitlePreviewError" type="warning" :show-icon="false"
@@ -1733,7 +1670,8 @@ onUnmounted(() => {
         <template v-if="key === 'download' && media.found">
           <div class="prev-row">
             <div class="vid-col">
-              <VideoPreview v-if="preview.url" :key="preview.version || preview.url" class="vid" :src="preview.url" />
+              <VideoPreview v-if="preview.url" :key="preview.version || preview.url" class="vid" :src="preview.url"
+                            :chapters="downloadChapters" :duration="downloadDuration" :frame-rate="media.fps" />
             </div>
             <div class="info">
               <MediaInfo :media="media" />
@@ -1741,16 +1679,21 @@ onUnmounted(() => {
           </div>
         </template>
         <AudioTracksPlayer v-else-if="preview.kind === 'tracks'"
-                           :tracks="preview.audios" :video-url="preview.videoUrl" />
+                           :tracks="preview.audios" :video-url="preview.videoUrl" :chapters="downloadChapters" />
         <VideoPreview v-else-if="preview.kind === 'video' && preview.url" :key="preview.version || preview.url" class="vid"
-                      :src="preview.url" />
+                      :src="preview.url" :chapters="outputPreviewChapters" :frame-rate="media.fps" />
         <template v-if="preview.kind === 'audio'">
           <div v-for="a in preview.audios ?? []" :key="`${a.name}:${a.version || ''}`" class="audio-row">
             <n-text depth="3" style="font-size: 12px; width: 76px">{{ a.label }}</n-text>
             <audio v-release-media :src="a.url" controls style="width: 100%; height: 36px" />
           </div>
         </template>
-        <pre v-if="preview.kind === 'text'" class="textprev">{{ previewText || '(空)' }}</pre>
+        <n-alert v-if="key === 'translate' && (running || translationPreviewState === 'partial')" type="info" :show-icon="false" style="margin-top:12px" role="status">
+          <template v-if="translationPreviewState === 'partial'">本次部分译文 · 已完成 {{ translationPreviewCount }} 句。尚未替换完整产物。</template>
+          <template v-else-if="translationPreviewState === 'waiting'">正在生成本次译文；完成首个窗口后在这里显示。</template>
+          <template v-else>当前显示上次完整译文，本次结果将在完成窗口后刷新。</template>
+        </n-alert>
+        <pre v-if="preview.kind === 'text'" class="textprev">{{ previewText || (translationPreviewState === 'waiting' ? '等待首个翻译窗口…' : '(空)') }}</pre>
         <n-text v-if="preview.kind === 'text' && previewText.length >= 6000"
                 depth="3" style="font-size: 11px">
           (内容较长, 仅显示前 6000 字符; 完整文件见项目目录)
@@ -1758,19 +1701,20 @@ onUnmounted(() => {
 
       </n-card>
       <VideoInfoPanel v-if="key === 'download'" :key="uid" :uid="uid" :available="!!videoInfoArtifact"
-                      :version="videoInfoVersion" :automation="nav.commentsProgress" @show-diagnostics="showLlmDiagnostics" />
+                      mode="video"
+                      :version="videoInfoVersion" :automation="nav.commentsProgress"
+                      @info-change="downloadInfo = $event" />
 
       </div>
       <nav v-show="key !== 'tts' || route.query.panel !== 'subtitles'" class="section-nav step-detail-nav" aria-label="步骤详情分类">
         <button v-if="cfgRows.length && key !== 'tts'" :aria-pressed="detailSection === 'parameters'" @click="detailSection = 'parameters'">{{ key === 'assemble' ? '项目默认参数' : '步骤参数' }}</button>
         <button :aria-pressed="detailSection === 'logs'" @click="detailSection = 'logs'">运行日志<span v-if="running" class="live-dot" /></button>
-        <button v-if="llmStep || key === 'download'" :aria-pressed="detailSection === 'llm'" @click="detailSection = 'llm'">LLM 对话<span v-if="llmStep && running || key === 'download' && nav.commentsProgress?.state === 'running'" class="live-dot" /></button>
+        <button v-if="llmStep" :aria-pressed="detailSection === 'llm'" @click="detailSection = 'llm'">LLM 对话<span v-if="running" class="live-dot" /></button>
         <button :aria-pressed="detailSection === 'files'" @click="detailSection = 'files'">输入与产物 · {{ step.artifacts?.length || 0 }}</button>
       </nav>
       <div v-show="key !== 'tts' || route.query.panel !== 'subtitles'" class="step-detail-content">
         <!-- 日志 -->
         <div v-show="detailSection === 'llm'" id="llm-conversation" ref="llmSection">
-          <CommentDiagnostics v-if="key === 'download' && detailSection === 'llm'" :uid="uid"/>
           <n-empty v-if="llmStep && !running && !llmMessages.length" description="暂无对话记录；运行后可查看模型输入、输出和纠错过程。"/>
           <!-- LLM 实时对话: 产出预览之后展示当前请求详情 -->
       <n-card v-if="llmStep && (running || llmMessages.length)" size="small"
@@ -1781,12 +1725,12 @@ onUnmounted(() => {
         </template>
         <n-alert v-if="key === 'split' && step?.cfg?.split?.use_llm !== false"
                  type="info" :show-icon="false" style="margin-bottom: 10px">
-          已启用<strong>全文语义整理</strong>：一次提供整段原文、时间轴和真实长静音，保留完整上下文。
-          思考参数的实际生效值见下方设置预览；程序校正词级时间并保留静音空档，质量问题最多定向重试一次。
+          已启用<strong>全文语义整理</strong>：{{ splitSemanticDescription }} 保留真实长静音和相邻上下文。
+          思考参数的实际生效值见下方设置预览；程序校正词级时间并保留静音空档。
         </n-alert>
         <n-alert v-if="key === 'translate'" type="info" :show-icon="false" style="margin-bottom: 10px">
-          当前优先<strong>全文一次翻译</strong>：保留完整上下文，逐句沿用整理稿的编号、数量和时间。
-          全文超过模型上下文预算时才分窗口，保留边界参考与术语交接；格式或缺行问题按范围恢复。
+          当前优先<strong>完整窗口翻译</strong>：每个窗口保留连续上下文，逐句沿用整理稿的编号、数量和时间。
+          超过模型上下文预算或单窗口字幕行数安全上限时自动分窗（默认最多 100 行，可在步骤参数中设为 0 关闭行数上限），保留边界参考与术语交接；格式或缺行问题按范围恢复。
           思考参数的实际生效值见下方设置预览，下方视频会叠加当前翻译产物。
         </n-alert>
         <n-alert v-if="running && !llmMessages.length" type="info" :show-icon="false" style="margin-bottom: 10px">
@@ -1803,10 +1747,8 @@ onUnmounted(() => {
       （线性时间线<template v-if="llmRetryCount"> · {{ llmRetryCount }} 个逻辑请求发生自动修复</template>）
     </n-text>
   </div>
-  <div class="llm-history llm-conversation-history">
-    <div v-for="row in llmMessages" :key="row.id"
-         :class="['llm-message', `llm-message-${row.role}`, row.kind ? `llm-message-validation-${row.kind}` : '']">
-      <div class="llm-message-head">
+  <LlmConversationPanel :rows="llmMessages" :heading="false">
+    <template #header="{row}">
         <n-tag size="tiny" :type="llmRoleTagType(row)" :bordered="false">{{ llmRoleLabel(row) }}</n-tag>
         <n-text depth="3" style="font-size: 11px">
           <template v-if="row.ts"> {{ formatLlmTime(row.ts) }}</template>
@@ -1818,8 +1760,8 @@ onUnmounted(() => {
           <template v-if="row.outputChars"> · 输出 {{ row.outputChars.toLocaleString() }} 字符</template>
           <template v-if="row.elapsedMs != null"> · 耗时 {{ (row.elapsedMs / 1000).toFixed(1) }}s</template>
         </n-text>
-      </div>
-      <details v-if="row.role === 'reasoning'" class="llm-reasoning">
+    </template>
+    <template #content="{row}">      <details v-if="row.role === 'reasoning'" class="llm-reasoning">
         <summary>展开模型思考（{{ row.content.length.toLocaleString() }} 字符）</summary>
         <pre class="llm-message-content" :ref="(el) => setLlmOutputEl(row.id, el)"
              @scroll="onLlmOutputScroll(row.id, $event)"
@@ -1829,8 +1771,8 @@ onUnmounted(() => {
            :ref="row.role === 'assistant' ? (el) => setLlmOutputEl(row.id, el) : undefined"
            @scroll="row.role === 'assistant' ? onLlmOutputScroll(row.id, $event) : undefined"
            v-text="row.role === 'assistant' ? (displayLlmContent(row) || '（等待内容）') : (row.content || '（等待内容）')"></pre>
-    </div>
-  </div>
+    </template>
+  </LlmConversationPanel>
   <n-text depth="3" style="display:block; margin-top:6px; font-size:11px">
     重试请求中重复携带的 system / 历史 user / assistant 消息只显示第一次出现；完整原始请求仍保存于项目 logs/{{ key }}.llm.jsonl。
   </n-text>
@@ -1849,12 +1791,12 @@ onUnmounted(() => {
         <!-- 本步骤参数: 项目级覆盖 ?? 全局默认; 标识偏离项, 可单键/整体恢复 -->
         <div v-if="cfgRows.length && key !== 'tts'" v-show="detailSection === 'parameters'">
           <n-card size="small" :title="key === 'assemble' ? '项目默认 · 混音与输出' : '本步骤参数'">
-            <n-text v-if="key === 'assemble'" depth="3" style="display:block;margin-bottom:14px;font-size:12px">仅影响选择“跟随项目默认”的版本；本版本覆盖值保持不变。</n-text>
-            <ProjectParameterForm :uid="uid" :step-key="key" :disabled="nav.busy"
+            <div v-if="key === 'assemble'" class="project-defaults-guide"><n-text depth="3">这里的基础值保留创建或上次应用时的设置。单项恢复不会读取最新全局或模板；修改只影响跟随项目默认的版本。</n-text><n-button size="small" :disabled="nav.archived || dirMissing || parametersDirty || assemblyPending || reviewDirty || reviewBusy" @click="assemblyWorkspace?.openDefaults()">查看并应用最新合成设置</n-button></div>
+            <ProjectParameterForm :uid="uid" :step-key="key" :refresh-token="projectParametersRefresh" :disabled="nav.archived"
                                   :exclude-paths="key === 'assemble' ? [...SUBTITLE_STYLE_PATHS, 'assemble.burn_subtitles'] : undefined"
                                   @draft-change="draft = $event" @fields-change="editablePaths = $event"
-                                  @dirty-change="parametersDirty = $event"
-                                  @saved="nav.poll()" />
+                                  @dirty-change="stepParametersDirty = $event"
+                                  @saved="stepParametersSaved" />
             <n-descriptions v-if="extraCfgRows.length" :column="1" label-placement="left"
                             size="small" bordered>
               <n-descriptions-item v-for="row in extraCfgRows" :key="row.k" :label="row.k">
@@ -1863,6 +1805,8 @@ onUnmounted(() => {
             </n-descriptions>
 
           </n-card>
+          <TranslationContextPanel v-if="key === 'translate'" :uid="uid" :disabled="nav.archived || dirMissing"
+            @dirty-change="translationDirty = $event" @busy-change="translationBusy = $event" @saved="nav.poll()" />
         </div>
         <!-- 文件清单: 上游文件 / 计划产物 / 实际产物, 每行可点击定位 -->
         <div v-show="detailSection === 'files'">
@@ -1900,6 +1844,10 @@ onUnmounted(() => {
               <FilePathLink class="flex-path" :path="a.path" />
               <n-tag v-if="a.exists === false" size="small" :bordered="false" type="warning">磁盘上缺失</n-tag>
               <n-text depth="3" style="font-size: 11.5px">{{ fmtSize(a.size) }}</n-text>
+              <n-text v-if="a.job_id || a.settings_snapshot_hash" depth="3" style="font-size: 10.5px"
+                      :title="a.settings_snapshot_hash ? `生成任务 #${a.job_id || '—'} · 配置快照 ${a.settings_snapshot_hash}` : `生成任务 #${a.job_id}`">
+                · 任务 #{{ a.job_id || '—' }} · 设置快照 {{ (a.settings_snapshot_hash || '').slice(0, 10) }}
+              </n-text>
               <a v-if="key === 'subtitles' && a.name.endsWith('.srt')"
                  :href="`/api/projects/${uid}/steps/${key}/artifacts/${encodeURIComponent(a.name)}/raw`"
                  :download="a.name" style="font-size:12px">下载</a>
@@ -1927,6 +1875,10 @@ onUnmounted(() => {
 </template>
 
 <style scoped>
+.step-action-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px 12px; }
+.project-defaults-guide{display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px 18px;margin-bottom:18px;padding-bottom:16px;border-bottom:1px solid var(--df-border)}
+.project-defaults-guide .n-text{flex:1;min-width:min(100%,300px);font-size:12px;line-height:1.7}
+.comment-recovery-links { display:flex; gap:16px; flex-wrap:wrap; margin-top:10px; font-size:12px; }
 .header-badges{display:inline-flex;align-items:center;flex-wrap:wrap;gap:8px}.dependency-context{margin:14px 0;border:1px solid var(--df-border);border-radius:8px;padding:10px 14px;background:var(--df-panel)}.dependency-context>summary{cursor:pointer;color:var(--df-text);font-size:12px;line-height:1.8}.dependency-context>summary::marker{color:var(--df-muted)}.dependency-context>summary small{font-size:11px;color:var(--df-muted);margin-left:14px}.dependency-context :deep(.dependency-notice){margin-top:10px}
 .step-detail-nav { margin-top: 24px; margin-bottom: 16px; }
 .step-detail-content { min-width: 0; }
@@ -1980,14 +1932,10 @@ onUnmounted(() => {
 .plabel { display: inline-flex; align-items: center; gap: 4px; }
 .gtag { opacity: 0.55; }
 .audio-row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
-.step-progress { position: relative; }
-.step-progress-eta { margin-left: 8px; font-size: 12px; opacity: 0.65; }
-.step-progress :deep(.n-progress) { display: block; width: 100%; }
-.step-progress-value {
-  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
-  z-index: 1; pointer-events: none; color: #fff; font-size: 11px;
-  line-height: 14px; font-variant-numeric: tabular-nums; text-shadow: 0 1px 2px #000;
-}
+.step-runtime { display: grid; gap: 10px; min-width: 0; }
+.step-runtime > :deep(.progress-activity) { margin-top: 0; }
+.runtime-pause { justify-self: start; }
+.runtime-meta { display: block; font-size: 12px; line-height: 1.7; overflow-wrap: anywhere; }
 .param-label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .help-dot { min-width: 18px; width: 18px; height: 18px; padding: 0; font-size: 11px; }
 .textprev {
@@ -2049,4 +1997,5 @@ onUnmounted(() => {
   :deep(.n-form-item-label) { width: 100% !important; padding-bottom: 4px; }
   :deep(.n-form-item-blank) { width: 100%; }
 }
+.assembly-review-context{margin:14px 0;border-bottom:1px solid var(--df-border);padding:0 0 14px}.assembly-review-context>summary{display:flex;align-items:center;gap:14px;cursor:pointer;list-style:none;font-size:12px;min-height:28px}.assembly-review-context>summary::before{content:'›';color:var(--df-muted);font-size:18px}.assembly-review-context[open]>summary::before{transform:rotate(90deg)}.assembly-review-context>summary>span{color:var(--df-muted);font-size:11px}.assembly-review-context>summary:focus-visible{outline:2px solid var(--df-accent);outline-offset:4px}.assembly-review-context :deep(.n-card){margin-top:12px}@media(max-width:600px){.assembly-review-context>summary{align-items:flex-start;flex-wrap:wrap;gap:6px}.assembly-review-context>summary>span{flex-basis:100%;padding-left:14px}}
 </style>

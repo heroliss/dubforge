@@ -17,11 +17,13 @@ import math
 import re
 import tempfile
 import threading
+import time
 from pathlib import Path
 
 from dubforge.video_info import SOURCE_META_FIELDS, _build_video_info, _read_json
 from dubforge.errors import DubForgeError
 from dubforge.progress import RateProgress, _bind
+from dubforge.execution_progress import report_stage
 from dubforge.pipeline.video_source import find_final_video, resolve_source
 from dubforge.utils.fs import atomic_replace
 from dubforge.utils.srt import SubLine, write_srt
@@ -29,6 +31,86 @@ from dubforge.utils.srt import SubLine, write_srt
 
 # 下载完成后让 yt-dlp 直接回传来源元数据；用 JSON 标量可安全保留多行描述
 _SOURCE_META_FIELDS = SOURCE_META_FIELDS
+
+# 只回传展示和进度需要的字段，不能把媒体直链、签名或请求头带入运行记录。
+_STREAM_META_FIELDS = (
+    "format_id", "filesize", "filesize_approx", "width", "height", "fps",
+    "vcodec", "acodec", "abr", "ext", "format_note",
+)
+_STREAM_PROJECTION = "{" + ",".join(_STREAM_META_FIELDS) + "}"
+
+
+def _positive_number(value, maximum: float | None = None) -> float | None:
+    if isinstance(value, bool):
+        return None
+    try:
+        value = float(value)
+    except (ValueError, TypeError, OverflowError):
+        return None
+    return value if math.isfinite(value) and value > 0 and (maximum is None or value <= maximum) else None
+
+
+def _codec_name(value) -> str | None:
+    """编解码器名称来自实际媒体资料，格式编号不参与猜测。"""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]{0,47}", value):
+        return None
+    base = value.lower().split(".", 1)[0]
+    if base in {"none", "unknown", "null", "na", "n/a"}:
+        return None
+    names = {
+        "av01": "AV1", "av1": "AV1", "vp09": "VP9", "vp9": "VP9", "vp8": "VP8",
+        "avc1": "H.264", "avc3": "H.264", "h264": "H.264", "hev1": "HEVC", "hvc1": "HEVC",
+        "hevc": "HEVC", "mp4a": "AAC", "aac": "AAC", "opus": "Opus", "vorbis": "Vorbis",
+        "mp3": "MP3", "flac": "FLAC", "alac": "ALAC",
+    }
+    return names.get(base, value)
+
+
+def _stream_description(info: dict) -> str | None:
+    """按实际流资料生成短说明；资料不足时保留编号兜底，避免误导。"""
+    video, audio = _codec_name(info.get("vcodec")), _codec_name(info.get("acodec"))
+    if not video and not audio:
+        return None
+    parts = []
+    if video:
+        width, height = (_positive_number(info.get(field), 32768) for field in ("width", "height"))
+        width = int(width) if width is not None and width.is_integer() else None
+        height = int(height) if height is not None and height.is_integer() else None
+        if width and height:
+            if width <= height:
+                # 竖屏和正方形保留实际宽高，不能把长边写成横屏清晰度。
+                parts.append(f"{width}×{height}")
+            else:
+                parts.append({(3840, 2160): "4K", (4096, 2160): "4K",
+                              (7680, 4320): "8K", (8192, 4320): "8K"}.get((width, height), f"{height}p"))
+        elif height:
+            # 缺少宽度时无法确认方向，不推断 4K 或横屏清晰度。
+            parts.append(f"高 {height} 像素")
+        fps = _positive_number(info.get("fps"), 1000)
+        if fps is not None:
+            parts.append(f"{fps:g} fps")
+    if video and audio:
+        parts.append(f"{video} + {audio} 音视频流")
+    elif video:
+        parts.append(f"{video} 视频流")
+    else:
+        parts.append(f"{audio} 音频流")
+    if audio:
+        abr = _positive_number(info.get("abr"), 10000)
+        if abr is not None:
+            parts.append(f"{abr:g} kbps")
+    return " · ".join(parts)
+
+
+def _stream_plan(payload: str) -> list[dict]:
+    """分离流计划为空时使用顶层单流资料，并兼容旧的单 JSON 协议。"""
+    selected, separator, fallback = payload.partition("\t")
+    plan = json.loads(selected)
+    if not plan and separator:
+        plan = json.loads(fallback)
+    rows = plan if isinstance(plan, list) else [plan]
+    return [{key: value for key, value in row.items() if key in _STREAM_META_FIELDS}
+            for row in rows if isinstance(row, dict) and row.get("format_id") is not None]
 
 
 def _ydl_format(resolution: int) -> str:
@@ -56,7 +138,10 @@ def _ytdlp_cmd(ctx, url: str, out_template: str) -> list[str]:
         "--socket-timeout", "30", "--retries", "5", "--fragment-retries", "5",
         "--retry-sleep", "http:exp=1:10", "--retry-sleep", "fragment:exp=1:10",
         "--continue", "--part", "--abort-on-unavailable-fragments",
-        "--print", "before_dl:DUBFORGE_PLAN:%(requested_formats.:.{format_id,filesize,filesize_approx},.{format_id,filesize,filesize_approx})j",
+        # requested_formats 缺失时投影会得到 []，yt-dlp 的逗号回退不会生效；
+        # 单独输出顶层白名单投影，供单流下载在解析时回退。
+        "--print", (f"before_dl:DUBFORGE_PLAN:%(requested_formats.:.{_STREAM_PROJECTION})j"
+                    f"\t%(.{_STREAM_PROJECTION})j"),
         "--progress-template", "download:DUBFORGE_BYTES:%(info.format_id)j\t%(progress.{status,downloaded_bytes,total_bytes,total_bytes_estimate})j",
         "--print", "after_move:%(filepath)s",
         "--print", "after_move:%(title)s",
@@ -127,11 +212,15 @@ def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
     cmd = _ytdlp_cmd(ctx, url, out_template)
     ctx.log("下载连接读取超时 30 秒；HTTP 与分片错误最多各重试 5 次，间隔 1–10 秒")
     last_pct = -1
-    totals, received = {}, {}
+    totals, received, stream_labels = {}, {}, {}
     tracker = None
     plan_ready = False
     progress_lock = threading.Lock()
     source_meta: dict = {}
+    # 速度从第一次结构化回调之后开始计算，故意排除 --continue 已存在的
+    # 断点字节；使用 StepContext 的活动时钟也让测试和暂停状态保持一致。
+    speed_started = None
+    speed_anchor = 0.0
 
     def on_meta(line: str) -> None:
         name, _, payload = line.partition(":")
@@ -155,16 +244,19 @@ def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
         if not line.startswith("DUBFORGE_PLAN:"):
             return
         try:
-            plan = json.loads(line.partition(":")[2])
+            plan = _stream_plan(line.partition(":")[2])
             with progress_lock:
-                for item in plan if isinstance(plan, list) else [plan]:
-                    totals[str(item["format_id"])] = float(item.get("filesize") or item.get("filesize_approx") or 0)
+                for item in plan:
+                    key = str(item["format_id"])
+                    totals[key] = (_positive_number(item.get("filesize"))
+                                   or _positive_number(item.get("filesize_approx")) or 0)
+                    stream_labels[key] = _stream_description(item)
                 plan_ready = True
         except (ValueError, TypeError, KeyError):
             pass
 
     def on_stderr(line: str) -> None:
-        nonlocal last_pct, tracker
+        nonlocal last_pct, tracker, speed_started, speed_anchor
         if line.startswith(("DUBFORGE_PLAN:", "DUBFORGE_META_")):
             on_stdout(line)
             return
@@ -190,6 +282,30 @@ def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
                     tracker = RateProgress(ctx, total, end=100, scope="phase")
                 tracker.total = total
                 tracker.update(done, cached=first)
+                now = (ctx.active_seconds() if callable(getattr(ctx, "active_seconds", None))
+                       else time.monotonic())
+                if speed_started is None:
+                    speed_started, speed_anchor = now, done
+                elapsed = max(0.0, now - speed_started)
+                downloaded = max(0.0, done - speed_anchor)
+                speed = downloaded / elapsed if elapsed >= 0.5 and downloaded > 0 else None
+                detail = {
+                    "phase": "downloading",
+                    "label": "下载视频与音频",
+                    "completed": int(done),
+                    "unit": "字节",
+                    "loaded": int(done),
+                    "total": int(total),
+                    "current_format": key,
+                    "current_stream": stream_labels.get(key),
+                }
+                if speed is not None and math.isfinite(speed):
+                    detail["speed_bps"] = round(speed, 1)
+                report_stage(ctx, 'downloading', '下载视频与音频', completed=int(done), total=int(total), unit='字节',
+                             loaded=int(done), current_format=key, current_stream=detail["current_stream"],
+                             loaded_bytes=int(done), total_bytes=int(total),
+                             **({'speed_bps': detail['speed_bps'], 'speed_bytes_per_second': detail['speed_bps']}
+                                if 'speed_bps' in detail else {}))
                 pct = done / total * 100
                 if int(pct) // 5 != last_pct:
                     ctx.log(f"下载中 {pct:.1f}%（音视频合计，按本次累计平均速度估算剩余时间）")
@@ -205,6 +321,7 @@ def _run_ytdlp(ctx, url: str, out_template: str) -> dict:
         error = _download_error(err or out or f"下载进程退出码 {rc}")
         ctx.log(f"下载错误详情:\n{error.detail}")
         raise error
+    report_stage(ctx, 'finalizing', '合并下载文件并核对输出')
     # 过滤结构化进度后，--print 留下文件路径和标题。
     lines = [ln.strip() for ln in out.splitlines() if ln.strip() and not ln.startswith("DUBFORGE_")]
     filepath = next((ln for ln in lines
@@ -225,6 +342,7 @@ def _validate_download(ctx, path: Path) -> None:
     if not path.is_file() or path.stat().st_size == 0:
         raise DownloadError("下载结果为空，未替换旧视频", code="DOWNLOAD_INVALID")
     ctx.check_cancel()
+    report_stage(ctx, 'validating_video', '校验下载视频的容器与时长')
     try:
         rc, out, err = ctx.run_subprocess([
             "ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
@@ -298,19 +416,30 @@ def _ensure_video_info(ctx, kind: str, title: str, source_url: str,
     path = ctx.artifact_dir() / "video_info.json"
     current = None if refresh else _read_json(path)
     if current is None:
+        report_stage(ctx, 'metadata', '整理视频资料与中文概要')
         current = _build_video_info(kind, title, source_url, ctx, raw_meta)
+        report_stage(ctx, 'saving_metadata', '保存视频资料')
         ctx.write_json("video_info.json", current)
         if current.get("summary_status") == "generated":
             ctx.log("✅ 已整理视频信息（中文标题与内容概要）")
         elif current.get("summary_status") == "local_no_metadata":
             ctx.log("已生成本地视频基础信息；转录后可再补充内容概要")
     else:
+        report_stage(ctx, 'reuse_metadata', '复用已有视频资料', reused=True)
         # 旧工程升级到新版本时，同名产物可能还在但尚未登记到当前运行记录。
         ctx.write_json("video_info.json", current)
+    from dubforge.project_titles import sync
+    try:
+        if sync(ctx.project, current):
+            ctx.log("已按视频资料更新自动项目名称")
+    except Exception:
+        # 名称是辅助信息，不能把已完成的视频获取误判失败。
+        ctx.log("自动项目名称暂未同步，可在改名中选择使用视频标题")
     return current
 
 
 def run(ctx) -> None:
+    report_stage(ctx, 'checking_source', '检查视频来源与已有文件')
     media = ctx.pdir / "media"
     media.mkdir(exist_ok=True)
     kind = ctx.project.source_kind
@@ -330,6 +459,7 @@ def run(ctx) -> None:
             existing = _find_downloaded(media)
 
     if existing:
+        report_stage(ctx, 'reuse_video', '复用已获取视频', reused=True)
         ctx.log(f"已存在视频: {existing.name}, 跳过获取")
         ctx.register_file("video.mp4", existing, "video")
         meta_path = media / "meta.json"
@@ -357,6 +487,7 @@ def run(ctx) -> None:
         return
 
     if kind == "local":
+        report_stage(ctx, 'local_source', '核对本地视频文件')
         src = resolve_source(ctx.project, ctx.pdir)
         if not src:
             raise DubForgeError(
@@ -374,6 +505,7 @@ def run(ctx) -> None:
         if not url:
             raise DubForgeError("项目没有填写视频链接", code="SOURCE_URL_EMPTY")
         ctx.log(f"开始下载: {_diagnostic_text(url)}")
+        report_stage(ctx, 'connecting', '连接视频平台并获取下载信息')
         dst, info = _download_video(ctx, url, media)
         title = info.get("title") or "未命名视频"
         raw_meta = info.get("source_meta") if isinstance(info.get("source_meta"), dict) else {}
@@ -384,6 +516,7 @@ def run(ctx) -> None:
         raise DubForgeError(f"未知来源类型: {kind}", code="SOURCE_KIND_UNKNOWN")
 
     ctx.report_progress(90)
+    report_stage(ctx, 'saving', '保存视频与产物索引')
     # 简单元数据产物 (标题供项目列表展示; duration 供后续步骤参考)
     meta = {"title": title, "file": dst.name, "size": dst.stat().st_size}
     meta_path = media / "meta.json"

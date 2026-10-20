@@ -2,14 +2,17 @@
 // 短片使用上方当前组合，与完整成品清单分开；原声试片不要求配音就绪。
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
 import {
-  NAlert, NButton, NCard, NInputNumber, NText, useMessage,
+  NAlert, NButton, NCard, NText, useMessage,
 } from 'naive-ui'
 import { useNavStore } from '../stores/nav'
-import { newestVideoFirst, vReleaseMedia, finalVideoKind } from '../utils/preview'
+import { createLatestRefresh, newestVideoFirst, vReleaseMedia, finalVideoKind } from '../utils/preview'
 import { choiceLabel, outputKey, outputChoice, OUTPUT_LABELS, type AssemblyChoice } from '../utils/actionScope'
 import DependencyNotice from './DependencyNotice.vue'
+import VideoControls from './VideoControls.vue'
 import { useCommentOverlay } from '../composables/useCommentOverlay'
 import { refreshInBackground } from '../utils/backgroundRefresh'
+import { formatTimecode } from '../utils/timecode'
+import TimecodeInput from './TimecodeInput.vue'
 
 const props = defineProps<{
   uid: string
@@ -21,29 +24,40 @@ const props = defineProps<{
 
 const nav = useNavStore()
 let disposed = false
-onBeforeUnmount(() => { disposed = true })
+onBeforeUnmount(() => { disposed = true; chapterReader.cancel() })
 const message = useMessage()
 const videoEl = ref<HTMLVideoElement | null>(null)
+const resultVideoEl = ref<HTMLVideoElement | null>(null)
+const sourceChapters = ref<any[]>([])
+const chapterReader = createLatestRefresh(async signal => {
+  const r = await fetch(`/api/projects/${props.uid}/steps/download/video-info`, { cache: 'no-store', signal })
+  if (!r.ok) throw new Error('读取视频章节失败')
+  const value = await r.json()
+  const rows = value?.info?.content?.chapters
+  return Array.isArray(rows) ? rows : []
+}, value => { sourceChapters.value = value }, () => { sourceChapters.value = [] })
 const duration = ref(0)
 const start = ref(0)
 const end = ref(0)
+const startInvalid = ref(false), endInvalid = ref(false)
 const submitting = ref(false)
 const { count: commentCount, revision: commentRevision, failed: commentsFailed } = useCommentOverlay(() => props.uid)
 const currentChoice = computed(() => props.choice || outputChoice('src'))
 const planBlockers = ref<any[]>([])
 watch(currentChoice, () => { planBlockers.value = [] }, { deep: true })
+watch(() => props.sourceUrl, (url, previous) => {
+  if (!url) { chapterReader.cancel(); sourceChapters.value = []; return }
+  if (url !== previous || !sourceChapters.value.length) void chapterReader.refresh(url !== previous)
+}, { immediate: true })
 const running = computed(() => ['running', 'queued'].includes(nav.stepMap.assemble?.status))
 const previewRunning = computed(() => running.value && nav.stepMap.assemble?.assembly_task?.scope === 'preview')
-const ready = computed(() => !!props.sourceUrl && duration.value > 0.2)
-const validRange = computed(() => ready.value && end.value - start.value >= 0.2)
-const canSubmit = computed(() => validRange.value && outputKey(currentChoice.value) !== 'src' && !props.disabled && !running.value
+const ready = computed(() => !!props.sourceUrl && duration.value >= 0.2)
+const validRange = computed(() => ready.value && end.value - start.value >= 0.2 - 1e-9)
+const canSubmit = computed(() => validRange.value && !startInvalid.value && !endInvalid.value && outputKey(currentChoice.value) !== 'src' && !props.disabled && !running.value
   && (!currentChoice.value.include_comments || (commentCount.value > 0 && !commentsFailed.value)))
 
 function fmt(seconds: unknown): string {
-  const n = Math.max(0, Number(seconds) || 0)
-  const minute = Math.floor(n / 60)
-  const second = n - minute * 60
-  return `${minute}:${second.toFixed(1).padStart(4, '0')}`
+  return formatTimecode(typeof seconds === 'number' ? seconds : null, 3)
 }
 function clamp(value: number): number {
   if (!Number.isFinite(value)) return start.value
@@ -52,7 +66,7 @@ function clamp(value: number): number {
 function onMeta(event: Event) {
   const video = event.target as HTMLVideoElement
   duration.value = Number.isFinite(video.duration) ? video.duration : 0
-  if (duration.value > 0.2 && end.value <= 0.2) {
+  if (duration.value >= 0.2 && end.value <= 0.2) {
     start.value = 0
     end.value = Math.min(10, duration.value)
   }
@@ -63,13 +77,13 @@ watch(() => props.sourceUrl, () => {
   end.value = 0
 })
 function setStart(value: number | null) {
-  if (!ready.value) return
-  start.value = clamp(Number(value))
+  if (!ready.value || value === null || !Number.isFinite(value)) return
+  start.value = Math.min(clamp(value), Math.max(0, duration.value - 0.2))
   end.value = Math.max(end.value, Math.min(duration.value, start.value + 0.2))
 }
 function setEnd(value: number | null) {
-  if (!ready.value) return
-  end.value = clamp(Number(value))
+  if (!ready.value || value === null || !Number.isFinite(value)) return
+  end.value = Math.max(0.2, clamp(value))
   start.value = Math.min(start.value, Math.max(0, end.value - 0.2))
 }
 function markStart() {
@@ -140,13 +154,19 @@ async function submit() {
       <div class="video-grid">
         <section class="video-column">
           <div class="video-title">源视频</div>
-          <video v-release-media ref="videoEl" class="preview-video" :key="sourceUrl"
-                 :src="sourceUrl" controls preload="metadata" @loadedmetadata="onMeta" />
+          <div class="video-shell">
+            <video v-release-media ref="videoEl" class="preview-video" :key="sourceUrl"
+                   :src="sourceUrl" preload="metadata" @loadedmetadata="onMeta" />
+            <VideoControls :media="videoEl" :chapters="sourceChapters" :duration="duration" />
+          </div>
         </section>
         <section class="video-column">
           <div class="video-title">上次试合成结果{{ resultLabel ? ' · ' + resultLabel : '' }}</div>
-          <video v-if="latestPreview" v-release-media class="preview-video"
-                 :key="latestPreview.name" :src="previewUrl(latestPreview)" controls preload="metadata" />
+          <div v-if="latestPreview" class="video-shell">
+            <video v-release-media ref="resultVideoEl" class="preview-video"
+                   :key="latestPreview.name" :src="previewUrl(latestPreview)" preload="metadata" />
+            <VideoControls :media="resultVideoEl" />
+          </div>
           <div v-else class="result-empty">
             {{ previewRunning ? '试片正在生成，完成后显示在这里' : '选择区域并生成试片后显示在这里' }}
           </div>
@@ -156,22 +176,16 @@ async function submit() {
       <div class="range-bar">
         <div class="endpoint">
           <span>起点</span>
-          <n-input-number size="small" :value="start" :min="0" :max="duration" :step="0.1"
-                          :disabled="!ready" :update-value-on-input="false"
-                          aria-label="试合成起点秒数" @update:value="setStart">
-            <template #suffix>秒</template>
-          </n-input-number>
-          <n-button size="small" circle quaternary :disabled="!ready" title="使用当前播放时间作为起点"
+          <TimecodeInput size="small" :value="start" :min="0" :max="Math.max(0,duration - 0.2)"
+                         :disabled="!ready || submitting" aria-label="试合成起点（时分秒）" @update:value="setStart" @invalid-change="startInvalid=$event" />
+          <n-button size="small" circle quaternary :disabled="!ready || submitting" title="使用当前播放时间作为起点"
                     aria-label="使用当前播放时间作为起点" @click="markStart">⏱</n-button>
         </div>
         <div class="endpoint">
           <span>终点</span>
-          <n-input-number size="small" :value="end" :min="0" :max="duration" :step="0.1"
-                          :disabled="!ready" :update-value-on-input="false"
-                          aria-label="试合成终点秒数" @update:value="setEnd">
-            <template #suffix>秒</template>
-          </n-input-number>
-          <n-button size="small" circle quaternary :disabled="!ready" title="使用当前播放时间作为终点"
+          <TimecodeInput size="small" :value="end" :min="0.2" :max="duration"
+                         :disabled="!ready || submitting" aria-label="试合成终点（时分秒）" @update:value="setEnd" @invalid-change="endInvalid=$event" />
+          <n-button size="small" circle quaternary :disabled="!ready || submitting" title="使用当前播放时间作为终点"
                     aria-label="使用当前播放时间作为终点" @click="markEnd">⏱</n-button>
         </div>
         <div class="actions">
@@ -184,7 +198,7 @@ async function submit() {
       </div>
 
       <n-text depth="3" class="hint">
-        播放源视频到目标位置后点 ⏱ 取当前时间；评论也按原视频时间轴出现。样式与混音使用已保存设置。
+        时间使用时:分:秒，可输入秒数或分:秒；播放源视频到目标位置后点 ⏱ 取当前时间。评论按原视频时间轴出现，样式与混音使用已保存设置。
       </n-text>
       <n-text v-if="previewArtifacts.length > 1" depth="3" class="history">
         共保留 {{ previewArtifacts.length }} 个试合成片段；生成正式成品不会替换这些片段。
@@ -196,6 +210,7 @@ async function submit() {
 <style scoped>
 .assemble-preview-panel { margin-top: 14px; }
 .video-grid { display: grid; grid-template-columns: 1fr; gap: 14px; }
+.video-shell { position: relative; min-width: 0; }
 .video-column { min-width: 0; }
 .video-title { font-size: 12px; font-weight: 600; margin-bottom: 6px; }
 .preview-video {
@@ -214,7 +229,7 @@ async function submit() {
 }
 .endpoint { display: flex; align-items: center; gap: 6px; }
 .endpoint > span { font-size: 12px; }
-.endpoint :deep(.n-input-number) { width: 126px; }
+.endpoint :deep(.timecode-input) { width: 154px; }
 .actions { display: flex; align-items: center; gap: 10px; margin-left: auto; }
 .hint, .history { display: block; margin-top: 10px; font-size: 12px; line-height: 1.6; }
 .history { font-size: 11.5px; opacity: .75; }

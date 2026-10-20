@@ -1,5 +1,6 @@
 """自动流程文案补齐回归；隔离配置与项目，模型、制作及发布通信均为替身。"""
 import copy
+import threading
 import uuid
 
 import pytest
@@ -9,7 +10,7 @@ from dubforge.backends import llm
 from dubforge.publishing import copywriting, service
 from test_configuration import bind, save
 from test_publishing import setup_publish, upload
-from test_workflows import configure, finish, flow, start
+from test_workflows import apply_source, configure, finish, flow, start
 
 
 MANUAL_COPY = dict(title='我保存的项目标题', description='我核对过的简介',
@@ -30,6 +31,27 @@ def _start_saved(uid):
     return preview, service.view(result['publication_id'])
 
 
+@pytest.mark.parametrize('enabled', [True, False])
+def test_workflow_preserves_confirmed_chapter_policy_and_source_candidates(flow, monkeypatch, enabled):
+    uid, spec, calls, _ = flow
+    spec['mode'] = 'draft'
+    configure(uid, spec)
+    save('project:' + uid, {'publish.chapters_enabled': enabled, 'publish.chapters_translate': False,
+                           'publish.chapters_permanent': False})
+    source = [{'title': 'Intro', 'start_time': 0., 'end_time': 30.},
+              {'title': 'Main', 'start_time': 30., 'end_time': 100.}]
+    original = service.candidates
+    monkeypatch.setattr(service, 'candidates', lambda target: {**original(target), 'chapters': copy.deepcopy(source)})
+    preview, pub = _start_saved(uid)
+    assert preview['recipe']['chapters_enabled'] is enabled
+    assert pub['draft']['chapter_options'] == {
+        'enabled': enabled, 'translate': False, 'permanent': False, 'instruction': '', 'items': source}
+    frozen = service.plan(pub['id'])['snapshot']
+    assert frozen['chapter_options'] == pub['draft']['chapter_options']
+    assert all(part['chapter_items'] == source for part in frozen['parts'])
+    assert not any(operation in {'upload', 'submit'} for operation, _ in calls)
+
+
 @pytest.mark.parametrize('scope', ['project', 'global', 'series'])
 def test_all_explicit_copy_skips_ai_and_reuses_saved_project_or_template(flow, monkeypatch, scope):
     uid, spec, calls, _ = flow
@@ -40,12 +62,15 @@ def test_all_explicit_copy_skips_ai_and_reuses_saved_project_or_template(flow, m
     save('project:' + uid, reset=['publish.' + field for field in copywriting.COPY_FIELDS])
     if scope == 'series':
         template = configuration.create_template('文案继承测试')
-        bind([uid], template)
         key = template['key']
     else:
         key = 'project:' + uid if scope == 'project' else 'global'
     # AI 候选应用后的保存也走同一组稀疏 publish.* 覆盖键。
     save(key, {'publish.' + field: value for field, value in MANUAL_COPY.items()})
+    if scope == 'series':
+        bind([uid], template)
+    elif scope == 'global':
+        apply_source(uid)
     monkeypatch.setattr(copywriting, 'generate', _reject_generation)
     preview, pub = _start_saved(uid)
     assert {field: preview['settings'][field] for field in MANUAL_COPY} == MANUAL_COPY
@@ -61,7 +86,7 @@ def test_partial_copy_only_fills_unconfigured_fields_and_keeps_explicit_empty(fl
     spec['overrides']['description'] = ''
     generated_calls = []
 
-    def generate(project, current, instruction):
+    def generate(project, current, instruction, **kwargs):
         generated_calls.append(copy.deepcopy(current))
         return {'values': dict(title='不应覆盖标题', description='不应覆盖空简介',
                                tags=['不应覆盖标签'], dynamic='自动补充动态')}
@@ -143,3 +168,29 @@ def test_project_copy_saved_for_next_workflow_does_not_change_existing_snapshot(
     assert service.view(frozen['id'])['snapshot'] == snapshot
     assert service.view(frozen['id'])['settings'] == snapshot['settings']
     assert not any(operation == 'submit' for operation, _ in calls)
+
+
+def test_stopping_workflow_interrupts_copy_generation_before_creating_a_draft(flow, monkeypatch):
+    uid, spec, calls, _ = flow
+    spec.update(ai_copy=True, mode='draft')
+    existing = [row['id'] for row in service.list_publications(uid)]
+    entered, release = threading.Event(), threading.Event()
+
+    def generate(project, current, instruction, *, cancel_check, progress=None, conversation_owner_id=''):
+        entered.set()
+        assert release.wait(5), '测试未发出停止信号'
+        cancel_check()
+        pytest.fail('停止后不能继续生成文案或创建稿件')
+
+    monkeypatch.setattr(copywriting, 'generate', generate)
+    row, _ = start(uid, spec)
+    try:
+        assert entered.wait(5), '流程未进入文案生成'
+        workflows.stop(row['id'])
+    finally:
+        release.set()
+    result = finish(row['id'])
+    assert result['status'] == 'paused', result
+    assert not result['publication_id']
+    assert [row['id'] for row in service.list_publications(uid)] == existing
+    assert not any(operation in {'upload', 'submit'} for operation, _ in calls)

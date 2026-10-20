@@ -29,6 +29,11 @@ test('摘要过滤媒体签名、代理凭据及冗长参考路径，但保留�
   assert.doesNotMatch(url.message, /secret|private/)
 })
 
+test('收尾也是实际执行阶段，不丢弃清理和释放资源动态', () => {
+  assert.match(latestJobActivity(['[12:03:00] [任务#8] 收尾清理: 已删除临时文件'],8)!.message,/收尾清理/)
+  assert.match(latestJobActivity(['[12:03:01] [任务#8] 🧹 释放模型资源'],8)!.message,/释放模型资源/)
+})
+
 test('暂停和排队优先于日志；没有详细事件时展示真实阶段，不编造进度', () => {
   const row = {status:'running',label:'配音',synthesis_task:{total:90,completed:20}}
   const log = {label:'最新动态',message:'第 20 句已完成'}
@@ -41,17 +46,43 @@ test('暂停和排队优先于日志；没有详细事件时展示真实阶段�
   assert.equal(stepActivity({...row,status:'done'}, log), null)
 })
 
-test('评论提示由本次冻结计划决定，明确配音后采集并区分完成和中断', () => {
+test('评论提示由本次冻结计划决定，明确优先复用、按需获取及中断后恢复范围', () => {
   const run = {id:'r',status:'running',cursor:1}
   const plan = {id:'r',steps:['download','tts','comments','assemble'],labels:{tts:'字幕与配音'},recipe:{comment_limit:200,comment_count:30}}
   const waiting = workflowComments(run, plan)!
   assert.equal(waiting.state,'upcoming'); assert.match(waiting.message,/字幕与配音完成后/)
   assert.match(waiting.message,/200.*30/)
-  assert.equal(workflowComments({...run,cursor:2},plan)!.state,'running')
+  assert.match(waiting.message,/优先复用已采集评论.*需要时最多获取/)
+  assert.match(waiting.message,/仅按需翻译候选/)
+  const running=workflowComments({...run,cursor:2},plan)!
+  assert.equal(running.state,'running');assert.match(running.message,/复用已有采集和有效评分.*按需翻译候选/)
   assert.equal(workflowComments({...run,cursor:3},plan)!.state,'done')
-  assert.equal(workflowComments({...run,cursor:2,status:'failed'},plan)!.state,'stopped')
+  const stopped=workflowComments({...run,cursor:2,status:'failed'},plan)!
+  assert.equal(stopped.state,'stopped');assert.match(stopped.message,/已完成结果保留.*复用有效结果.*仅补缺失或变化/)
+  assert.match(stopped.message,/采集范围扩大或来源变化时可能重新获取/)
   assert.equal(workflowComments(run,{...plan,id:'old'}),null)
   assert.equal(workflowComments(run,{...plan,steps:['download','assemble']})!.state,'none')
+})
+
+test('损坏或未读取的冻结范围不崩溃，也不能断言本次未安排评论',()=>{
+  const run={id:'r',status:'running',cursor:1}
+  for(const steps of [undefined,null,'comments',{0:'comments',length:1},['tts',null],['tts',{}],[' ']]) {
+    assert.equal(workflowComments(run,{id:'r',steps}),null)
+  }
+  assert.equal(workflowComments(run,{id:'r',steps:[]})?.state,'none','明确空范围仍与未知区分')
+})
+
+test('评论当前运行阶段直接显示后端真实动态与数量，不混入其他步骤旧阶段', () => {
+  const run={id:'r',status:'running',cursor:1},plan={id:'r',steps:['tts','comments','assemble']}
+  const phases=['评论采集：检查可复用资料，缺少或范围扩大时获取','评论评分：本次 200 条，复用有效评分',
+    '评论筛选：核对内容与各成片版本的显示要求','评论翻译：已选 3/30 条，本批 5 条候选','评论确认：保存 30 条上屏方案']
+  for(const phase of phases) assert.equal(workflowComments({...run,phase},plan)!.message,phase)
+  const oldPhase='正在生成配音 · 已完成 20 / 90 句'
+  assert.doesNotMatch(workflowComments({...run,phase:oldPhase},plan)!.message,/配音|20|90/)
+  assert.equal(workflowComments({...run,cursor:0,phase:phases[3]},plan)!.state,'upcoming')
+  assert.doesNotMatch(workflowComments({...run,cursor:0,phase:phases[3]},plan)!.message,/已选 3\/30/)
+  assert.equal(workflowComments({...run,cursor:2,phase:phases[3]},plan)!.state,'done')
+  assert.equal(workflowComments({...run,status:'paused',phase:phases[3]},plan)!.state,'stopped')
 })
 
 test('发布动态显示稿件和实际确认分P数量，不根据百分比猜当前上传文件', () => {

@@ -42,17 +42,18 @@ test('无链不渲染; active 显示剩余计划与停止入口', async () => {
   const none = await render(null)
   assert.doesNotMatch(none.html, /chain-status/)
   const html = (await render(activeChain())).html
-  assert.match(html, /自动运行中/)
+  assert.match(html, /制作计划执行中/)
   assert.match(html, /剩余：翻译 → 字幕与配音/)
-  assert.match(html, /停止后续自动运行/)
+  assert.match(html, /停止后续制作/)
+  assert.match(html, /仅制作，不含上传或投稿/)
   assert.doesNotMatch(html, /放弃计划/)
 })
 
 test('挂起显示原因分类与 恢复/放弃 双操作', async () => {
   const html = (await render(heldChain())).html
-  assert.match(html, /自动运行已挂起/)
+  assert.match(html, /制作计划已挂起/)
   assert.match(html, /「翻译」失败 \[STEP_FAILED\]：模拟失败/)
-  assert.match(html, /检查恢复方案/)
+  assert.match(html, /检查制作恢复方案/)
   assert.match(html, /放弃计划/)
   assert.match(html, /查看该步骤/)
 })

@@ -26,9 +26,9 @@ function currentValue(change:FreshnessChange) {
     </div>
     <p v-if="!report.steps.length" class="empty-reasons">当前没有需更新或待补齐的旧结果。状态可能已变化，请以最新检查为准。</p>
     <section v-for="(entry,stepIndex) in report.steps" :key="entry.key" class="freshness-step">
-      <header v-if="report.steps.length>1 || entry.freshness_label || entry.fresh===true || entry.key==='tts' || entry.status && !['done','stale'].includes(entry.status)" class="step-header">
+      <header v-if="report.steps.length>1 || entry.freshness_label || entry.fresh===true || entry.settings_changed || entry.upstream_changed || entry.key==='tts' || entry.status && !['done','stale'].includes(entry.status)" class="step-header">
         <div class="step-heading"><span v-if="report.steps.length>1" class="step-number" aria-hidden="true">{{ String(stepIndex+1).padStart(2,'0') }}</span><h3>{{ stepName(entry) }}</h3></div>
-        <div class="step-status"><n-tag v-if="entry.status && !['done','stale'].includes(entry.status)" size="small" :type="STATUS_TAG[entry.status] || 'default'" :bordered="false">{{ STATUS_TEXT[entry.status] || '状态待确认' }}</n-tag><n-tag v-if="entry.fresh===true" size="small" type="success" :bordered="false">{{ entry.freshness_label || '当前结果已是最新' }}</n-tag><n-tag v-else-if="entry.freshness_label || entry.key==='tts'" size="small" type="warning" :bordered="false">{{ entry.freshness_label || '配音完整性待核对' }}</n-tag></div>
+        <div class="step-status"><n-tag v-if="entry.status && !['done','stale'].includes(entry.status)" size="small" :type="STATUS_TAG[entry.status] || 'default'" :bordered="false">{{ STATUS_TEXT[entry.status] || '状态待确认' }}</n-tag><n-tag v-if="entry.settings_changed" size="small" type="warning" :bordered="false">本步设置已改</n-tag><n-tag v-if="entry.upstream_changed" size="small" type="warning" :bordered="false">上游产物已变</n-tag><n-tag v-if="entry.fresh===true" size="small" type="success" :bordered="false">{{ entry.freshness_label || '当前结果已是最新' }}</n-tag><n-tag v-else-if="entry.freshness_label || entry.key==='tts'" size="small" type="warning" :bordered="false">{{ entry.freshness_label || '配音完整性待核对' }}</n-tag></div>
       </header>
       <div class="step-body">
         <p class="summary">{{ entry.summary || entry.freshness_reason || '尚未取得更具体的变化说明。' }}</p>

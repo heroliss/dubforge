@@ -142,7 +142,8 @@ def source(value, *, check_file=True):
         normalized_host += f':{port}' if port is not None and port != default_port else ''
         identity = ('youtube:' + video if video else
                     urlunsplit((parts.scheme.lower(), normalized_host, parts.path or '/', parts.query, '')))
-        title = (host + '_' + (video or parts.path.rstrip('/').rsplit('/', 1)[-1])).rstrip('_')
+        from dubforge.project_titles import placeholder
+        title = placeholder(value, "link")
         return dict(source=value, source_kind='link', identity=identity, title=title[:200])
     path = Path(value)
     if not path.is_absolute() or value.startswith(('\\\\', '//', '\\\\?\\', '\\\\.\\')):
@@ -195,6 +196,8 @@ def preview(body):
             title = raw.get('title', '')
             if not isinstance(title, str) or len(title) > 200:
                 raise ImportError('项目名称请填写200字以内的文字')
+            row['requested_title'] = title.strip()
+            row['title_mode'] = "manual" if title.strip() else "auto"
             row['title'] = title.strip() or row['title']
             selected = overrides.get(str(index), raw.get('template', defaults.get('template', body.get('default_template'))))
             parent, name = _template(selected, templates)
@@ -203,6 +206,9 @@ def preview(body):
                 bases[parent] = cfg.resolve(key=parent or 'global')
             base = bases[parent]
             patch = {**_settings(defaults.get('settings', {})), **_settings(raw.get('settings', {}))}
+            if any(isinstance(v, dict) and v.get('partial') for v in patch.get('assembly.versions', [])
+                   if isinstance(patch.get('assembly.versions'), list)):
+                raise ImportError('局部修订只属于原项目，不能导入到新项目；请在目标项目中重新选择基准成片。')
             cfg._validate(patch, base['values'])
             row['settings'], row['base_fingerprint'] = patch, base['fingerprint']
             row['duplicates'] = existing.get(row['identity'], [])
@@ -228,13 +234,16 @@ def _result(row, existing=None):
         uids = [r['uid'] for r in saved.values() if r.get('uid')]
         from dubforge.domain.models import Project
         with Session(get_engine()) as session:
-            existing = set(session.exec(select(Project.uid).where(Project.uid.in_(uids))).all()) if uids else set()
+            existing = dict(session.exec(select(Project.uid, Project.title).where(Project.uid.in_(uids))).all()) if uids else {}
     items = []
     for item in plan:
         result = saved.get(str(item['index']), dict(status='pending', uid='', error=''))
         if result['status'] == 'created' and result['uid'] not in existing:
             result = {**result, 'status': 'removed', 'error': '项目后来已删除，不会因重试重新创建'}
-        items.append(dict(index=item['index'], title=item['title'], source=item['source'],
+        current_title = existing.get(result.get('uid')) if result['status'] == 'created' else None
+        items.append(dict(index=item['index'], title=current_title or item['title'], source=item['source'],
+                          title_mode=item.get('title_mode', 'manual'),
+                          requested_title=item.get('requested_title', item['title']),
                           template=item['template'], settings=item['settings'], **result))
     return dict(request_id=row.id, created_at=row.created_at, running=row.id in _running,
                 items=items, created=sum(i['status'] == 'created' for i in items),
@@ -258,7 +267,7 @@ def history(limit=20):
         # rowid 保留旧回执及同一时刻多批导入的先后顺序。
         rows = session.exec(select(ProjectImport).order_by(literal_column('rowid').desc()).limit(limit)).all()
         uids = {r['uid'] for row in rows for r in json.loads(row.results).values() if r.get('uid')}
-        existing = set(session.exec(select(Project.uid).where(Project.uid.in_(uids))).all()) if uids else set()
+        existing = dict(session.exec(select(Project.uid, Project.title).where(Project.uid.in_(uids))).all()) if uids else {}
     items = []
     for row in rows:
         data = _result(row, existing)
@@ -355,7 +364,7 @@ def _run_items(request_id, items):
                         receipt.results = _json(results)
                         session.add(receipt)
                     crud.create_project(title=item['title'], source_url=item['source'], source_kind=item['source_kind'],
-                                        initialize=initialize)
+                                        initialize=initialize, title_mode=item.get('title_mode', 'manual'))
             except Exception as exc:
                 logger.exception('批量导入 %s 第%d项创建失败', request_id, item['index'] + 1)
                 with Session(get_engine()) as session:
@@ -419,8 +428,8 @@ def catalog():
                 fields=list(fields.values()), instructions=[
                     '只输出 JSON，不输出解释。使用 schema、defaults、projects 结构，每个项目必须包含 source。',
                     'source 是单个视频的 HTTP(S) 地址，或运行 DubForge 的电脑上的绝对视频路径；不展开播放列表。',
-                    'template 使用列出的 series:标识或唯一模板名称；null 表示只跟随全局默认；省略则使用批次默认模板。',
-                    'settings 使用下列点分参数名，只填写要覆盖的值；项目 settings 优先于 defaults.settings，未填写项继续实时继承。',
+                    'template 使用列出的 series:标识或唯一模板名称；null 表示使用创建时的全局默认；省略则使用批次默认模板。',
+                    'settings 使用下列点分参数名，只填写要覆盖的值；项目 settings 优先于 defaults.settings，未填写的制作参数保存为创建时的基础值，后续修改全局或模板不会自动改变已有项目。',
                     '共享的字幕、配音、成片与合集设置优先放在系列模板；不要把模板里所有值重复写入 settings，避免固定为项目覆盖。',
                     'Windows JSON 路径建议用 D:/Videos/a.mp4；反斜杠必须转义为双反斜杠。纯文本路径不需要转义。',
                     '布尔值使用 true/false；数组（包括成片版本）整体替换；null 是实际值，不表示恢复继承。',

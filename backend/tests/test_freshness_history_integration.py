@@ -18,6 +18,20 @@ from dubforge.pipeline import steps
 from dubforge.runner import StepContext, compute_fingerprint, runner
 from dubforge.utils.fs import atomic_write_bytes
 from test_dubbing_preparation import prepared
+from test_configuration import save
+
+
+def _external_project_update(uid, updates):
+    """模拟旧工具或外部数据库写入；正常界面仍禁止运行中编辑项目。"""
+    from dubforge.configuration_models import ConfigurationScope
+    with crud.session() as session:
+        row = session.get(ConfigurationScope, 'project:' + uid)
+        values = json.loads(row.values)
+        values.update(updates)
+        row.values = json.dumps(values, ensure_ascii=False)
+        row.revision += 1
+        session.add(row)
+        session.commit()
 
 
 @pytest.fixture
@@ -26,7 +40,7 @@ def history_env(make_project, monkeypatch):
     config.set_key('download.resolution', 1080)
     uid = make_project()
     futures, calls = [], []
-    original_submit = runner._pool.submit
+    original_submit = runner._queue_execution
 
     def submit(*args, **kwargs):
         future = original_submit(*args, **kwargs)
@@ -37,7 +51,8 @@ def history_env(make_project, monkeypatch):
         calls.append(ctx.cfg('download.resolution'))
         ctx.write_bytes('video.mp4', b'isolated downloaded video', 'video')
 
-    monkeypatch.setattr(runner._pool, 'submit', submit)
+    # 等待覆盖资源准入与线程池执行的完整操作，而非尚未创建的池内 Future。
+    monkeypatch.setattr(runner, '_queue_execution', submit)
     monkeypatch.setitem(steps._RUNNERS, 'download', download)
     return SimpleNamespace(uid=uid, root=crud.project_dir(uid), futures=futures,
                            calls=calls, download=download)
@@ -87,7 +102,7 @@ def test_success_then_config_change_reports_precise_before_after_without_get_wri
     assert json.loads(step.input_snapshot)
     current = _get(history_env.uid)
     assert current['history_available'] and current['fresh'] and not current['changes']
-    config.set_key('download.resolution', 720)
+    save('project:' + history_env.uid, {'download.resolution': 720})
     before = _rows_and_files(history_env.uid)
     changed = _get(history_env.uid)
     change = _change(changed, 'download.resolution')
@@ -113,7 +128,7 @@ def test_config_changed_during_execution_keeps_the_consumed_old_baseline(history
     runner.start_step(history_env.uid, 'download')
     try:
         assert started.wait(5)
-        config.set_key('download.resolution', 720)
+        _external_project_update(history_env.uid, {'download.resolution': 720})
     finally:
         release.set()
     step = _finish(history_env)
@@ -126,15 +141,18 @@ def test_config_changed_during_execution_keeps_the_consumed_old_baseline(history
 
 def test_queued_fingerprint_and_snapshot_match_actual_context_values(history_env, monkeypatch):
     queued = []
+    submitted = Event()
 
     def defer(function, *args, **kwargs):
         future = Future()
         queued.append((future, function, args, kwargs))
+        submitted.set()
         return future
 
     monkeypatch.setattr(runner._pool, 'submit', defer)
     runner.start_step(history_env.uid, 'download')
-    config.set_key('download.resolution', 720)
+    _external_project_update(history_env.uid, {'download.resolution': 720})
+    assert submitted.wait(5), '资源准入未把任务提交给隔离的延迟执行器'
     future, function, args, kwargs = queued[0]
     try:
         function(*args, **kwargs)
@@ -150,7 +168,7 @@ def test_queued_fingerprint_and_snapshot_match_actual_context_values(history_env
 
 def test_failed_attempt_does_not_replace_last_successful_input_snapshot(history_env, monkeypatch):
     baseline = _run(history_env).input_snapshot
-    config.set_key('download.resolution', 720)
+    save('project:' + history_env.uid, {'download.resolution': 720})
 
     def fail(ctx):
         raise DubForgeError('隔离模拟下载失败', code='DOWNLOAD_FAIL')
@@ -179,7 +197,7 @@ def test_legacy_skip_keeps_history_unknown_instead_of_inventing_current_baseline
     assert runner.start_step(history_env.uid, 'download')['status'] == 'skipped'
     assert crud.get_step(project.id, 'download').input_snapshot == '{}'
     assert history_env.calls == []
-    config.set_key('download.resolution', 720)
+    save('project:' + history_env.uid, {'download.resolution': 720})
     before = _rows_and_files(history_env.uid)
     report = _get(history_env.uid)
     assert report['history_available'] is False and report['warnings']
@@ -252,14 +270,14 @@ def test_selected_dubbing_success_does_not_overwrite_whole_step_baseline(prepare
     step.input_snapshot, step.input_fingerprint = baseline, 'previous-whole-batch'
     crud.save_step(step)
     pending = []
-    submit = runner._pool.submit
+    submit = runner._queue_execution
 
     def track(*args, **kwargs):
         future = submit(*args, **kwargs)
         pending.append(future)
         return future
 
-    monkeypatch.setattr(runner._pool, 'submit', track)
+    monkeypatch.setattr(runner, '_queue_execution', track)
     runner.start_dubbing(uid, [1])
     for future in pending:
         future.result(timeout=10)
@@ -274,7 +292,7 @@ def _comment_render_inputs(env):
     from dubforge.pipeline import assembly_versions as av, content_redaction, version_render
     from dubforge.pipeline.stale_explanation import capture
 
-    config.set_key('assemble.crf', 22)
+    save('project:' + env.uid, {'assemble.crf': 22})
     mark_upstream_done(env.uid, 'assemble')
     project = crud.get_project(env.uid)
     log = env.root / 'logs/assemble_history.log'
@@ -302,8 +320,8 @@ def test_auto_comment_prepared_snapshot_uses_final_safe_overlay_and_frozen_setti
     from dubforge.pipeline import assembly_versions as av, version_render
 
     ctx, deps, _, initial, unfiltered, final = _comment_render_inputs(history_env)
-    # 自动评论准备期间修改全局参数，成片继续消费本轮固定的22。
-    config.set_key('assemble.crf', 35)
+    # 模拟外部修改项目参数，成片仍消费上下文已经固定的22。
+    _external_project_update(history_env.uid, {'assemble.crf': 35})
     version_render.capture_prepared_inputs(ctx, deps, [final])
     actual = ctx._completed_input_snapshot
     expected = comment_studio.render_fingerprint_plan(final['comment_overlay'])
@@ -341,7 +359,7 @@ def test_success_promotes_prepared_comment_snapshot_instead_of_empty_enqueue_sna
 
     def encode_without_network(ctx):
         # 保留真实运行器、冻结依赖、摘要捕获和提交，仅将媒体编码替换为隔离字节。
-        config.set_key('assemble.crf', 35)
+        _external_project_update(history_env.uid, {'assemble.crf': 35})
         ctx.task_data['version_specs'] = [final]
         version_render.capture_prepared_inputs(ctx, ctx.dependencies(), [final])
         ctx.write_bytes('final_version_auto-comments.mp4', b'isolated reviewed comments video', 'video')

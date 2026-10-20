@@ -19,8 +19,25 @@ from test_publish_studio import BV, env as studio_env
 
 @pytest.fixture
 def review_env(studio_env):
-    config.set_key('content_review.enabled', True)
+    _project_setting(studio_env.uid, 'content_review.enabled', True)
     return studio_env
+
+
+def _project_setting(uid, path, value, *, external=False):
+    if external:
+        # 模拟绕开正常编辑门禁的外部数据库改动，发送前仍必须再次核对。
+        from dubforge.configuration_models import ConfigurationScope
+        with Session(db.get_engine()) as session:
+            row = session.get(ConfigurationScope, 'project:' + uid)
+            patch = json.loads(row.values)
+            patch[path] = value
+            row.values = configuration._json(patch)
+            row.revision += 1
+            session.add(row)
+            session.commit()
+        return
+    current = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=current['revision'], updates={path: value}))
 
 
 def _uploaded(env, *, risky=False, reviewed=True, comments=False):
@@ -94,7 +111,7 @@ def test_old_upload_without_required_review_proof_cannot_prepare_append(review_e
 def test_terms_changed_after_upload_or_preview_block_append(review_env, after_preview):
     key = _uploaded(review_env)
     change = _prepare(key) if after_preview else None
-    config.set_key('content_review.blocked_terms', 'beautiful')
+    _project_setting(review_env.uid, 'content_review.blocked_terms', 'beautiful')
     with pytest.raises(DubForgeError) as error:
         if change:
             studio.commit('123', change['id'], {'confirmed': True})
@@ -108,7 +125,7 @@ def test_terms_changed_after_upload_or_preview_block_append(review_env, after_pr
 def test_changed_audio_policy_invalidates_uploaded_review_before_commit(review_env):
     key = _uploaded(review_env, risky=True)
     change = _prepare(key)
-    config.set_key('content_review.mute_audio', False)
+    _project_setting(review_env.uid, 'content_review.mute_audio', False)
     with pytest.raises(DubForgeError) as error:
         studio.commit('123', change['id'], {'confirmed': True})
     assert error.value.code == 'CONTENT_REVIEW_OUTPUT_STALE'
@@ -142,7 +159,7 @@ def test_last_moment_rule_change_is_definite_failure_without_remote_write(review
         real_check(snapshot)
         if len(checks) == 1:
             # 首次检查后规则变化，发送前的第二次检查仍必须阻止网络写入。
-            config.set_key('content_review.blocked_terms', 'beautiful')
+            _project_setting(review_env.uid, 'content_review.blocked_terms', 'beautiful', external=True)
 
     monkeypatch.setattr(content_review_service, 'assert_snapshot', check)
     with pytest.raises(DubForgeError) as error:
@@ -214,15 +231,16 @@ def _revision_proof(env, monkeypatch):
 
     def signature():
         return service._hash([comment_studio._read(project).get('overlay'),
-                              config.get('assemble.crf')])
+                              configuration.resolve(env.uid)['values']['assemble.crf']])
 
     frozen, checks = signature(), []
 
     def current(deps, version, record=None, verify_hash=False):
         checks.append((record.artifact_id, verify_hash))
-        return signature() == frozen
+        valid = signature() == frozen
+        return dict(current=valid, reasons=[] if valid else [dict(code='REVIEW_RECIPE_CHANGED', message='修订制作设置已变化')])
 
-    monkeypatch.setattr(review_render, 'is_current', current)
+    monkeypatch.setattr(review_render, 'revision_state', current)
     return checks
 
 
@@ -247,7 +265,7 @@ def test_changed_revision_recipe_blocks_append_even_without_text_risk(review_env
             settings=comment_studio.DEFAULT_SETTINGS, items=[dict(id='c1', source_hash='source',
             text='A lovely city', source_text='A lovely city', display_text='城市很漂亮')])})
     else:
-        config.set_key('assemble.crf', config.get('assemble.crf') + 1)
+        _project_setting(review_env.uid, 'assemble.crf', configuration.resolve(review_env.uid)['values']['assemble.crf'] + 1)
     assert content_redaction.plan(Dependencies(crud.get_project(review_env.uid)))['ranges'] == []
     with pytest.raises(DubForgeError) as error:
         if change:
@@ -269,7 +287,8 @@ def test_revision_recipe_rechecked_at_actual_send_boundary(review_env, monkeypat
         checks.append(snapshot)
         real_check(snapshot)
         if len(checks) == 1:
-            config.set_key('assemble.crf', config.get('assemble.crf') + 1)
+            _project_setting(review_env.uid, 'assemble.crf', configuration.resolve(review_env.uid)['values']['assemble.crf'] + 1,
+                             external=True)
 
     monkeypatch.setattr(review_draft, 'assert_snapshot_current', check)
     with pytest.raises(DubForgeError) as error:

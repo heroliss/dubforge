@@ -4,6 +4,7 @@ import { computed, onUnmounted, ref, watch } from 'vue'
 import { NAlert, NButton, NModal, NTag, NText } from 'naive-ui'
 
 const props = defineProps<{ uid: string; disabled: boolean; revision: number }>()
+const emit = defineEmits<{ (event: 'status', value: Service): void }>()
 type Service = {
   backend: string; online: boolean; status: string; can_start: boolean; can_stop: boolean; managed: boolean; pid: number | null
   message: string; log_path: string | null
@@ -24,10 +25,10 @@ let logTimer: number | undefined
 
 function cancel() {
   generation++
-  window.clearTimeout(timer)
+  globalThis.clearTimeout(timer)
   controller?.abort()
   logController?.abort()
-  window.clearTimeout(logTimer)
+  globalThis.clearTimeout(logTimer)
   pending.value = false
   stopping.value = false
   logBusy.value = false
@@ -36,7 +37,7 @@ function cancel() {
 
 async function request(action: '' | 'start' | 'stop' = '') {
   if (pending.value || !props.uid || (action && props.disabled)) return
-  window.clearTimeout(timer)
+  globalThis.clearTimeout(timer)
   const current = generation
   controller = new AbortController()
   pending.value = true
@@ -49,6 +50,7 @@ async function request(action: '' | 'start' | 'stop' = '') {
     if (current !== generation) return
     if (!r.ok) throw new Error(body.message || '服务请求失败，请重试')
     service.value = body
+    emit('status', body)
     error.value = ''
   } catch (e) {
     if (current !== generation) return
@@ -58,14 +60,14 @@ async function request(action: '' | 'start' | 'stop' = '') {
       pending.value = false
       stopping.value = false
       // 自己启动的服务继续探测退出状态；请求结束再计时，避免慢连接堆积。
-      if (starting.value || service.value?.managed) timer = window.setTimeout(() => void request(), 3000)
+      if (starting.value || service.value?.managed) timer = globalThis.setTimeout(() => void request(), 3000)
     }
   }
 }
 
 async function loadLog() {
   if (logBusy.value || !showLog.value) return
-  window.clearTimeout(logTimer)
+  globalThis.clearTimeout(logTimer)
   const current = generation
   const active = new AbortController()
   logController = active
@@ -83,13 +85,13 @@ async function loadLog() {
   } finally {
     if (current === generation && logController === active) {
       logBusy.value = false
-      if (showLog.value) logTimer = window.setTimeout(() => void loadLog(), 3000)
+      if (showLog.value) logTimer = globalThis.setTimeout(() => void loadLog(), 3000)
     }
   }
 }
 watch(showLog, visible => {
   if (visible) { logText.value = ''; logError.value = ''; void loadLog() }
-  else { window.clearTimeout(logTimer); logController?.abort(); logBusy.value = false }
+  else { globalThis.clearTimeout(logTimer); logController?.abort(); logBusy.value = false }
 })
 
 watch(() => [props.uid, props.revision], () => {

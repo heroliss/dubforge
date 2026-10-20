@@ -65,9 +65,11 @@ def test_edit_export_and_reset_without_generating_audio(prepared):
 
 def test_source_only_edit_export_then_translation_arrives(prepared):
     from app.main import app
+    from dubforge import configuration
     uid, project, calls = prepared
     (crud.project_dir(uid) / 'artifacts/translate/translate.txt').unlink()
-    config.set_key('subtitles.mode', 'source')
+    settings = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=settings['revision'], updates={'subtitles.mode': 'source'}))
     with TestClient(app) as client:
         rows = state(client, uid)['lines']
         assert len(rows) == 2 and not rows[0]['translation_available']
@@ -121,11 +123,13 @@ def test_legacy_audio_survives_manual_retime(prepared):
 
 def test_actual_mix_uses_edited_start_without_truncating_clip(prepared, monkeypatch):
     from app.main import app
+    from dubforge import configuration
     from dubforge.pipeline.step_assemble import _mix_timeline
     from dubforge.utils import audio as au
     import soundfile as sf
     uid, _, _ = prepared
-    config.set_key('assemble.loudnorm', False)
+    settings = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=settings['revision'], updates={'assemble.loudnorm': False}))
     with TestClient(app) as client:
         base = f'/api/projects/{uid}/workbench'
         assert synthesize(client, base + '/lines/1/synthesize', json={}).status_code == 200

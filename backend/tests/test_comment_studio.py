@@ -71,7 +71,7 @@ def fake_rating(prompt, **kwargs):
 
 def plan_body(uid, **settings):
     state = cs.view(uid)
-    return {'revision': state['overlay_revision'], 'items': [dict(row, display_text='已人工核对的中文') for row in state['rows']],
+    return {'revision': state['overlay_revision'], 'items': [dict(row, display_text='已人工核对的中文', selection_origin='manual') for row in state['rows']],
             'settings': {**cs.DEFAULT_SETTINGS, 'start': .5, 'interval': 2, 'duration': 1, **settings}}
 
 
@@ -87,6 +87,8 @@ def test_review_checks_authoritative_original_even_after_display_is_sanitized(ui
     path = replace_comment_text(uid, '0', 'The Tiananmen Square massacre')
     original_bytes = path.read_bytes()
     body = plan_body(uid)
+    for item in body['items']:
+        item['selection_origin'] = 'automatic'
     body['items'][0].update(text='伪造安全原文', source_text='Short original', display_text='普通中文评论')
     draft = cs.draft(uid, body)
     assert [row['id'] for row in draft['items']] == ['1', '2']
@@ -105,17 +107,20 @@ def test_review_checks_authoritative_original_even_after_display_is_sanitized(ui
 ])
 def test_review_checks_both_edited_languages_even_when_one_is_hidden(uid, mode, field, text):
     body = plan_body(uid, language_mode=mode)
+    for item in body['items']:
+        item['selection_origin'] = 'automatic'
     body['items'][0][field] = text
     draft = cs.draft(uid, body)
     assert [row['id'] for row in draft['items']] == ['1', '2']
     assert draft['review_excluded'][0]['review_reasons']
 
 
-def test_review_all_excluded_manual_save_is_explicit_and_keeps_previous_plan(uid):
+def test_review_all_excluded_automatic_selection_is_explicit_and_keeps_previous_plan(uid):
     saved = cs.save(uid, plan_body(uid))
     before = cs._path(crud.get_project(uid)).read_bytes()
     body = plan_body(uid)
     for item in body['items']:
+        item['selection_origin'] = 'automatic'
         item['display_text'] = '天安门广场的悲剧'
     with pytest.raises(cs.CommentError) as exc:
         cs.save(uid, body)
@@ -200,7 +205,10 @@ def test_review_uses_project_resolved_custom_terms_and_new_authoritative_text(ui
     conf_save('project:' + uid, {'content_review.blocked_terms': 'opinion 0'})
     state = cs.view(uid)
     assert state['rows'][0]['review_blocked'] and not state['rows'][1]['review_blocked']
-    saved = cs.save(uid, plan_body(uid))
+    body = plan_body(uid)
+    for item in body['items']:
+        item['selection_origin'] = 'automatic'
+    saved = cs.save(uid, body)
     assert [row['id'] for row in saved['overlay']['items']] == ['1', '2']
     replace_comment_text(uid, '1', 'The Tiananmen Square massacre')
     assert [row['id'] for row in cs.confirmed(uid)['items']] == ['2']
@@ -442,8 +450,7 @@ def test_manual_confirmation_validates_source_text_and_revision(uid):
     with pytest.raises(cs.CommentError, match='原文已变化'):
         cs.save(uid, body)
     body = plan_body(uid); body['items'][0]['display_text'] = '长' * 241
-    with pytest.raises(cs.CommentError, match='240'):
-        cs.save(uid, body)
+    assert cs.save(uid, body)['overlay']['items'][0]['display_text'] == '长' * 241
     body = plan_body(uid); body['items'] = []
     assert cs.save(uid, body)['overlay']['items'] == []
 

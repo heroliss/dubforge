@@ -44,23 +44,31 @@ def audio_seconds(path):
         raise DubForgeError('无法读取合成音频的有效时长', code='TTS_AUDIO_INVALID', detail=str(exc)) from exc
 
 
-def synthesize(synth, out, line, factors, *, log, on_attempt, can_retry):
+def synthesize(synth, out, line, factors, *, log, on_attempt, can_retry, existing=None):
     """synth(path, factor) 仅负责调用模型；失败/停止重试不损坏已生成的音频。"""
-    available = max(0.0, float(line.get('available_duration',
-        float(line['end']) - float(line['start']) + float(line.get('gap', 0)))))
-    info = {'available': available, 'attempts': [], 'used_factor': factors[0]}
+    # 语音岛范围优先于单句短槽位；只有整个连续片段都放不下时才缩时。
+    available = max(0.0, float(line.get('adaptive_available_duration',
+        line.get('available_duration',
+                 float(line['end']) - float(line['start']) + float(line.get('gap', 0))))))
+    info = {'available': round(available, 6), 'attempts': [], 'used_factor': factors[0]}
+    previous = dict(existing or {})
+    info['attempts'] = list(previous.get('attempts', []))
     candidate = out.with_suffix('.retry.wav.tmp')
     best = out.with_suffix('.best.wav.tmp')
-    best_seconds = None
+    best_seconds = audio_seconds(out) if existing is not None and out.is_file() else None
+    if best_seconds is not None:
+        info['used_factor'] = previous.get('used_factor')
     try:
         for index, factor in enumerate(factors):
-            if index:
+            if index or existing is not None:
                 if not can_retry():
                     break
+                attempt = (f'缩时尝试 {len(info["attempts"]) + 1}' if existing is not None
+                           else f'缩时重试 {index}/{len(factors) - 1}')
                 log(f"句 {line['id']} 配音 {best_seconds:.2f}s，可用 {available:.2f}s；"
-                    f"缩时重试 {index}/{len(factors) - 1}，时长因子 {factor:g}")
+                    f"{attempt}，时长因子 {factor:g}")
             on_attempt(index, len(factors), factor)
-            info['retries'] = index
+            info['retries'] = max(0, len(info['attempts'])) if existing is not None else index
             path = candidate
             try:
                 synth(path, factor)
@@ -83,7 +91,7 @@ def synthesize(synth, out, line, factors, *, log, on_attempt, can_retry):
                 info['used_factor'] = factor
             if best_seconds <= available + EPSILON_SECONDS:
                 break
-            if best_seconds <= available + max(EPSILON_SECONDS, min(.15, available * .05)):
+            if existing is None and best_seconds <= available + max(EPSILON_SECONDS, min(.15, available * .05)):
                 info['retry_skipped'] = 'minor_overrun'
                 log(f"句 {line['id']} 轻微超长 {best_seconds - available:.2f}s，"
                     '不重复调用模型；保留完整音频和超长提示')
@@ -92,7 +100,9 @@ def synthesize(synth, out, line, factors, *, log, on_attempt, can_retry):
         info['overrun'] = best_seconds > available + EPSILON_SECONDS
         if info['overrun']:
             log(f"句 {line['id']} 配音仍超长 {best_seconds - available:.2f}s，保留完整音频，需试听或调整译文/时间")
-        atomic_replace(best, out)
+        # 布局后二轮可能得到更长的音频；这时保留本轮已生成的最短版本。
+        if best.is_file():
+            atomic_replace(best, out)
         return info
     finally:
         candidate.unlink(missing_ok=True)

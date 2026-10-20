@@ -48,6 +48,11 @@ test('证书错误明确提示，不能退化为忽略证书校验', () => {
   assert.match(result.message, /不会关闭证书校验/)
   assert.doesNotMatch(result.message, /private-host/)
 })
+test('创作管理未发送失败保留脱敏阶段，便于定位预检问题', () => {
+  const result = safeError({code:'PUBLISH_WRITE_NOT_SENT', detail:{stage:'validate',remote_code:-400,secret:'private'}})
+  assert.deepEqual(result.detail, {stage:'validate',remote_code:-400})
+  assert.doesNotMatch(JSON.stringify(result), /private/)
+})
 
 test('合集错误保留失败环节和平台原因，剔除凭据、URL与堆栈', () => {
   const secret = 'fixture-sensitive-token'

@@ -5,6 +5,75 @@ export const PUBLICATION_STATUS: Record<string, string> = {
   joining: '正在加入合集', collection_pending: '已投稿 · 待加入合集', checking: '正在核对状态',
 }
 export const PUBLISH_ACTIVE = ['queued', 'uploading', 'submitting', 'joining', 'checking']
+/** 后台仍可能推进的回执；等待审核不属于正在写入，不能复用操作锁的状态集合。 */
+export function publicationReadbackPending(status: unknown): boolean {
+  return typeof status==='string' && (PUBLISH_ACTIVE.includes(status) || ['submitted','collection_pending'].includes(status))
+}
+// 稿件已完成平台交付：公开、仅自己可见和保留原稿可见性都属于成功终态。
+// 该维度只用于交付筛选，不改变项目本地制作 status。
+export const PUBLISHED_PUBLICATION_STATUSES = ['published', 'private', 'reviewed'] as const
+export function isPublicationComplete(status: unknown): boolean {
+  return typeof status === 'string' && (PUBLISHED_PUBLICATION_STATUSES as readonly string[]).includes(status)
+}
+/**
+ * 合集显示同时保留可读名称和稳定 ID；旧记录没有名称时仍给出明确的 ID 标签。
+ * 名称只是平台资料的显示快照，不用于判断合集是否仍然有效。
+ */
+export function collectionDisplay(id: unknown, title?: unknown, sectionTitle?: unknown): string {
+  if (id === null || id === undefined || id === '' || Number(id) <= 0) return '不加入合集'
+  const parts = [title, sectionTitle].map(value => typeof value === 'string' ? value.trim() : '').filter(Boolean)
+  parts.push(`ID ${id}`)
+  return parts.length > 1 ? parts.join(' · ') : `合集 · ${parts[0]}`
+}
+
+/** 显示名称与发布身份分离；不为读取名称追加平台请求，也不影响运行指纹。 */
+export function publicationTargetDisplay(plan: any) {
+  const settings = plan?.settings || plan?.scope || plan?.snapshot?.settings || {}
+  const accountId = plan?.account_id || plan?.recipe?.account_id || settings.account_id || plan?.snapshot?.account_id
+  // 顺序批次的展示信息可能保存在各项目预检中；必须完整匹配目标身份后才可采用。
+  const nested = [...(plan?.items || []), ...(plan?.plan?.items || [])]
+    .map((item:any)=>item?.plan?.settings_display)
+    .find((item:any)=>item && String(item.account_id)===String(accountId)
+      && String(item.season_id ?? '')===String(settings.season_id ?? '')
+      && String(item.section_id ?? '')===String(settings.section_id ?? ''))
+  const raw = plan?.settings_display || nested || plan?.scope_display || plan?.plan?.scope_display || {}
+  const matches = (key: string, value: unknown) => raw[key] === undefined || raw[key] === null || String(raw[key]) === String(value ?? '')
+  const accountMatches = matches('account_id', accountId)
+  const display = accountMatches ? raw : {}
+  const legacy = plan?.scope_display || plan?.plan?.scope_display || {}
+  const name = (value: unknown) => typeof value === 'string' ? value.trim() : ''
+  const authoritative = ['platform','cache'].includes(name(display.source))
+  const identity = (label: string, id: unknown, title: unknown) => {
+    const readable = name(title)
+    return readable ? `${readable}${id ? `（ID ${id}）` : ''}` : id ? `${label}（ID ${id}，名称未载入）` : ''
+  }
+  // 老记录的名称仅在其自身身份下采用；显式绑定不一致时不能借用其他账号或合集名称。
+  const seasonMatches = accountMatches && matches('season_id', settings.season_id)
+  const seasonTitle = seasonMatches ? name(display.season_title) || (!authoritative ? name(settings.season_title) || name(legacy.season_title) : '') : ''
+  const sectionTitle = seasonMatches && matches('section_id', settings.section_id)
+    ? name(display.section_title) || (!authoritative ? name(settings.section_title) || name(legacy.section_title) : '') : ''
+  let collection = collectionDisplay(settings.season_id, seasonTitle, sectionTitle)
+  if (settings.season_id && !seasonTitle) collection += '（名称未载入）'
+  if (settings.season_id && settings.section_id && !sectionTitle) collection += ` · 小节（ID ${settings.section_id}，名称未载入）`
+  const categoryId = settings.human_type2 || settings.tid
+  const category = identity('分区', categoryId, matches('human_type2', categoryId) ? display.category_title : '')
+  const account = identity('账号', accountId, name(plan?.account_name) || display.account_name)
+  const source = accountMatches ? name(display.source) : ''
+  const notice = source === 'cache' ? '名称来自最近读取的B站资料，仅供识别；本次仍按已确认的账号、分区和合集ID执行。'
+    : source === 'platform' ? '名称来自本次读取的B站资料；发布目标仍以已确认的ID为准。' : ''
+  const fields = [
+    ...(account ? [{ key:'account', label:'账号', title:name(plan?.account_name) || name(display.account_name) || '名称未载入', id:accountId }] : []),
+    ...(category ? [{ key:'category', label:'分区', title:matches('human_type2',categoryId) && name(display.category_title) || '名称未载入', id:categoryId }] : []),
+    { key:'season', label:'合集', title:settings.season_id ? seasonTitle || '名称未载入' : '不加入合集', id:settings.season_id },
+    ...(settings.season_id && settings.section_id ? [{ key:'section', label:'小节', title:sectionTitle || '名称未载入', id:settings.section_id }] : []),
+  ]
+  return { account, collection, category, notice, fields, cached:source === 'cache' }
+}
+
+export function publicationVisibility(value: unknown): string {
+  return value === 'self' ? '仅自己可见' : value === 'public' || !value ? '公开可见' : '可见范围未识别，请核对发布设置'
+}
+
 export function publicationUploadProgress(row: any) {
   if (!row || !['queued', 'uploading', 'paused', 'failed', 'uploaded', 'submitting', 'joining', 'checking'].includes(row.status)) return null
   const detail = row.progress_detail || {}

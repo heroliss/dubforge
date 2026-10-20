@@ -45,7 +45,7 @@ async function render(t:any, name:string, initial=false, locked=false) {
   app.mixin({created(){
     if(this.$options.__name===name){
       page=this.$.setupState
-      if(name==='ConfigurationForm') { page.adopt({...config(),overrides:initial?{[enabled]:true}:{}}); page.loading=false; page.busy=locked }
+      if(name==='ConfigurationForm') { page.adopt(config()); page.loading=false; if(initial)page.change(enabled,true); page.busy=locked }
       if(name==='CommentStudioPanel') {
         const state={ rows:[{id:'a',source_hash:'a',text:'Original',text_zh:'译文'}], fields, defaults:{source_style_enabled:initial,source_color:values['comments.source_color'],width_percent:60},
           configuration:{...config(),sources:{},overrides:initial?{[enabled]:true}:{}}, overlay_revision:'r1', overlay:null }
@@ -56,7 +56,7 @@ async function render(t:any, name:string, initial=false, locked=false) {
     if(this.$options.__name==='TextColorPresets')palette=this.$.setupState
     if(this.$options.__name==='ParamControl' && this.$props.field.path==='comments.width_percent')widthControl=this.$.setupState
     if(this.$options.name==='Switch' && this.$attrs['aria-label']==='原文独立样式')switchControl=this.$.setupState
-    if(this.$options.name==='Button' && this.$attrs['aria-label']==='原文独立样式恢复继承')buttons.push(this)
+    if(this.$options.name==='Button' && this.$attrs['aria-label']===`原文独立样式${name==='ConfigurationForm'?'撤销修改':name==='AssemblyVersionWorkspace'?'恢复项目默认':'恢复项目基础值'}`)buttons.push(this)
   }})
   const html=await renderToString(app)
   return {page,switchControl,palette,widthControl,buttons,html}
@@ -116,8 +116,20 @@ for(const name of ['ConfigurationForm','CommentStudioPanel','AssemblyVersionWork
     assert.equal(current(page),false)
     assert.equal(name==='CommentStudioPanel'?page.settings.source_color:page.values['comments.source_color'],'#FFD65A')
     const saved=await render(t,name,true)
+    if(name==='ConfigurationForm')saved.page.change('comments.color','#88AAFF')
+    else if(name==='AssemblyVersionWorkspace')saved.page.override('comments.color','#88AAFF')
+    else saved.page.setStyle('color','#88AAFF')
     // 使用模板绑定的按钮事件；不是模拟调用父级方法。
     saved.buttons[0].$.setupState.handleClick({preventDefault(){},stopPropagation(){}})
     assert.equal(current(saved.page),false)
+    if(name==='CommentStudioPanel'){
+      assert.equal(saved.page.ownsStyle('source_style_enabled'),false)
+      assert.equal(saved.page.settings.color,'#88AAFF')
+      assert.equal(saved.page.ownsStyle('color'),true)
+    }else{
+      const overrides=name==='ConfigurationForm'?saved.page.patch:saved.page.active.overrides
+      assert.equal(Object.hasOwn(overrides,enabled),false)
+      assert.equal(overrides['comments.color'],'#88AAFF')
+    }
   })
 }

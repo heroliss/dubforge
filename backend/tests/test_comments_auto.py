@@ -137,7 +137,11 @@ def test_auto_replenishes_after_original_and_hidden_translation_are_blocked(isol
     monkeypatch.setattr(comment_studio, 'chat_validated', trusting_ai)
     from dubforge import comments_auto
     spec = comments_auto.spec_from_config(uid)
-    # 原文版也不能借隐藏中文来绕过审查；地名及宗教祝福仍正常递补。
+    # 原文版不生成不需要的中文；但已有隐藏中文仍必须检查，不能借换语言绕过。
+    video_info.update(uid, 'comments', comment_limit=spec['comment_limit'])
+    c2 = next(row for row in comment_studio.view(uid)['rows'] if row['id'] == 'c2')
+    comment_studio._write(crud.get_project(uid), {'translations': {
+        'c2': dict(source_hash=c2['source_hash'], text_zh='天安门广场的悲剧')}})
     spec['comment_settings']['language_mode'] = 'original'
     warnings, count = comments_auto.prepare_overlay(uid, spec)
     state = comment_studio.view(uid)
@@ -163,3 +167,211 @@ def test_auto_all_locally_blocked_is_explicit_even_when_llm_accepts(isolated_env
         comments_auto.prepare_overlay(uid, comments_auto.spec_from_config(uid))
     assert exc.value.code == 'COMMENTS_AUTO_EMPTY' and '内容检查' in exc.value.message
     assert not (comment_studio.view(uid)['overlay'] or {}).get('items')
+
+
+def test_auto_translates_only_ranked_candidates_and_replenishes_after_review(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id=f'c{i}', text=f'Feedback {i}', author='Viewer') for i in range(1, 7)]))
+    translated = []
+    def ai(prompt, **kwargs):
+        rows = request_payload(prompt)['comments']
+        if '【评分要求】' in prompt:
+            return validated_result({'assessments': [dict(id=r['id'], eligible=r['text'] != 'Feedback 1',
+                score=100-int(r['text'].split()[-1]), reason='观众反馈') for r in rows]}, kwargs)
+        translated.extend(r['text'] for r in rows)
+        return validated_result({'translations': [dict(id=r['id'], text_zh=
+            '天安门广场的悲剧' if r['text'] == 'Feedback 2' else '美好的旅途') for r in rows]}, kwargs)
+    monkeypatch.setattr(comment_studio, 'chat_validated', ai)
+    from dubforge import comments_auto
+    phases = []
+    warnings, count = comments_auto.prepare_overlay(uid, comments_auto.spec_from_config(uid), phase=phases.append)
+    state = comment_studio.view(uid)
+    assert count == 2 and [r['id'] for r in state['overlay']['items']] == ['c3', 'c4']
+    assert translated == ['Feedback 2', 'Feedback 3', 'Feedback 4']
+    assert not next(r for r in state['rows'] if r['id'] == 'c6')['text_zh']
+    assert any('内容检查' in warning and '递补' in warning for warning in warnings)
+    assert any(label.startswith('评论翻译：已选 1/2 条，本批 1 条') for label in phases)
+    assert phases[-1] == '评论确认：保存 2 条上屏方案'
+
+
+def test_auto_replenishes_rejected_candidate_and_reuses_collection_on_retry(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    fetched, translated = [], []
+    def fetch(*a, **kw):
+        fetched.append(True)
+        return dict(title='Travel test', comments=[
+            dict(id=f'c{i}', text=f'Feedback {i}', author='Viewer') for i in range(1, 5)])
+    monkeypatch.setattr(video_info, '_fetch_source', fetch)
+    def ai(prompt, **kwargs):
+        rows = request_payload(prompt)['comments']
+        if '【评分要求】' in prompt:
+            return validated_result({'assessments': [dict(id=r['id'], eligible=True,
+                score=100-int(r['text'].split()[-1]), reason='观众反馈') for r in rows]}, kwargs)
+        translated.extend(r['text'] for r in rows)
+        if any(r['text'] == 'Feedback 1' for r in rows):
+            raise DubForgeError('服务商拒绝本条', code='LLM_CONTENT_REJECTED')
+        return validated_result({'translations': [dict(id=r['id'], text_zh='美好的旅途') for r in rows]}, kwargs)
+    monkeypatch.setattr(comment_studio, 'chat_validated', ai)
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 2
+    assert [r['id'] for r in comment_studio.view(uid)['overlay']['items']] == ['c2', 'c3']
+    assert set(translated) == {'Feedback 1', 'Feedback 2', 'Feedback 3'}
+    translated.clear()
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 2
+    assert len(fetched) == 1 and not translated
+
+
+def test_auto_service_fault_stops_and_retains_scoring_for_resume(isolated_env, monkeypatch):
+    uid, calls = _setup(isolated_env, monkeypatch, 'auto')
+    base = comment_studio.chat_validated
+    def ai(prompt, **kwargs):
+        if '【评分要求】' not in prompt:
+            raise DubForgeError('服务额度不足', code='LLM_RATE_LIMITED')
+        return base(prompt, **kwargs)
+    monkeypatch.setattr(comment_studio, 'chat_validated', ai)
+    from dubforge import comments_auto
+    with pytest.raises(DubForgeError) as exc:
+        comments_auto.prepare_overlay(uid, comments_auto.spec_from_config(uid))
+    assert exc.value.code == 'LLM_RATE_LIMITED'
+    assert comment_studio.view(uid)['rating_progress']['saved'] == 2
+    assert not (comment_studio.view(uid)['overlay'] or {}).get('items')
+    assert calls == ['score']
+
+
+def test_auto_stops_at_three_independent_rejections_across_candidate_batches(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id=f'c{i}', text=f'Feedback {i}', author='Viewer') for i in range(1, 7)]))
+    independently_tested = []
+    def ai(prompt, **kwargs):
+        rows = request_payload(prompt)['comments']
+        if '【评分要求】' in prompt:
+            return validated_result({'assessments': [dict(id=r['id'], eligible=True,
+                score=100-int(r['text'].split()[-1]), reason='观众反馈') for r in rows]}, kwargs)
+        if len(rows) == 1:
+            independently_tested.append(rows[0]['text'])
+        raise DubForgeError('服务商拒绝请求', code='LLM_CONTENT_REJECTED')
+    monkeypatch.setattr(comment_studio, 'chat_validated', ai)
+    from dubforge import comments_auto
+    with pytest.raises(DubForgeError) as exc:
+        comments_auto.prepare_overlay(uid, comments_auto.spec_from_config(uid))
+    assert exc.value.code == 'COMMENTS_AUTO_EMPTY'
+    assert independently_tested == ['Feedback 1', 'Feedback 2', 'Feedback 3']
+    rows = {r['id']: r for r in comment_studio.view(uid)['rows']}
+    assert rows['c4']['ai_issues']['translate']['status'] == 'deferred'
+    assert not rows['c5'].get('ai_issues', {}).get('translate')
+
+
+def test_original_only_actual_version_does_not_translate_or_change_default_language(isolated_env, monkeypatch, stub_heavy_steps):
+    uid, calls = _setup(isolated_env, monkeypatch, 'auto')
+    view = assembly_versions.view(uid)
+    versions = [{key: row[key] for key in ('id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides')}
+                for row in view['versions']]
+    versions[0]['overrides']['comments.language_mode'] = 'original'
+    assembly_versions.save(uid, dict(revision=view['revision'], versions=versions))
+    from dubforge import configuration
+    before = configuration.resolve(uid)
+    assert before['values']['comments.language_mode'] == 'translated'
+    from dubforge.runner import runner
+    from conftest import wait_status
+    runner.start_step(uid, 'assemble')
+    wait_status(uid, 'assemble', {'done'})
+    assert calls == ['score']
+    state = comment_studio.view(uid)
+    assert len(state['overlay']['items']) == 2
+    assert all(item['display_text'] == '' for item in state['overlay']['items'])
+    assert configuration.resolve(uid)['fingerprint'] == before['fingerprint']
+
+
+def _save_manual_plan(uid, spec, *, excluded_ids=(), source_text='人工精简的原文', origin='manual'):
+    """人工确认与来源不明旧方案都应保护，但不能混淆来源计数。"""
+    video_info.ensure_comments(uid, comment_limit=spec['comment_limit'])
+    state = comment_studio.view(uid)
+    row = next(item for item in state['rows'] if item['id'] == 'c2')
+    return comment_studio.save(uid, {
+        'revision': state['overlay_revision'], 'settings': spec['comment_settings'],
+        'items': [{'id': row['id'], 'source_hash': row['source_hash'],
+                   'source_text': source_text, 'display_text': '人工保留的上屏文字',
+                   **({'selection_origin': origin} if origin is not None else {})}],
+        'excluded_ids': list(excluded_ids),
+    })
+
+
+def test_auto_treats_missing_selection_origin_as_automatic(isolated_env, monkeypatch):
+    uid, calls = _setup(isolated_env, monkeypatch, 'auto')
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    _save_manual_plan(uid, spec, origin=None)
+    calls.clear()
+    spec['comment_count'] = 1
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 1
+    items = comment_studio.view(uid)['overlay']['items']
+    assert [item['id'] for item in items] == ['c1']
+    assert items[0]['selection_origin'] == 'automatic'
+    assert 'comment_translate' in calls
+
+
+def test_auto_respects_manual_exclusion_and_labels_new_automatic_items(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id=f'c{i}', text=f'Feedback {i}', author='Viewer') for i in range(1, 5)]))
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    video_info.ensure_comments(uid, comment_limit=spec['comment_limit'])
+    c1 = next(item for item in comment_studio.view(uid)['rows'] if item['id'] == 'c1')
+    exclusion = {'id': 'c1', 'source_hash': c1['source_hash']}
+    _save_manual_plan(uid, spec, excluded_ids=[exclusion])
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 2
+    overlay = comment_studio.view(uid)['overlay']
+    assert [item['id'] for item in overlay['items']] == ['c2', 'c3']
+    assert [item['selection_origin'] for item in overlay['items']] == ['manual', 'automatic']
+    assert overlay['excluded_ids'] == [exclusion]
+
+
+def test_auto_lower_target_removes_only_automatic_items(isolated_env, monkeypatch):
+    uid, calls = _setup(isolated_env, monkeypatch, 'auto')
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 2
+    assert all(item['selection_origin'] == 'automatic' for item in comment_studio.view(uid)['overlay']['items'])
+    calls.clear()
+    spec['comment_count'] = 1
+    assert comments_auto.prepare_overlay(uid, spec)[1] == 1
+    assert [item['id'] for item in comment_studio.view(uid)['overlay']['items']] == ['c1']
+    assert calls == []
+
+
+def test_auto_long_manual_keeps_full_text_and_completes(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    _save_manual_plan(uid, spec, source_text='original ' * 100)
+    spec['comment_settings']['language_mode'] = 'original'
+    warnings, count = comments_auto.prepare_overlay(uid, spec)
+    assert count == 2
+    kept = next(row for row in comment_studio.view(uid)['overlay']['items'] if row['id'] == 'c2')
+    assert kept['source_text'] == ('original ' * 100).strip()
+    assert kept['selection_origin'] == 'manual'
+    assert any('超过建议字数' in warning for warning in warnings)
+
+
+def test_auto_never_discards_manual_items_to_fit_video_capacity(isolated_env, monkeypatch):
+    uid, _ = _setup(isolated_env, monkeypatch, 'auto')
+    monkeypatch.setattr(video_info, '_fetch_source', lambda *a, **kw: dict(title='Travel test', comments=[
+        dict(id=f'c{i}', text=f'Feedback {i}', author='Viewer') for i in range(1, 4)]))
+    from dubforge import comments_auto
+    spec = comments_auto.spec_from_config(uid)
+    video_info.ensure_comments(uid, comment_limit=spec['comment_limit'])
+    state = comment_studio.view(uid)
+    before = comment_studio.save(uid, {
+        'revision': state['overlay_revision'], 'settings': spec['comment_settings'],
+        'items': [{'id': row['id'], 'source_hash': row['source_hash'],
+                   'source_text': row['text'], 'display_text': '人工保留', 'selection_origin': 'manual'} for row in state['rows']],
+    })['overlay']
+    with pytest.raises(DubForgeError) as exc:
+        comments_auto.prepare_overlay(uid, spec)
+    assert exc.value.code == 'COMMENTS_MANUAL_INVALID'
+    assert exc.value.detail['capacity'] == 2
+    assert comment_studio.view(uid)['overlay'] == before

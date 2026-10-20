@@ -35,8 +35,8 @@ def test_path_resolution_reused_but_same_request_deleted_file_is_not_ready(make_
 
 
 def test_version_defaults_reuse_request_configuration_but_new_request_reads_changes(make_project, monkeypatch):
-    uid = make_project()
     config.set_key('assemble.crf', 22)
+    uid = make_project()
     deps = Dependencies(crud.get_project(uid))
     original, calls = configuration.resolve, []
 
@@ -47,9 +47,12 @@ def test_version_defaults_reuse_request_configuration_but_new_request_reads_chan
     monkeypatch.setattr(configuration, 'resolve', resolve)
     first = av.base_values(deps)
     assert av.base_values(deps) == first and len(calls) == 1
-    config.set_key('assemble.crf', 35)
+    config.set_key('assemble.crf', 26)
     assert av.base_values(deps)[0]['assemble.crf'] == 22
-    assert av.base_values(Dependencies(crud.get_project(uid)))[0]['assemble.crf'] == 35
+    assert av.base_values(Dependencies(crud.get_project(uid)))[0]['assemble.crf'] == 22
+    current = configuration.resolve(uid)
+    configuration.save('project:' + uid, dict(revision=current['revision'], updates={'assemble.crf': 26}))
+    assert av.base_values(Dependencies(crud.get_project(uid)))[0]['assemble.crf'] == 26
 
 
 def test_production_choices_reused_across_versions_but_changed_selection_recomputed(make_project, monkeypatch):

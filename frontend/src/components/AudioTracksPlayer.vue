@@ -2,24 +2,40 @@
 // 音轨同步播放器 v4: 视频为主控, 右侧四个单选音轨 —— 原始 / 分离人声 / 背景音 /
 // 合成(人声+背景)。单选 = 一次听一路; 选「合成」时人声+背景两路同时播放。
 // 原始音轨优先用视频自带的声音 (原始音质, 16k 的 raw.wav 仅作无视频时兜底):
-// 勾选「原始」= 解除视频静音; 在原生控件里点小喇叭 = 同步选中「原始」, 双向一致。
+// 音轨选择与监听总音量独立；静音和恢复不会切换声源。
 // 全部按头部对齐跟随视频 (拖动/倍速/暂停同步, 漂移>0.3s 校正); 波形画播放位置竖线
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { NButton, NEmpty, NRadio, NRadioGroup, NText } from 'naive-ui'
 import { fmtDur } from '../utils/format'
 import { vReleaseMedia } from '../utils/preview'
+import VideoControls from './VideoControls.vue'
+import { listeningAudioState, type ListeningAudioState } from '../utils/listeningAudio'
 
 const MIXED = '__mixed__'
 const props = defineProps<{
   tracks: { name: string, label: string, url: string, peaks: string,
     size?: number, sha256?: string }[]
   videoUrl: string | null
+  chapters?: { title?: string; start_time?: number; end_time?: number | null }[]
 }>()
 
 const videoEl = ref<HTMLVideoElement | null>(null)
 const canvasEls = new Map<string, HTMLCanvasElement>()
 const audioEls = new Map<string, HTMLAudioElement>()
 const selected = ref<string>('')
+const monitorAudio = ref<ListeningAudioState>({ volume: 1, muted: false })
+function applyMonitorAudio() {
+  const audio = monitorAudio.value, video = videoEl.value
+  if (video) {
+    video.volume = audio.volume
+    video.muted = audio.muted || !(hasVideo.value && selected.value === rawName.value)
+  }
+  for (const media of audioEls.values()) { media.volume = audio.volume; media.muted = audio.muted }
+}
+function setMonitorAudio(value: ListeningAudioState) {
+  monitorAudio.value = listeningAudioState(value)
+  applyMonitorAudio()
+}
 const peaksMap = ref<Record<string, number[]>>({})
 const durs = ref<Record<string, number>>({})
 const peaksMax = ref<Record<string, number>>({})
@@ -142,7 +158,7 @@ function setCanvas(name: string, el: HTMLCanvasElement | null) {
   }
 }
 function setAudio(name: string, el: HTMLAudioElement | null) {
-  if (el) audioEls.set(name, el)
+  if (el) { audioEls.set(name, el); el.volume = monitorAudio.value.volume; el.muted = monitorAudio.value.muted }
   else audioEls.delete(name)
 }
 
@@ -151,7 +167,7 @@ function setAudio(name: string, el: HTMLAudioElement | null) {
 //  当前时间对齐接着响, 否则叠音/无声)
 watch(selected, (s) => {
   const v = videoEl.value
-  if (v) v.muted = !(hasVideo.value && s === rawName.value)
+  applyMonitorAudio()
   for (const a of audioEls.values()) a.pause()
   const act = audiosFor(s)
   if (v) {
@@ -163,14 +179,7 @@ watch(selected, (s) => {
   }
   draw()
 })
-// 原生控件的小喇叭 → 同步回单选 (双向一致, 防止叠加两层声音)
-function onVideoVolumeChange() {
-  const v = videoEl.value
-  if (!v) return
-  const wantRaw = hasVideo.value && selected.value === rawName.value
-  if (!v.muted && !wantRaw) selected.value = rawName.value
-  else if (v.muted && wantRaw) selected.value = ''
-}
+watch(videoEl, applyMonitorAudio)
 
 // —— 同步: 视频时间轴为基准, 各发声元素头部对齐 ——
 function resync(hard = false) {
@@ -221,6 +230,7 @@ function onMeta(e: Event) {
   if (v.videoWidth && v.videoHeight) {
     v.style.aspectRatio = `${v.videoWidth} / ${v.videoHeight}`
   }
+  applyMonitorAudio()
   draw()
 }
 
@@ -319,12 +329,15 @@ onBeforeUnmount(() => {
 <template>
   <div class="prev-row">
     <div class="vid-col">
-      <video v-if="hasVideo" v-release-media :key="videoUrl || ''" ref="videoEl" class="vid" :src="videoUrl || undefined"
-             muted controls preload="metadata"
+      <div v-if="hasVideo" class="video-shell">
+      <video v-release-media :key="videoUrl || ''" ref="videoEl" class="vid" :src="videoUrl || undefined"
+             muted preload="metadata"
              @play="onVideoPlay" @pause="onVideoPause" @ended="onVideoEnded"
              @seeked="onVideoSeeked" @ratechange="onVideoRate"
              @loadedmetadata="onMeta"
-             @volumechange="onVideoVolumeChange" @error="videoErr = true" />
+             @error="videoErr = true" />
+      <VideoControls :media="videoEl" :chapters="chapters" :audio-control="monitorAudio" @audio-change="setMonitorAudio" />
+      </div>
       <template v-else>
         <n-empty v-if="videoUrl && videoErr" size="small"
                  description="视频无法加载 (源文件可能被移动)" style="padding: 30px 0" />
@@ -349,7 +362,7 @@ onBeforeUnmount(() => {
       </n-radio-group>
       <n-text depth="3" style="font-size: 11.5px; display: block; margin-top: 6px">
         单选试听一路; 「合成」= 人声+背景逐样本混音 · 选「原始」时用视频自带声音
-        (原生小喇叭与本单选联动) · 竖线为播放位置 · 点波形跳转
+        · 小喇叭与音量只影响本机试听 · 竖线为播放位置 · 点波形跳转
       </n-text>
       <n-text v-if="trackErr.size" type="warning" style="font-size: 11.5px; display: block">
         ⚠ 音轨加载失败: {{ [...trackErr].map(n => options.find(o => o.name === n)?.label ?? n).join('、') }}
@@ -387,6 +400,7 @@ onBeforeUnmount(() => {
   border-radius: 8px;
   background: #000;
 }
+.video-shell { position: relative; min-width: 0; }
 /* 音轨行均分右列高度。canvas 固有尺寸 300x150 会污染 flex 基准 ——
    用 basis 0 + height 0 消掉 */
 .right :deep(.n-radio-group) { display: flex; flex-direction: column; flex: 1; min-height: 0; }

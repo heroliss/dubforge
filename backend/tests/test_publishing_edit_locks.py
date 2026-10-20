@@ -58,7 +58,7 @@ def test_upload_preflight_locks_affected_settings_without_holding_global_gate(se
     other = make_project()
     entered, release = threading.Event(), threading.Event()
 
-    def slow_plan(_key):
+    def slow_plan(_key, *, progress=None):
         entered.set()
         assert release.wait(5)
         return preview
@@ -69,10 +69,15 @@ def test_upload_preflight_locks_affected_settings_without_holding_global_gate(se
                              fingerprint=preview['fingerprint']))
         try:
             assert entered.wait(5)
-            assert runtime_edit.editability('project:' + uid)['locked']
-            with pytest.raises(DubForgeError) as caught:
-                configuration.save('global', dict(revision=0, updates={'assemble.crf': 24}))
-            assert caught.value.code == 'CONFIGURATION_BUSY'
+            # ADR-0132：上传预检先占用项目级资源，但尚未锁住设置字段；
+            # 只有与活动步骤相交的字段写入才由 locked/locked_paths 拦截。
+            report = runtime_edit.editability('project:' + uid)
+            assert report['locked'] is False
+            assert report['resource_locked'] is True
+            assert uid in report['resource_project_uids']
+            # 预检占用的是发布资源，不是设置字段；无关的制作参数仍可保存。
+            saved_global = configuration.save('global', dict(revision=0, updates={'assemble.crf': 24}))
+            assert saved_global['values']['assemble.crf'] == 24
             saved = configuration.save('project:' + other, dict(revision=0, updates={'assemble.crf': 24}))
             assert saved['values']['assemble.crf'] == 24
         finally:
@@ -88,6 +93,77 @@ def test_failed_preflight_releases_prepare_occupancy(setup_publish):
     assert row['id'] not in service._running
     assert not runtime_edit.editability('project:' + uid)['locked']
     assert calls == []
+
+
+def test_preflight_does_not_block_other_publication_controls_and_cancel_never_queues(setup_publish, make_project, monkeypatch):
+    uid, row, _, calls = setup_publish
+    preview = service.plan(row['id'])
+    other = service.create(make_project())
+    other_cancel = threading.Event()
+    entered, release = threading.Event(), threading.Event()
+    submitted = []
+
+    def slow_plan(_key, *, progress=None):
+        entered.set()
+        assert release.wait(5)
+        return preview
+
+    monkeypatch.setattr(service, 'plan', slow_plan)
+    monkeypatch.setattr(service._pool, 'submit', lambda *args: submitted.append(args))
+    with service._lock:
+        service._running[other['id']] = other_cancel
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            pending = pool.submit(service.enqueue, row['id'], dict(action='upload', revision=row['revision'],
+                                  fingerprint=preview['fingerprint']))
+            try:
+                assert entered.wait(5)
+                def other_controls():
+                    service.pause(other['id'])
+                    service._update(other['id'], error='其他稿件进度仍可写入')
+                pool.submit(other_controls).result(timeout=2)
+                assert other_cancel.is_set()
+                assert service.view(other['id'])['error'] == '其他稿件进度仍可写入'
+                # 同稿件幂等保护、同项目制作占用依然存在。
+                with pytest.raises(service.PublishError):
+                    service.enqueue(row['id'], dict(action='upload', revision=row['revision'],
+                                    fingerprint=preview['fingerprint']))
+                with pytest.raises(DubForgeError) as occupied:
+                    service.create(uid)
+                assert occupied.value.code == 'CONFIGURATION_BUSY'
+                assert runtime_edit.editability('project:' + uid)['resource_locked']
+                service.pause(row['id'])
+            finally:
+                release.set()
+            with pytest.raises(service.PublishError) as caught:
+                pending.result(timeout=5)
+            assert caught.value.code == 'PUBLISH_PREPARATION_CANCELLED'
+        current = service.view(row['id'])
+        assert current['status'] == 'draft' and not current['snapshot']
+        assert row['id'] not in service._running
+        assert submitted == [] and calls == []
+    finally:
+        with service._lock:
+            service._running.pop(other['id'], None)
+
+
+def test_queue_failure_restores_retryable_record_and_releases_occupancy(setup_publish, monkeypatch):
+    _, row, _, calls = setup_publish
+    preview = service.plan(row['id'])
+    original_submit = service._pool.submit
+    def unavailable(*args, **kwargs):
+        raise RuntimeError('隔离队列拒绝')
+    monkeypatch.setattr(service._pool, 'submit', unavailable)
+    body = dict(action='upload', revision=row['revision'], fingerprint=preview['fingerprint'])
+    with pytest.raises(service.PublishError) as caught:
+        service.enqueue(row['id'], body)
+    assert caught.value.code == 'PUBLISH_QUEUE_UNAVAILABLE'
+    current = service.view(row['id'])
+    assert current['status'] == 'draft' and not current['snapshot']
+    assert row['id'] not in service._running and calls == []
+    monkeypatch.setattr(service._pool, 'submit', original_submit)
+    service.enqueue(row['id'], body)
+    assert finish(row['id'])['status'] == 'uploaded'
 
 
 def test_platform_subtitle_import_waits_for_publication_upload(setup_publish):

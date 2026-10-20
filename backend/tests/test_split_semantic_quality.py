@@ -7,7 +7,7 @@ import pytest
 from dubforge.errors import StepFailedError
 from dubforge.pipeline import step_split
 from dubforge.runner import StepCancelled, StepContext
-from dubforge.utils.srt import SubLine
+from dubforge.utils.srt import SubLine, parse_srt
 from test_text_chain import _seed_transcribe, read_split
 
 
@@ -112,11 +112,13 @@ def test_connected_china_fragment_does_not_force_retry_or_local_rewrite(make_pro
     calls = _responses(monkeypatch,
                        "1. 0.00-1.90: about taking the train in\n2. 1.90-2.00: china",
                        "1. 0.00-2.00: about taking the train in china")
-    step_split.run(ctx)
+    # 质量门禁只能警告；run 的后置相邻归并策略由 test_text_chain 单独覆盖。
+    result = step_split._llm_resegment(ctx, parse_srt(ctx.upstream('transcribe', 'src.srt')),
+                                     50, 15, 0, words)
     assert len(calls) == 1
-    assert read_split(uid)["lines"] == [
-        {"id": 1, "start": 0.0, "end": 1.9, "text": "about taking the train in"},
-        {"id": 2, "start": 1.9, "end": 2.0, "text": "china"}]
+    assert result == [
+        {"start": 0.0, "end": 1.9, "text": "about taking the train in"},
+        {"start": 1.9, "end": 2.0, "text": "china"}]
     log = (pdir(uid) / "logs" / "split.log").read_text(encoding="utf-8")
     assert "不足0.5秒" in log and "不能确认错误" in log
 
@@ -131,10 +133,13 @@ def test_short_time_warning_uses_real_word_alignment_without_retry(make_project,
     calls = _responses(monkeypatch,
                        "1. 0.00-1.40: we arrived\n2. 1.40-2.90: in china",
                        "1. 0.00-2.90: we arrived in china")
-    step_split.run(ctx)
+    # 在后置归并前验证真实词级对齐，不能为短时长再请求模型或改写候选。
+    result = step_split._llm_resegment(ctx, parse_srt(ctx.upstream('transcribe', 'src.srt')),
+                                     50, 15, 0, words)
     assert len(calls) == 1
-    result = read_split(uid)["lines"]
-    assert [(row["start"], row["end"]) for row in result] == [(0, 2.7), (2.7, 2.9)]
+    assert result == [
+        {"start": 0.0, "end": 2.7, "text": "we arrived"},
+        {"start": 2.7, "end": 2.9, "text": "in china"}]
     assert "0.200秒" in (pdir(uid) / "logs" / "split.log").read_text(encoding="utf-8")
 
 
@@ -215,7 +220,10 @@ def test_quality_retry_keeps_full_original_context_without_bad_candidate(make_pr
              SubLine(2, 1, 3, "about taking the train in china"),
              SubLine(3, 3, 4, "following context")]
     uid, ctx = _ctx(make_project, pdir, lines=[(x.start, x.end, x.text) for x in lines])
-    bad = "1. 0.00-1.00: previous context\n3. 1.00-3.00: about taking the train in china\n4. 3.00-4.00: following context"
+    bad = ("1. 0.00-1.00: previous context\n"
+           "2. 1.00-3.00: about taking the train in china\n"
+           "3. 1.00-3.00: about taking the train in china\n"
+           "4. 3.00-4.00: following context")
     good = "1. 0.00-1.00: previous context\n2. 1.00-3.00: about taking the train in china\n3. 3.00-4.00: following context"
     calls = _responses(monkeypatch, bad, good)
     result = step_split._llm_resegment(ctx, lines, 50, 15, 2, [])
@@ -225,6 +233,30 @@ def test_quality_retry_keeps_full_original_context_without_bad_candidate(make_pr
     assert "previous context" in retry and "following context" in retry
     assert bad not in retry
     assert calls[1][1].get("messages") is None
+
+
+def test_long_quality_retry_rotates_to_next_profile(make_project, pdir, monkeypatch):
+    lines = [SubLine(1, 0, 1, "previous context"),
+             SubLine(2, 1, 3, "about taking the train in china"),
+             SubLine(3, 3, 4, "following context")]
+    uid, ctx = _ctx(make_project, pdir, lines=[(x.start, x.end, x.text) for x in lines])
+    monkeypatch.setattr(
+        step_split, "_coarse_resegment_prompt",
+        lambda *args, **kwargs: "x" * (step_split._LONG_SEMANTIC_PROMPT_CHARS + 1),
+    )
+    bad = ("1. 0.00-1.00: previous context\n"
+           "2. 1.00-3.00: about taking the train in china\n"
+           "3. 1.00-3.00: about taking the train in china\n"
+           "4. 3.00-4.00: following context")
+    good = ("1. 0.00-1.00: previous context\n"
+            "2. 1.00-3.00: about taking the train in china\n"
+            "3. 3.00-4.00: following context")
+    calls = _responses(monkeypatch, bad, good)
+    result = step_split._llm_resegment(ctx, lines, 50, 15, 2, [])
+    assert result and len(calls) == 2
+    first = calls[0][1]["profile"]
+    second = calls[1][1]["profile"]
+    assert [item["name"] for item in second] == [item["name"] for item in first][1:]
 
 
 @pytest.mark.parametrize("error", [StepCancelled("步骤被用户取消"),
@@ -381,7 +413,7 @@ def test_long_document_without_full_fuzzy_alignment_repairs_pause_once(make_proj
                     lines=[(0.0, 100.0, prefix.strip()),
                            (145.61, 146.97, "one"),
                            (160.86, 162.92, "really cool thing about taking the train in china")],
-                    words=words, max_len=10000, max_duration=300)
+                    words=words, max_len=80, max_duration=20)
     assert len(step_split._alignment_text(prefix)) > 4000
     assert step_split._alignment_text(prefix) != step_split._alignment_text(changed)
     seen = []
@@ -430,7 +462,8 @@ def test_large_quality_diagnostic_over_budget_stops_before_second_request(make_p
 
     monkeypatch.setattr(step_split, "_split_repair_prompt", oversized_repair)
     calls = _responses(monkeypatch,
-                       "1. 0.00-1.00: about taking the train\n1. 1.00-2.00: in china")
+                       "1. 0.00-1.00: about taking the train in china\n"
+                       "2. 1.00-2.00: about taking the train in china")
     with pytest.raises(StepFailedError) as exc:
         step_split.run(ctx)
     assert exc.value.code == "SPLIT_CONTEXT_BUDGET"

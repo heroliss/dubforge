@@ -49,6 +49,7 @@ def test_webui_native_preset_mapping_is_read_only(preset_env, method, mode):
     assert loaded[P + "temperature"] == 1.1
     assert loaded[P + "emo_audio"] != loaded[P + "timbre_audio"]
     assert P + "lang" not in loaded and P + "duration_factor" not in loaded
+    assert P + "dynamic_reference_max_seconds" not in loaded
     assert config.config_path().read_bytes() == before
 
 
@@ -111,12 +112,18 @@ def test_preset_cannot_read_audio_outside_its_directory(preset_env):
 
 def test_dynamic_reference_is_local_only(preset_env):
     root, values = preset_env
-    values.update({P + "timbre_mode": "dynamic", P + "emo_mode": "stable"})
+    values.update({P + "timbre_mode": "dynamic", P + "emo_mode": "stable",
+                   P + "dynamic_reference_max_seconds": 10.0,
+                   P + "timbre_reference_line_id": 2, P + "emo_reference_line_id": 3})
     with pytest.raises(PresetError, match="视频原声"):
         presets.save("shared", "视频参考", values, project_dir=str(root))
     presets.save("local", "视频参考", values, project_dir=str(root))
     loaded = presets.load("local", "视频参考", str(root))["values"]
     assert loaded[P + "timbre_mode"] == "dynamic" and loaded[P + "emo_mode"] == "stable"
+    assert loaded[P + "dynamic_reference_max_seconds"] == 10.0
+    assert loaded[P + "timbre_reference_line_id"] == 2 and loaded[P + "emo_reference_line_id"] == 3
+    assert P + "url" not in loaded and P + "project_dir" not in loaded
+    assert P + "request_timeout_seconds" not in loaded
 
 
 @pytest.mark.parametrize("value", [[0] * 7, [float('nan')] * 8, [1.1] * 8, [None] * 8, "0,0,0,0,0,0,0,0"])
@@ -201,7 +208,7 @@ def test_gradio_receives_explicit_current_parameters(preset_env, monkeypatch, tm
     monkeypatch.setattr(backend.subprocess, "run", ffmpeg)
     backend.synth("http://localhost:7860", "你好", tmp_path / "final.wav", "ZH", timbre_ref=output,
                   emo_mode=mode, emo_text="开心", emo_random=True, emo_vector=[0.3] * 8,
-                  advanced={"temperature": 1.1})
+                  emo_ref=tmp_path / '不参与当前模式的旧参考.wav', advanced={"do_sample": False, "temperature": 1.1})
     args = client.submit.call_args.kwargs
     client.predict.assert_not_called()
     client.close.assert_called_once()
@@ -210,3 +217,17 @@ def test_gradio_receives_explicit_current_parameters(preset_env, monkeypatch, tm
     assert args["emo_text"] == ("开心" if mode == "text" else "")
     assert args["vec1"] == (0.3 if mode == "vector" else 0)
     assert args["param_21"] == 1.1
+    assert args["param_18"] is False
+
+
+def test_old_stable_local_preset_loads_default_first_reference_sentence(preset_env):
+    root, values = preset_env
+    values.update({P + 'timbre_mode': 'stable', P + 'emo_mode': 'stable',
+                   P + 'timbre_reference_line_id': 3, P + 'emo_reference_line_id': 4})
+    target = Path(presets.save('local', '旧稳定参考', values, project_dir=str(root))['path'])
+    payload = json.loads(target.read_text(encoding='utf-8'))
+    payload['dubforge'].pop('timbre_reference_line_id')
+    payload['dubforge'].pop('emo_reference_line_id')
+    target.write_text(json.dumps(payload), encoding='utf-8')
+    loaded = presets.load('local', '旧稳定参考', str(root))['values']
+    assert loaded[P + 'timbre_reference_line_id'] == loaded[P + 'emo_reference_line_id'] == 1

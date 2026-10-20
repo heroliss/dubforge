@@ -9,6 +9,12 @@ from dubforge.domain import crud
 from dubforge.errors import DubForgeError
 
 
+def _report_stage(ctx, label):
+    """阶段的实时计数由评论工作室提供，这里仅标记当前自动准备活动。"""
+    from dubforge.execution_progress import report_stage
+    report_stage(ctx, 'preparing_comments', label)
+
+
 def spec_from_config(uid) -> dict:
     """从项目/全局设置推导自动采集规格（与 run_spec 同源，不含发布字段）。"""
     from dubforge import configuration
@@ -20,7 +26,7 @@ def spec_from_config(uid) -> dict:
                 comment_settings={k: values['comments.' + k] for k in DEFAULT_SETTINGS})
 
 
-def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=()) -> tuple[list, int]:
+def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(), log=None, phase=None) -> tuple[list, int]:
     """执行自动采集并保存上屏方案；返回 (警告列表, 实际上屏条数)。
 
     cancel_check 在每个网络/LLM 阶段之间被调用；extra_settings 是各版本冻结的
@@ -28,55 +34,75 @@ def prepare_overlay(uid: str, spec: dict, *, cancel_check=None, extra_settings=(
     零条可用时抛 COMMENTS_AUTO_EMPTY。
     """
     cancel = cancel_check or (lambda: None)
+    write_log = log or (lambda _message: None)
+    report_phase = phase or (lambda _message: None)
     from dubforge import comment_studio, video_info, configuration
     cancel()
-    video_info.update(uid, 'comments', comment_limit=spec['comment_limit'])
+    report_phase('评论采集：检查可复用资料，缺少或范围扩大时获取')
+    write_log('评论准备：检查已采集评论，缺少有效快照或采集范围扩大时再获取…')
+    snapshot = video_info.ensure_comments(uid, comment_limit=spec['comment_limit'],
+                                          **({'cancel_check': cancel_check} if cancel_check else {}))
+    source_ids = snapshot['ids']
+    if snapshot['reused']:
+        write_log(f'复用 {snapshot["collected_at"]} 已采集的 {snapshot["available"]} 条评论，本次处理前 {snapshot["count"]} 条；没有重新联网获取。')
+    else:
+        write_log(f'评论采集完成：本次获取 {snapshot["count"]} 条，采集上限 {snapshot["requested_limit"]} 条。')
     cancel()
-    warnings = []
-    for action in ('filter', 'translate'):
-        # 全部翻译仍服务于阅读评论；单条内容失败不再阻塞其他评论。
-        result = comment_studio.run(uid, action, prompt=spec['comment_prompt'], limit=spec['comment_count'],
-            failure_policy=spec.get('comment_failure_policy', 'skip'), cancel_check=cancel)
-        warning = result.get('job', {}).get('warning') if isinstance(result, dict) else None
-        if warning:
-            warnings.append(('评分：' if action == 'filter' else '翻译：') + warning)
-    state = comment_studio.view(uid)
-    cfg = state.get('configuration') or configuration.resolve(uid)
-    review_settings = comment_studio._review_settings(uid, cfg['values'])
-    rows = {r['id']: r for r in state['rows']}
-    assessments = state['filter'].get('assessments')
-    candidates = sorted((item for item in assessments if item['eligible']), key=lambda item: -item['score']) \
-        if assessments is not None else state['filter']['items']
+    if not source_ids:
+        raise DubForgeError('没有可上屏评论：已获取评论，但没有可用正文；请手工选择其他来源或调整评论版本', code='COMMENTS_AUTO_EMPTY')
     settings = spec['comment_settings']
-    display_settings = [settings, *extra_settings]
-
-    def usable(ident):
-        row = rows.get(ident)
-        return bool(row and not comment_studio.review_reasons(row, review_settings)
-                    and all(not comment_studio.overlay_text_issues(
-            {'display_text': row.get('text_zh', ''), 'source_text': row['text']}, current) for current in display_settings))
-
-    usable_ids = [item['id'] for item in candidates if usable(item['id'])]
-    excluded = len(candidates) - len(usable_ids)
-    if excluded:
-        warnings.append(f'已自动排除{excluded}条命中内容检查或不满足本次语言要求的候选（缺字或超长），按评分递补；完整评论与译文仍保留。')
-    ids = usable_ids[:spec['comment_count']]
+    display_settings = list(extra_settings) or [settings]
     from dubforge.pipeline.video_source import resolve_video
     from dubforge.publishing.service import _probe
+    from dubforge.pipeline import comment_overlay
+    from dubforge import comment_preparation
     project = crud.get_project(uid)
-    duration = _probe(resolve_video(project, crud.project_dir(uid)))
+    video = resolve_video(project, crud.project_dir(uid))
+    duration = _probe(video)
+    # 自动流程与评论页面共用同一准备器；这里只提供成片的真实容量与画幅。
+    # 缓存、失败递补和人工选择保护不能因入口不同而出现两套规则。
+    if video.is_file():
+        try:
+            canvas = comment_overlay.video_canvas(video)
+        except DubForgeError:
+            # 正式渲染入口仍会核对真实画幅，探测暂不可用时不丢有效 AI 缓存。
+            canvas = (1920, 1080)
+    else:
+        canvas = (1920, 1080)
     fitting = max(0, int((duration - settings['start'] - settings['duration']) // settings['interval']) + 1)
-    ids = ids[:fitting]
-    if not ids:
+    if not fitting:
+        raise DubForgeError('评论开始时间和显示时长超出视频，无法上屏；请调整评论时间设置', code='COMMENTS_AUTO_EMPTY')
+    state = comment_preparation.prepare(uid, {
+        'target': spec['comment_count'], 'prompt': spec['comment_prompt'], 'ids': source_ids,
+        'failure_policy': spec.get('comment_failure_policy', 'skip'), 'settings': settings,
+    }, cancel_check=cancel, extra_settings=display_settings, canvas=canvas, capacity=fitting,
+       log=write_log, phase=report_phase)
+    prepared = state['preparation']
+    invalid_manual = prepared.get('invalid_manual') or []
+    if invalid_manual:
+        # 自动补齐不能撤销人工决定；超长人工文字只提示，不会进入此阻断列表。
+        labels = '、'.join(str(item['id']) for item in invalid_manual[:8])
+        raise DubForgeError(f'保留的评论仍需调整（{labels}），原上屏方案未修改；请在评论精选中处理后继续',
+            code='COMMENTS_MANUAL_INVALID', detail={'invalid_manual': invalid_manual})
+    draft = prepared['draft']
+    items = draft['items']
+    if len(items) > fitting:
+        raise DubForgeError(f'保留的评论超过当前视频可容纳的 {fitting} 条，原上屏方案未修改；请调整显示间隔或解除部分保留',
+            code='COMMENTS_MANUAL_INVALID', detail={'capacity': fitting, 'selected': len(items)})
+    if not items:
         raise DubForgeError('没有可上屏评论：需通过内容检查并满足当前语言、文字长度及时间设置；请检查逐条原因或重新选择评论',
                             code='COMMENTS_AUTO_EMPTY')
-    if len(ids) < spec['comment_count']:
-        warnings.append(f'本片实际使用{len(ids)}条评论：受有效评分、可用译文、文字长度或视频时长限制。')
-    items = [dict(id=k, source_hash=rows[k]['source_hash'], display_text=rows[k]['text_zh'], source_text=rows[k]['text'])
-             for k in ids]
+    warnings = list(prepared.get('warnings') or [])
+    if len(items) < spec['comment_count']:
+        # 页面返回待确认草稿，自动模式则即将确认；使用实际成片数量表述。
+        warnings = [message for message in warnings if not message.startswith('本次已准备 ')]
+        warnings.append(f'本片实际使用{len(items)}条评论：受有效评分、可用译文、文字长度或视频时长限制。')
     cancel()
-    comment_studio.save(uid, dict(revision=state['overlay_revision'],
-        configuration_fingerprint=cfg['fingerprint'], settings=settings, items=items))
+    write_log(f'评论确认：已选 {len(items)} 条，正在保存本次上屏方案…')
+    report_phase(f'评论确认：保存 {len(items)} 条上屏方案')
+    cfg = state.get('configuration') or configuration.resolve(uid)
+    comment_studio.save(uid, {**draft, 'revision': state['overlay_revision'],
+        'configuration_fingerprint': cfg['fingerprint']}, display_settings=display_settings)
     return warnings, len(items)
 
 
@@ -117,7 +143,52 @@ def ensure_render_specs(ctx, deps, specs) -> list:
     """comments_auto 合成任务的前置：仍无已确认方案时自动准备一份；随后带方案
     重新解析全部版本规格，让运行内指纹与实际渲染输入一致。"""
     uid = ctx.project.uid
+    from dubforge import comment_studio, configuration
+    from dubforge.pipeline import comment_overlay
+    from dubforge.pipeline.video_source import resolve_video
     overlay = current_overlay(uid)
+    # 评论方案可能是在旧样式或旧画幅下确认的；仅靠字符数校验无法保证
+    # 正式 ASS 能容纳双语、作者名和换行。所有合成入口都做一次同路径预检，
+    # 自动模式可重新筛选并递补，手动模式则保留明确的排版错误供用户修正。
+    layout_error = None
+    if overlay and overlay.get('items'):
+        video = resolve_video(ctx.project, deps.root)
+        canvas = comment_overlay.video_canvas(video) if video.is_file() else (1920, 1080)
+        for version in specs:
+            plan = version.get('comment_overlay')
+            if not plan or not version.get('include_comments'):
+                continue
+            try:
+                comment_overlay.ass_document(plan, canvas)
+            except comment_studio.CommentError as exc:
+                if exc.code == 'COMMENTS_LAYOUT_OVERFLOW':
+                    layout_error = exc
+                    break
+                raise
+    if layout_error:
+        mode = configuration.resolve(uid)['values'].get('comments.mode')
+        if mode != 'auto':
+            raise layout_error
+        # 自动模式的确认方案不可直接放进成片；复用评分/翻译缓存，
+        # 让 prepare_overlay 按实际画幅筛掉问题候选并从评分池递补。
+        spec = spec_from_config(uid)
+        base = spec['comment_settings']
+        extra = [{**base, 'language_mode': s['values'].get('comments.language_mode', base['language_mode'])}
+                 for s in specs if s['include_comments']]
+        ctx.log('评论方案与当前画幅/样式不匹配：自动重新筛选可排版评论并递补…')
+        from dubforge import runtime_edit
+        set_phase = getattr(ctx, 'set_progress_phase', lambda *_args, **_kwargs: None)
+        with runtime_edit.pipeline_writes(ctx):
+            try:
+                warnings, count = prepare_overlay(uid, spec, cancel_check=ctx.check_cancel,
+                    extra_settings=extra, log=ctx.log,
+                    phase=lambda label: _report_stage(ctx, label))
+            finally:
+                set_phase('', indeterminate=False)
+        for warning in warnings:
+            ctx.log(f'⚠ {warning}')
+        ctx.log(f'已重新确认 {count} 条可排版评论')
+        overlay = current_overlay(uid)
     if overlay and overlay.get('items'):
         ctx.log('复用已确认的评论上屏方案')
     else:
@@ -127,8 +198,13 @@ def ensure_render_specs(ctx, deps, specs) -> list:
                  for s in specs if s['include_comments']]
         ctx.log('评论准备为自动采集：正在采集、评分并翻译上屏评论…')
         from dubforge import runtime_edit
+        set_phase = getattr(ctx, 'set_progress_phase', lambda *_args, **_kwargs: None)
         with runtime_edit.pipeline_writes(ctx):
-            warnings, count = prepare_overlay(uid, spec, cancel_check=ctx.check_cancel, extra_settings=extra)
+            try:
+                warnings, count = prepare_overlay(uid, spec, cancel_check=ctx.check_cancel, extra_settings=extra,
+                    log=ctx.log, phase=lambda label: _report_stage(ctx, label))
+            finally:
+                set_phase('', indeterminate=False)
         for warning in warnings:
             ctx.log(f'⚠ {warning}')
         ctx.log(f'已自动确认 {count} 条上屏评论')

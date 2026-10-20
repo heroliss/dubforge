@@ -45,9 +45,8 @@ def step_params():
     values = {f.path: cfg.get(f.path, settings=settings)
               for fields in (*STEP_PARAM_SCHEMA.values(), COMMENT_DEFAULT_FIELDS) for f in fields}
     caps = language_capabilities(settings=settings)
-    from dubforge.backends.tts_indextts25 import synthesis_profiles
     return {"ok": True, "steps": schema_view(values, caps, settings=settings, global_defaults=True),
-            "caps": caps, "indextts_profiles": synthesis_profiles()}
+            "caps": caps}
 
 
 @router.get("/llm_display")
@@ -94,11 +93,21 @@ def update_settings(body: SettingsUpdate):
     from dubforge.runner import runner
     with runner._start_lock, dubbing_session.gate:
         if not runtime_edit.display_only(body.updates):
-            runtime_edit.assert_editable('global')
+            runtime_edit.assert_editable('global', paths=set(body.updates))
         validate_numeric_updates(body.updates)
         validate_default_updates(body.updates)
+        from dubforge.llm_request_preview import validate_settings
+        validate_settings(body.updates)
         config.update_config(body.updates)
     return {"ok": True, "applied": body.updates}
+
+
+@router.post('/preview_llm')
+def preview_llm(body: dict):
+    """仅构造当前表单的请求预览；不读密钥、不保存、不向外部服务发送请求。"""
+    from dubforge.llm_request_preview import preview_request
+    return preview_request(body.get('profile'), mode=body.get('mode', 'profile'),
+                           thinking_mode=body.get('thinking_mode'))
 
 
 @router.post("/test_llm")
@@ -114,17 +123,22 @@ def test_llm(body: dict | None = None):
 
     from dubforge.backends import llm
 
+    from dubforge.llm_request_preview import validate_profiles
     profiles = (body or {}).get("profiles")
-    if not profiles:  # 兼容: 未传则测 config 启用组
+    if profiles is None:  # 兼容: 未传则测 config 启用组
         profiles = [p for p in (config.load_config().get("llm", {})
                                 .get("profiles") or []) if p.get("enabled", True)]
-        if not profiles:
-            raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
-                                suggestion="在设置页勾选至少一组配置的「启用」开关。")
+    validate_profiles(profiles)
+    if not profiles:
+        raise DubForgeError("没有启用的 LLM 配置", code="NO_ENABLED_PROFILE",
+                            suggestion="在设置页勾选至少一组配置的「启用」开关。")
 
     def probe(item):
+        from dubforge import llm_conversations
         i, p = item
-        return {**llm.test_provider(p), "index": i, "name": p.get("name")}
+        # 配置测试并行在线程池内执行，归属必须在各自工作线程绑定。
+        with llm_conversations.context(operation='provider_test', label='模型连通性测试', owner_id=str(i)):
+            return {**llm.test_provider(p), "index": i, "name": p.get("name")}
 
     with ThreadPoolExecutor(max_workers=min(len(profiles), 8)) as pool:
         results = list(pool.map(probe, enumerate(profiles)))

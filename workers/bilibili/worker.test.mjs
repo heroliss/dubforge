@@ -54,7 +54,7 @@ test('上传进度保留阶段变化与最终字节，过滤SDK地址与凭据',
 test('确认缺失或账号不匹配时，不触达投稿方法', async () => {
   const platform = { addMediaWebApiV3: () => assert.fail('不应提交') }
   await assert.rejects(fixture(platform).run('submit'), /确认/)
-  await assert.rejects(fixture(platform, 456).run('upload'), /账号校验不一致/)
+  await assert.rejects(fixture(platform, 456).run('upload'), /登录账号与所选账号不一致/)
 })
 test('提交使用有序分P列表；网络失败不重试、不切换接口', async () => {
   let requests = 0

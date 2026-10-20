@@ -71,31 +71,50 @@ function seedPublication(page: any) { page.catalog = { accounts: [], defaults: s
 function buttons(html: string) { return [...html.matchAll(/<button\b[^>]*>[\s\S]*?<\/button>/g)].map(row => row[0]) }
 function button(html: string, label: string) { const found = buttons(html).find(row => row.replace(/<[^>]*>/g, '').trim() === label); assert.ok(found, label); return found }
 
-test('评论方案在项目运行时不可改动，但原文、对照与只读重读仍可用', async t => {
+test('评论方案在项目资源占用时保留本地字段草稿，原文、对照与只读重读仍可用', async t => {
   execution.setNavigationExecution('fixture', true)
   const result = await render('CommentStudioPanel', { uid: 'fixture' }, seedComments)
-  const page = result.page.state, before = JSON.stringify({ items: page.items, settings: page.settings }), calls: any[] = []
+  const page = result.page.state, calls: any[] = []
   t.mock.method(globalThis, 'fetch', async (url, options) => { calls.push({ url, options }); return { ok: true, json: async () => comments() } as any })
   try {
-    page.toggle(comments().rows[1], true); page.setStyle('font_size', 72); page.inheritStyle('font_size'); page.useCandidates(); page.move(0, 1)
-    page.confirmPlan(); await page.process('filter'); await page.process('translate')
-    assert.equal(JSON.stringify({ items: page.items, settings: page.settings }), before)
-    assert.equal(result.dialogs.length, 0); assert.equal(calls.length, 0)
-    assert.match(button(result.page.html, '确认上屏方案（1 条）'), /disabled/)
-    assert.match(result.page.html, /原文、评分和日志仍可查看/)
+    page.toggle(comments().rows[1], true); page.setStyle('font_size', 72); page.move(0, 1); page.confirmPlan()
+    assert.equal(page.items.length, 2)
+    assert.equal(page.settings.font_size, 72)
+    assert.equal(result.dialogs.length, 1)
+    const draft=JSON.stringify({items:page.items,settings:page.settings})
     page.compare = true; page.onlySuggested = true; await page.load()
-    assert.equal(page.compare, true); assert.equal(calls.length, 1); assert.equal(calls[0].options, undefined)
+    assert.equal(page.compare, true); assert.equal(calls.length, 1)
+    assert.equal(calls[0].options.cache, 'no-store'); assert.ok(calls[0].options.signal instanceof AbortSignal)
+    assert.equal(JSON.stringify({items:page.items,settings:page.settings}),draft,'资源占用期间重读不覆盖勾选、顺序或样式草稿')
+    assert.ok(calls.every(call=>!call.options?.method),'查看与打开确认不启动准备、保存或AI处理')
+    result.dialogs[0].onNegativeClick();assert.equal(page.saving,false);assert.equal(page.dirty,true)
   } finally { result.cleanup() }
 })
 
-test('评论确认窗口打开后任务启动，保存前重新拦截并保留草稿', async () => {
+test('评论只读请求同步抛错后释放读取状态，重读能恢复且保留人工草稿', async t => {
+  const result = await render('CommentStudioPanel', { uid: 'fixture' }, seedComments), page = result.page.state
+  try {
+    assert.match(page.error, /测试禁止未声明网络请求/)
+    page.toggle(comments().rows[1], true)
+    let reads = 0
+    t.mock.method(globalThis, 'fetch', (url, options) => {
+      reads++; assert.match(String(url), /\/comments$/); assert.equal(options?.cache, 'no-store')
+      return Promise.resolve({ ok: true, json: async () => comments() }) as any
+    })
+    await page.load()
+    assert.equal(reads, 1); assert.equal(page.error, '')
+    assert.equal(page.items.length, 2); assert.equal(page.dirty, true)
+  } finally { result.cleanup() }
+})
+
+test('评论确认窗口打开后资源状态变化，仍保留待确认草稿', async () => {
   const result = await render('CommentStudioPanel', { uid: 'fixture' }, seedComments), page = result.page.state
   try {
     page.confirmPlan(); assert.equal(result.dialogs.length, 1)
     execution.setNavigationExecution('fixture', true)
-    assert.equal(await result.dialogs[0].onPositiveClick(), false)
+    await result.dialogs[0].onPositiveClick()
     assert.equal(page.saving, false); assert.equal(page.items[0].display_text, '当前中文')
-    assert.match(page.error, /正在执行|正在运行/)
+    assert.equal(page.items.length, 1)
   } finally { result.cleanup() }
 })
 
@@ -138,15 +157,16 @@ test('平台导入只锁保存到目标项目，读取候选仍可用，确认�
   } finally { result.cleanup() }
 })
 
-test('已拖动的混音在任务启动后不发迟到PUT，保留试听值和待保存状态', async t => {
+test('已拖动的混音按字段契约保存，保留试听值和收尾刷新', async t => {
   const result = await render('DubbingPanel', { uid: 'fixture' }), page = result.page.state, calls: any[] = []
   t.mock.method(globalThis, 'fetch', async (url, options) => { calls.push({ url, options }); return { ok: true, json: async () => ({}) } as any })
   try {
     page.mixEdits.change('voice', .35)
     execution.setNavigationExecution('fixture', true)
     await page.mixEdits.save()
-    assert.equal(calls.length, 0); assert.equal(page.volDub, .35); assert.equal(page.mixEdits.pending.value, true)
-    assert.match(page.mixEdits.error.value, /正在执行|正在运行/)
+    assert.equal(calls.filter(call => call.options?.method === 'PUT').length, 1)
+    assert.equal(page.volDub, .35); assert.equal(page.mixEdits.pending.value, false)
+    assert.equal(page.mixEdits.error.value, '')
     assert.equal(page.playbackDisabled, false)
   } finally { await page.mixEdits.dispose(); result.cleanup() }
 })
@@ -181,37 +201,67 @@ test('实时显示阈值接收本窗口和其它窗口更新，非法内容及�
   } finally { result.cleanup() }
 })
 
-test('总览勾选只发一份冻结PUT，预检等待期间开始运行或状态锁定均不修改勾选', async t => {
+test('总览不再维护技术步骤勾选或临时发布配置，空局部范围不发送请求', async t => {
   const result = await render('PipelineView', {}, page => { page.nav.uid = 'fixture'; page.nav.steps = []; page.nav.autoSteps = null }, '/projects/fixture')
-  const page = result.page.state, calls: any[] = []; let finish: any
-  t.mock.method(globalThis, 'fetch', (url, options) => { calls.push({ url, options }); return new Promise(resolve => { finish = resolve }) })
+  const page = result.page.state, calls: any[] = []
+  t.mock.method(globalThis, 'fetch', async (url, options) => { calls.push({ url, options }); return { ok: true, json: async () => ({}) } as any })
   try {
-    const first = page.toggleAuto('tts', false)
-    await page.toggleAuto('assemble', false)
-    assert.equal(calls.length, 1); assert.equal(page.nav.autoStepsSaving, true)
-    assert.equal(calls[0].options.method, 'PUT')
-    assert.deepEqual(JSON.parse(calls[0].options.body).steps, navModule.STEP_ORDER.filter((key: string) => key !== 'tts'))
-    finish({ ok: true, json: async () => ({ ok: true }) }); await first
-    assert.equal(page.nav.autoStepsSaving, false)
+    assert.equal(page.toggleAuto, undefined)
+    assert.equal(page.runSelectedScope, undefined)
+    assert.equal(page.includePublication, undefined)
+    assert.doesNotMatch(result.page.html, /按当前勾选运行制作|设置本次流程|选择获取视频|仅运行勾选制作步骤/)
+    assert.match(result.page.html, /运行项目/)
+    await page.runSelection(true)
+    assert.equal(calls.length, 0)
+    assert.equal(page.nav.autoSteps, null)
+  } finally { result.cleanup() }
+})
 
-    page.nav.autoSteps = null
-    page.nav.steps = [{ key: 'split', status: 'running' }]
-    await page.toggleAuto('tts', false); assert.equal(calls.length, 1); assert.equal(page.nav.autoSteps, null)
-    page.nav.steps = []
-    execution.setNavigationExecution('', false, true)
-    t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ locked: false }) } as any))
-    await page.editability.refresh(); page.editability.observing.value = true
-    t.mock.method(globalThis, 'fetch', (url, options) => { calls.push({ url, options }); return new Promise(resolve => { finish = resolve }) })
-    const checking = page.toggleAuto('tts', false)
-    assert.equal(calls.length, 2); assert.match(String(calls[1].url), /\/editability$/)
-    page.nav.steps = [{ key: 'split', status: 'queued' }]
-    finish({ ok: true, json: async () => ({ locked: false }) }); await checking
-    assert.equal(page.nav.autoSteps, null); assert.equal(page.nav.autoStepsSaving, false)
-    assert.equal(calls.filter(call => call.options.method === 'PUT').length, 1)
+test('步骤从此继续只传项目目标起点，未保存草稿和归档均阻止打开检查',async()=>{
+  const result=await render('StepView',{},page=>{
+    page.nav.uid='fixture';page.nav.steps=[{key:'split',label:'语义整理',status:'pending',cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[]}]
+  },'/projects/fixture/steps/split')
+  try{
+    const page=result.page.state,opens:any[]=[]
+    page.projectExecution={open:async(...args:any[])=>opens.push(args)}
+    page.stepParametersDirty=true;await page.localRunAction('continue');assert.equal(opens.length,0)
+    page.stepParametersDirty=false;page.reviewDirty=true;await page.localRunAction('continue');assert.equal(opens.length,0)
+    page.reviewDirty=false;await page.localRunAction('continue');assert.deepEqual(opens,[['','split']])
+    page.nav.archived=true;await page.localRunAction('continue');assert.equal(opens.length,1)
+    assert.equal(result.dialogs.length,0,'局部入口不另开发布方式或技术步骤设置窗口')
+  }finally{result.cleanup()}
+})
 
-    page.nav.steps = []
-    t.mock.method(globalThis, 'fetch', async () => ({ ok: true, json: async () => ({ locked: true, reason: '项目正在上传' }) } as any))
-    await page.editability.refresh()
-    await page.toggleAuto('tts', false); assert.equal(page.nav.autoSteps, null)
-  } finally { page.editability.observing.value = false; result.cleanup() }
+test('顺序发布中的未来项目总览锁项目运行与局部制作，仍提供批次进度链接', async () => {
+  const result=await render('PipelineView',{},page=>{page.nav.uid='fixture';page.nav.releaseBatch={id:'locked-batch',status:'running',position:2,total:3,phase:'等待前项完成'};page.nav.steps=[{key:'download',label:'获取视频',status:'pending',fresh:false,inputs:[]}];page.nav.autoSteps=null},'/projects/fixture')
+  const page=result.page.state
+  try {
+    await page.run({key:'split',label:'语义整理'});await page.runSelection(true,'split')
+    assert.equal(page.nav.autoSteps,null);assert.equal(page.busyKey,'');assert.equal(page.nav.busy,true)
+    assert.match(button(result.page.html,'运行项目…'),/disabled/)
+    assert.doesNotMatch(result.page.html, /aria-label="选择获取视频"/)
+    assert.match(result.page.html,/\/#release-batch-locked-batch/);assert.match(result.page.html,/等待前项完成/)
+  }finally{result.cleanup()}
+})
+
+test('归档项目总览保留查看，项目和局部制作入口不请求网络', async () => {
+  const result=await render('PipelineView',{},page=>{page.nav.uid='fixture';page.nav.archived=true;page.nav.steps=[{key:'download',label:'获取视频',status:'pending',fresh:false,inputs:[]}];page.nav.autoSteps=null},'/projects/fixture')
+  const page=result.page.state
+  try {
+    await page.run({key:'split',label:'语义整理'})
+    await page.runSelection(true,'split');await page.runEditorWorkflow()
+    assert.equal(page.nav.autoSteps,null);assert.equal(page.busyKey,'')
+    assert.match(button(result.page.html,'运行项目…'),/disabled/)
+    assert.doesNotMatch(result.page.html, /aria-label="选择获取视频"/)
+  } finally {result.cleanup()}
+})
+
+test('归档项目步骤页关闭重跑与补齐入口，确认窗口不再打开', async () => {
+  const result=await render('StepView',{},page=>{page.nav.uid='fixture';page.nav.archived=true;page.nav.steps=[{key:'split',label:'语义整理',status:'pending',cfg:{},artifacts:[],inputs:[],outputs:[],affected_steps:[]}]},'/projects/fixture/steps/split')
+  const page=result.page.state
+  try {
+    await page.run();await page.runWithDependencies();page.rerunDialog()
+    assert.equal(page.canRun,false);assert.equal(page.busy,false);assert.equal(result.dialogs.length,0)
+    assert.match(button(result.page.html,'运行本步'),/disabled/)
+  } finally {result.cleanup()}
 })

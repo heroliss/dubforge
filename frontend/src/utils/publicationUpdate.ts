@@ -1,6 +1,6 @@
 /** 原稿更新的显示状态独立于首次投稿，不把上传完成解释成审核通过。 */
 export const UPDATE_STATUS: Record<string, string> = {
-  prepared: '方案已检查 · 待确认', queued: '等待执行', uploading: '正在上传替换视频',
+  prepared: '方案已检查 · 待确认', uploaded: '文件已上传 · 待确认更新', queued: '等待执行', uploading: '正在上传替换视频',
   submitting: '正在更新原稿件', waiting: '等待平台转码或审核', delivering: '正在同步后续设置', failed: '部分步骤未完成',
   unknown: '操作结果待核对', paused: '更新已暂停', completed: '本次更新已核验',
 }
@@ -59,17 +59,21 @@ export const UPDATE_ACTIVE = ['queued', 'uploading', 'submitting', 'waiting', 'd
 export function publicationUpdateProgress(publication: any) {
   const task = publication?.latest_update
   if (!task || typeof task !== 'object') return null
-  const raw = Number(task.progress)
-  const progress = Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : null
+  const progressDetail = task.execution?.progress_detail || task.progress_detail || {}
+  const raw = Number(task.progress ?? task.execution?.progress ?? progressDetail.progress)
   const status = String(task.status || 'unknown')
+  const progress = status === 'completed' ? 100
+    : Number.isFinite(raw) ? Math.max(0, Math.min(100, raw)) : null
   const text = UPDATE_STATUS[status] || '原稿更新状态待核对'
   const active = (UPDATE_ACTIVE as readonly string[]).includes(status)
   const tone = status === 'completed' ? 'success' : ['failed', 'unknown'].includes(status) ? 'warning'
     : status === 'paused' ? 'warning' : active ? 'info' : 'default'
-  const stages = updateStages({ execution: { stages: task.stages } })
+  const stageSource = task.stages || task.execution?.stages || progressDetail.stages || {}
+  const stages = updateStages({ execution: { stages: stageSource, delivery: task.execution?.delivery } })
   const current = stages.find(stage => ['running', 'active', 'uploading', 'submitting', 'waiting'].includes(stage.status))
     || stages.find(stage => stage.status === 'failed')
-  return { task, status, text, progress, active, tone, phase: task.phase || current?.label || '', current, stages }
+  return { task, status, text, progress, active, tone,
+    phase: task.phase || progressDetail.current_stage_label || current?.label || '', current, stages }
 }
 export function updateNeedsReconcile(task: any): boolean {
   return task?.status === 'unknown' || task?.error_code === 'PUBLISH_UPDATE_UNKNOWN'
@@ -83,7 +87,10 @@ export function updateStages(task: any) {
     const derived = reported === null ? deliveryProgress(task, key) : { progress: reported, estimated: false }
     // 后端会为待执行阶段写入 0 作为稳定快照，但用户不需要看到一排
     // “0%”进度条；只有正在执行、等待平台或已有实际进度时才显示细条。
-    const hasActualProgress = ['running', 'active', 'uploading', 'submitting', 'waiting'].includes(status)
+    // 等待远端转码/审核时没有可量化的完成比例；后端会保留 0 作为
+    // 稳定快照，但界面应显示“等待平台处理”，不要显示误导性的 0%细条。
+    const hasActualProgress = ['running', 'active', 'uploading', 'submitting'].includes(status)
+      || (status === 'waiting' && ((reported !== null && reported > 0) || (derived.progress !== null && derived.progress > 0)))
       || (reported !== null && reported > 0) || derived.progress !== null && derived.progress > 0
     const progress = TERMINAL_STAGE_STATES.has(status) ? 100 : hasActualProgress ? derived.progress : null
     return { key, label: value.label || label, status, text: stageStatuses[status] || '等待状态更新',

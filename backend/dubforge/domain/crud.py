@@ -25,6 +25,11 @@ _MANIFEST_LOCK = threading.RLock()
 _CREATE_LOCK = threading.RLock()
 
 
+class ProjectDeletionError(DubForgeError):
+    code = 'PROJECT_DELETE_FAILED'
+    suggestion = '请检查项目目录和回收站状态后重试；项目登记仍保留。'
+
+
 def new_uid() -> str:
     """短随机 id: 6 位十六进制, 只作稳定标识 (API/URL), 不再当目录名"""
     return secrets.token_hex(3)
@@ -64,13 +69,15 @@ def project_dir(uid: str) -> Path:
 
 
 def create_project(title: str, source_url: str = "", source_kind: str = "youtube",
-                   params: dict | None = None, *, initialize=None) -> Project:
+                   params: dict | None = None, *, initialize=None, title_mode: str = "manual") -> Project:
     """目录独占创建；项目、步骤及可选初始化登记在同一个事务内。"""
-    with _CREATE_LOCK:
-        return _create_project(title, source_url, source_kind, params, initialize)
+    from dubforge import configuration
+    # 导入先持配置门禁；所有创建入口保持相同锁序，避免与模板保存相互等待。
+    with configuration.gate, _CREATE_LOCK:
+        return _create_project(title, source_url, source_kind, params, initialize, title_mode)
 
 
-def _create_project(title, source_url, source_kind, params, initialize):
+def _create_project(title, source_url, source_kind, params, initialize, title_mode):
     uid = new_uid()
     dir_name = _new_dir_name(title or "未命名")
     root = config.projects_dir().resolve()
@@ -92,22 +99,28 @@ def _create_project(title, source_url, source_kind, params, initialize):
         initial_params = dict(params or {})
         initial_settings = initial_params.pop('step_params', {})
         project = Project(uid=uid, dir_name=dir_name, title=title or uid,
+                          title_mode="auto" if title_mode == "auto" else "manual",
                           source_url=source_url, source_kind=source_kind,
                           params=json.dumps(initial_params, ensure_ascii=False))
         with session() as s:
             s.add(project)
             s.flush()
-            if initial_settings:
-                from dubforge.configuration_models import ConfigurationScope
-                from dubforge.configuration import defaults
-                initial_settings = {k: v for k, v in initial_settings.items() if k in defaults() and v is not None}
-                if initial_settings:
-                    s.add(ConfigurationScope(key='project:' + uid, values=json.dumps(initial_settings, ensure_ascii=False), revision=0))
             for step in STEPS:
                 s.add(StepRun(project_id=project.id, step_key=step.key, status="pending"))
-            if initialize is not None:
-                initialize(s, project)
-            s.commit()
+            from dubforge.configuration_models import ConfigurationScope
+            from dubforge import configuration
+            # 导入回调先登记选定模板和稀疏覆盖；基础值与项目回执在同一事务提交。
+            with configuration.gate:
+                if initialize is not None:
+                    initialize(s, project)
+                s.flush()
+                scope = s.get(ConfigurationScope, 'project:' + uid) or ConfigurationScope(key='project:' + uid, name='本项目')
+                initial_settings = {k: v for k, v in initial_settings.items() if k in configuration.defaults()
+                                    and (v is not None or k == 'publish.project_target')}
+                scope.values = configuration._json({**initial_settings, **json.loads(scope.values)})
+                scope.baseline = configuration._json(configuration.capture_baseline(s, scope.parent))
+                s.add(scope)
+                s.commit()
             committed = True
             s.refresh(project)
     except Exception:
@@ -125,9 +138,19 @@ def get_project(uid: str) -> Project | None:
         return s.exec(sqlmodel.select(Project).where(Project.uid == uid)).first()
 
 
-def list_projects() -> list[Project]:
+def list_projects(*, archive: str = 'all') -> list[Project]:
+    """领域查询默认保留全部项目；界面入口显式选择活动或归档列表。"""
+    if archive not in {'all', 'active', 'archived'}:
+        from dubforge.project_archive import ProjectArchiveError
+        raise ProjectArchiveError('项目列表范围无效，请选择活动项目、已归档或全部项目',
+                                  code='PROJECT_ARCHIVE_FILTER_INVALID')
+    query = sqlmodel.select(Project)
+    if archive == 'active':
+        query = query.where(Project.archived_at.is_(None))
+    elif archive == 'archived':
+        query = query.where(Project.archived_at.is_not(None))
     with session() as s:
-        return list(s.exec(sqlmodel.select(Project).order_by(Project.created_at.desc())).all())
+        return list(s.exec(query.order_by(Project.created_at.desc())).all())
 
 
 def delete_project(uid: str) -> bool:
@@ -140,19 +163,28 @@ def delete_project(uid: str) -> bool:
 
 
 def _delete_project(uid: str) -> bool:
-    """删除项目: 取消登记 + 目录移入系统回收站。
-    反悔 = 从回收站还原目录 → 设置页「从项目目录重建索引」即可整个找回;
-    回收站被禁用时由系统永久删除 (删除确认弹窗里已说明)。"""
+    """成功回收整个项目目录后才删除登记；无法回收绝不降级永久删除。
+    从回收站还原目录后，在项目列表「找回项目」重建登记。"""
     project = get_project(uid)
     if not project:
         return False
     pid = project.id
-    pdir = project_dir(uid)     # 行删除前解析 (语义化目录名要从行里查)
-    # 目录先进回收站 (可还原找回; 回收站被禁用时由系统永久删除), 再删登记行;
+    pdir = _project_directory_for_removal(project)
+    # 先刷新可恢复清单、确认回收成功，再删登记行；任何失败都保留索引。
     # 目录本就不在磁盘上 (被外部移走) → 跳过回收站, 只清理登记。
     if pdir.exists():
-        from send2trash import send2trash
-        send2trash(str(pdir))
+        if not pdir.is_dir():
+            raise ProjectDeletionError('项目路径不是目录，已取消删除', code='PROJECT_DELETE_PATH_INVALID')
+        try:
+            write_manifest(uid)
+        except Exception as exc:
+            raise ProjectDeletionError('项目恢复清单写入失败，已取消删除',
+                                       code='PROJECT_DELETE_MANIFEST_FAILED') from exc
+        if _project_directory_for_removal(project) != pdir or not (pdir / 'manifest.json').is_file():
+            raise ProjectDeletionError('项目目录或恢复清单已变化，已取消删除',
+                                       code='PROJECT_DELETE_MANIFEST_FAILED')
+        from dubforge.utils.recycle import recycle_file
+        recycle_file(pdir)
     with session() as s:
         for model in (Artifact, Job, StepRun):
             for row in s.exec(sqlmodel.select(model).where(model.project_id == pid)).all():
@@ -166,6 +198,25 @@ def _delete_project(uid: str) -> bool:
         s.delete(s.get(Project, pid))
         s.commit()
     return True
+
+
+def _project_directory_for_removal(project: Project) -> Path:
+    """删除必须使用真实直属项目目录，禁止读取入口的越界回退或链接跳转。"""
+    name = _dir_name_of(project, project.uid)
+    if (not isinstance(name, str) or not name or name in {'.', '..'}
+            or '/' in name or '\\' in name or Path(name).is_absolute() or Path(name).name != name):
+        raise ProjectDeletionError('项目目录登记无效，已取消删除', code='PROJECT_DELETE_PATH_INVALID')
+    try:
+        root = config.projects_dir().resolve()
+        path = root / name
+        resolved = path.resolve()
+        if resolved.parent != root or path.is_symlink() or path.is_junction():
+            raise ProjectDeletionError('项目目录越界或是链接目录，已取消删除',
+                                       code='PROJECT_DELETE_PATH_INVALID')
+        return resolved
+    except (OSError, RuntimeError) as exc:
+        raise ProjectDeletionError('无法安全确认项目目录，已取消删除',
+                                   code='PROJECT_DELETE_PATH_INVALID') from exc
 
 
 def backfill_steps() -> int:
@@ -318,14 +369,16 @@ def project_dir_by_project(project: Project) -> Path:
 
 
 def add_artifact(project_id: int, step_key: str, kind: str, name: str,
-                 abs_path: Path, rel_path: str, *, replace_existing: bool = False) -> Artifact:
+                 abs_path: Path, rel_path: str, *, replace_existing: bool = False,
+                 job_id: int | None = None, settings_snapshot_hash: str = '') -> Artifact:
     import hashlib
     h = hashlib.sha256()
     with open(abs_path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     art = Artifact(project_id=project_id, step_key=step_key, kind=kind, name=name,
-                   rel_path=rel_path, sha256=h.hexdigest(), size=abs_path.stat().st_size)
+                   rel_path=rel_path, sha256=h.hexdigest(), size=abs_path.stat().st_size,
+                   job_id=job_id, settings_snapshot_hash=settings_snapshot_hash or '')
     with session() as s:
         if replace_existing:
             existing = s.exec(sqlmodel.select(Artifact).where(
@@ -336,6 +389,7 @@ def add_artifact(project_id: int, step_key: str, kind: str, name: str,
                 # 保持发布草稿的产物 ID；更新摘要后旧确认快照自动失效。
                 existing.sha256, existing.size = art.sha256, art.size
                 existing.kind, existing.created_at = kind, art.created_at
+                existing.job_id, existing.settings_snapshot_hash = art.job_id, art.settings_snapshot_hash
                 art = existing
         s.add(art)
         s.commit()
@@ -364,7 +418,8 @@ def delete_step_artifacts(project_id: int, step_key: str) -> None:
             # 强制重跑失败时，已有成品仍能在预览和发布中心使用。
             preserve_history = (step_key == "assemble"
                                 and p.is_relative_to((root / "output").resolve()))
-            if preserve_history and a.name.startswith('final_'):
+            if preserve_history and (a.name.startswith('final_') or re.fullmatch(
+                    r'preview_version_[a-z0-9][a-z0-9_-]{0,63}_[0-9a-f]{32}\.mp4', a.name)):
                 continue
             if (p.is_relative_to(root)
                     and not p.is_relative_to((root / "media").resolve())
@@ -399,27 +454,57 @@ def latest_job(project_id: int, step_key: str) -> Job | None:
                       .order_by(Job.id.desc()).limit(1)).first()
 
 
-def update_job(job: Job, *, heartbeat_only: bool = False) -> None:
+def update_job(job: Job, *, heartbeat_only: bool = False, execution_only: bool = False) -> None:
     # 只更新已存在的行: 心跳线程可能持有上个测试/旧库的 Job 引用,
     # merge 会把它当新行插进当前库 (幽灵行) —— 此处按主键存在性守卫
     with session() as s:
         current = s.get(Job, job.id)
         if current is None:
             return
-        if heartbeat_only:
+        if execution_only:
+            current.execution = job.execution
+            s.add(current)
+        elif heartbeat_only:
             # 心跳不能用旧快照覆盖执行线程刚保存的逐句结果或终态。
             current.heartbeat_at = job.heartbeat_at
             s.add(current)
         else:
-            s.merge(job)
+            # 过程诊断有独立节流写入，旧任务快照不能把它覆盖回旧阶段。
+            # 也不回写共享 Job 对象：模型回调可能正在它上面提交新阶段。
+            from sqlalchemy import update
+            s.exec(update(Job).where(Job.id == job.id).values(
+                **job.model_dump(exclude={'id', 'execution'})))
+        s.commit()
+
+
+def finish_job(job: Job, step: StepRun | None = None) -> None:
+    """任务与步骤终态同一事务公开，避免协调器读到半边完成。"""
+    from sqlalchemy import update
+    with session() as s:
+        if s.get(Job, job.id) is None:
+            return
+        s.exec(update(Job).where(Job.id == job.id).values(
+            **job.model_dump(exclude={'id', 'execution'})))
+        if step is not None and s.get(StepRun, step.id) is not None:
+            s.merge(step)
         s.commit()
 
 
 def save_project(project: Project) -> None:
+    from sqlalchemy import update
     project.updated_at = datetime.datetime.now(datetime.timezone.utc)
     with session() as s:
-        s.merge(project)
-        s.commit()
+        current = s.get(Project, project.id) if project.id is not None else None
+        if current is not None:
+            # SQL 更新排除管理字段，旧任务快照与归档并发保存也不能取消归档。
+            s.exec(update(Project).where(Project.id == project.id).values(
+                **project.model_dump(exclude={'id', 'archived_at'})))
+            s.commit()
+            s.refresh(current)
+            project.archived_at = current.archived_at
+        else:
+            s.merge(project)
+            s.commit()
 
 
 def update_project_status(project_id: int, status: str) -> None:
@@ -433,18 +518,22 @@ def update_project_status(project_id: int, status: str) -> None:
         row.updated_at = datetime.datetime.now(datetime.timezone.utc)
         s.add(row)
         s.commit()
+        uid = row.uid
+    # manifest 是可搬运的诊断快照，必须在数据库聚合状态提交后再双写，
+    # 否则长任务收尾会留下旧的 failed/processing 状态。
+    write_manifest(uid)
 
 
-def update_project_title(uid: str, title: str) -> None:
-    """只更新标题列 (理由同 update_project_status: 避免旧快照整行覆盖)。"""
-    from sqlmodel import select
+def update_project_title(uid: str, title: str, *, title_mode: str = "manual") -> None:
+    """只更新名称及命名方式，手工改名后资料刷新不能覆盖。"""
+    from sqlalchemy import update
     with session() as s:
-        row = s.exec(select(Project).where(Project.uid == uid)).first()
-        if row is None:
-            return
-        row.title = title
-        row.updated_at = datetime.datetime.now(datetime.timezone.utc)
-        s.add(row)
+        # 同名手工保存也显式写入标题，避免读取之后的自动更新夺走用户提交值。
+        s.exec(update(Project).where(Project.uid == uid).values(
+            title=title,
+            title_mode="auto" if title_mode == "auto" else "manual",
+            updated_at=datetime.datetime.now(datetime.timezone.utc),
+        ))
         s.commit()
 
 
@@ -456,6 +545,7 @@ def write_manifest(uid: str) -> None:
 
 
 def _write_manifest(uid: str) -> None:
+    from dubforge.project_archive import archived_at_iso
     project = get_project(uid)
     if not project:
         return
@@ -464,9 +554,10 @@ def _write_manifest(uid: str) -> None:
     by_step: dict[str, list] = {}
     for a in sorted(arts.values(), key=lambda x: (x.step_key, x.name)):
         by_step.setdefault(a.step_key, []).append(
-            {"name": a.name, "file": a.rel_path, "size": a.size})
+            {"name": a.name, "file": a.rel_path, "size": a.size,
+             "job_id": a.job_id, "settings_snapshot_hash": a.settings_snapshot_hash or None})
     data = {
-        "uid": project.uid, "title": project.title,
+        "uid": project.uid, "title": project.title, "title_mode": project.title_mode,
         "dir_name": project.dir_name or uid,
         "source": {
             "kind": project.source_kind, "url": project.source_url,
@@ -477,6 +568,7 @@ def _write_manifest(uid: str) -> None:
                      else ""),
         },
         "status": project.status, "params": project_params(project),
+        "archived_at": archived_at_iso(project.archived_at),
         "updated_at": project.updated_at.isoformat(),
         "steps": [{"key": s.step_key, "status": s.status,
                    # 指纹 = "已最新可跳过"的判断依据, 一并入 manifest (重建索引时恢复)
@@ -490,13 +582,16 @@ def _write_manifest(uid: str) -> None:
     from dubforge.configuration_models import ConfigurationScope
     with session() as s:
         from dubforge.configuration import _resolve
+        from dubforge.pipeline.step_params import RUNTIME_PARAM_PATHS
         settings = _resolve(s, 'project:' + uid)
         layers = []
         for key in ['global'] + ([settings['parent']] if settings['parent'] else []):
             layer = _resolve(s, key)
-            layers.append(dict(key=key, name=layer['name'], revision=layer['revision'],
-                               values=layer['values'] if key == 'global' else layer['overrides']))
-        data['configuration'] = dict(values=settings['overrides'], parent=settings['parent'],
+            layer_values = layer['values'] if key == 'global' else layer['overrides']
+            layers.append(dict(key=key, name=layer['name'], revision=layer['revision'], archived=layer['archived'],
+                               configured=[path for path in layer['configured'] if path not in RUNTIME_PARAM_PATHS],
+                               values={path: value for path, value in layer_values.items() if path not in RUNTIME_PARAM_PATHS}))
+        data['configuration'] = dict(values=settings['overrides'], baseline=settings['baseline'], parent=settings['parent'],
                                      revision=settings['revision'], layers=layers)
         names = {a.id: a.name for a in arts.values() if a.step_key == 'assemble'}
         data['assembly_results'] = [dict(version_id=r.version_id, name=names[r.artifact_id],
@@ -543,7 +638,6 @@ def rebuild_from_dirs() -> dict:
         uid = data.get("uid")
         if not isinstance(uid, str) or not uid.strip() or uid in known:
             continue
-        known.add(uid)
         source = data.get("source") or {}
         if not isinstance(source, dict):
             source = {}
@@ -562,17 +656,30 @@ def rebuild_from_dirs() -> dict:
         source_kind = raw_kind if isinstance(raw_kind, str) and raw_kind else "link"
         raw_status = data.get("status")
         status = raw_status if raw_status in {"created", "processing", "done", "failed"} else "created"
+        archived_at = None
+        raw_archived_at = data.get('archived_at')
+        if isinstance(raw_archived_at, str):
+            try:
+                archived_at = datetime.datetime.fromisoformat(raw_archived_at)
+                if archived_at.tzinfo is None:
+                    archived_at = archived_at.replace(tzinfo=datetime.timezone.utc)
+                else:
+                    archived_at = archived_at.astimezone(datetime.timezone.utc)
+            except (ValueError, OverflowError):
+                # 旧清单缺省或不合法的管理字段不影响制作产物恢复。
+                archived_at = None
         with session() as s:
             proj = Project(uid=uid, dir_name=dir_name,
                            title=title,
+                           title_mode="auto" if data.get("title_mode") == "auto" else "manual",
                            source_url=source_url,
                            source_kind=source_kind,
                            status=status,
+                           archived_at=archived_at,
                            params=json.dumps(params, ensure_ascii=False))
             s.add(proj)
-            s.commit()
-            s.refresh(proj)
-            counts["projects"] += 1
+            # 直到配置、步骤及产物全部恢复才提交；坏基线不得留下半个项目。
+            s.flush()
             # 步骤行: manifest 记载的状态/错误/指纹; 缺的按注册表补 pending
             have: set[str] = set()
             raw_steps = data.get("steps")
@@ -647,24 +754,81 @@ def rebuild_from_dirs() -> dict:
             from dubforge.configuration_models import ConfigurationScope
             from dubforge.pipeline.assembly_versions import validate_list, validate, VersionError
             raw_settings = data.get('configuration')
+            refresh_manifest = False
             if isinstance(raw_settings, dict) and isinstance(raw_settings.get('values'), dict):
                 parent = raw_settings.get('parent', '')
                 for layer in raw_settings.get('layers', []):
                     key = layer.get('key', '')
                     if key in ('global', parent) and not s.get(ConfigurationScope, key):
+                        explicit = layer.get('configured')
+                        layer_values = layer.get('values', {})
+                        if key == 'global' and isinstance(explicit, list):
+                            layer_values = {path: value for path, value in layer_values.items() if path in explicit}
+                        elif key == 'global':
+                            copy_fields = {'publish.title', 'publish.description', 'publish.tags', 'publish.dynamic'}
+                            layer_values = {path: value for path, value in layer_values.items()
+                                            if path not in copy_fields or value not in ('', [], None)}
                         s.add(ConfigurationScope(key=key, name=layer.get('name', ''),
-                            values=json.dumps(layer.get('values', {}), ensure_ascii=False), revision=layer.get('revision', 0)))
+                            values=json.dumps(layer_values, ensure_ascii=False), revision=layer.get('revision', 0),
+                            archived=layer.get('archived') is True))
                         s.flush()
                 if parent and not s.get(ConfigurationScope, parent):
                     raise DubForgeError('项目引用的系列模板不存在，请同时恢复配置数据库', code='CONFIGURATION_PARENT_MISSING')
-                s.merge(ConfigurationScope(key='project:' + uid, parent=parent,
+                from dubforge import configuration
+                baseline = configuration.read_baseline(raw_settings.get('baseline', {}))
+                if baseline is None:
+                    refresh_manifest = True
+                    # 老清单的层值就是其保存依据，不能用恢复环境的新全局值改写旧项目。
+                    saved = configuration.defaults()
+                    origins = {key: '全局默认' for key in saved}
+                    sources = {key: configuration.scope_source('global') for key in saved}
+                    configured = set()
+                    for layer in raw_settings.get('layers', []):
+                        layer_key = layer.get('key', '')
+                        if layer_key not in ('global', parent) or not isinstance(layer.get('values'), dict):
+                            continue
+                        values = {key: value for key, value in layer['values'].items() if key in saved}
+                        saved.update(values)
+                        origins.update({key: layer.get('name') or '全局默认' for key in values})
+                        sources.update({key: configuration.scope_source(layer_key, layer.get('name', '')) for key in values})
+                        explicit = layer.get('configured')
+                        if isinstance(explicit, list):
+                            configured.update(path for path in explicit if path in values)
+                        elif layer_key == 'global':
+                            # 旧全局层是完整值，默认空文案没有人工指定证据；项目/模板稀疏空值仍明确。
+                            copy_fields = {'publish.title', 'publish.description', 'publish.tags', 'publish.dynamic'}
+                            configured.update(path for path, value in values.items()
+                                              if path not in copy_fields or value not in ('', [], None))
+                        else:
+                            configured.update(values)
+                    baseline = configuration.baseline_from(dict(values=saved, origins=origins, sources=sources,
+                                                               configured=sorted(configured)))
+                else:
+                    stored = raw_settings['baseline']
+                    stored = json.loads(stored) if isinstance(stored, str) else stored
+                    missing = set(baseline['values']) - set(stored['values'])
+                    if missing:
+                        # 与启动补齐相同：仅新字段取当前来源一次，原有值与来源不变。
+                        latest = configuration.capture_baseline(s, parent)
+                        for group in ('values', 'origins', 'sources'):
+                            baseline[group].update({key: latest[group][key] for key in missing})
+                        baseline['configured'] = sorted(set(baseline['configured']) | (set(latest['configured']) & missing))
+                        refresh_manifest = True
+                normalized = configuration._json({'schema': 1, **baseline})
+                s.merge(ConfigurationScope(key='project:' + uid, parent=parent, baseline=normalized,
                     values=json.dumps(raw_settings['values'], ensure_ascii=False), revision=int(raw_settings.get('revision', 0))))
+            else:
+                # 无配置的早期清单首次恢复时固定当前起点，之后不再随全局变化。
+                refresh_manifest = True
+                from dubforge import configuration
+                baseline = configuration.capture_baseline(s)
+                s.merge(ConfigurationScope(key='project:' + uid, baseline=configuration._json(baseline)))
             s.flush()
             names = {a.name: a for a in s.exec(sqlmodel.select(Artifact).where(Artifact.project_id == proj.id, Artifact.step_key == 'assemble')).all()}
             for row in data.get('assembly_results', []) if isinstance(data.get('assembly_results'), list) else []:
                 try:
                     snapshot = row['snapshot']
-                    validate({k: snapshot[k] for k in ('id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides')})
+                    validate({k: snapshot[k] for k in ('id', 'name', 'dubbing', 'burn_subtitles', 'include_comments', 'overrides', 'partial') if k in snapshot})
                     art = names[row['name']]
                     if snapshot['id'] != row['version_id'] or not isinstance(snapshot.get('values'), dict): continue
                     s.merge(AssemblyResult(key=f'{uid}:{row["version_id"]}', project_uid=uid,
@@ -673,6 +837,11 @@ def rebuild_from_dirs() -> dict:
                 except (VersionError, TypeError, ValueError, KeyError):
                     continue
             s.commit()
+            known.add(uid)
+            counts["projects"] += 1
+            if refresh_manifest:
+                # 提交成功后才原子更新清单，确保再次手动重建仍保留首次捕获值。
+                write_manifest(uid)
     return counts
 
 

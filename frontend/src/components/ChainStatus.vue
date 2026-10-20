@@ -10,7 +10,7 @@ import { STEP_LABELS, useNavStore } from '../stores/nav'
 import { chainKind, chainSequence, holdDescription, type ChainInfo } from '../utils/chainStatus'
 import BatchWorkflowResume from './BatchWorkflowResume.vue'
 
-const props = defineProps<{ uid: string; chain: ChainInfo | null }>()
+const props = defineProps<{ uid: string; chain: ChainInfo | null; hideRecovery?: boolean }>()
 const nav = useNavStore()
 const message = useMessage()
 const busy = ref(false)
@@ -22,6 +22,7 @@ const holdText = computed(() => props.chain ? holdDescription(props.chain, STEP_
 const holdStep = computed(() => props.chain?.hold?.step || props.chain?.remaining[0] || '')
 
 async function call(path: string, okText: string) {
+  if (nav.archived && held.value) { message.info('项目已归档，请先恢复项目后再修改保留计划。'); return }
   if (busy.value) return
   busy.value = true
   try {
@@ -44,25 +45,28 @@ async function call(path: string, okText: string) {
     <template v-if="held">
       <span class="chain-icon" aria-hidden="true">⏸</span>
       <div class="chain-text">
-        <strong>自动运行已挂起</strong>
+        <strong>制作计划已挂起</strong>
         <span class="muted">{{ holdText || '等待确认' }}</span>
         <span class="seq">剩余：{{ sequence }}</span>
+        <span class="muted">仅制作，不含上传或投稿</span>
       </div>
       <div class="chain-actions">
         <RouterLink v-if="holdStep" :to="`/projects/${uid}/steps/${holdStep}`" class="chain-link">查看该步骤 →</RouterLink>
-        <BatchWorkflowResume :projects="[{ uid, title: nav.title || uid }]" kind="chain" label="检查恢复方案…"
-          :disabled="busy || nav.busy || nav.dirMissing" @resumed="nav.poll()" />
-        <NButton size="tiny" quaternary :disabled="busy" @click="call('stop', '已放弃剩余计划')">放弃计划</NButton>
+        <span v-if="hideRecovery" class="muted">在「运行项目」中查看方案</span>
+        <BatchWorkflowResume v-else :projects="[{ uid, title: nav.title || uid }]" kind="chain" label="检查制作恢复方案…"
+          :disabled="busy || nav.archived || nav.busy || nav.dirMissing" @resumed="nav.poll()" />
+        <NButton size="tiny" quaternary :disabled="busy || nav.archived" @click="call('stop', '已放弃剩余计划')">放弃计划</NButton>
       </div>
     </template>
     <template v-else>
       <span class="chain-icon" aria-hidden="true">⛓</span>
       <div class="chain-text">
-        <strong>自动运行中</strong>
+        <strong>制作计划执行中</strong>
         <span class="seq">剩余：{{ sequence }}</span>
+        <span class="muted">仅制作，不含上传或投稿</span>
       </div>
       <div class="chain-actions">
-        <NButton size="tiny" quaternary :disabled="busy" @click="call('stop', '已停止后续自动运行; 当前步骤不受影响')">停止后续自动运行</NButton>
+        <NButton size="tiny" quaternary :disabled="busy" @click="call('stop', '已停止后续制作；当前步骤继续执行')">停止后续制作</NButton>
       </div>
     </template>
   </div>

@@ -16,7 +16,8 @@ PREFIX = "tts.indextts25."
 ADVANCED = ("do_sample", "top_p", "top_k", "temperature", "length_penalty", "num_beams",
             "repetition_penalty", "max_mel_tokens", "max_text_tokens_per_segment")
 EMOTIONS = {0: "same", 1: "preset", 2: "vector", 3: "text"}
-EXTENSION = ("lang", "duration_factor", "duration_retry_factors", "timbre_mode", "emo_mode")
+EXTENSION = ("lang", "duration_factor", "duration_retry_factors", "timbre_mode", "emo_mode",
+             "dynamic_reference_max_seconds", "timbre_reference_line_id", "emo_reference_line_id")
 _lock = threading.Lock()
 
 
@@ -95,6 +96,10 @@ def load(storage: str, name: str, project_dir="") -> dict:
     for key in EXTENSION:
         if key in extension:
             values[PREFIX + key] = extension[key]
+    for part in ('timbre', 'emo'):
+        # 旧稳定预设没有句子选择器；载入时明确回到默认第 1 句，不能继承表单旧选择。
+        if values[PREFIX + f'{part}_mode'] == 'stable':
+            values.setdefault(PREFIX + f'{part}_reference_line_id', 1)
     try:
         validate_numeric_updates(values)
     except ConfigError as exc:
