@@ -79,9 +79,9 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Asr -
 uv run --project backend --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8600 --loop app.event_loop:create_event_loop
 ~~~
 
-浏览器打开 **http://127.0.0.1:8600**。该方式由同一后端托管已构建的网页。
+浏览器打开 [http://127.0.0.1:8600](http://127.0.0.1:8600/)。该方式由同一后端托管已构建的网页。
 
-开发或需要统一控制台时，可运行 **StartDev.bat**；它按配置启动后端、启动 Vite，并提供状态、日志与重启操作。默认前端地址为 **http://127.0.0.1:5273**。更换端口及开发命令见[开发指南](docs/development.md)。
+开发或需要统一控制台时，可运行 **StartDev.bat**；它按配置启动后端、启动 Vite，并提供状态、日志与重启操作。默认前端地址为 [http://127.0.0.1:5273](http://127.0.0.1:5273/)。更换端口及开发命令见[开发指南](docs/development.md)。
 
 ### 3. 配置服务，先做一段短片
 
