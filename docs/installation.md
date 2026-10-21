@@ -30,7 +30,20 @@ DubForge 主程序与配音服务使用独立 Python 环境。按所需能力安
 
 首次安装会创建配置文件，构建前端；不会安装配音服务或提前下载全部模型。若 PowerShell 的脚本执行策略阻止运行，可在符合自己机器管理规则的情况下使用 `powershell -ExecutionPolicy Bypass -File .\scripts\install.ps1`，这只对该进程生效。
 
-5. 双击 `StartDev.bat`。在「设置 → 模型与服务」的环境检测区域检查工具和组件，然后填写大模型及配音连接参数。构建后也可[只运行后端托管页面](development.md#测试与构建)。源码、依赖和外部服务仍需安装，不是独立可执行安装包。
+5. 安装完成后，在 DubForge 根目录启动后端，由它同时托管已构建的网页：
+
+```powershell
+uv run --project backend --no-sync uvicorn app.main:app --host 127.0.0.1 --port 8600 --loop app.event_loop:create_event_loop
+```
+
+浏览器打开 [http://127.0.0.1:8600](http://127.0.0.1:8600/)，在「设置 → 模型与服务」的环境检测区域检查工具和组件，然后填写大模型及配音连接参数。源码、依赖和外部服务仍需安装，不是独立可执行安装包。
+
+<details>
+<summary>开发或需要统一控制台时</summary>
+
+可双击 `StartDev.bat`，按配置启动后端与 Vite，并通过控制台查看状态、日志及管理服务。默认前端地址为 [http://127.0.0.1:5273](http://127.0.0.1:5273/)。更换端口与控制台操作见[开发与维护](development.md#原控制台与服务管理)。
+
+</details>
 
 基础程序中不含 faster-whisper、Demucs、PyTorch。识别与分离选项按需安装这些依赖；当前本地 ML 依赖沿用已验证的 CUDA 12.6 PyTorch 源，体积较大，即使以 CPU 运行也不是精简 CPU 包。NVIDIA GPU 还需兼容驱动，faster-whisper 的 GPU 推理需要对应 CUDA/cuDNN 动态库，详见其[官方要求](https://github.com/SYSTRAN/faster-whisper#gpu)。环境页的“依赖已安装”仅代表发现 Python 包，不保证 GPU 动态库、网络和模型权重已可用。模型在首次执行相应步骤时下载，失败可检查代理后重试。
 

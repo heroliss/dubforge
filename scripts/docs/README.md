@@ -119,3 +119,14 @@ New-Item -ItemType File -Path (Join-Path $demoRun 'runtime.stop') | Out-Null
 也可等到最大运行时间。确认服务进程正常退出、`runtime-events.json` 有 shutdown 且 watcher 已结束、8611 不再监听；不要按端口强杀其他进程。含 `runtime.stop` 的目录不会被重新启动，应为下一次截图准备新目录。
 
 保留本次 `fixture.json`、`screens.json`、`runtime.json`、`runtime-events.json` 和必要的浏览器只读请求/截图记录在忽略的运行目录中；提交文档用的原图 JPG/PNG、标注 JSON、WebP 与摘要收据。不要提交演示数据库、配置、运行目录或私有浏览器资料。整组工具与图片只证明界面复现和标注过程，不代替正式媒体、模型端到端或平台发布验收。
+
+## 首页的说明性示意图
+
+README 另有两张直接维护的 SVG，和上述真实截图区分：
+
+| 文件 | 解释什么 |
+|---|---|
+| [workflow-overview.svg](../../docs/images/workflow-overview.svg) | 导入、校对、成片与交付的四段体验，不代表所有项目必须执行全部步骤 |
+| [local-architecture.svg](../../docs/images/local-architecture.svg) | 浏览器、本地程序与文件、媒体工具、按需模型服务及 B 站连接的边界 |
+
+SVG 自带文字、图形及可访问性标题，不加载远程资源或字体，也不模拟产品界面。修改后应在 GitHub 的实际内容宽度下检查中文可读性、连线和文字边界；截图收据 `capture.json` 只描述真实采集的五张图，不把示意图加入该采集记录。

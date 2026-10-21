@@ -1,0 +1,74 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1180" height="350" viewBox="0 0 1180 350" role="img" aria-labelledby="workflow-title workflow-desc">
+  <title id="workflow-title">DubForge 的四段制作体验</title>
+  <desc id="workflow-desc">从视频链接或本地文件开始，确认制作目标；校对双语文字并逐句试听；组合原声、配音、字幕和剪辑，生成多个成片版本；保存到本机，或按需投稿到 B 站。各环节可以检查，中断后先检查有效结果再继续。这是流程示意图，不是界面截图。</desc>
+  <defs>
+    <marker id="workflow-arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="m1 1 4 3-4 3" fill="none" stroke="#8797a5" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+  </defs>
+  <g font-family="-apple-system,BlinkMacSystemFont,'Segoe UI','Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif">
+    <rect x="1" y="1" width="1178" height="348" rx="22" fill="#f7f9fb" stroke="#dce3ea" stroke-width="2"/>
+    <text x="30" y="45" font-size="27" font-weight="700" fill="#172a3a">从一条视频，到你需要的成片</text>
+    <text x="1150" y="44" text-anchor="end" font-size="18" fill="#536574">四段体验 · 按目标选择</text>
+
+    <g fill="#fff" stroke="#dce3ea" stroke-width="1.5">
+      <rect x="30" y="76" width="262" height="211" rx="16"/>
+      <rect x="316" y="76" width="262" height="211" rx="16"/>
+      <rect x="602" y="76" width="262" height="211" rx="16"/>
+      <rect x="888" y="76" width="262" height="211" rx="16"/>
+    </g>
+    <g fill="none" stroke="#8797a5" stroke-width="1.8" marker-end="url(#workflow-arrow)">
+      <path d="M297 180h13"/><path d="M583 180h13"/><path d="M869 180h13"/>
+    </g>
+
+    <g>
+      <rect x="48" y="95" width="44" height="30" rx="9" fill="#edf3fd"/>
+      <text x="70" y="117" text-anchor="middle" font-size="18" font-weight="700" fill="#255ca5">01</text>
+      <g transform="translate(220 99)" fill="none" stroke="#255ca5" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="0" y="0" width="42" height="31" rx="5"/>
+        <path d="m17 9 11 6-11 7z"/><path d="M30 31v9m-7-4 7 4 7-4"/>
+      </g>
+      <text x="48" y="169" font-size="23" font-weight="700" fill="#172a3a">导入与计划</text>
+      <text x="48" y="210" font-size="19" fill="#495d6d">视频链接或本地文件</text>
+      <text x="48" y="242" font-size="19" fill="#495d6d">确认目标，按需套模板</text>
+    </g>
+
+    <g>
+      <rect x="334" y="95" width="44" height="30" rx="9" fill="#eaf5f2"/>
+      <text x="356" y="117" text-anchor="middle" font-size="18" font-weight="700" fill="#0f766e">02</text>
+      <g transform="translate(505 98)" fill="none" stroke="#0f766e" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M0 0h24v34H0zM6 8h12M6 15h10M6 22h6"/>
+        <path d="M31 11v16m6-22v28m6-20v12"/>
+      </g>
+      <text x="334" y="169" font-size="23" font-weight="700" fill="#172a3a">校对文字和声音</text>
+      <text x="334" y="210" font-size="19" fill="#495d6d">双语校对 · 逐句试听</text>
+      <text x="334" y="242" font-size="19" fill="#495d6d">先试少量，再补齐全片</text>
+    </g>
+
+    <g>
+      <rect x="620" y="95" width="44" height="30" rx="9" fill="#fff0e6"/>
+      <text x="642" y="117" text-anchor="middle" font-size="18" font-weight="700" fill="#b9521d">03</text>
+      <g transform="translate(790 97)" fill="none" stroke="#b9521d" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <rect x="0" y="10" width="37" height="27" rx="4"/>
+        <path d="M6 5h31a5 5 0 0 1 5 5v21M12 0h26a9 9 0 0 1 9 9v16m-27-4 9 5-9 5z"/>
+      </g>
+      <text x="620" y="169" font-size="23" font-weight="700" fill="#172a3a">组合成片版本</text>
+      <text x="620" y="210" font-size="19" fill="#495d6d">原声 / 配音 · 字幕</text>
+      <text x="620" y="242" font-size="19" fill="#495d6d">剪辑清单 · 多个版本</text>
+    </g>
+
+    <g>
+      <rect x="906" y="95" width="44" height="30" rx="9" fill="#edf3fd"/>
+      <text x="928" y="117" text-anchor="middle" font-size="18" font-weight="700" fill="#255ca5">04</text>
+      <g transform="translate(1078 97)" fill="none" stroke="#255ca5" stroke-width="2.3" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M0 18v17h42V18M21 24V0m-8 8 8-8 8 8"/>
+        <path d="M7 41h28"/>
+      </g>
+      <text x="906" y="169" font-size="23" font-weight="700" fill="#172a3a">本地导出或交付</text>
+      <text x="906" y="210" font-size="19" fill="#495d6d">成片保存到本机</text>
+      <text x="906" y="242" font-size="19" fill="#495d6d">按需投稿到 B 站</text>
+    </g>
+
+    <circle cx="42" cy="320" r="11" fill="#eaf5f2"/>
+    <path d="m37 320 3 3 6-7" fill="none" stroke="#0f766e" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    <text x="64" y="326" font-size="18" fill="#495d6d">各环节都能检查与调整；中断后先核对有效结果，再继续。</text>
+  </g>
+</svg>
