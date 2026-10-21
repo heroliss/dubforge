@@ -213,7 +213,7 @@ with Path(sys.argv[1]).open('r+b', buffering=0) as handle:
 @pytest.mark.parametrize('initial', [b'', b'0'], ids=['empty', 'legacy-marker'])
 @pytest.mark.parametrize('owner', ['thread', 'process'])
 @pytest.mark.parametrize('cancel_wait', [False, True], ids=['wait-release', 'cancel-wait'])
-def test_cache_lock_waits_without_writing_and_cancellation_is_safe(tmp_path, initial, owner, cancel_wait):
+def test_cache_lock_waits_without_writing_and_cancellation_is_safe(tmp_path, isolated_env, initial, owner, cancel_wait):
     path = tmp_path / 'master.lock'
     path.write_bytes(initial)
     waiting, entered, cancel = threading.Event(), threading.Event(), threading.Event()
@@ -261,7 +261,7 @@ def test_cache_lock_waits_without_writing_and_cancellation_is_safe(tmp_path, ini
 
 
 @pytest.mark.parametrize('initial', [b'', b'0'], ids=['empty', 'legacy-marker'])
-def test_cache_lock_releases_after_body_failure(tmp_path, initial):
+def test_cache_lock_releases_after_body_failure(tmp_path, isolated_env, initial):
     path = tmp_path / 'master.lock'
     path.write_bytes(initial)
     ctx = SimpleNamespace(check_cancel=lambda: None)
