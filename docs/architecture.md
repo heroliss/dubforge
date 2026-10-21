@@ -18,6 +18,8 @@ DubForge 面向本机、单用户的视频制作工作流，主程序为 Python 
 
 首个正式版本的源码交付、统一版本号、显式运行目录和 Windows 媒体读取约定见 [ADR 0232](decisions/0232-first-stable-source-release.md)。
 
+完整音轨缓存与服务登记的文件锁直接协调空文件，不在加锁前写入占位字节；并发、取消与释放约定见 [ADR 0233](decisions/0233-empty-file-locks-without-prewrites.md)。
+
 ## 制作与交付是两个层次
 
 制作步骤定义在 [`pipeline/registry.py`](../backend/dubforge/pipeline/registry.py)：获取视频、音轨分离、语音转文字、语义整理、翻译、字幕与配音、单独字幕导出、合成成片。内部 `dubtask` 键保留兼容，准备任务表已归入配音操作；发布使用独立交付状态机。

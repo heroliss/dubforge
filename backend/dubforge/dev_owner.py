@@ -45,9 +45,7 @@ def _locked(path):
     # OS 文件锁随进程退出释放；不能用崩溃后残留的目录锁阻断下一次启动。
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.with_suffix('.lock').open('a+b') as handle:
-        handle.seek(0, 2)
-        if not handle.tell():
-            handle.write(b'0'); handle.flush()
+        # Windows 允许锁定 EOF 外的字节；预填充可能写入另一句柄已锁定的区域。
         deadline = time.monotonic() + 3
         while True:
             try:

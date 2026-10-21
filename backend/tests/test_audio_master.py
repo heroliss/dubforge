@@ -1,7 +1,11 @@
 """完整音轨统一响度的真实FFmpeg回归；所有音频均由测试临时生成。"""
+import os
 import subprocess
+import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import numpy as np
@@ -141,6 +145,134 @@ def test_concurrent_same_key_only_processes_once(tmp_path):
     assert {r['cache_hit'] for r in results} == {False, True}
     assert len(commands) == 3  # 两遍处理、一次实际FLAC测量；另一调用只读验证缓存。
     assert results[0]['path'] == results[1]['path']
+
+
+def _native_cache_lock(handle, *, unlock=False):
+    """用真实系统锁持有测试文件，不依赖待验证的缓存锁实现。"""
+    handle.seek(0)
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+@contextmanager
+def _held_cache_lock(path, owner):
+    if owner == 'thread':
+        with path.open('r+b', buffering=0) as handle:
+            _native_cache_lock(handle)
+            try:
+                yield
+            finally:
+                _native_cache_lock(handle, unlock=True)
+        return
+
+    # 独立进程只操作本测试的临时锁文件；就绪后等待父进程发出释放指令。
+    ready = path.with_suffix('.ready')
+    code = '''
+import os, sys
+from pathlib import Path
+with Path(sys.argv[1]).open('r+b', buffering=0) as handle:
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    Path(sys.argv[2]).write_text('locked', encoding='ascii')
+    sys.stdin.readline()
+    handle.seek(0)
+    if os.name == 'nt':
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(handle, fcntl.LOCK_UN)
+'''
+    process = subprocess.Popen([sys.executable, '-c', code, str(path), str(ready)],
+                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                               text=True, encoding='utf-8', errors='replace')
+    try:
+        deadline = time.monotonic() + 10
+        while not ready.exists():
+            if process.poll() is not None:
+                raise AssertionError('测试持锁进程提前退出：' + process.stderr.read())
+            assert time.monotonic() < deadline, '测试持锁进程未按时就绪'
+            time.sleep(.02)
+        yield
+    finally:
+        try:
+            _, error = process.communicate('release\n', timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            raise AssertionError('测试持锁进程未按时退出') from None
+        assert process.returncode == 0, error
+
+
+@pytest.mark.parametrize('initial', [b'', b'0'], ids=['empty', 'legacy-marker'])
+@pytest.mark.parametrize('owner', ['thread', 'process'])
+@pytest.mark.parametrize('cancel_wait', [False, True], ids=['wait-release', 'cancel-wait'])
+def test_cache_lock_waits_without_writing_and_cancellation_is_safe(tmp_path, initial, owner, cancel_wait):
+    path = tmp_path / 'master.lock'
+    path.write_bytes(initial)
+    waiting, entered, cancel = threading.Event(), threading.Event(), threading.Event()
+    checks = 0
+
+    def check_cancel():
+        nonlocal checks
+        checks += 1
+        if checks >= 2:
+            waiting.set()
+
+    ctx = SimpleNamespace(check_cancel=check_cancel, _audio_cancel=cancel)
+
+    def acquire():
+        with master._cache_lock(path, ctx):
+            entered.set()
+        return True
+
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with _held_cache_lock(path, owner):
+            future = pool.submit(acquire)
+            deadline = time.monotonic() + 10
+            while not waiting.wait(.02):
+                if future.done():
+                    future.result()  # 原实现会在预写空锁文件时直接抛出 PermissionError。
+                    pytest.fail('持锁者尚未释放，等待者却已进入临界区')
+                if time.monotonic() >= deadline:
+                    cancel.set()
+                    pytest.fail('等待者未进入可取消的加锁重试')
+            assert not entered.is_set()
+            if cancel_wait:
+                cancel.set()
+                with pytest.raises(DubForgeError) as caught:
+                    future.result(timeout=5)
+                assert caught.value.code == 'AUDIO_MASTER_CANCELLED'
+                assert not entered.is_set()
+        if not cancel_wait:
+            assert future.result(timeout=5)
+            assert entered.is_set()
+
+    assert path.read_bytes() == initial
+    cancel.clear()
+    with master._cache_lock(path, ctx):
+        pass  # 正常结束和取消等待后，后续调用都能继续获取同一把锁。
+
+
+@pytest.mark.parametrize('initial', [b'', b'0'], ids=['empty', 'legacy-marker'])
+def test_cache_lock_releases_after_body_failure(tmp_path, initial):
+    path = tmp_path / 'master.lock'
+    path.write_bytes(initial)
+    ctx = SimpleNamespace(check_cancel=lambda: None)
+    with pytest.raises(RuntimeError, match='模拟处理失败'):
+        with master._cache_lock(path, ctx):
+            raise RuntimeError('模拟处理失败')
+    with _held_cache_lock(path, 'thread'):
+        pass  # 独立文件句柄能立即取得系统锁，证明异常退出没有遗留占用。
+    with master._cache_lock(path, ctx):
+        pass
+    assert path.read_bytes() == initial
 
 
 def test_cancel_and_invalid_inputs_do_not_publish_cache(tmp_path):

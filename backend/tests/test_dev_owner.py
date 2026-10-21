@@ -2,6 +2,8 @@
 import base64
 from concurrent.futures import ThreadPoolExecutor
 import json
+import multiprocessing
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import time
@@ -10,6 +12,128 @@ import psutil
 import pytest
 
 from dubforge import dev_owner as owner
+
+
+def _native_owner_lock(handle, *, unlock=False):
+    """用独立句柄核对真实 OS 锁，不依赖被测上下文的重试逻辑。"""
+    handle.seek(0)
+    if os.name == 'nt':
+        import msvcrt
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(handle, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _hold_owner_lock_in_child(path, connection):
+    """仅持有隔离锁文件；管道握手固定顺序，不启动任何服务。"""
+    try:
+        with owner._locked(Path(path)):
+            connection.send('locked')
+            if connection.recv() == 'exit':
+                # 故意跳过 finally，核对进程退出也由 OS 释放锁。
+                os._exit(0)
+        connection.send('released')
+    finally:
+        connection.close()
+
+
+def test_empty_owner_lock_retries_without_writing_into_a_held_byte(tmp_path, monkeypatch, isolated_env):
+    path = tmp_path / 'backend.process.json'
+    lock_path = path.with_suffix('.lock')
+    sleeps = []
+    with lock_path.open('a+b') as held:
+        _native_owner_lock(held)
+        try:
+            def release_after_contention(delay):
+                # 第一次申请必定遇到已持有的空文件锁，才允许释放供重试取得。
+                sleeps.append(delay)
+                assert sleeps == [.02]
+                _native_owner_lock(held, unlock=True)
+
+            monkeypatch.setattr(owner, 'time', SimpleNamespace(
+                monotonic=time.monotonic, sleep=release_after_contention))
+            with owner._locked(path):
+                assert sleeps == [.02]
+                assert lock_path.stat().st_size == 0
+                with lock_path.open('a+b') as contender:
+                    with pytest.raises(OSError):
+                        _native_owner_lock(contender)
+        finally:
+            # 旧实现会在进入重试前写入受保护的字节；失败时也需释放测试自己的句柄。
+            if not sleeps:
+                _native_owner_lock(held, unlock=True)
+    assert lock_path.read_bytes() == b''
+
+
+def test_owner_lock_preserves_three_second_wait_deadline(tmp_path, monkeypatch, isolated_env):
+    path = tmp_path / 'backend.process.json'
+    ticks = iter((100., 102.99, 103.))
+    sleeps = []
+    with path.with_suffix('.lock').open('a+b') as held:
+        _native_owner_lock(held)
+        try:
+            monkeypatch.setattr(owner, 'time', SimpleNamespace(
+                monotonic=lambda: next(ticks), sleep=sleeps.append))
+            with pytest.raises(owner.DevelopmentOwnerError, match='其他控制台更新') as failure:
+                with owner._locked(path):
+                    pytest.fail('锁仍由另一句柄持有，不能进入登记事务')
+            assert failure.value.code == 'DEV_PROCESS_OWNER_INVALID'
+            assert isinstance(failure.value.__cause__, OSError)
+            assert sleeps == [.02], '3 秒截止前重试，达到原截止时间后立即结束'
+            assert path.with_suffix('.lock').stat().st_size == 0
+        finally:
+            _native_owner_lock(held, unlock=True)
+
+
+@pytest.mark.parametrize('contents', [b'', b'0'], ids=['empty', 'legacy-byte'])
+@pytest.mark.parametrize('release', ['normal', 'exit'])
+def test_owner_lock_cross_process_exclusion_and_release(tmp_path, isolated_env, contents, release):
+    path = tmp_path / 'backend.process.json'
+    lock_path = path.with_suffix('.lock')
+    lock_path.write_bytes(contents)
+    context = multiprocessing.get_context('spawn')
+    connection, child_connection = context.Pipe()
+    process = context.Process(target=_hold_owner_lock_in_child, args=(str(path), child_connection))
+    process.start()
+    child_connection.close()
+    try:
+        assert connection.poll(15), '测试子进程未能取得隔离锁'
+        assert connection.recv() == 'locked'
+        assert lock_path.stat().st_size == len(contents)
+        with lock_path.open('a+b') as contender:
+            with pytest.raises(OSError):
+                _native_owner_lock(contender)
+        connection.send(release)
+        if release == 'normal':
+            assert connection.poll(15), '测试子进程未能释放隔离锁'
+            assert connection.recv() == 'released'
+        process.join(15)
+        assert not process.is_alive()
+        assert process.exitcode == 0
+        # 普通退出与跳过 finally 的退出都必须允许同一偏移重新取得锁。
+        with owner._locked(path):
+            assert lock_path.stat().st_size == len(contents)
+            with lock_path.open('a+b') as contender:
+                with pytest.raises(OSError):
+                    _native_owner_lock(contender)
+        assert lock_path.read_bytes() == contents
+    finally:
+        connection.close()
+        if process.is_alive():
+            process.terminate()
+            process.join(15)
+        process.close()
+
+
+def test_owner_lock_releases_after_transaction_error(tmp_path, isolated_env):
+    path = tmp_path / 'backend.process.json'
+    with pytest.raises(RuntimeError, match='隔离事务失败'):
+        with owner._locked(path):
+            raise RuntimeError('隔离事务失败')
+    with path.with_suffix('.lock').open('a+b') as contender:
+        _native_owner_lock(contender)
+        _native_owner_lock(contender, unlock=True)
 
 
 @pytest.fixture

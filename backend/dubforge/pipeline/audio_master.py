@@ -85,9 +85,7 @@ def _signature(ctx, cmd, filters, label, cut_plan, duration, options, *, algorit
 def _cache_lock(path, ctx):
     """操作系统文件锁支持线程与多进程；进程退出自动释放，不留下永久忙碌标志。"""
     with path.open('a+b') as handle:
-        if handle.seek(0, os.SEEK_END) == 0:
-            handle.write(b'0')
-            handle.flush()
+        # Windows 可锁住 EOF 之外的字节；预写占位会与另一持锁者竞争，空文件也直接加锁。
         while True:
             _check(ctx)
             try:
