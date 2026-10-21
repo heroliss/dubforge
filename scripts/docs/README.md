@@ -57,14 +57,21 @@ HTTP 只允许 GET/HEAD/OPTIONS；设置保存、制作、模型请求、外部 
 | `subtitles-dubbing` | `/projects/<本次UID>/steps/tts` | 演示视频、六句校对稿、逐句设置 |
 | `assembly-versions` | `/projects/<本次UID>/steps/assemble` | 原声/配音两版本及尚未制作的剪辑草稿 |
 | `production-settings` | `/settings?section=production&stage=assemble` | 制作规则与继承入口，无真实账号和连接 |
+| `settings-models` | `/settings?section=models` | 模型连接字段、测试入口与保存位置；未测试或保存连接 |
+| `settings-runtime` | `/settings?section=runtime` | 并行度与总工作目录；未修改实际设置 |
+| `manual-step` | `/projects/<本次UID>/steps/split` | 普通步骤的运行入口与尚未补齐的依赖 |
+| `publishing-target` | `/projects/<本次UID>/steps/upload` | 项目交付方式与稿件目标，无发布记录 |
+| `publishing-parts` | `/projects/<本次UID>/steps/upload` | 项目分 P 清单、排序与名称，无上传或投稿 |
 
 只进行导航、滚动、折叠展开和本地勾选。不要点击保存、运行、生成、试配、试片、取帧、服务启动、测试连接、上传或投稿；被服务拒绝也不是许可去试这些操作。
 
-保持真实浏览器尺寸和页面布局。本次原图宽 2560 像素，高度为 1215 或 1271，以每张图片的实际元数据为准；内容区域自身限制宽度，不为构图修改 viewport、CSS 或业务状态。`screens.json` 中的视口值只是准备脚本的参考值，不能当成本次真实采集尺寸。
+保持真实浏览器尺寸和页面布局。首组原图宽 2560 像素，教学补图还包含宽 3160 像素的 JPEG，以每张图片的实际元数据为准；内容区域自身限制宽度，不为构图修改 viewport、CSS 或业务状态。`screens.json` 中的视口值只是准备脚本的参考值，不能当成本次真实采集尺寸。
 
 先保存完整浏览器截图的原始字节；本次使用默认完整截图，不使用非零原点的浏览器截图裁剪。当前连接工具返回 JPEG，所以原图放在 `docs/images/raw/<图片名>.jpg`。其他工具若确实返回 PNG，可以保存 `.png`；**不要只改扩展名冒充格式**，也不要用后续裁剪结果覆盖原图。
 
 记录原图尺寸、实际视口、待展示区域的 DOM 边界、页面缩放/设备像素比及本次夹具目录。按这些事实换算到原图像素后，在下一步的 `spec.crop` 中指定局部裁剪；这只是对已保存原图的离线处理，不改变浏览器视口或页面布局。
+
+截图工具可能为画布补白，不能直接用“原图宽度 ÷ 视口宽度”推断缩放。用可辨识的控件边界核对实际映射，再逐图检查裁切与标记。
 
 ## 4. 添加圈线与编号
 
@@ -104,7 +111,7 @@ node scripts/docs/annotate.mjs docs/images/raw/project-space.jpg docs/images/ann
 
 工具保留完整原图和标注清单，依次裁剪、合成标注、缩放；为输出独立生成 `project-space.webp.json`，记录原图/输出摘要、`original_size`、实际 `crop` 与原始 `spec`。省略 `crop` 时，收据仍记录原点为零的完整画布。输入、清单、输出、收据及临时路径不得互相覆盖或通过路径别名指向同一文件。
 
-逐张目视检查：编号对应文字、圈线没有挡住按钮、裁剪包含必要上下文、缩小后中文仍可读。README 图注明确“隔离演示项目”，不把待运行状态改成成功，也不从演示库杜撰账号、审核或模型质量。[本次采集清单](../../docs/images/capture.json)记录实际原图尺寸、裁剪、输出大小和摘要。
+逐张目视检查：编号对应文字、圈线没有挡住按钮、裁剪包含必要上下文、缩小后中文仍可读。README 图注明确“隔离演示项目”，不把待运行状态改成成功，也不从演示库杜撰账号、审核或模型质量。[首组采集清单](../../docs/images/capture.json)与[教学补图清单](../../docs/images/tutorial-capture.json)记录实际原图尺寸、裁剪、输出大小和摘要。
 
 ## 5. 退出与保留证据
 

@@ -1,0 +1,187 @@
+{
+  "schema": "dubforge.documentation-capture.v1",
+  "captured_on": "2026-10-21",
+  "version": "1.0.0",
+  "app_source_commit": "d293c7e2e7db422d0e762c0f3dc8f4e3377d7066",
+  "browser": "Chrome",
+  "viewport_override": false,
+  "source": "Real dark Vue build and isolated read-only local API on 127.0.0.1:8611; self-authored demo projects and geometry video",
+  "boundary": {
+    "steps_pending": 27,
+    "jobs": 0,
+    "accounts": 0,
+    "publications": 0,
+    "formal_assembly_results": 0,
+    "model_calls": 0,
+    "tts_calls": 0
+  },
+  "original_pixels_preserved": true,
+  "annotations": "Local SVG overlay via Sharp; offline crop and resize; no UI or business-state fabrication",
+  "screens": [
+    {
+      "name": "settings-models",
+      "raw": "raw/settings-models.jpg",
+      "annotation": "annotations/settings-models.json",
+      "image": "settings-models.webp",
+      "receipt": "settings-models.webp.json",
+      "raw_size": {
+        "width": 3160,
+        "height": 1569
+      },
+      "viewport": {
+        "height": 1412,
+        "width": 2844
+      },
+      "content_scale": {
+        "x": 1,
+        "y": 1
+      },
+      "canvas_mapping": "1:1 content pixels; provider canvas has right/bottom padding",
+      "raw_sha256": "ed7b38623db061252a47d009986ece0c5e427c3dfb807dec58615c19ccba475c",
+      "output_sha256": "bca3514c5dd5d3fbc2fb526ee42f958e96e730fb4886a0857441f0005ae9c587",
+      "size": {
+        "width": 1180,
+        "height": 856,
+        "bytes": 249924
+      },
+      "crop": {
+        "left": 936,
+        "top": 375,
+        "width": 1200,
+        "height": 870
+      }
+    },
+    {
+      "name": "settings-runtime",
+      "raw": "raw/settings-runtime.png",
+      "annotation": "annotations/settings-runtime.json",
+      "image": "settings-runtime.webp",
+      "receipt": "settings-runtime.webp.json",
+      "raw_size": {
+        "width": 2560,
+        "height": 1271
+      },
+      "viewport": {
+        "height": 1412,
+        "width": 2844
+      },
+      "content_scale": {
+        "x": 0.90014064697609,
+        "y": 0.9001416430594901
+      },
+      "canvas_mapping": "proportional CDP surface capture",
+      "raw_sha256": "27dc3424d98ffe9ed6e6f181ad126980585189d725d15b722284698a1b4e596f",
+      "output_sha256": "c0d76aa156718bd4b8a19f947a7d16c7b973dbef95e4637c6ee6476a8bd4ad86",
+      "size": {
+        "width": 1089,
+        "height": 525,
+        "bytes": 15808
+      },
+      "crop": {
+        "left": 839,
+        "top": 484,
+        "width": 1089,
+        "height": 525
+      }
+    },
+    {
+      "name": "publishing-target",
+      "raw": "raw/publishing-target.jpg",
+      "annotation": "annotations/publishing-target.json",
+      "image": "publishing-target.webp",
+      "receipt": "publishing-target.webp.json",
+      "raw_size": {
+        "width": 3160,
+        "height": 1500
+      },
+      "viewport": {
+        "height": 1350,
+        "width": 2844
+      },
+      "content_scale": {
+        "x": 1,
+        "y": 1
+      },
+      "canvas_mapping": "1:1 content pixels; provider canvas has right/bottom padding",
+      "raw_sha256": "3b5196e185c83edf7fe004fbcebbe012d5f2f1eb45c914693308d61a0648a760",
+      "output_sha256": "9228329a740966439dbeb7305ef306ba26fd28a7044c4c01ebbdcb5e476181a4",
+      "size": {
+        "width": 1180,
+        "height": 469,
+        "bytes": 132132
+      },
+      "crop": {
+        "left": 812,
+        "top": 80,
+        "width": 1452,
+        "height": 577
+      }
+    },
+    {
+      "name": "publishing-parts",
+      "raw": "raw/publishing-parts.jpg",
+      "annotation": "annotations/publishing-parts.json",
+      "image": "publishing-parts.webp",
+      "receipt": "publishing-parts.webp.json",
+      "raw_size": {
+        "width": 3160,
+        "height": 1500
+      },
+      "viewport": {
+        "height": 1350,
+        "width": 2844
+      },
+      "content_scale": {
+        "x": 1,
+        "y": 1
+      },
+      "canvas_mapping": "1:1 content pixels; provider canvas has right/bottom padding",
+      "raw_sha256": "1fd19f070415126b26286b18969d37120d5457a2288a8cd29de096b50ba4d66b",
+      "output_sha256": "75336e4dec00ae95f3493e383833bff0bdf56f99438cb5712900b014be8ca649",
+      "size": {
+        "width": 1180,
+        "height": 421,
+        "bytes": 65204
+      },
+      "crop": {
+        "left": 812,
+        "top": 627,
+        "width": 1452,
+        "height": 518
+      }
+    },
+    {
+      "name": "manual-step",
+      "raw": "raw/manual-step.jpg",
+      "annotation": "annotations/manual-step.json",
+      "image": "manual-step.webp",
+      "receipt": "manual-step.webp.json",
+      "raw_size": {
+        "width": 3160,
+        "height": 1500
+      },
+      "viewport": {
+        "height": 1350,
+        "width": 2844
+      },
+      "content_scale": {
+        "x": 1,
+        "y": 1
+      },
+      "canvas_mapping": "1:1 content pixels; provider canvas has right/bottom padding",
+      "raw_sha256": "38a38870c6a9562f58371a07d8e3d49a90c0f79b3332ddd2f25e34b7b39ad702",
+      "output_sha256": "564af1e7cea802a59e02b140f687e59a64ce2a61ff1004d8fa7bfa283bace0a9",
+      "size": {
+        "width": 1180,
+        "height": 311,
+        "bytes": 76694
+      },
+      "crop": {
+        "left": 776,
+        "top": 83,
+        "width": 1535,
+        "height": 404
+      }
+    }
+  ]
+}

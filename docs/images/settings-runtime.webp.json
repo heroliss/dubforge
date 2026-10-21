@@ -1,0 +1,56 @@
+{
+  "input": "settings-runtime.png",
+  "input_sha256": "27dc3424d98ffe9ed6e6f181ad126980585189d725d15b722284698a1b4e596f",
+  "output_sha256": "c0d76aa156718bd4b8a19f947a7d16c7b973dbef95e4637c6ee6476a8bd4ad86",
+  "original_size": {
+    "width": 2560,
+    "height": 1271
+  },
+  "crop": {
+    "left": 839,
+    "top": 484,
+    "width": 1089,
+    "height": 525
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 839,
+      "top": 484,
+      "width": 1089,
+      "height": 525
+    },
+    "marks": [
+      {
+        "number": 1,
+        "shape": "rect",
+        "target": {
+          "x": 34,
+          "y": 70,
+          "width": 1023,
+          "height": 113
+        },
+        "label": {
+          "x": 24,
+          "y": 52
+        },
+        "arrow": true
+      },
+      {
+        "number": 2,
+        "shape": "rect",
+        "target": {
+          "x": 34,
+          "y": 345,
+          "width": 383,
+          "height": 38
+        },
+        "label": {
+          "x": 24,
+          "y": 326
+        },
+        "arrow": true
+      }
+    ]
+  }
+}

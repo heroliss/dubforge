@@ -1,0 +1,56 @@
+{
+  "input": "publishing-target.jpg",
+  "input_sha256": "3b5196e185c83edf7fe004fbcebbe012d5f2f1eb45c914693308d61a0648a760",
+  "output_sha256": "9228329a740966439dbeb7305ef306ba26fd28a7044c4c01ebbdcb5e476181a4",
+  "original_size": {
+    "width": 3160,
+    "height": 1500
+  },
+  "crop": {
+    "left": 812,
+    "top": 80,
+    "width": 1452,
+    "height": 577
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 812,
+      "top": 80,
+      "width": 1452,
+      "height": 577
+    },
+    "marks": [
+      {
+        "number": 1,
+        "shape": "rect",
+        "target": {
+          "x": 36,
+          "y": 327,
+          "width": 790,
+          "height": 42
+        },
+        "label": {
+          "x": 24,
+          "y": 307
+        },
+        "arrow": true
+      },
+      {
+        "number": 2,
+        "shape": "rect",
+        "target": {
+          "x": 36,
+          "y": 434,
+          "width": 790,
+          "height": 42
+        },
+        "label": {
+          "x": 24,
+          "y": 416
+        },
+        "arrow": true
+      }
+    ]
+  }
+}

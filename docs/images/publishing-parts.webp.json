@@ -1,0 +1,71 @@
+{
+  "input": "publishing-parts.jpg",
+  "input_sha256": "1fd19f070415126b26286b18969d37120d5457a2288a8cd29de096b50ba4d66b",
+  "output_sha256": "75336e4dec00ae95f3493e383833bff0bdf56f99438cb5712900b014be8ca649",
+  "original_size": {
+    "width": 3160,
+    "height": 1500
+  },
+  "crop": {
+    "left": 812,
+    "top": 627,
+    "width": 1452,
+    "height": 518
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 812,
+      "top": 627,
+      "width": 1452,
+      "height": 518
+    },
+    "marks": [
+      {
+        "number": 1,
+        "shape": "rect",
+        "target": {
+          "x": 40,
+          "y": 73,
+          "width": 1360,
+          "height": 45
+        },
+        "label": {
+          "x": 24,
+          "y": 57
+        },
+        "arrow": true
+      },
+      {
+        "number": 2,
+        "shape": "rect",
+        "target": {
+          "x": 1258,
+          "y": 165,
+          "width": 145,
+          "height": 38
+        },
+        "label": {
+          "x": 1236,
+          "y": 144
+        },
+        "arrow": true
+      },
+      {
+        "number": 3,
+        "shape": "rect",
+        "target": {
+          "x": 53,
+          "y": 242,
+          "width": 1340,
+          "height": 43
+        },
+        "label": {
+          "x": 30,
+          "y": 223
+        },
+        "arrow": true
+      }
+    ]
+  }
+}

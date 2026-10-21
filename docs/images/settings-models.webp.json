@@ -1,0 +1,71 @@
+{
+  "input": "settings-models.jpg",
+  "input_sha256": "ed7b38623db061252a47d009986ece0c5e427c3dfb807dec58615c19ccba475c",
+  "output_sha256": "bca3514c5dd5d3fbc2fb526ee42f958e96e730fb4886a0857441f0005ae9c587",
+  "original_size": {
+    "width": 3160,
+    "height": 1569
+  },
+  "crop": {
+    "left": 936,
+    "top": 375,
+    "width": 1200,
+    "height": 870
+  },
+  "spec": {
+    "maxWidth": 1180,
+    "crop": {
+      "left": 936,
+      "top": 375,
+      "width": 1200,
+      "height": 870
+    },
+    "marks": [
+      {
+        "number": 1,
+        "shape": "rect",
+        "target": {
+          "x": 36,
+          "y": 172,
+          "width": 1110,
+          "height": 90
+        },
+        "label": {
+          "x": 24,
+          "y": 160
+        },
+        "arrow": true
+      },
+      {
+        "number": 2,
+        "shape": "rect",
+        "target": {
+          "x": 959,
+          "y": 132,
+          "width": 83,
+          "height": 37
+        },
+        "label": {
+          "x": 941,
+          "y": 109
+        },
+        "arrow": true
+      },
+      {
+        "number": 3,
+        "shape": "rect",
+        "target": {
+          "x": 34,
+          "y": 805,
+          "width": 126,
+          "height": 36
+        },
+        "label": {
+          "x": 24,
+          "y": 787
+        },
+        "arrow": true
+      }
+    ]
+  }
+}

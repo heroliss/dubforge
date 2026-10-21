@@ -151,6 +151,39 @@ class VersionChecks(unittest.TestCase):
 
 
 class DocumentationChecks(unittest.TestCase):
+    def test_current_tutorial_links_are_checked_without_scanning_history(self):
+        tutorials = (
+            'docs/tutorials/README.md', 'docs/tutorials/first-video.md',
+            'docs/tutorials/manual-workflow.md', 'docs/tutorials/automation-and-templates.md',
+            'docs/tutorials/settings.md',
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in (*release.CURRENT_DOCS, *tutorials):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('', encoding='utf-8')
+            for name in ('docs/plans/old.md', 'docs/research/old.md'):
+                path = root / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('[历史链接](missing.md)\n', encoding='utf-8')
+            valid = '[设置说明](settings.md)\n'
+            for name in tutorials:
+                (root / name).write_text(valid, encoding='utf-8')
+            # 使用真实当前文档清单，验证教程内的链接确实进入检查，而非只断言常量。
+            with patch.object(release, 'ROOT', root):
+                self.assertEqual(release.docs_errors(), ([], len(tutorials)))
+                for name in tutorials:
+                    with self.subTest(tutorial=name):
+                        path = root / name
+                        path.write_text(valid + '[缺失章节](missing-topic.md)\n', encoding='utf-8')
+                        errors, count = release.docs_errors()
+                        self.assertEqual(count, len(tutorials) + 1)
+                        self.assertEqual(len(errors), 1)
+                        self.assertIn(name, errors[0])
+                        self.assertIn('missing-topic.md', errors[0])
+                        path.write_text(valid, encoding='utf-8')
+
     def test_supported_local_links_images_and_escape(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

@@ -1,0 +1,56 @@
+{
+  "maxWidth": 1180,
+  "crop": {
+    "left": 812,
+    "top": 627,
+    "width": 1452,
+    "height": 518
+  },
+  "marks": [
+    {
+      "number": 1,
+      "shape": "rect",
+      "target": {
+        "x": 40,
+        "y": 73,
+        "width": 1360,
+        "height": 45
+      },
+      "label": {
+        "x": 24,
+        "y": 57
+      },
+      "arrow": true
+    },
+    {
+      "number": 2,
+      "shape": "rect",
+      "target": {
+        "x": 1258,
+        "y": 165,
+        "width": 145,
+        "height": 38
+      },
+      "label": {
+        "x": 1236,
+        "y": 144
+      },
+      "arrow": true
+    },
+    {
+      "number": 3,
+      "shape": "rect",
+      "target": {
+        "x": 53,
+        "y": 242,
+        "width": 1340,
+        "height": 43
+      },
+      "label": {
+        "x": 30,
+        "y": 223
+      },
+      "arrow": true
+    }
+  ]
+}

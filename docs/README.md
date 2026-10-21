@@ -4,7 +4,7 @@ DubForge 是独立开发的视频翻译配音工作台。当前发行提供源�
 
 ## 从哪里开始
 
-- **第一次了解**：[首页图解](../README.md#一条视频按你的目标制作) → [快速开始](../README.md#快速开始) → [工作台操作](../README.md#在工作台里完成制作)。
+- **第一次了解**：[首页图解](../README.md#一条视频按你的目标制作) → [快速开始](../README.md#快速开始) → [分主题教学](tutorials/README.md)。
 - **已经在使用**：按下面的使用与安装表，查找模型配置、批量导入或故障处理。
 - **准备开发维护**：先读架构与开发指南，再按具体问题查阅 ADR；历史计划不代表当前待办。
 
@@ -13,6 +13,7 @@ DubForge 是独立开发的视频翻译配音工作台。当前发行提供源�
 | 需要做什么 | 阅读位置 |
 |---|---|
 | 了解能力、界面与基本流程 | [项目首页](../README.md)；应用内「使用帮助」 |
+| 由浅入深学习：短片、手动步骤、自动流程与设置 | [教学目录](tutorials/README.md) · [第一条视频](tutorials/first-video.md) · [手动制作](tutorials/manual-workflow.md) · [自动流程与模板](tutorials/automation-and-templates.md) · [设置说明](tutorials/settings.md) |
 | 首次安装、选装识别/分离/发布组件、连接配音服务 | [安装与环境配置](installation.md) |
 | 从文本或 JSON 批量创建项目 | [批量创建项目](batch-project-import.md)；[基础样板](examples/batch-projects.json)、[双分P样板](examples/batch-projects-two-parts.json) |
 | 处理启动、服务、缓存、恢复及投稿问题 | [故障排查](troubleshooting.md) |

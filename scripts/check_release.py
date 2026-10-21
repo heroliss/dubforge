@@ -22,6 +22,9 @@ CURRENT_DOCS = (
     'docs/README.md', 'docs/architecture.md', 'docs/development.md',
     'docs/troubleshooting.md', 'docs/installation.md', 'docs/releasing.md',
     'docs/batch-project-import.md', 'scripts/docs/README.md', 'docs/validation-v1.0.0.md',
+    'docs/tutorials/README.md', 'docs/tutorials/first-video.md',
+    'docs/tutorials/manual-workflow.md', 'docs/tutorials/automation-and-templates.md',
+    'docs/tutorials/settings.md',
 )
 LINK = re.compile(r'!?\[[^\]\n]*\]\((?:<([^>]+)>|([^\s)]+))(?:\s+["\'][^\n]*["\'])?\)')
 IMAGE = re.compile(r'<img\b[^>]*\bsrc=["\']([^"\']+)["\']', re.I)
