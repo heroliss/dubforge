@@ -58,7 +58,7 @@ git checkout v1.0.0
 powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\install.ps1 -Asr -Separation
 ```
 
-下载[发行版源码压缩包](https://github.com/heroliss/dubforge/releases/latest)的用户，解压后在项目目录执行最后一行即可。私有仓库的源码与发行版需要已有仓库权限。
+下载[发行版源码压缩包](https://github.com/heroliss/dubforge/releases/latest)的用户，解压后在项目目录执行最后一行即可。
 
 <details>
 <summary>按需安装：只做字幕、增加投稿，或已有配音服务</summary>
@@ -172,6 +172,6 @@ DubForge 独立开发、独立运行。界面、任务状态和媒体处理在�
 
 - **真实界面截图**来自隔离演示项目，使用自写双语稿和自绘视频，不含真实账号、密钥或私有作品；不代表已完成真实模型或平台交付。首页与教学各章按内容复用配图，原图和圈线复现方法见[截图工具说明](scripts/docs/README.md)。两张流程／架构图是说明性示意图。
 - **源码发行不包含**模型、配音服务、账号凭据和视频产物。升级前保留自己的配置与工作目录，先阅读变更记录。
-- **仓库保持私有，尚未指定开源许可证。** 第三方组件与模型遵循各自的许可证及使用条款，见[第三方说明](THIRD_PARTY.md)。
+- **源码与发行记录公开可读，尚未指定开源许可证。** 第三方组件与模型遵循各自的许可证及使用条款，见[第三方说明](THIRD_PARTY.md)。
 
 </details>
